@@ -18,32 +18,41 @@ TEMPLATE = (devteam.SKILL / "templates/team-brief.md").read_text()
 
 FAKE_HERDR = textwrap.dedent(r'''
     #!/usr/bin/env python3
+    # A herdr stand-in. Panes keep their label and agent_session after their agent exits, like herdr does.
     import json, os, sys
     path = os.environ["FAKE_HERDR"]
     s = json.load(open(path))
     s["calls"].append(sys.argv[1:])
     a = sys.argv[1:]
+    panes = s["panes"]  # pane_id -> {pane_id, tab_id, label, agent, name, agent_status, agent_session}
     def out(result):
         json.dump(s, open(path, "w")); print(json.dumps({"id": "1", "result": result})); sys.exit(0)
     def fail(msg):
         json.dump(s, open(path, "w")); print(json.dumps({"error": msg}), file=sys.stderr); sys.exit(1)
-    agents = s["agents"]  # pane_id -> agent info
+    def find(target):
+        return panes.get(target) or next((p for p in panes.values() if p.get("agent") and p.get("name") == target), None)
     if a[:2] == ["agent", "list"]:
-        out({"type": "agent_list", "agents": list(agents.values())})
+        out({"type": "agent_list", "agents": [p for p in panes.values() if p.get("agent")]})
     if a[:2] == ["agent", "get"]:
-        hit = agents.get(a[2]) or next((x for x in agents.values() if x.get("name") == a[2]), None)
-        out({"type": "agent_info", "agent": hit}) if hit else fail("agent_not_found")
+        p = find(a[2])
+        out({"type": "agent_info", "agent": p}) if p and p.get("agent") else fail("agent_not_found")
     if a[:2] == ["agent", "rename"]:
-        agents[a[2]]["name"] = a[3]; out({"type": "agent_info", "agent": agents[a[2]]})
-    if a[:2] == ["pane", "get"]:
-        out({"type": "pane_info", "pane": {"pane_id": a[2]}}) if a[2] in s["panes"] else fail("pane_not_found")
+        find(a[2])["name"] = a[3]; out({"type": "agent_info", "agent": find(a[3])})
+    if a[:2] == ["pane", "list"]:
+        out({"type": "pane_list", "panes": list(panes.values())})
+    if a[:2] == ["pane", "rename"]:
+        panes[a[2]]["label"] = a[3]; out({"type": "pane_info", "pane": panes[a[2]]})
     if a[:2] == ["pane", "split"]:
-        pid = f"w1:p{len(s['panes']) + 1}"; s["panes"].append(pid)
-        out({"type": "pane_info", "pane": {"pane_id": pid}})
+        s["next"] += 1
+        pid = f"w1:p{s['next']}"
+        panes[pid] = {"pane_id": pid, "tab_id": panes[a[2]]["tab_id"], "label": None}
+        out({"type": "pane_info", "pane": panes[pid]})
     if a[:2] == ["agent", "start"]:
         name, kind, pane = a[2], a[a.index("--kind") + 1], a[a.index("--pane") + 1]
-        agents[pane] = {"pane_id": pane, "name": name, "agent": kind, "agent_status": "idle"}
-        out({"type": "agent_started", "agent": agents[pane], "argv": a[a.index("--") + 1:]})
+        if panes[pane].get("agent"):
+            fail("pane_busy")
+        panes[pane].update(agent=kind, name=name, agent_status="idle")
+        out({"type": "agent_started", "agent": panes[pane], "argv": a[a.index("--") + 1:]})
     if a[:2] == ["agent", "prompt"]:
         out({"type": "agent_prompted", "agent": {}})
     fail("unexpected " + " ".join(a))
@@ -96,17 +105,17 @@ def team_brief(settings, body="## Workflow\n\n1. {lead} hands out work.\n"):
 
 
 class Env:
-    """A temp repo with .devteam/team-brief.md (the template unless given), a fake herdr, fake harnesses,
+    """A temp repo with team-brief.md at its root (the template unless given), a fake herdr, fake harnesses,
     a Codex model cache, and the lead (a claude agent) in pane w1:p1."""
 
-    def __init__(self, brief=TEMPLATE, agents=None, harnesses=("claude", "codex", "pi", "omp", "opencode"), models=MODELS):
+    def __init__(self, brief=TEMPLATE, panes=None, harnesses=("claude", "codex", "pi", "omp", "opencode"), models=MODELS):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = pathlib.Path(self.tmp.name)
         self.home = self.root / "home"
         (self.home / ".codex").mkdir(parents=True)
         (self.home / ".codex/models_cache.json").write_text(json.dumps(CODEX_CACHE))
         self.repo = self.root / "repo"
-        (self.repo / ".devteam").mkdir(parents=True)
+        (self.repo / "sub").mkdir(parents=True)
         if brief is not None:
             self.write_brief(brief)
         bin_ = self.root / "bin"
@@ -119,24 +128,22 @@ class Env:
                 (bin_ / name).write_text(body)
                 (bin_ / name).chmod(0o755)
         self.fake = self.root / "herdr.json"
-        lead = {"pane_id": "w1:p1", "name": None, "agent": "claude", "agent_status": "working"}
-        self.write_fake({"calls": [], "panes": ["w1:p1"], "agents": {"w1:p1": lead, **(agents or {})}})
+        lead = {"pane_id": "w1:p1", "tab_id": "w1:t1", "label": None, "agent": "claude", "name": None,
+                "agent_status": "working"}
+        self.write_fake({"calls": [], "next": 1, "panes": {"w1:p1": lead, **(panes or {})}})
         self.env = {**os.environ, "HERDR_BIN": str(bin_ / "herdr"), "FAKE_HERDR": str(self.fake),
-                    "HERDR_ENV": "1", "HERDR_PANE_ID": "w1:p1", "PATH": str(bin_), "HOME": str(self.home),
-                    "FAKE_MODELS": models}
+                    "HERDR_ENV": "1", "HERDR_PANE_ID": "w1:p1", "HERDR_WORKSPACE_ID": "w1", "PATH": str(bin_),
+                    "HOME": str(self.home), "XDG_CACHE_HOME": str(self.root / "cache"), "FAKE_MODELS": models}
         self.env.pop("CODEX_HOME", None)
 
     def write_brief(self, text):
-        (self.repo / ".devteam/team-brief.md").write_text(text)
+        (self.repo / "team-brief.md").write_text(text)
 
     def write_fake(self, s):
         self.fake.write_text(json.dumps(s))
 
     def fake_state(self):
         return json.loads(self.fake.read_text())
-
-    def state(self):
-        return json.loads((self.repo / ".devteam/state/team.json").read_text())
 
     def run(self, *args, check=True, cwd=None, **env):
         p = subprocess.run([sys.executable, str(SCRIPT), args[0], "--cwd", str(cwd or self.repo), *args[1:]],
@@ -154,10 +161,26 @@ class Env:
     def prompts(self):
         return [(c[2], c[3]) for c in self.calls("agent", "prompt")]
 
-    def kill(self, *names):
-        """Members exit: their panes lose the agent."""
+    def pane_of(self, name):
+        return next(p for p in self.fake_state()["panes"].values() if p.get("label") == name)
+
+    def set_session(self, name, ref):
         fs = self.fake_state()
-        fs["agents"] = {p: a for p, a in fs["agents"].items() if a.get("name") not in names}
+        next(p for p in fs["panes"].values() if p.get("label") == name)["agent_session"] = ref
+        self.write_fake(fs)
+
+    def kill(self, *names):
+        """Members' agents exit; their panes stay, with label and session reference."""
+        fs = self.fake_state()
+        for p in fs["panes"].values():
+            if p.get("label") in names:
+                for k in ("agent", "name", "agent_status"):
+                    p.pop(k, None)
+        self.write_fake(fs)
+
+    def close(self, *names):
+        fs = self.fake_state()
+        fs["panes"] = {k: p for k, p in fs["panes"].items() if p.get("label") not in names}
         self.write_fake(fs)
 
     def __enter__(self):
@@ -180,16 +203,19 @@ def kind(call):
 
 
 class UpTests(unittest.TestCase):
-    def test_default_team_launches_and_gets_both_briefs(self):
+    def test_default_team_launches_labeled_and_briefed(self):
         with Env() as e:
-            (e.repo / ".devteam/project-brief.md").write_text("# Project\nA Go TUI for GitHub issues.\n")
-            e.run("up", cwd=e.repo / ".devteam")  # .devteam is found from a subdirectory too
+            e.run("up", cwd=e.repo / "sub")  # team-brief.md is found from a subdirectory too
             fs = e.fake_state()
-            self.assertEqual(fs["agents"]["w1:p1"]["name"], "cto")
+            self.assertEqual(fs["panes"]["w1:p1"]["name"], "cto")
+            self.assertEqual(fs["panes"]["w1:p1"]["label"], "cto")
             splits = e.calls("pane", "split")
             self.assertEqual((splits[0][2], flag(splits[0], "--direction")), ("w1:p1", "right"))
             self.assertEqual((splits[1][2], flag(splits[1], "--direction")), ("w1:p2", "down"))
             self.assertTrue(all("--no-focus" in c and flag(c, "--cwd") == str(e.repo) for c in splits))
+            labels = {p["label"]: k for k, p in fs["panes"].items()}
+            self.assertEqual(labels, {"cto": "w1:p1", "lead-dev": "w1:p2", "frontend-dev": "w1:p3",
+                                      "reviewer": "w1:p4", "pm": "w1:p5"})
 
             starts = e.starts()
             self.assertEqual({n: kind(c) for n, c in starts.items()},
@@ -202,24 +228,19 @@ class UpTests(unittest.TestCase):
             self.assertIn("You are @reviewer", instructions["developer_instructions"])
             fe = native(starts["frontend-dev"])
             prompt_file = pathlib.Path(flag(fe, "--append-system-prompt-file"))
-            self.assertEqual(prompt_file.parent, e.repo / ".devteam/state/prompts")
+            self.assertTrue(str(prompt_file).startswith(str(e.root / "cache/devteam")))  # outside the repo
             self.assertIn("Never run `git commit`", prompt_file.read_text())
-            self.assertIn(".devteam/project-brief.md", prompt_file.read_text())
-            pm = native(starts["pm"])
-            self.assertEqual(flag(pm, "--model"), "openrouter/deepseek/deepseek-v4.1-flash")
+            self.assertIn("Only @pm updates the tracker (TODO.md at the repo root)", prompt_file.read_text())
+            self.assertEqual(flag(native(starts["pm"]), "--model"), "openrouter/deepseek/deepseek-v4.1-flash")
 
-            sent = e.prompts()
-            briefs = [(n, t) for n, t in sent if t.startswith("# Team brief (from @cto)")]
+            briefs = [(n, t) for n, t in e.prompts() if t.startswith("# Team brief (from @cto)")]
             self.assertEqual({n for n, _ in briefs}, {"lead-dev", "frontend-dev", "reviewer", "pm"})
             text = briefs[0][1]
-            for needle in ("| **@lead-dev** | Codex, gpt-6.1-sol, high |", "**@pm** owns `TODO.md`",
-                           "## Workflow", "The project brief comes next."):
+            for needle in ("| **@lead-dev** | Codex, gpt-6.1-sol, high |", "**@pm** owns the tracker",
+                           "## Workflow", "## Project", "Reply only: ready."):
                 self.assertIn(needle, text)
-            self.assertNotIn("+++", text)  # settings become the roster, not raw TOML
-            projects = [n for n, t in sent if t.startswith("[from @cto] Project brief")]
-            self.assertEqual(len(projects), 4)
-            self.assertEqual((e.repo / ".devteam/.gitignore").read_text(), "state/\n")
-            self.assertEqual(e.state()["agents"]["pm"]["pane_id"], "w1:p5")
+            self.assertNotIn("+++", text)
+            self.assertEqual(sorted(p.name for p in e.repo.iterdir()), ["sub", "team-brief.md"])  # nothing else
 
     def test_failed_check_launches_nothing_and_explains_the_fix(self):
         with Env(team_brief('''
@@ -319,15 +340,19 @@ class UpTests(unittest.TestCase):
             p = e.run("check", "reviewer", check=False, FAKE_OPENCODE_VERSION="opencode 1.4.0")
             self.assertIn("devteam supports v2 or later", p.stdout)
 
-    def test_adhoc_member_second_instance_and_clashes(self):
-        running = {"w1:p9": {"pane_id": "w1:p9", "name": "lead-dev", "agent": "codex", "agent_status": "idle"}}
-        with Env(agents=running) as e:
+    def test_adhoc_member_joins_the_brief(self):
+        with Env() as e:
             e.run("up", "backend-dev-2", "--role", "backend-dev", "--model", "gpt-6-luna", "--thinking", "high",
                   "--no-brief", "--", "--search")
             call = e.starts()["backend-dev-2"]
             self.assertEqual(kind(call), "codex")
             self.assertEqual(native(call)[-1], "--search")
-            self.assertIn("already running: lead-dev", e.run("up", "lead-dev", check=False).stderr)
+            cfg = devteam.Config(e.repo)
+            self.assertEqual(cfg.members["backend-dev-2"],
+                             {"role": "backend-dev", "harness": "codex", "model": "gpt-6-luna", "thinking": "high"})
+            self.assertIn("## Workflow", cfg.body)  # the prose survived the edit
+            self.assertIn("@backend-dev-2", e.run("status").stdout)
+            self.assertIn("already running: backend-dev-2", e.run("up", "backend-dev-2", check=False).stderr)
             self.assertIn("is not a member or a role", e.run("check", "wizard", check=False).stderr)
 
     def test_say(self):
@@ -342,7 +367,7 @@ class UpTests(unittest.TestCase):
             self.assertIn(("pm", "[from @cto] add a todo: ship it"), sent)
             self.assertIn("not running: reviewer", e.run("say", "reviewer", "hi", check=False).stderr)
 
-    def test_dry_run_and_outside_herdr_and_no_brief(self):
+    def test_dry_run_outside_herdr_and_no_brief(self):
         with Env() as e:
             out = e.run("up", "--team", "planning", "--dry-run").stdout
             self.assertIn("would start @product", out)
@@ -353,50 +378,66 @@ class UpTests(unittest.TestCase):
 
 
 class ContinueTests(unittest.TestCase):
-    def test_resumes_gone_members_in_their_sessions_with_current_settings(self):
+    def test_brings_members_back_in_their_panes_and_sessions(self):
         with Env() as e:
             e.run("up", "lead-dev", "frontend-dev", "pm", "--no-brief")
-            fs = e.fake_state()
-            refs = {
-                "w1:p2": {"source": "herdr:codex", "agent": "codex", "kind": "id", "value": "cx-1"},
-                "w1:p3": {"source": "herdr:claude", "agent": "claude", "kind": "id", "value": "cl-1"},
-                "w1:p4": {"source": "herdr:pi", "agent": "pi", "kind": "path", "value": "/s/2026_pi-1.jsonl"},
-            }
-            for pane, ref in refs.items():
-                fs["agents"][pane]["agent_session"] = ref
-            e.write_fake(fs)
-            e.run("status")  # records the session refs
+            e.set_session("lead-dev", {"source": "herdr:codex", "agent": "codex", "kind": "id", "value": "cx-1"})
+            e.set_session("frontend-dev", {"source": "herdr:claude", "agent": "claude", "kind": "id", "value": "cl-1"})
+            e.set_session("pm", {"source": "herdr:pi", "agent": "pi", "kind": "path", "value": "/s/2026_pi-1.jsonl"})
             e.kill("lead-dev", "frontend-dev", "pm")
-            # The brief changes while they are gone: lead-dev moves to Luna.
+            panes_before = {n: e.pane_of(n)["pane_id"] for n in ("lead-dev", "frontend-dev", "pm")}
+            # The brief changed while they were gone: lead-dev moves to Luna.
             e.write_brief(TEMPLATE.replace('model = "gpt-6.1-sol"\nthinking = "high"',
                                            'model = "gpt-6-luna"\nthinking = "medium"'))
-            status = e.run("status").stdout
-            self.assertIn("gone", status)
-            self.assertIn("model gpt-6.1-sol -> gpt-6-luna", status)
+            self.assertIn("gone", e.run("status").stdout)
 
             e.run("continue")
-            starts = [c for c in e.calls("agent", "start")][3:]  # after the first three launches
-            by = {c[2]: native(c) for c in starts}
-            self.assertEqual(by["lead-dev"][:2], ["resume", "cx-1"])
-            self.assertEqual(flag(by["lead-dev"], "-m"), "gpt-6-luna")  # new settings apply on resume
-            self.assertEqual(flag(by["frontend-dev"], "--resume"), "cl-1")
-            self.assertEqual(flag(by["pm"], "--session"), "/s/2026_pi-1.jsonl")
-            notes = [n for n, t in e.prompts() if "picking up where we left off" in t]
-            self.assertEqual(sorted(notes), ["frontend-dev", "lead-dev", "pm"])
+            by = {c[2]: c for c in e.calls("agent", "start")[3:]}
+            self.assertEqual({n: flag(c, "--pane") for n, c in by.items()}, panes_before)  # same panes, no splits
+            self.assertEqual(len(e.calls("pane", "split")), 3)
+            self.assertEqual(native(by["lead-dev"])[:2], ["resume", "cx-1"])
+            self.assertEqual(flag(native(by["lead-dev"]), "-m"), "gpt-6-luna")  # current settings apply
+            self.assertEqual(flag(native(by["frontend-dev"]), "--resume"), "cl-1")
+            self.assertEqual(flag(native(by["pm"]), "--session"), "/s/2026_pi-1.jsonl")
+            notes = sorted(n for n, t in e.prompts() if "picking up where we left off" in t)
+            self.assertEqual(notes, ["frontend-dev", "lead-dev", "pm"])
             self.assertIn("every member is running", e.run("continue").stdout)
 
-    def test_fresh_and_harness_change_start_new_sessions(self):
+    def test_adopts_members_herdr_resumed_after_a_restart(self):
         with Env() as e:
-            e.run("up", "pm", "--no-brief")
+            e.run("up", "lead-dev", "pm", "--no-brief")
+            # herdr restarted and resumed both agents in their labeled panes; names do not survive that.
             fs = e.fake_state()
-            fs["agents"]["w1:p2"]["agent_session"] = {"agent": "pi", "kind": "path", "value": "/s/p.jsonl"}
+            for p in fs["panes"].values():
+                p["name"] = None
             e.write_fake(fs)
-            e.run("status")
+            self.assertIn("idle (unnamed)", e.run("status").stdout)
+            self.assertIn("already running: lead-dev", e.run("up", "lead-dev", check=False).stderr)
+            out = e.run("continue").stdout
+            self.assertIn("adopted @lead-dev", out)
+            self.assertIn("not necessarily gpt-6.1-sol", out)
+            fs = e.fake_state()
+            self.assertEqual({p["label"]: p["name"] for p in fs["panes"].values()},
+                             {"cto": "cto", "lead-dev": "lead-dev", "pm": "pm"})
+            self.assertEqual(len(e.calls("agent", "start")), 2)  # nothing relaunched
+            standing = [n for n, t in e.prompts() if "herdr resumed your session" in t]
+            self.assertEqual(sorted(standing), ["lead-dev", "pm"])
+            self.assertIn("You are @pm", next(t for n, t in e.prompts() if n == "pm" and "standing" in t))
+
+    def test_closed_pane_or_changed_harness_starts_fresh(self):
+        with Env() as e:
+            e.run("up", "pm", "reviewer", "--no-brief")
+            e.set_session("pm", {"agent": "pi", "kind": "path", "value": "/s/p.jsonl"})
             e.kill("pm")
+            e.close("reviewer")
             e.write_brief(TEMPLATE.replace('model = "deepseek/deepseek-v4.1-flash"', 'model = "gpt-6-sol"')
                           .replace('[members.pm]\nharness = "pi"', '[members.pm]\nharness = "codex"'))
-            e.run("continue")
-            self.assertNotIn("resume", native(e.calls("agent", "start")[-1]))  # a pi session can't open in codex
+            out = e.run("continue", "pm", "reviewer").stdout
+            self.assertIn("@reviewer has no pane any more", out)
+            by = {c[2]: native(c) for c in e.calls("agent", "start")[2:]}
+            self.assertNotIn("resume", by["pm"])  # a pi session can't open in codex
+            self.assertNotIn("resume", by["reviewer"])
+            self.assertEqual(e.pane_of("reviewer")["pane_id"], "w1:p4")  # a new, labeled pane
 
 
 class ConfigTests(unittest.TestCase):
@@ -407,14 +448,19 @@ class ConfigTests(unittest.TestCase):
                 p = devteam.plan(cfg, name)
                 self.assertIn(p["harness"], devteam.HARNESSES, name)
                 self.assertTrue(p["model"], name)
-            self.assertEqual(cfg.board, "TODO.md")
-            self.assertIn("## Workflow", cfg.body)
+            self.assertEqual(cfg.tracker, "TODO.md at the repo root")
+            self.assertIn("## Project", cfg.body)
             out = e.run("show").stdout
             self.assertIn("@lead-dev", out)
-            self.assertIn("project brief: not written yet", out)
+            self.assertIn("tracker: TODO.md at the repo root", out)
         models = tomllib.loads((devteam.SKILL / "models.toml").read_text())
         for tiers in models["tiers"]["codex"].values():
             self.assertFalse(any("/" in m for m in tiers), "Codex takes bare model names")
+
+    def test_no_tracker(self):
+        with Env(team_brief('[members.pm]\n')) as e:
+            self.assertIsNone(devteam.Config(e.repo).tracker)
+            self.assertNotIn("tracker", e.run("prompt", "pm").stdout.split("## Talking to the team")[1])
 
     def test_infer_harness(self):
         for model, want in [("claude-fable-5-2", "claude"), ("opus", "claude"), ("anthropic/claude-sonnet-5-5", "claude"),
@@ -432,24 +478,22 @@ class ConfigTests(unittest.TestCase):
             self.assertIn("ghost", e.run("show", check=False).stderr)
             e.write_brief("no front matter\n")
             self.assertIn("must start with a +++ line", e.run("show", check=False).stderr)
-            e.write_brief("+++\nboard = 'x'\n")
+            e.write_brief("+++\ntracker = 'x'\n")
             self.assertIn("no closing +++", e.run("show", check=False).stderr)
 
     def test_init(self):
         with Env(brief=None) as e:
-            e.run("init")
-            self.assertEqual((e.repo / ".devteam/team-brief.md").read_text(), TEMPLATE)
-            self.assertIn("exists", e.run("init", check=False).stderr)
-            e.run("init", "--force")
+            e.run("init", cwd=e.repo / "sub")
+            self.assertEqual((e.repo / "sub/team-brief.md").read_text(), TEMPLATE)  # no git: where you are
+            self.assertIn("exists", e.run("init", cwd=e.repo / "sub", check=False).stderr)
+            e.run("init", "--force", cwd=e.repo / "sub")
 
     def test_brief_preview_and_member_prompt(self):
         with Env() as e:
             text = e.run("brief", "--team", "planning").stdout
             self.assertIn("| **@product** | Claude Code, claude-opus-5-5, medium |", text)
             self.assertIn("Reply only: ready.", text)
-            self.assertNotIn("project brief comes next", text)
-            prompt = e.run("prompt", "reviewer").stdout
-            self.assertIn("You are read-only", prompt)
+            self.assertIn("You are read-only", e.run("prompt", "reviewer").stdout)
 
     def test_session_id_from_ref(self):
         self.assertEqual(devteam.session_id({"kind": "id", "value": "abc"}), "abc")
@@ -488,12 +532,9 @@ class CostTests(unittest.TestCase):
             jsonl(cx, [{"type": "turn_context", "payload": {"model": "gpt-6.1-sol"}},
                        {"type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {
                            "input_tokens": 1_000_000, "cached_input_tokens": 500_000, "output_tokens": 10_000}}}}])
-
-            fs = e.fake_state()
-            fs["agents"]["w1:p1"]["agent_session"] = {"source": "herdr:claude", "agent": "claude", "kind": "id", "value": "c-1"}
-            fs["agents"]["w1:p2"]["agent_session"] = {"source": "herdr:codex", "agent": "codex", "kind": "id", "value": "x-1"}
-            fs["agents"]["w1:p3"]["agent_session"] = {"source": "herdr:pi", "agent": "pi", "kind": "path", "value": str(pi)}
-            e.write_fake(fs)
+            e.set_session("cto", {"source": "herdr:claude", "agent": "claude", "kind": "id", "value": "c-1"})
+            e.set_session("lead-dev", {"source": "herdr:codex", "agent": "codex", "kind": "id", "value": "x-1"})
+            e.set_session("pm", {"source": "herdr:pi", "agent": "pi", "kind": "path", "value": str(pi)})
 
             by = {a["agent"]: a for a in json.loads(e.run("cost", "--json", "--home", str(h)).stdout)["agents"]}
             self.assertEqual(by["cto"]["models"]["claude-fable-5-2"]["input"], 1000)
@@ -507,7 +548,7 @@ class CostTests(unittest.TestCase):
             self.assertIn("$1.28+?", table)
             self.assertIn("Codex records tokens only", table)
 
-            e.kill("pm", "lead-dev")
+            e.kill("pm")  # exited, but its pane still holds the session reference
             gone = {a["agent"]: a for a in json.loads(e.run("cost", "--json", "--home", str(h)).stdout)["agents"]}
             self.assertEqual(gone["pm"]["status"], "gone")
             self.assertAlmostEqual(gone["pm"]["cost_usd"], 0.03)

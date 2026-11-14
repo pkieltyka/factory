@@ -1,7 +1,7 @@
 +++
-# The team brief: one file holds the team's settings (this block) and its prose (below the closing +++).
-# devteam.py reads the settings to launch members; every member receives the whole brief, with a
-# roster table built from these settings when it is sent, so the two cannot drift apart.
+# team-brief.md: the whole team in one file at the repo root. Settings in this block, prose below the
+# closing +++ (role details, workflow, and a short project section at the end). devteam.py launches members
+# from the settings; every member receives the brief with a roster table built from them, so nothing drifts.
 #
 # Member fields (the table key is the @name: lowercase, digits, - or _):
 #   role      a role in the skill's roles/ (defaults to the name)
@@ -13,7 +13,12 @@
 # Two of the same role get distinct names: [members.backend-dev-2] role = "backend-dev".
 # Top-level keys must come before the first [table].
 
-board = "TODO.md"     # the PM's board of todos, owners, status, bugs and decisions
+# Where @pm tracks tasks, owners, status and bugs, in words members can act on. Leave it out for no tracker.
+#   "TODO.md at the repo root"
+#   "GitHub Issues on owner/repo, via `gh issue` (board: GitHub Project 'Roadmap')"
+#   "Linear team ENG, via the Linear MCP tools"
+#   "the `todo` CLI (`todo --help`)"
+tracker = "TODO.md at the repo root"
 lead_commits = true   # only the lead runs git commit / git push
 
 [lead]
@@ -89,11 +94,15 @@ full = ["architect", "product", "lead-dev", "backend-dev", "frontend-dev", "desi
 
 - **@lead-dev** and **@frontend-dev** agree on the interface between the core and the UI before either builds against it, and keep each other posted when it changes.
 - **@reviewer**: when @cto asks for a review, read the diff (`git status`, `git diff`, new untracked files), build and test where that helps, and report findings ordered by severity, each with `file:line` and a concrete failure scenario. Read-only: you report, the developers fix.
-- **@pm** owns `TODO.md`: short, current, ordered by priority, with an owner and status on every item. Only @pm edits it; teammates ask @pm to add or update items.
+- **@pm** owns the tracker: short, current, ordered by priority, with an owner and status on every item. Only @pm updates it; teammates ask @pm to add or change items.
 
 ## Workflow
 
-1. @cto sets direction and hands out tasks; @pm records them in `TODO.md`.
+1. @cto sets direction and hands out tasks; @pm records them in the tracker.
 2. Developers implement and leave their work uncommitted.
 3. @reviewer does the first-pass review of the diff; the developers fix what it finds.
 4. @cto does the final review and commits. Nobody else runs `git commit` or `git push`.
+
+## Project
+
+<!-- One to three sentences: what we are building, for whom, and the stack. Details come from @cto. -->
