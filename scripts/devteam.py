@@ -1,18 +1,25 @@
 #!/usr/bin/env python3
-"""Run a team of coding agents in herdr panes. You are the lead (CTO); members run on any harness and model.
+"""devteam: a software team of coding agents in herdr panes. You are the lead (CTO); each member runs
+on its own harness, model and thinking level.
 
-  team.py config [--team NAME]          the formation: each member's role, harness, model, thinking
-  team.py check  [NAMES | --team X]     verify harnesses, models and thinking levels; launches nothing
-  team.py up     [NAMES | --team X]     check, launch members in new panes, then send the team briefing
-  team.py up --role backend-dev --name backend-dev-2 --model z-ai/glm-5.3      an extra member, ad hoc
-  team.py briefing [--send]             the team briefing: roster, role details, workflow, how to talk
-  team.py say NAMES|all "message"       message members as the lead (or --file project.md)
-  team.py roster                        who is on the team and their live status
-  team.py cost [--json]                 tokens and dollars per agent from each harness's session files
-  team.py brief NAME                    the system prompt a member gets
-  team.py init                          copy the default formation to ./agent-team.toml
+The team lives in the repo, under .devteam/:
+  team-brief.md      settings (+++ TOML front matter +++) and prose for the team; the one source of truth
+  project-brief.md   what we are building; sent after the team brief
+  state/             git-ignored: panes and session ids of running members
 
-Harnesses: claude, codex, pi, omp, opencode (v2+). `up` launches nothing if any member fails `check`.
+  devteam.py init                     write .devteam/team-brief.md from the template
+  devteam.py harnesses                which harnesses and recommended models this machine has
+  devteam.py show [--team NAME]       the formation
+  devteam.py check [NAMES|--team X]   can these members launch? launches nothing
+  devteam.py up [NAMES|--team X]      check, launch in new panes, send the team and project briefs
+  devteam.py continue                 restart members whose panes are gone, in their old sessions
+  devteam.py status                   running members, their state, and drift from the brief
+  devteam.py brief [--send]           render (or send) the team brief, then the project brief
+  devteam.py say NAMES|all "msg"      message members as the lead (or --file)
+  devteam.py cost [--json]            tokens and dollars per agent
+  devteam.py prompt NAME              the system prompt a member gets
+
+Harnesses: claude, codex, pi, omp, opencode (v2+). Nothing launches if any member fails the check.
 """
 import argparse
 import collections
@@ -33,6 +40,7 @@ LABEL = {"claude": "Claude Code", "codex": "Codex", "pi": "pi", "omp": "omp", "o
 NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 CLAUDE_ALIASES = ("opus", "sonnet", "haiku", "fable")
 PROBE_TIMEOUT = 60
+DOT = ".devteam"
 
 INSTALL = {
     "claude": "Install Claude Code (https://code.claude.com/docs) and log in once by running `claude`.",
@@ -51,7 +59,29 @@ class Problem(Exception):
         self.what, self.fix = what, fix
 
 
-# ================================================================ config
+# ================================================================ files
+
+def find_root(cwd):
+    """The directory holding .devteam/, searching up from cwd; else cwd itself."""
+    cwd = pathlib.Path(cwd).resolve()
+    for d in (cwd, *cwd.parents):
+        if (d / DOT / "team-brief.md").is_file():
+            return d
+    return cwd
+
+
+def parse_front(text, path):
+    """'+++\\n<toml>\\n+++\\n<body>' -> (settings, body)."""
+    if not text.startswith("+++\n"):
+        raise SystemExit(f"{path}: must start with a +++ line, then TOML settings, then +++")
+    head, sep, body = text[4:].partition("\n+++\n")
+    if not sep:
+        raise SystemExit(f"{path}: no closing +++ line after the settings")
+    try:
+        return tomllib.loads(head), body.strip()
+    except tomllib.TOMLDecodeError as e:
+        raise SystemExit(f"{path}: settings: {e}")
+
 
 def parse_role(path):
     _, head, body = path.read_text().split("---\n", 2)
@@ -76,41 +106,34 @@ def merge(base, over):
     return out
 
 
-def config_files(cwd, explicit=None):
-    """Team config layers, lowest first: built-in, user, project, --config."""
-    xdg = pathlib.Path(os.environ.get("XDG_CONFIG_HOME") or pathlib.Path.home() / ".config")
-    files = [SKILL / "team.toml", xdg / "agent-team/team.toml", pathlib.Path(cwd) / "agent-team.toml"]
-    files = [f for f in files if f.is_file()]
-    if explicit:
-        p = pathlib.Path(explicit).expanduser()
-        if not p.is_file():
-            raise SystemExit(f"--config {explicit}: no such file")
-        files.append(p)
-    return files
-
-
 class Config:
-    def __init__(self, cwd, explicit=None):
-        self.cwd = pathlib.Path(cwd)
+    def __init__(self, cwd, require=True):
+        self.root = find_root(cwd)
+        self.dir = self.root / DOT
+        self.brief_file = self.dir / "team-brief.md"
+        self.project_file = self.dir / "project-brief.md"
         self.roles = {p.stem: parse_role(p) for p in sorted((SKILL / "roles").glob("*.md"))}
         self.models = tomllib.loads((SKILL / "models.toml").read_text())
-        self.files = config_files(cwd, explicit)
-        team = {}
-        for f in self.files:
-            try:
-                team = merge(team, tomllib.loads(f.read_text()))
-            except tomllib.TOMLDecodeError as e:
-                raise SystemExit(f"{f}: {e}")
-        if "prices" in team:
-            self.models = merge(self.models, {"prices": team["prices"]})
-        self.team = team
-        self.lead = {"name": "cto", **team.get("lead", {})}
-        self.members = team.get("members", {})
+        if self.brief_file.is_file():
+            self.team, self.body = parse_front(self.brief_file.read_text(), self.brief_file)
+        elif require:
+            raise SystemExit(f"no {DOT}/team-brief.md in {self.root} or above. Run `/devteam setup`"
+                             " (or `devteam.py init`) first.")
+        else:
+            self.team, self.body = {}, ""
+        if "prices" in self.team:
+            self.models = merge(self.models, {"prices": self.team["prices"]})
+        self.lead = {"name": "cto", **self.team.get("lead", {})}
+        self.members = self.team.get("members", {})
         for name, m in self.members.items():
             if not NAME_RE.match(name):
                 raise SystemExit(f"member name {name!r} must match {NAME_RE.pattern}")
             if m.get("role", name) not in self.roles:
                 raise SystemExit(f"member {name!r}: no role {m.get('role', name)!r}; roles are {sorted(self.roles)}")
+        for team, names in self.team.get("teams", {}).items():
+            unknown = [n for n in names if n not in self.members]
+            if unknown:
+                raise SystemExit(f"team {team!r} names members not in [members]: {', '.join(unknown)}")
 
     @property
     def board(self):
@@ -137,15 +160,14 @@ def plan(cfg, name, overrides=None):
         raise SystemExit(f"{name!r} is not a member or a role; members: {sorted(cfg.members)}")
     meta, _ = cfg.roles[role]
     model = m.get("model")
-    harness = m.get("harness") or (infer_harness(model) if model else cfg.team.get("harness", "claude"))
+    harness = m.get("harness") or (infer_harness(model) if model else "claude")
     tier = m.get("tier") or meta["tier"]
     if not model and harness in cfg.models.get("tiers", {}):
         models = cfg.models["tiers"][harness][tier]
         model = models[min(m.get("pick", 0), len(models) - 1)]
     return {"name": name, "role": role, "harness": harness, "model": model, "tier": tier,
             "thinking": str(m.get("thinking") or m.get("effort") or meta["thinking"]),
-            "readonly": meta["readonly"] == "true", "notes": m.get("notes", ""),
-            "works_with": list(m.get("works_with", []))}
+            "readonly": meta["readonly"] == "true", "notes": m.get("notes", "")}
 
 
 # ================================================================ availability checks
@@ -156,13 +178,13 @@ def run_probe(argv, env=None):
                            env={**os.environ, **(env or {})})
     except (OSError, subprocess.TimeoutExpired) as e:
         raise Problem(f"`{' '.join(argv[:3])}` failed: {e}",
-                      "Run team.py outside any sandbox, or check that the harness starts on its own.")
+                      "Run devteam.py outside any sandbox, or check that the harness starts on its own.")
     if p.returncode != 0:
         err = [l.strip() for l in (p.stderr.strip() or p.stdout.strip()).splitlines() if l.strip()]
         named = [l for l in err if re.match(r"(error|\w*Error)\b", l, re.I)]  # skip stack frames
         tail = (named or err or [f"exit {p.returncode}"])[0][:300]
         raise Problem(f"`{' '.join(argv[:3])}` failed: {tail}",
-                      "If a sandbox blocks it (read-only file system), run team.py outside the sandbox.")
+                      "If a sandbox blocks it (read-only file system), run devteam.py outside the sandbox.")
     return p.stdout
 
 
@@ -193,7 +215,7 @@ def resolve_listed(model, listed, harness):
         return hits[0]
     if len(hits) > 1:
         raise Problem(f"{harness} serves {base} from several providers: {', '.join(hits)}",
-                      "Write the model as provider/model in the team config to pick one.")
+                      "Write the model as provider/model in the team brief to pick one.")
     fix = {
         "pi": "Configure a provider that serves it in pi: an OpenRouter key (`pi auth --help`), or run it"
               " locally (vLLM, Ollama, llama.cpp) and add it to ~/.pi/agent/models.json (pi docs/models.md).",
@@ -245,9 +267,14 @@ class Checker:
         out = run_probe(["opencode", "--version"])
         m = re.search(r"(\d+)\.(\d+)", out)
         if not m or int(m.group(1)) < 2:
-            raise Problem(f"OpenCode {out.strip() or '?'} is too old; this skill supports v2 or later",
+            raise Problem(f"OpenCode {out.strip() or '?'} is too old; devteam supports v2 or later",
                           "Upgrade with `opencode upgrade`.")
         return out.strip()
+
+    def pi_listing(self, harness, query):
+        argv = ["pi", "--list-models", query] if harness == "pi" else ["omp", "models", query]
+        env = {"PI_OFFLINE": "1"} if harness == "pi" else None
+        return listed_models(self.probe((harness, query), lambda: run_probe(argv, env)))
 
     def check(self, p):
         """-> member dict with a launch-ready model, or raises Problem."""
@@ -283,15 +310,11 @@ class Checker:
         elif harness in ("pi", "omp"):
             levels = self.cfg.models["thinking"][harness]
             if not self.trust:
-                def listing(query):
-                    argv = ["pi", "--list-models", query] if harness == "pi" else ["omp", "models", query]
-                    env = {"PI_OFFLINE": "1"} if harness == "pi" else None
-                    return listed_models(self.probe((harness, query), lambda: run_probe(argv, env)))
                 try:
-                    p["model"] = resolve_listed(model, listing(model.rsplit("/", 1)[-1]), harness)
+                    p["model"] = resolve_listed(model, self.pi_listing(harness, model.rsplit("/", 1)[-1]), harness)
                 except Problem as e:
                     if "has no model" in e.what and stem(model):
-                        raise suggest(e, listing(stem(model)), model)
+                        raise suggest(e, self.pi_listing(harness, stem(model)), model)
                     raise
         else:  # opencode
             self.probe("opencode-version", self.opencode_version)
@@ -322,10 +345,10 @@ def check_all(cfg, plans, trust_models=False):
 def report_problems(problems):
     print(f"\nCannot launch: {len(problems)} member(s) failed the check. Nothing was started.\n")
     for p, e in problems:
-        print(f"- {p['name']} ({p['role']}, {p['harness']} {p['model'] or '?'}, thinking {p['thinking']}):")
+        print(f"- @{p['name']} ({p['role']}, {p['harness']} {p['model'] or '?'}, thinking {p['thinking']}):")
         print(f"    problem: {e.what}")
         print(f"    fix:     {e.fix}")
-    print("\nFix these, or change the member in the team config, then run again.")
+    print(f"\nFix these, or change the member in {DOT}/team-brief.md, then run again.")
 
 
 # ================================================================ briefs
@@ -335,12 +358,13 @@ def tag(name):
 
 
 def member_prompt(member, body, lead, cfg):
-    """System prompt for one member: who it is, its role rules, and the protocol. The roster lives in the briefing."""
+    """System prompt for one member: who it is, its role rules, and the protocol."""
     name, role = member["name"], member["role"]
     lines = [
-        f"You are @{name}, the {role} on a team of coding agents. Each agent runs in its own herdr pane in the"
-        f" same repo. The lead (orchestrator and CTO) is @{lead}; the human speaks through @{lead}.",
-        f"A team briefing from @{lead} lists everyone and how we work; the project brief follows it.",
+        f"You are @{name}, the {role} on a software team of coding agents. Each agent runs in its own herdr pane"
+        f" in the same repo. The lead (orchestrator and CTO) is @{lead}; the human speaks through @{lead}.",
+        f"The team brief (`{DOT}/team-brief.md`: who is on the team and how we work) and the project brief"
+        f" (`{DOT}/project-brief.md`) come from @{lead}. Re-read both whenever you lose track of context.",
         "",
         "## Your role",
         body,
@@ -367,116 +391,92 @@ def member_prompt(member, body, lead, cfg):
     return "\n".join(lines) + "\n"
 
 
-def repo_line(cwd):
+def repo_line(root):
     try:
-        url = subprocess.run(["git", "-C", str(cwd), "remote", "get-url", "origin"],
+        url = subprocess.run(["git", "-C", str(root), "remote", "get-url", "origin"],
                              capture_output=True, text=True).stdout.strip()
     except OSError:
         url = ""
     url = re.sub(r"^(git@|https://)([^:/]+)[:/](.+?)(\.git)?$", r"\2/\3", url)
-    return f"`{cwd}`" + (f" ({url})" if url else "")
+    return f"`{root}`" + (f" ({url})" if url else "")
 
 
-def team_briefing(cfg, members, lead, cwd):
-    """The shared briefing: roster, role details, workflow, and how to talk. No project details."""
-    by_role = collections.defaultdict(list)
-    for m in members:
-        by_role[m["role"]].append(f"@{m['name']}")
-    names = {m["name"] for m in members}
-
-    def fill(text):
-        def sub(mt):
-            key = mt.group(1)
-            if key == "lead":
-                return f"@{lead}"
-            if key == "board":
-                return cfg.board
-            if key in names:
-                return f"@{key}"
-            if by_role.get(key):
-                return " and ".join(by_role[key])
-            raise KeyError(key)
-        return re.sub(r"\{([a-z][a-z0-9_-]*)\}", sub, text)
-
+def render_team_brief(cfg, members, lead):
+    """The team brief as sent: roster built from the settings now, then the brief's prose, then how to talk."""
     L = cfg.lead
-    out = [f"# Team briefing (from @{lead})", "",
+    out = [f"# Team brief (from @{lead})", "",
            f"We are a team of {len(members) + 1} agents, each in its own herdr pane, all working in the same repo:"
-           f" {repo_line(cwd)}.", "", "## Roles", "", "| Name | Agent | Role |", "|---|---|---|"]
-    lead_agent = ", ".join(x for x in (LABEL.get(L.get("harness"), L.get("harness")), L.get("model"),
-                                       L.get("thinking")) if x)
-    out.append(f"| **@{lead}** | {lead_agent} | {fill(L.get('notes') or 'Orchestrator and lead.')} |")
+           f" {repo_line(cfg.root)}. This brief lives in `{DOT}/team-brief.md`.", "",
+           "## Roles", "", "| Name | Agent | Role |", "|---|---|---|"]
+    lead_agent = ", ".join(x for x in (LABEL.get(L.get("harness"), L.get("harness")), L.get("model"), L.get("thinking")) if x)
+    out.append(f"| **@{lead}** | {lead_agent} | {L.get('notes') or 'Orchestrator and lead.'} |")
     for m in members:
         meta, _ = cfg.roles[m["role"]]
-        agent = f"{LABEL[m['harness']]}, {m['model']}, {m['thinking']}"
-        out.append(f"| **@{m['name']}** | {agent} | {fill(m['notes']) if m['notes'] else meta['description']} |")
-
-    details = []
-    for m in members:
-        pals = [f"@{w}" for w in m["works_with"] if w in names]
-        if pals:
-            details.append(f"- **@{m['name']}** works closely with {' and '.join(pals)}: agree on shared interfaces"
-                           " before building against them, and keep each other posted when they change.")
-    if "pm" in by_role:
-        details.append(f"- **{' and '.join(by_role['pm'])}** owns `{cfg.board}`: short, current, ordered by priority,"
-                       " with an owner and status on every item. Teammates ask @pm to add or update items.")
-    for role in ("reviewer", "designer", "architect", "product"):
-        if role in by_role and cfg.roles[role][0]["readonly"] == "true":
-            details.append(f"- **{' and '.join(by_role[role])}** ({role}) is read-only: reports findings, the"
-                           " developers fix.")
-    if details:
-        out += ["", "## Role details", ""] + details
-
-    steps = []
-    for step in cfg.team.get("workflow", []):
-        try:
-            steps.append(fill(step))
-        except KeyError:
-            continue  # names a role nobody on the team has
-    if cfg.team.get("lead_commits", True):
-        steps.append(f"Nobody but @{lead} runs `git commit` or `git push`.")
-    if steps:
-        out += ["", "## Workflow", ""] + [f"{i}. {s}" for i, s in enumerate(steps, 1)]
-
-    names_list = ", ".join("`" + m["name"] + "`" for m in members)
+        out.append(f"| **@{m['name']}** | {LABEL.get(m['harness'], m['harness'])}, {m['model']}, {m['thinking']}"
+                   f" | {m.get('notes') or meta['description']} |")
+    if cfg.body:
+        out += ["", cfg.body]
+    names = ", ".join("`" + m["name"] + "`" for m in members)
     out += ["", "## Talking to each other", "",
             "- Refer to teammates by @name, and lean on them when it helps.",
             '- Message a teammate: `herdr agent prompt <name> "[from @you] your message"`',
-            f"  Names: {names_list}, and `{lead}` for the lead."
-            " Start every message with your `[from @you]` tag. Keep it short and specific.",
+            f"  Names: {names}, and `{lead}` for the lead. Start every message with your `[from @you]` tag."
+            " Keep it short and specific.",
             f"- Report to @{lead} by message when you finish, are blocked, or need a decision.",
             f"- Scope and architecture questions go to @{lead}; do not settle them between yourselves.",
-            "", "That is the whole team briefing. Reply only: ready. The project brief comes next."]
-    return "\n".join(out) + "\n"
+            "", "That is the whole team brief. Reply only: ready."
+            + (" The project brief comes next." if cfg.project_file.is_file() else "")]
+    return "\n".join(out).replace("{lead}", f"@{lead}") + "\n"
 
 
-def launch_spec(m, brief_path, brief_text, extra):
-    """-> (native argv after `--`, pane env, send the member prompt as first message?)"""
+def launch_spec(m, prompt_path, prompt_text, extra, resume=None):
+    """-> (native argv after `--`, pane env, send the member prompt as first message?)
+    resume: a session id or path to reopen instead of starting fresh."""
     h, model, thinking, ro = m["harness"], m["model"], m["thinking"], m["readonly"]
     if h == "claude":
-        argv = ["--model", model, "--effort", thinking, "--append-system-prompt-file", str(brief_path), "--name", m["name"]]
+        argv = ["--model", model, "--effort", thinking, "--append-system-prompt-file", str(prompt_path), "--name", m["name"]]
         if ro:
             argv += ["--disallowedTools", "Edit", "Write", "NotebookEdit"]
+        if resume:
+            argv += ["--resume", session_id(resume)]
         return argv + extra, {}, False
     if h == "pi":
-        argv = ["--model", model, "--thinking", thinking, "--append-system-prompt", str(brief_path), "--name", m["name"]]
+        argv = ["--model", model, "--thinking", thinking, "--append-system-prompt", str(prompt_path), "--name", m["name"]]
         if ro:
             argv += ["--exclude-tools", "edit,write"]
+        if resume:
+            argv += ["--session", resume["value"]]
         return argv + extra, {}, False
     if h == "omp":  # omp has no tool denylist; read-only relies on the prompt
-        return ["--model", model, "--thinking", thinking, "--append-system-prompt", str(brief_path)] + extra, {}, False
+        argv = ["--model", model, "--thinking", thinking, "--append-system-prompt", str(prompt_path)]
+        if resume:
+            argv.append(f"--resume={resume['value']}")
+        return argv + extra, {}, False
     if h == "codex":
         argv = ["-m", model, "-c", f"model_reasoning_effort={json.dumps(thinking)}",
-                "-c", f"developer_instructions={json.dumps(brief_text, ensure_ascii=False)}",
+                "-c", f"developer_instructions={json.dumps(prompt_text, ensure_ascii=False)}",
                 "-s", "read-only" if ro else "workspace-write"]
+        if resume:
+            argv = ["resume", session_id(resume)] + argv
         return argv + extra, {}, False
     # opencode v2: a primary agent per member via inline config. Its `system` key would replace
     # OpenCode's base prompt, so the member prompt goes in as the first message instead.
-    agent = {"mode": "primary", "description": f"{m['role']} on the agent team",
+    agent = {"mode": "primary", "description": f"{m['role']} on the dev team",
              "model": model + (f"#{thinking}" if thinking and thinking != "default" else "")}
     if ro:
         agent["permissions"] = [{"action": "edit", "resource": "*", "effect": "deny"}]
     content = {"default_agent": m["name"], "agents": {m["name"]: agent}}
-    return list(extra), {"OPENCODE_CONFIG_CONTENT": json.dumps(content)}, True
+    argv = ["--session", session_id(resume)] if resume else []
+    return argv + list(extra), {"OPENCODE_CONFIG_CONTENT": json.dumps(content)}, not resume
+
+
+def session_id(ref):
+    """A session id from a herdr session ref, which may hold an id or a file path."""
+    if ref.get("kind") != "path":
+        return ref["value"]
+    name = pathlib.Path(ref["value"]).stem
+    uuids = re.findall(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", name)
+    return uuids[-1] if uuids else name
 
 
 # ================================================================ herdr
@@ -521,20 +521,24 @@ def ensure_lead(state, cfg):
         raise SystemExit("HERDR_PANE_ID is not set; run this from the lead's herdr pane.")
     info = herdr("agent", "get", pane, check=False).get("result", {}).get("agent") or {}
     if not info:
-        raise SystemExit(f"herdr sees no agent in this pane ({pane}). Run team.py from the lead agent's pane.")
+        raise SystemExit(f"herdr sees no agent in this pane ({pane}). Run devteam.py from the lead agent's pane.")
     name = info.get("name")
     if not name:
         taken = {a.get("name") for a in live_agents()}
         name = unique(cfg.lead["name"], taken)
         herdr("agent", "rename", pane, name)
-        print(f"named this pane's agent `{name}`")
+        print(f"named this pane's agent @{name}")
+    old = state.get("lead", {}).get("name")
+    if old and old != name:
+        state["agents"].pop(old, None)
     state["lead"] = {"name": name, "pane_id": pane, "kind": info.get("agent")}
-    state["agents"].setdefault(name, {"role": "lead", "kind": info.get("agent"), "pane_id": pane})
+    rec = state["agents"].setdefault(name, {"role": "lead"})
+    rec.update(kind=info.get("agent"), pane_id=pane)
     return name
 
 
 def column_target(state):
-    """First teammate goes right of the lead; later ones stack under the last teammate."""
+    """First member goes right of the lead; later ones stack under the last member."""
     col = state.get("column")
     if col and "result" in herdr("pane", "get", col, check=False):
         return col, "down"
@@ -543,35 +547,42 @@ def column_target(state):
 
 # ================================================================ state
 
-def state_dir():
-    base = os.environ.get("XDG_STATE_HOME") or str(pathlib.Path.home() / ".local/state")
-    return pathlib.Path(os.environ.get("HERDR_TEAM_STATE", pathlib.Path(base) / "herdr-team"))
+def state_file(cfg):
+    return cfg.dir / "state" / "team.json"
 
 
-def state_path(cwd):
-    return state_dir() / (re.sub(r"[^A-Za-z0-9]", "-", str(cwd)).strip("-") + ".json")
+def load_state(cfg):
+    p = state_file(cfg)
+    return json.loads(p.read_text()) if p.exists() else {"agents": {}}
 
 
-def load_state(cwd):
-    p = state_path(cwd)
-    return json.loads(p.read_text()) if p.exists() else {"cwd": str(cwd), "agents": {}}
-
-
-def save_state(cwd, state):
-    p = state_path(cwd)
+def save_state(cfg, state):
+    p = state_file(cfg)
     p.parent.mkdir(parents=True, exist_ok=True)
+    ignore = cfg.dir / ".gitignore"
+    if not ignore.exists():
+        ignore.write_text("state/\n")
     p.write_text(json.dumps(state, indent=2) + "\n")
 
 
 def sync_sessions(state, agents):
-    """Remember each team agent's session refs so its cost stays visible after it exits."""
+    """Remember each member's session refs: cost keeps counting them, and `continue` resumes the last one."""
     by_pane = {a.get("pane_id"): name for name, a in state["agents"].items()}
     for a in agents:
         name, ref = by_pane.get(a.get("pane_id")), a.get("agent_session")
-        if name and ref:  # other herdr agents are not on this team
+        if name and ref and a.get("name") == name:  # other herdr agents are not on this team
             seen = state["agents"][name].setdefault("sessions", [])
-            if ref not in seen:  # a restart in the same pane adds a session; keep counting the old one
+            if ref not in seen:
                 seen.append(ref)
+
+
+def normalize(m):
+    """A state record in the shape of a member plan."""
+    m = dict(m)
+    m["harness"] = m.get("harness") or m.get("kind")
+    m.setdefault("notes", "")
+    m.setdefault("readonly", False)
+    return m
 
 
 def team_members(state, live_names=None):
@@ -580,10 +591,64 @@ def team_members(state, live_names=None):
             if a.get("role") != "lead" and (live_names is None or n in live_names)]
 
 
+# ================================================================ launching
+
+def launch(cfg, state, m, lead, extra, timeout, resume=None):
+    """Split a pane, start one member in it, record it. Exits on failure."""
+    _, body = cfg.roles[m["role"]]
+    text = member_prompt(m, body, lead, cfg)
+    ppath = cfg.dir / "state" / "prompts" / f"{m['name']}.md"
+    ppath.parent.mkdir(parents=True, exist_ok=True)
+    ppath.write_text(text)
+    argv, env, first_prompt = launch_spec(m, ppath, text, extra, resume)
+    target, direction = column_target(state)
+    split = ["pane", "split", target, "--direction", direction, "--cwd", str(cfg.root), "--no-focus"]
+    for k, v in env.items():
+        split += ["--env", f"{k}={v}"]
+    pane = herdr(*split)["result"]["pane"]["pane_id"]
+    state["column"] = pane
+    rec = state["agents"].setdefault(m["name"], {})
+    rec.update(role=m["role"], kind=m["harness"], model=m["model"], thinking=m["thinking"], notes=m["notes"],
+               readonly=m["readonly"], pane_id=pane, started=datetime.datetime.now().isoformat(timespec="seconds"))
+    save_state(cfg, state)
+    started = herdr("agent", "start", m["name"], "--kind", m["harness"], "--pane", pane,
+                    "--timeout", str(timeout), "--", *argv, check=False)
+    if "result" not in started:
+        print(f"@{m['name']} did not come up in pane {pane}. Stopping; later members were not started.")
+        print(f"Look at it with: herdr pane read {pane} --source recent-unwrapped --lines 60")
+        sys.exit(3)
+    if first_prompt:
+        herdr("agent", "prompt", m["name"], f"{tag(lead)} {text}\nReply only: ready.", check=False)
+    how = "resumed" if resume else "started"
+    print(f"{how} @{m['name']} ({m['role']}) on {m['harness']} {m['model']}, thinking {m['thinking']} in {pane}")
+
+
+def send_briefs(cfg, state, lead, note=None):
+    """Team brief to every live member, then the project brief if there is one, then an optional note."""
+    live = {a.get("name") for a in live_agents()}
+    members = team_members(state, live)
+    if not members:
+        print("no members running")
+        return
+    text = render_team_brief(cfg, members, lead)
+    project = cfg.project_file.read_text() if cfg.project_file.is_file() else None
+    for m in members:
+        herdr("agent", "prompt", m["name"], text, check=False)
+        if project:
+            herdr("agent", "prompt", m["name"], f"{tag(lead)} Project brief (`{DOT}/project-brief.md`):\n\n{project}",
+                  check=False)
+        if note:
+            herdr("agent", "prompt", m["name"], f"{tag(lead)} {note}", check=False)
+    sent = "team brief" + (" and project brief" if project else "")
+    print(f"sent the {sent} to {', '.join('@' + m['name'] for m in members)}")
+    if not project:
+        print(f"no {DOT}/project-brief.md yet: write it, then `devteam.py brief --send` (or `say all --file`).")
+
+
 # ================================================================ commands
 
-def cwd_of(args):
-    return pathlib.Path(args.cwd or os.getcwd()).resolve()
+def cfg_of(args, require=True):
+    return Config(pathlib.Path(args.cwd or os.getcwd()), require)
 
 
 def selected(cfg, args):
@@ -599,7 +664,7 @@ def selected(cfg, args):
     if args.team or not names:
         team = args.team or "default"
         if team not in cfg.team.get("teams", {}):
-            raise SystemExit(f"no team {team!r}; teams: {sorted(cfg.team.get('teams', {}))}")
+            raise SystemExit(f"no team {team!r} in {DOT}/team-brief.md; teams: {sorted(cfg.team.get('teams', {}))}")
         names += cfg.team["teams"][team]
     if len(names) > 1 and any(v is not None for v in overrides.values()):
         raise SystemExit("--harness/--model/--tier/--thinking apply to one member; name exactly one")
@@ -609,17 +674,58 @@ def selected(cfg, args):
 def print_plan(plans, extra_col=None):
     rows = [("Member", "Role", "Harness", "Model", "Thinking") + ((extra_col[0],) if extra_col else ())]
     for p in plans:
-        rows.append((p["name"], p["role"], p["harness"], p["model"] or "?", p["thinking"])
+        rows.append(("@" + p["name"], p["role"], p["harness"], p["model"] or "?", p["thinking"])
                     + ((extra_col[1](p),) if extra_col else ()))
     print_table(rows)
 
 
-def cmd_config(args):
-    cfg = Config(cwd_of(args), args.config)
-    print("config:", " < ".join(str(f) for f in cfg.files))
+def cmd_init(args):
+    dest = pathlib.Path(args.cwd or os.getcwd()).resolve() / DOT / "team-brief.md"
+    if dest.exists() and not args.force:
+        raise SystemExit(f"{dest} exists; edit it, or pass --force to replace it")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text((SKILL / "templates/team-brief.md").read_text())
+    (dest.parent / ".gitignore").write_text("state/\n")
+    print(f"wrote {dest}; edit the members, teams and prose, then run `devteam.py check`")
+
+
+def cmd_harnesses(args):
+    """What this machine can run: installed harnesses and which recommended models each can use."""
+    cfg = cfg_of(args, require=False)
+    checker = Checker(cfg)
+    for h in HARNESSES:
+        if not shutil.which(h):
+            print(f"{h:9} not installed. {INSTALL[h]}")
+            continue
+        tiers = cfg.models.get("tiers", {}).get("pi" if h == "omp" else h, {})
+        candidates = list(dict.fromkeys(m for tier in ("top", "mid", "fast") for m in tiers.get(tier, [])))
+        ok, missing, broken = [], [], None
+        for model in candidates:
+            try:
+                ok.append(checker.check({"name": h, "role": "", "harness": h, "model": model,
+                                         "thinking": "medium", "readonly": False, "notes": ""})["model"])
+            except Problem as e:
+                if "has no model" in e.what or "does not offer" in e.what or "unknown Claude" in e.what:
+                    missing.append(model)
+                else:  # the harness itself could not answer; the same for every model
+                    broken = e
+                    break
+        if broken:
+            print(f"{h:9} installed, but could not list its models: {broken.what}\n{'':10}{broken.fix}")
+            continue
+        print(f"{h:9} available: {', '.join(ok) or 'none of the recommended models'}")
+        if missing:
+            print(f"{'':10}not configured: {', '.join(missing)}")
+        if h == "codex":
+            print(f"{'':10}Codex offers: {', '.join(sorted(checker.probe('codex', checker.codex_models)))}")
+
+
+def cmd_show(args):
+    cfg = cfg_of(args)
     L = cfg.lead
-    print(f"lead (you): @{L['name']} on {L.get('harness', '?')} {L.get('model', '?')}, thinking {L.get('thinking', '?')}"
-          f"   board: {cfg.board}\n")
+    print(f"{cfg.brief_file}\nlead (you): @{L['name']} on {L.get('harness', '?')} {L.get('model', '?')},"
+          f" thinking {L.get('thinking', '?')}   board: {cfg.board}"
+          f"   project brief: {'yes' if cfg.project_file.is_file() else 'not written yet'}\n")
     names = cfg.team["teams"][args.team] if args.team else list(cfg.members)
     print_plan([plan(cfg, n) for n in names])
     print("\nteams:")
@@ -628,7 +734,7 @@ def cmd_config(args):
 
 
 def cmd_check(args):
-    cfg = Config(cwd_of(args), args.config)
+    cfg = cfg_of(args)
     plans = selected(cfg, args)
     ready, problems = check_all(cfg, plans, args.trust_models)
     ok = {p["name"]: p for p in ready}
@@ -639,8 +745,7 @@ def cmd_check(args):
 
 
 def cmd_up(args):
-    cwd = cwd_of(args)
-    cfg = Config(cwd, args.config)
+    cfg = cfg_of(args)
     plans = selected(cfg, args)
     if args.name:
         if len(plans) != 1:
@@ -650,92 +755,123 @@ def cmd_up(args):
         if not NAME_RE.match(p["name"]):
             raise SystemExit(f"agent name {p['name']!r} must match {NAME_RE.pattern}")
 
-    # Every member must pass before anything starts.
+    ready, problems = check_all(cfg, plans, args.trust_models)  # every member must pass first
+    if problems:
+        print_plan(plans)
+        report_problems(problems)
+        sys.exit(2)
+    if args.dry_run:
+        for m in ready:
+            argv, _, _ = launch_spec(m, cfg.dir / "state/prompts" / f"{m['name']}.md", "...", args.extra)
+            print(f"would start @{m['name']} ({m['role']}) on {m['harness']} {m['model']}, thinking {m['thinking']}")
+            print("  herdr agent start", m["name"], "--kind", m["harness"], "--pane <new> --",
+                  " ".join(a if len(a) < 80 else a[:77] + "..." for a in argv))
+        return
+
+    require_herdr()
+    state = load_state(cfg)
+    lead = ensure_lead(state, cfg)
+    live = {a.get("name") for a in live_agents()}
+    clash = [m["name"] for m in ready if m["name"] in live]
+    if clash:
+        raise SystemExit(f"already running: {', '.join(clash)}. Use --name for another instance.")
+    for m in ready:
+        launch(cfg, state, m, lead, args.extra, args.timeout)
+    if args.no_brief:
+        print("next: devteam.py brief --send")
+        return
+    send_briefs(cfg, state, lead)
+
+
+def cmd_continue(args):
+    """Bring the team back after its panes or sessions were lost: resume each missing member's last session."""
+    require_herdr()
+    cfg = cfg_of(args)
+    state = load_state(cfg)
+    if not team_members(state):
+        raise SystemExit("no team recorded here yet; run `devteam.py up` first")
+    live = live_agents()
+    sync_sessions(state, live)
+    lead = ensure_lead(state, cfg)
+    live_names = {a.get("name") for a in live}
+    gone = [m for m in team_members(state) if m["name"] not in live_names and (not args.names or m["name"] in args.names)]
+    plans, skipped = [], []
+    for m in gone:
+        if m["name"] in cfg.members:
+            plans.append(plan(cfg, m["name"]))  # current settings from the brief, not the old ones
+        elif m["role"] in cfg.roles:
+            plans.append(plan(cfg, m["name"], {"role": m["role"], "harness": m["harness"], "model": m.get("model"),
+                                               "thinking": m.get("thinking")}))
+        else:
+            skipped.append(m["name"])
+    for n in skipped:
+        print(f"skip @{n}: no longer in the team brief and its role is gone")
     ready, problems = check_all(cfg, plans, args.trust_models)
     if problems:
         print_plan(plans)
         report_problems(problems)
         sys.exit(2)
-
-    if args.dry_run:
-        state, lead, live = load_state(cwd), cfg.lead["name"], set()
-    else:
-        require_herdr()
-        state = load_state(cwd)
-        lead = ensure_lead(state, cfg)
-        live = {a.get("name") for a in live_agents()}
-    clash = [m["name"] for m in ready if m["name"] in live]
-    if clash:
-        raise SystemExit(f"already running: {', '.join(clash)}. Use --name for another instance.")
-
-    briefs = state_dir() / "briefs"
     for m in ready:
-        _, body = cfg.roles[m["role"]]
-        text = member_prompt(m, body, lead, cfg)
-        bpath = briefs / f"{state_path(cwd).stem}--{m['name']}.md"
-        argv, env, first_prompt = launch_spec(m, bpath, text, args.extra)
-        where = f"{m['harness']} {m['model']}, thinking {m['thinking']}"
-        if args.dry_run:
-            print(f"would start @{m['name']} ({m['role']}) on {where}")
-            print("  herdr agent start", m["name"], "--kind", m["harness"], "--pane <new> --",
-                  " ".join(a if len(a) < 80 else a[:77] + "..." for a in argv))
-            continue
+        sessions = state["agents"][m["name"]].get("sessions", [])
+        same = [s for s in sessions if s.get("agent") == m["harness"]] if not args.fresh else []
+        launch(cfg, state, m, lead, args.extra, args.timeout, resume=same[-1] if same else None)
+    if not ready:
+        print("every member is running")
+    save_state(cfg, state)
+    send_briefs(cfg, state, lead, note=(
+        f"We are picking up where we left off. Re-read `{DOT}/team-brief.md` and `{DOT}/project-brief.md`,"
+        f" check `{cfg.board}`, then send @{lead} one line: what you were doing and what you will do next."))
 
-        bpath.parent.mkdir(parents=True, exist_ok=True)
-        bpath.write_text(text)
-        target, direction = column_target(state)
-        split = ["pane", "split", target, "--direction", direction, "--cwd", str(cwd), "--no-focus"]
-        for k, v in env.items():
-            split += ["--env", f"{k}={v}"]
-        pane = herdr(*split)["result"]["pane"]["pane_id"]
-        state["column"] = pane
-        state["agents"][m["name"]] = {
-            "role": m["role"], "kind": m["harness"], "model": m["model"], "thinking": m["thinking"],
-            "notes": m["notes"], "works_with": m["works_with"], "readonly": m["readonly"],
-            "pane_id": pane, "started": datetime.datetime.now().isoformat(timespec="seconds"),
-        }
-        save_state(cwd, state)
-        started = herdr("agent", "start", m["name"], "--kind", m["harness"], "--pane", pane,
-                        "--timeout", str(args.timeout), "--", *argv, check=False)
-        if "result" not in started:
-            print(f"@{m['name']} did not come up in pane {pane}. Stopping; the remaining members were not started.")
-            print(f"Look at it with: herdr pane read {pane} --source recent-unwrapped --lines 60")
-            sys.exit(3)
-        if first_prompt:
-            herdr("agent", "prompt", m["name"], f"{tag(lead)} {text}\nReply only: ready.", check=False)
-        print(f"started @{m['name']} ({m['role']}) on {where} in {pane}")
-    if args.dry_run:
+
+def drift(cfg, name, rec):
+    """Differences between a running member and what the team brief now says."""
+    if name not in cfg.members:
+        return ["not in the team brief"]
+    want, out = plan(cfg, name), []
+    for key, have in (("harness", rec.get("kind")), ("model", rec.get("model")), ("thinking", rec.get("thinking")),
+                      ("role", rec.get("role"))):
+        w = want[key]
+        if have and w and have != w and not (key == "model" and have.endswith("/" + w)):
+            out.append(f"{key} {have} -> {w}")
+    return out
+
+
+def cmd_status(args):
+    cfg = cfg_of(args)
+    state = load_state(cfg)
+    live = {a.get("pane_id"): a for a in live_agents()}
+    sync_sessions(state, live.values())
+    if state["agents"]:
+        save_state(cfg, state)
+    rows = [("Agent", "Role", "Harness", "Model", "Thinking", "Status", "Pane", "Changed in brief")]
+    for name, a in state["agents"].items():
+        la = live.get(a.get("pane_id"))
+        status = la.get("agent_status", "?") if la and la.get("name") == name else "gone"
+        changes = "" if a.get("role") == "lead" else "; ".join(drift(cfg, name, a))
+        rows.append(("@" + name, a.get("role", ""), a.get("kind") or "", a.get("model") or "", a.get("thinking") or "",
+                     status, a.get("pane_id", ""), changes))
+    if len(rows) == 1:
+        print(f"No team running from {cfg.brief_file}. Next: `devteam.py check`, then `devteam.py up`.")
         return
-    if args.no_briefing:
-        print("next: team.py briefing --send, then the project brief with team.py say all --file <brief.md>")
-        return
-    send_briefing(cfg, state, cwd, lead)
-    print("next: send the project brief with: team.py say all --file <brief.md>")
+    print_table(rows)
+    gone = [r[0] for r in rows[1:] if r[5] == "gone" and r[1] != "lead"]
+    if gone:
+        print(f"\n{', '.join(gone)} gone: `devteam.py continue` resumes them in their last sessions.")
+    if any(r[7] for r in rows[1:]):
+        print("Changed members pick up the new settings when restarted (close the pane, then `continue`).")
+    if not cfg.project_file.is_file():
+        print(f"No {DOT}/project-brief.md yet.")
 
 
-def send_briefing(cfg, state, cwd, lead):
-    live = {a.get("name") for a in live_agents()}
-    members = team_members(state, live)
-    text = team_briefing(cfg, members, lead, cwd)
-    path = state_dir() / "briefs" / f"{state_path(cwd).stem}--team-briefing.md"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text)
-    for m in members:
-        herdr("agent", "prompt", m["name"], text, check=False)
-    print(f"sent the team briefing to {', '.join('@' + m['name'] for m in members)} ({path})")
-
-
-def cmd_briefing(args):
-    cwd = cwd_of(args)
-    cfg = Config(cwd, args.config)
-    state = load_state(cwd)
+def cmd_brief(args):
+    cfg = cfg_of(args)
+    state = load_state(cfg)
     if args.send:
         require_herdr()
         lead = ensure_lead(state, cfg)
-        save_state(cwd, state)
-        send_briefing(cfg, state, cwd, lead)
+        save_state(cfg, state)
+        send_briefs(cfg, state, lead)
         return
-    # Preview: the members recorded for this repo, or else the team that `up` would launch.
     members = team_members(state)
     if not members or args.team:
         team = args.team or "default"
@@ -743,31 +879,21 @@ def cmd_briefing(args):
             raise SystemExit(f"no team {team!r}; teams: {sorted(cfg.team.get('teams', {}))}")
         members = [plan(cfg, n) for n in cfg.team["teams"][team]]
     lead = (state.get("lead") or {}).get("name") or cfg.lead["name"]
-    print(team_briefing(cfg, members, lead, cwd))
-
-
-def normalize(m):
-    """A state record in the shape of a member plan."""
-    m = dict(m)
-    m["harness"] = m.get("harness") or m.get("kind")
-    m.setdefault("notes", "")
-    m.setdefault("works_with", [])
-    return m
+    print(render_team_brief(cfg, members, lead))
 
 
 def cmd_say(args):
     """Message members as the lead: `say all ...` or `say lead-dev frontend-dev ...`."""
     require_herdr()
-    cwd = cwd_of(args)
-    cfg = Config(cwd, args.config)
-    state = load_state(cwd)
+    cfg = cfg_of(args)
+    state = load_state(cfg)
     lead = ensure_lead(state, cfg)
-    save_state(cwd, state)
+    save_state(cfg, state)
     text = pathlib.Path(args.file).read_text() if args.file else args.message
     if not text:
         raise SystemExit("give a message or --file")
     live = {a.get("name") for a in live_agents()}
-    names = [m["name"] for m in team_members(state, live)] if args.to == ["all"] else args.to
+    names = [m["name"] for m in team_members(state, live)] if args.to == ["all"] else [n.lstrip("@") for n in args.to]
     missing = [n for n in names if n not in live]
     if missing:
         raise SystemExit(f"not running: {', '.join(missing)}")
@@ -776,35 +902,12 @@ def cmd_say(args):
     print(f"sent to {', '.join('@' + n for n in names)}")
 
 
-def cmd_roster(args):
-    cwd = cwd_of(args)
-    state = load_state(cwd)
-    live = {a.get("pane_id"): a for a in live_agents()}
-    sync_sessions(state, live.values())
-    save_state(cwd, state)
-    rows = [("Agent", "Role", "Harness", "Model", "Thinking", "Status", "Pane")]
-    for name, a in state["agents"].items():
-        la = live.get(a.get("pane_id"))
-        status = la.get("agent_status", "?") if la and la.get("name") == name else "gone"
-        rows.append((name, a.get("role", ""), a.get("kind") or "", a.get("model") or "", a.get("thinking") or "",
-                     status, a.get("pane_id", "")))
-    print_table(rows)
-
-
-def cmd_brief(args):
-    cfg = Config(cwd_of(args), args.config)
+def cmd_prompt(args):
+    cfg = cfg_of(args)
     p = plan(cfg, args.name)
     _, body = cfg.roles[p["role"]]
     print(f"# @{p['name']} ({p['role']}) on {p['harness']} {p['model']}, thinking {p['thinking']}\n")
-    print(member_prompt(p, body, args.lead or cfg.lead["name"], cfg))
-
-
-def cmd_init(args):
-    dest = cwd_of(args) / "agent-team.toml"
-    if dest.exists():
-        raise SystemExit(f"{dest} exists; edit it, or remove it first")
-    dest.write_text((SKILL / "team.toml").read_text())
-    print(f"wrote {dest}; edit the members and teams, then run `team.py check`")
+    print(member_prompt(p, body, cfg.lead["name"], cfg))
 
 
 # ================================================================ cost
@@ -915,15 +1018,15 @@ def estimate(models, prices):
 
 
 def cmd_cost(args):
-    cwd = cwd_of(args)
-    prices = Config(cwd, args.config).models.get("prices", {})
+    cfg = cfg_of(args)
+    prices = cfg.models.get("prices", {})
     home = pathlib.Path(args.home).expanduser()
-    state = load_state(cwd)
+    state = load_state(cfg)
     live = []
     if not args.offline:
         live = live_agents()
         sync_sessions(state, live)
-        save_state(cwd, state)
+        save_state(cfg, state)
     status = {a.get("name"): a.get("agent_status") for a in live}
 
     report = []
@@ -934,8 +1037,8 @@ def cmd_cost(args):
         for ref in a.get("sessions", []):
             kind = ref.get("agent") or a.get("kind")
             path = find_session_file(ref, home)
-            if not path or kind not in PARSERS:
-                continue
+            if not path or kind not in PARSERS or str(path) in entry["session_files"]:
+                continue  # a resumed session appears once even if herdr reported it twice
             entry["harness"] = kind
             entry["session_files"].append(str(path))
             m, d, source = PARSERS[kind](path)
@@ -955,7 +1058,7 @@ def cmd_cost(args):
         report.append(entry)
 
     if args.json:
-        print(json.dumps({"cwd": str(cwd), "agents": report}, indent=2))
+        print(json.dumps({"root": str(cfg.root), "agents": report}, indent=2))
         return
     rows = [("Agent", "Role", "Harness", "Model", "In", "Out", "Cost", "Status")]
     known, unknown = 0.0, False
@@ -969,17 +1072,17 @@ def cmd_cost(args):
         else:
             known += e["cost_usd"]
             cost = ("~" if e["cost_source"] == "estimated" else "") + f"${e['cost_usd']:.2f}"
-        rows.append((e["agent"], e["role"], e["harness"] or "", model, fmt_tok(tin), fmt_tok(tout), cost, e["status"]))
+        rows.append(("@" + e["agent"], e["role"], e["harness"] or "", model, fmt_tok(tin), fmt_tok(tout), cost, e["status"]))
     rows.append(("Total", "", "", "", "", "", f"${known:.2f}" + ("+?" if unknown else ""), ""))
     print_table(rows, total=True)
     notes = []
     if any(e["harness"] == "claude" and e["models"] and e["cost_source"] is None for e in report):
         notes.append("Claude Code writes dollars when a session exits or resumes; until then it shows tokens"
-                     " (or add [prices] to models.toml for an estimate).")
+                     " (or add [prices] to the team brief for an estimate).")
     if any(e["harness"] == "codex" and e["models"] and e["cost_source"] is None for e in report):
-        notes.append("Codex records tokens only; add its models to [prices] in models.toml for dollars.")
+        notes.append("Codex records tokens only; add its models to [prices] for dollars.")
     if any(e["harness"] == "opencode" for e in report):
-        notes.append("OpenCode keeps sessions in a database team.py does not read yet; use `opencode stats`.")
+        notes.append("OpenCode keeps sessions in a database devteam does not read yet; use `opencode stats`.")
     if any(e["models"] == {} and e["status"] != "gone" and e["harness"] != "opencode" for e in report):
         notes.append("Agents without numbers have not reported a session file to herdr yet"
                      " (run `herdr integration install <harness>` once per harness).")
@@ -1014,13 +1117,17 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def common(sp):
-        sp.add_argument("--config", help="team TOML file layered on top of the others")
-        sp.add_argument("--cwd")
+        sp.add_argument("--cwd", help="where to look for .devteam/ (default: here, then parent directories)")
+
+    def launching(sp):
+        sp.add_argument("--timeout", type=int, default=60000, help="ms to wait for each agent to be ready")
+        sp.add_argument("--trust-models", action="store_true",
+                        help="skip asking harnesses which models they have (harness and thinking checks still run)")
 
     def selection(sp):
         sp.add_argument("names", nargs="*", help="member names (default: the `default` team)")
         sp.add_argument("--team", help="a roster from [teams]")
-        sp.add_argument("--role", help="add an ad-hoc member with this role (name: first NAME, else the role)")
+        sp.add_argument("--role", help="an ad-hoc member with this role (name: first NAME, else the role)")
         sp.add_argument("--harness", choices=HARNESSES)
         sp.add_argument("--model", help="exact model id")
         sp.add_argument("--tier", choices=["top", "mid", "fast"], help="pick the model by tier from models.toml")
@@ -1030,48 +1137,54 @@ def main(argv=None):
                         help="skip asking harnesses which models they have (harness and thinking checks still run)")
         common(sp)
 
-    cf = sub.add_parser("config", help="show the formation")
-    cf.add_argument("--team")
-    common(cf)
+    it = sub.add_parser("init", help="write .devteam/team-brief.md from the template")
+    it.add_argument("--force", action="store_true")
+    common(it)
 
-    ck = sub.add_parser("check", help="verify members can launch; launches nothing")
-    selection(ck)
+    common(sub.add_parser("harnesses", help="installed harnesses and which recommended models they can use"))
 
-    up = sub.add_parser("up", help="check, launch members in new herdr panes, send the team briefing",
+    sh = sub.add_parser("show", help="the formation")
+    sh.add_argument("--team")
+    common(sh)
+
+    selection(sub.add_parser("check", help="verify members can launch; launches nothing"))
+
+    up = sub.add_parser("up", help="check, launch members in new herdr panes, send the briefs",
                         epilog="Arguments after a bare -- go to every launched harness, "
                                "e.g. up frontend-dev -- --permission-mode acceptEdits")
     selection(up)
     up.add_argument("--name", help="agent name for a single member (for a second instance)")
     up.add_argument("--timeout", type=int, default=60000, help="ms to wait for each agent to be ready")
-    up.add_argument("--no-briefing", action="store_true", help="do not send the team briefing afterwards")
+    up.add_argument("--no-brief", action="store_true", help="do not send the briefs afterwards")
     up.add_argument("--dry-run", action="store_true", help="check and print the launch plan only")
 
-    bf = sub.add_parser("briefing", help="print the team briefing, or --send it to every live member")
+    co = sub.add_parser("continue", help="restart gone members in their last sessions and re-brief the team")
+    co.add_argument("names", nargs="*", help="only these members")
+    co.add_argument("--fresh", action="store_true", help="start new sessions instead of resuming")
+    launching(co)
+    common(co)
+
+    common(sub.add_parser("status", help="running members, state, and drift from the team brief"))
+
+    bf = sub.add_parser("brief", help="print the team brief as members get it, or --send it (and the project brief)")
     bf.add_argument("--send", action="store_true")
-    bf.add_argument("--team", help="preview for this team when nothing is running yet")
+    bf.add_argument("--team", help="preview for this team")
     common(bf)
 
     sy = sub.add_parser("say", help="message members as the lead")
     sy.add_argument("to", nargs="+", help="member names, or `all`; the last word is the message unless --file")
-    sy.add_argument("--file", help="send this file's contents (e.g. the project brief)")
+    sy.add_argument("--file", help="send this file's contents")
     common(sy)
 
-    ro = sub.add_parser("roster", help="team agents and their live status")
-    ro.add_argument("--cwd")
+    cs = sub.add_parser("cost", help="tokens and dollars per agent")
+    cs.add_argument("--json", action="store_true")
+    cs.add_argument("--home", default=str(pathlib.Path.home()))
+    cs.add_argument("--offline", action="store_true", help="use saved session refs only; do not ask herdr")
+    common(cs)
 
-    co = sub.add_parser("cost", help="tokens and dollars per agent")
-    co.add_argument("--json", action="store_true")
-    co.add_argument("--home", default=str(pathlib.Path.home()))
-    co.add_argument("--offline", action="store_true", help="use saved session refs only; do not ask herdr")
-    common(co)
-
-    br = sub.add_parser("brief", help="print the system prompt a member gets")
-    br.add_argument("name")
-    br.add_argument("--lead")
-    common(br)
-
-    it = sub.add_parser("init", help="copy the default formation to ./agent-team.toml")
-    it.add_argument("--cwd")
+    pr = sub.add_parser("prompt", help="the system prompt a member gets")
+    pr.add_argument("name")
+    common(pr)
 
     argv = list(sys.argv[1:] if argv is None else argv)
     extra = []
@@ -1084,8 +1197,9 @@ def main(argv=None):
         args.message = None if args.file else (args.to.pop() if len(args.to) > 1 else None)
     if getattr(args, "pick", 0) < 0:
         ap.error("--pick must be >= 0")
-    {"config": cmd_config, "check": cmd_check, "up": cmd_up, "briefing": cmd_briefing, "say": cmd_say,
-     "roster": cmd_roster, "cost": cmd_cost, "brief": cmd_brief, "init": cmd_init}[args.cmd](args)
+    {"init": cmd_init, "harnesses": cmd_harnesses, "show": cmd_show, "check": cmd_check, "up": cmd_up,
+     "continue": cmd_continue, "status": cmd_status, "brief": cmd_brief, "say": cmd_say, "cost": cmd_cost,
+     "prompt": cmd_prompt}[args.cmd](args)
 
 
 if __name__ == "__main__":
