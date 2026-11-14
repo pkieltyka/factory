@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
-"""devteam: a software team of coding agents in herdr panes. You are the lead (CTO); each member runs
+"""a-team: a software team of coding agents in herdr panes. You are the lead (CTO); each member runs
 on its own harness, model and thinking level.
 
 The team is one file at the repo root, team-brief.md: settings in +++ TOML front matter +++, then prose
 (role details, workflow, a short project section). There is no other state: each member's herdr pane is
 labeled with its @name, so herdr itself knows the team, its panes and their harness sessions.
 
-  devteam.py init                     write team-brief.md from the template
-  devteam.py harnesses                which harnesses and recommended models this machine has
-  devteam.py show [--team NAME]       the formation
-  devteam.py check [NAMES|--team X]   can these members launch? launches nothing
-  devteam.py up [NAMES|--team X]      check, launch in new panes, send the team brief
-  devteam.py continue                 restart members whose agents exited, in their panes and sessions
-  devteam.py status [--all]           members, harness, model, and idle/working/blocked/gone
-  devteam.py brief [--send]           render (or send) the team brief
-  devteam.py say NAMES|all "msg"      message members as the lead (or --file)
-  devteam.py cost [--json]            tokens and dollars per agent
-  devteam.py prompt NAME              the system prompt a member gets
+  ateam.py init                     write team-brief.md from the template
+  ateam.py harnesses                which harnesses and recommended models this machine has
+  ateam.py show [--team NAME]       the formation
+  ateam.py check [NAMES|--team X]   can these members launch? launches nothing
+  ateam.py up [NAMES|--team X]      check, launch in new panes, send the team brief
+  ateam.py continue                 restart members whose agents exited, in their panes and sessions
+  ateam.py status [--all]           members, harness, model, and idle/working/blocked/gone
+  ateam.py brief [--send]           render (or send) the team brief
+  ateam.py say NAMES|all "msg"      message members as the lead (or --file)
+  ateam.py cost [--json]            tokens and dollars per agent
+  ateam.py prompt NAME              the system prompt a member gets
 
 Harnesses: claude, codex, pi, omp, opencode (v2+). Nothing launches if any member fails the check.
 """
@@ -114,8 +114,8 @@ class Config:
         if self.brief_file.is_file():
             self.team, self.body = parse_front(self.brief_file.read_text(), self.brief_file)
         elif require:
-            raise SystemExit(f"no {BRIEF} in {self.root} or above. Run `/devteam setup`"
-                             " (or `devteam.py init`) first.")
+            raise SystemExit(f"no {BRIEF} in {self.root} or above. Run `/a-team setup`"
+                             " (or `ateam.py init`) first.")
         else:
             self.team, self.body = {}, ""
         if "prices" in self.team:
@@ -176,13 +176,13 @@ def run_probe(argv, env=None):
                            env={**os.environ, **(env or {})})
     except (OSError, subprocess.TimeoutExpired) as e:
         raise Problem(f"`{' '.join(argv[:3])}` failed: {e}",
-                      "Run devteam.py outside any sandbox, or check that the harness starts on its own.")
+                      "Run ateam.py outside any sandbox, or check that the harness starts on its own.")
     if p.returncode != 0:
         err = [l.strip() for l in (p.stderr.strip() or p.stdout.strip()).splitlines() if l.strip()]
         named = [l for l in err if re.match(r"(error|\w*Error)\b", l, re.I)]  # skip stack frames
         tail = (named or err or [f"exit {p.returncode}"])[0][:300]
         raise Problem(f"`{' '.join(argv[:3])}` failed: {tail}",
-                      "If a sandbox blocks it (read-only file system), run devteam.py outside the sandbox.")
+                      "If a sandbox blocks it (read-only file system), run ateam.py outside the sandbox.")
     return p.stdout
 
 
@@ -265,7 +265,7 @@ class Checker:
         out = run_probe(["opencode", "--version"])
         m = re.search(r"(\d+)\.(\d+)", out)
         if not m or int(m.group(1)) < 2:
-            raise Problem(f"OpenCode {out.strip() or '?'} is too old; devteam supports v2 or later",
+            raise Problem(f"OpenCode {out.strip() or '?'} is too old; a-team supports v2 or later",
                           "Upgrade with `opencode upgrade`.")
         return out.strip()
 
@@ -549,7 +549,7 @@ def ensure_lead(cfg):
         raise SystemExit("HERDR_PANE_ID is not set; run this from the lead's herdr pane.")
     info = herdr("agent", "get", pane, check=False).get("result", {}).get("agent") or {}
     if not info:
-        raise SystemExit(f"herdr sees no agent in this pane ({pane}). Run devteam.py from the lead agent's pane.")
+        raise SystemExit(f"herdr sees no agent in this pane ({pane}). Run ateam.py from the lead agent's pane.")
     name = info.get("name")
     if not name:
         name = cfg.lead["name"]
@@ -573,7 +573,7 @@ def column_target(team, lead_pane):
 def prompt_path(cfg, name):
     """Member system prompts are written fresh at each launch, outside the repo (a long prompt can exceed
     the terminal's line limit when passed inline)."""
-    base = pathlib.Path(os.environ.get("XDG_CACHE_HOME") or pathlib.Path.home() / ".cache") / "devteam"
+    base = pathlib.Path(os.environ.get("XDG_CACHE_HOME") or pathlib.Path.home() / ".cache") / "a-team"
     return base / re.sub(r"[^A-Za-z0-9]", "-", str(cfg.root)).strip("-") / f"{name}.md"
 
 
@@ -684,7 +684,7 @@ def cmd_init(args):
     if dest.exists() and not args.force:
         raise SystemExit(f"{dest} exists; edit it, or pass --force to replace it")
     dest.write_text((SKILL / "templates/team-brief.md").read_text())
-    print(f"wrote {dest}; edit the members, tracker, teams and prose, then run `devteam.py check`")
+    print(f"wrote {dest}; edit the members, tracker, teams and prose, then run `ateam.py check`")
 
 
 def cmd_harnesses(args):
@@ -778,7 +778,7 @@ def cmd_up(args):
             add_member_to_brief(cfg, m)
         launch(cfg, team, m, lead, args.extra, args.timeout)
     if args.no_brief:
-        print("next: devteam.py brief --send")
+        print("next: ateam.py brief --send")
         return
     send_brief(cfg, Team(cfg), lead)
 
@@ -791,7 +791,7 @@ def cmd_continue(args):
     team = Team(cfg)
     names = [n.lstrip("@") for n in args.names] or [n for n in cfg.members if team.pane(n)]
     if not names:
-        raise SystemExit(f"no member panes from {BRIEF} in this workspace; start the team with `devteam.py up`")
+        raise SystemExit(f"no member panes from {BRIEF} in this workspace; start the team with `ateam.py up`")
     for n in [n for n in names if team.live(n) and not team.named(n) and n in cfg.members]:
         adopt(cfg, team, n, lead)
     gone = [n for n in names if not team.live(n)]
@@ -830,7 +830,7 @@ def adopt(cfg, team, name, lead):
           f" instructions, unchanged:\n\n{member_prompt(m, body, lead, cfg)}", check=False)
     print(f"adopted @{name}: herdr had resumed it in {pane['pane_id']}. It runs on its harness's default"
           f" model, not necessarily {m['model']} at {m['thinking']}; to apply the brief's, exit it and"
-          f" run `devteam.py continue {name}`.")
+          f" run `ateam.py continue {name}`.")
 
 
 def cmd_status(args):
@@ -851,11 +851,11 @@ def cmd_status(args):
     print_table(rows)
     gone = [r[0] for r in rows[1:] if r[5] == "gone"]
     if gone:
-        print(f"\n{', '.join(gone)} gone: `devteam.py continue` brings them back in their panes and sessions.")
+        print(f"\n{', '.join(gone)} gone: `ateam.py continue` brings them back in their panes and sessions.")
     if any("(unnamed)" in r[5] for r in rows[2:]):
-        print("Unnamed members were resumed by herdr after a restart: `devteam.py continue` names and re-briefs them.")
+        print("Unnamed members were resumed by herdr after a restart: `ateam.py continue` names and re-briefs them.")
     if len(rows) == 2:
-        print(f"\nNo members running from {BRIEF}. Next: `devteam.py check`, then `devteam.py up`.")
+        print(f"\nNo members running from {BRIEF}. Next: `ateam.py check`, then `ateam.py up`.")
 
 
 def cmd_brief(args):
@@ -1061,7 +1061,7 @@ def cmd_cost(args):
     if any(e["harness"] == "codex" and e["models"] and e["cost_source"] is None for e in report):
         notes.append("Codex records tokens only; add its models to [prices] for dollars.")
     if any(e["harness"] == "opencode" for e in report):
-        notes.append("OpenCode keeps sessions in a database devteam does not read yet; use `opencode stats`.")
+        notes.append("OpenCode keeps sessions in a database a-team does not read yet; use `opencode stats`.")
     if any(e["models"] == {} and e["status"] != "gone" and e["harness"] != "opencode" for e in report):
         notes.append("Agents without numbers have not reported a session file to herdr yet"
                      " (run `herdr integration install <harness>` once per harness).")

@@ -5,8 +5,8 @@ How you, the lead, work with running members. Re-read this after compaction.
 ## Hand out work
 
 ```bash
-devteam.py say lead-dev "Build the gh wrapper for issue list and view. Done = tests pass. Report back."
-devteam.py say all --file /tmp/update.md
+ateam.py say lead-dev "Build the gh wrapper for issue list and view. Done = tests pass. Report back."
+ateam.py say all --file /tmp/update.md
 herdr agent prompt lead-dev "[from @cto] ..."     # the same thing by hand
 ```
 
@@ -36,12 +36,12 @@ Follow the team brief's *Workflow* when it differs from this.
 
 ## Keep the brief true
 
-- Changed the team? Edit `team-brief.md`, run `devteam.py check`, then `devteam.py brief --send`. New members: `devteam.py up <name>` (an ad-hoc `--role` member is added to the brief for you).
+- Changed the team? Edit `team-brief.md`, run `ateam.py check`, then `ateam.py brief --send`. New members: `ateam.py up <name>` (an ad-hoc `--role` member is added to the brief for you).
 - The project's direction changed? Update the brief's `## Project` section with the user, then tell the team.
-- The brief, the tracker and git are what `/devteam continue` rebuilds from. A decision that matters later belongs in one of them, not only in chat.
+- The brief, the tracker and git are what `/a-team continue` rebuilds from. A decision that matters later belongs in one of them, not only in chat.
 
 ## Rules
 
-- Do not close panes, tabs or workspaces unless the user asks, and only member panes (labeled with a member's @name). Do not relabel member panes: the labels are how devteam finds the team.
+- Do not close panes, tabs or workspaces unless the user asks, and only member panes (labeled with a member's @name). Do not relabel member panes: the labels are how a-team finds the team.
 - Keep the team as small as the work needs. Add a member when there is parallel work for it.
 - Read-only roles are enforced by Codex `-s read-only`, Claude `--disallowedTools Edit Write NotebookEdit`, pi `--exclude-tools edit,write` and OpenCode `edit: deny`. omp relies on the prompt, and shell access can still write.

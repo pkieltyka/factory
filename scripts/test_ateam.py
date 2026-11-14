@@ -1,4 +1,4 @@
-"""Tests for devteam.py with a fake `herdr` and fake harness binaries; nothing real is launched."""
+"""Tests for ateam.py with a fake `herdr` and fake harness binaries; nothing real is launched."""
 import importlib.util
 import json
 import os
@@ -10,11 +10,11 @@ import textwrap
 import tomllib
 import unittest
 
-SCRIPT = pathlib.Path(__file__).with_name("devteam.py")
-spec = importlib.util.spec_from_file_location("devteam", SCRIPT)
-devteam = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(devteam)
-TEMPLATE = (devteam.SKILL / "templates/team-brief.md").read_text()
+SCRIPT = pathlib.Path(__file__).with_name("ateam.py")
+spec = importlib.util.spec_from_file_location("ateam", SCRIPT)
+ateam = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(ateam)
+TEMPLATE = (ateam.SKILL / "templates/team-brief.md").read_text()
 
 FAKE_HERDR = textwrap.dedent(r'''
     #!/usr/bin/env python3
@@ -228,7 +228,7 @@ class UpTests(unittest.TestCase):
             self.assertIn("You are @reviewer", instructions["developer_instructions"])
             fe = native(starts["frontend-dev"])
             prompt_file = pathlib.Path(flag(fe, "--append-system-prompt-file"))
-            self.assertTrue(str(prompt_file).startswith(str(e.root / "cache/devteam")))  # outside the repo
+            self.assertTrue(str(prompt_file).startswith(str(e.root / "cache/a-team")))  # outside the repo
             self.assertIn("Never run `git commit`", prompt_file.read_text())
             self.assertIn("Only @pm updates the tracker (TODO.md at the repo root)", prompt_file.read_text())
             self.assertEqual(flag(native(starts["pm"]), "--model"), "openrouter/deepseek/deepseek-v4.1-flash")
@@ -338,7 +338,7 @@ class UpTests(unittest.TestCase):
             self.assertEqual(agent["permissions"], [{"action": "edit", "resource": "*", "effect": "deny"}])
             self.assertIn("You are @reviewer", e.prompts()[0][1])
             p = e.run("check", "reviewer", check=False, FAKE_OPENCODE_VERSION="opencode 1.4.0")
-            self.assertIn("devteam supports v2 or later", p.stdout)
+            self.assertIn("a-team supports v2 or later", p.stdout)
 
     def test_adhoc_member_joins_the_brief(self):
         with Env() as e:
@@ -347,7 +347,7 @@ class UpTests(unittest.TestCase):
             call = e.starts()["backend-dev-2"]
             self.assertEqual(kind(call), "codex")
             self.assertEqual(native(call)[-1], "--search")
-            cfg = devteam.Config(e.repo)
+            cfg = ateam.Config(e.repo)
             self.assertEqual(cfg.members["backend-dev-2"],
                              {"role": "backend-dev", "harness": "codex", "model": "gpt-6-luna", "thinking": "high"})
             self.assertIn("## Workflow", cfg.body)  # the prose survived the edit
@@ -374,7 +374,7 @@ class UpTests(unittest.TestCase):
             self.assertEqual(e.fake_state()["calls"], [])
             self.assertIn("not inside herdr", e.run("up", "pm", check=False, HERDR_ENV="").stderr)
         with Env(brief=None) as e:
-            self.assertIn("Run `/devteam setup`", e.run("show", check=False).stderr)
+            self.assertIn("Run `/a-team setup`", e.run("show", check=False).stderr)
 
 
 class ContinueTests(unittest.TestCase):
@@ -443,23 +443,23 @@ class ContinueTests(unittest.TestCase):
 class ConfigTests(unittest.TestCase):
     def test_template_is_consistent(self):
         with Env() as e:
-            cfg = devteam.Config(e.repo)
+            cfg = ateam.Config(e.repo)
             for name in cfg.members:
-                p = devteam.plan(cfg, name)
-                self.assertIn(p["harness"], devteam.HARNESSES, name)
+                p = ateam.plan(cfg, name)
+                self.assertIn(p["harness"], ateam.HARNESSES, name)
                 self.assertTrue(p["model"], name)
             self.assertEqual(cfg.tracker, "TODO.md at the repo root")
             self.assertIn("## Project", cfg.body)
             out = e.run("show").stdout
             self.assertIn("@lead-dev", out)
             self.assertIn("tracker: TODO.md at the repo root", out)
-        models = tomllib.loads((devteam.SKILL / "models.toml").read_text())
+        models = tomllib.loads((ateam.SKILL / "models.toml").read_text())
         for tiers in models["tiers"]["codex"].values():
             self.assertFalse(any("/" in m for m in tiers), "Codex takes bare model names")
 
     def test_no_tracker(self):
         with Env(team_brief('[members.pm]\n')) as e:
-            self.assertIsNone(devteam.Config(e.repo).tracker)
+            self.assertIsNone(ateam.Config(e.repo).tracker)
             self.assertNotIn("tracker", e.run("prompt", "pm").stdout.split("## Talking to the team")[1])
 
     def test_infer_harness(self):
@@ -467,7 +467,7 @@ class ConfigTests(unittest.TestCase):
                             ("gpt-6.1-sol", "codex"), ("openai/gpt-6-luna", "codex"), ("z-ai/glm-5.3", "pi"),
                             ("deepseek/deepseek-v4.1-flash", "pi"), ("openrouter/openai/gpt-6-luna", "pi"),
                             ("nvidia/Qwen3.8-Flash-Next-NVFP4", "pi")]:
-            self.assertEqual(devteam.infer_harness(model), want, model)
+            self.assertEqual(ateam.infer_harness(model), want, model)
 
     def test_brief_validation(self):
         with Env(team_brief('[members.wizard]\nmodel = "x"\n')) as e:
@@ -496,16 +496,16 @@ class ConfigTests(unittest.TestCase):
             self.assertIn("You are read-only", e.run("prompt", "reviewer").stdout)
 
     def test_session_id_from_ref(self):
-        self.assertEqual(devteam.session_id({"kind": "id", "value": "abc"}), "abc")
+        self.assertEqual(ateam.session_id({"kind": "id", "value": "abc"}), "abc")
         path = "/x/rollout-2026-11-11T13-02-52-01a1cbc6-e708-7623-986f-cc2e07efa28f.jsonl"
-        self.assertEqual(devteam.session_id({"kind": "path", "value": path}), "01a1cbc6-e708-7623-986f-cc2e07efa28f")
+        self.assertEqual(ateam.session_id({"kind": "path", "value": path}), "01a1cbc6-e708-7623-986f-cc2e07efa28f")
 
     def test_bad_role_frontmatter_names_file(self):
         with tempfile.TemporaryDirectory() as d:
             p = pathlib.Path(d) / "x.md"
             p.write_text("---\ntier: fast\noops\n---\nbody\n")
             with self.assertRaisesRegex(ValueError, "x.md:3"):
-                devteam.parse_role(p)
+                ateam.parse_role(p)
 
 
 def jsonl(path, records):
@@ -555,15 +555,15 @@ class CostTests(unittest.TestCase):
 
     def test_estimate_from_prices(self):
         models = {"gpt-6-luna": {"input": 1_000_000, "cache_read": 1_000_000, "cache_write": 0, "output": 100_000}}
-        self.assertAlmostEqual(devteam.estimate(models, {"gpt-6-luna": {"input": 2.0, "output": 10.0}}), 2.0 + 0.2 + 1.0)
-        self.assertIsNone(devteam.estimate(models, {}))
+        self.assertAlmostEqual(ateam.estimate(models, {"gpt-6-luna": {"input": 2.0, "output": 10.0}}), 2.0 + 0.2 + 1.0)
+        self.assertIsNone(ateam.estimate(models, {}))
 
 
 class ListingTests(unittest.TestCase):
     def test_listed_models_formats(self):
         pi = "provider  model  context\nopenrouter  z-ai/glm-5.3  1M\npax-vllm  nvidia/Q  262K\n"
-        self.assertEqual(devteam.listed_models(pi), ["openrouter/z-ai/glm-5.3", "pax-vllm/nvidia/Q"])
-        self.assertEqual(devteam.listed_models("openrouter/z-ai/glm-5.3\nollama/qwen3:8b\n"),
+        self.assertEqual(ateam.listed_models(pi), ["openrouter/z-ai/glm-5.3", "pax-vllm/nvidia/Q"])
+        self.assertEqual(ateam.listed_models("openrouter/z-ai/glm-5.3\nollama/qwen3:8b\n"),
                          ["openrouter/z-ai/glm-5.3", "ollama/qwen3:8b"])
 
 

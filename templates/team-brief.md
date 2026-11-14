@@ -1,6 +1,6 @@
 +++
 # team-brief.md: the whole team in one file at the repo root. Settings in this block, prose below the
-# closing +++ (role details, workflow, and a short project section at the end). devteam.py launches members
+# closing +++ (role details, workflow, and a short project section at the end). ateam.py launches members
 # from the settings; every member receives the brief with a roster table built from them, so nothing drifts.
 #
 # Member fields (the table key is the @name: lowercase, digits, - or _):
@@ -82,7 +82,7 @@ harness = "pi"
 model = "z-ai/glm-5.3-flash"
 thinking = "medium"
 
-# Rosters. `devteam.py up` with no names launches `default`.
+# Rosters. `ateam.py up` with no names launches `default`.
 [teams]
 default = ["lead-dev", "frontend-dev", "reviewer", "pm"]
 planning = ["product", "architect", "pm"]

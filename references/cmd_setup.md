@@ -1,12 +1,12 @@
-# `/devteam setup`: form the team
+# `/a-team setup`: form the team
 
 Guide the user to a team for this repo and write it to `team-brief.md` at the repo root. Incremental: if a brief exists, start from it and change only what the user wants.
 
 ## 1. Look before asking
 
 - Find the repo root (`git rev-parse --show-toplevel`). Note the stack from root markers (`go.mod`, `package.json`, `pyproject.toml`, `Cargo.toml`, ...) and whether there is a UI. Note any existing tracker: a `TODO.md`, GitHub Issues in use (`gh issue list --limit 5`), a Linear or todo CLI the user mentioned.
-- If `team-brief.md` exists, run `devteam.py show` and ask what they want to change. Then jump to step 4.
-- Run `devteam.py harnesses`: which harnesses are installed and which recommended models each can use. Recommend only what it reports as available. If a harness the user wants is missing or cannot list its models, show its fix line now.
+- If `team-brief.md` exists, run `ateam.py show` and ask what they want to change. Then jump to step 4.
+- Run `ateam.py harnesses`: which harnesses are installed and which recommended models each can use. Recommend only what it reports as available. If a harness the user wants is missing or cannot list its models, show its fix line now.
 
 ## 2. Ask (a few questions, one round)
 
@@ -57,7 +57,7 @@ Adjust until the user agrees.
 
 ## 4. Write and check
 
-1. With no brief yet, run `devteam.py init`. It writes the template, with every role defined, to the repo root. Then edit `team-brief.md`:
+1. With no brief yet, run `ateam.py init`. It writes the template, with every role defined, to the repo root. Then edit `team-brief.md`:
    - **Settings:**
      - keep only the chosen members, and set each one's harness, model and thinking;
      - add `notes` saying what each member owns on this project;
@@ -68,10 +68,10 @@ Adjust until the user agrees.
      - finish with `## Project`: two or three sentences on what we are building, for whom, and the stack.
 
    Keep it short.
-2. Run `devteam.py check`. If a member fails, show the problem and fix lines and ask: fix the setup, or change the member? Do not substitute on your own. Repeat until every member is `ok`.
-3. Run `devteam.py brief` and show the user the brief as members will receive it.
+2. Run `ateam.py check`. If a member fails, show the problem and fix lines and ask: fix the setup, or change the member? Do not substitute on your own. Repeat until every member is `ok`.
+3. Run `ateam.py brief` and show the user the brief as members will receive it.
 
 ## 5. Finish
 
 - Suggest committing `team-brief.md`.
-- Next: `/devteam up`.
+- Next: `/a-team up`.

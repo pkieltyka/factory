@@ -1,4 +1,4 @@
-# `/devteam continue`: pick up where the team left off
+# `/a-team continue`: pick up where the team left off
 
 Use this when members' agents exited, herdr restarted, or your own session was lost and the user started you again.
 
@@ -13,7 +13,7 @@ Your own context may be new. Read:
 ## 2. See what is running
 
 ```bash
-devteam.py status
+ateam.py status
 ```
 
 Each member's pane carries its @name. A member is:
@@ -35,15 +35,15 @@ Each member's pane carries its @name. A member is:
 ## 3. Bring the members back
 
 ```bash
-devteam.py continue              # every member with a pane whose agent is gone
-devteam.py continue lead-dev     # just these (also members whose pane was closed)
-devteam.py continue --fresh      # new sessions instead of resuming
+ateam.py continue                # every member with a pane whose agent is gone
+ateam.py continue lead-dev       # just these (also members whose pane was closed)
+ateam.py continue --fresh        # new sessions instead of resuming
 ```
 
 For a member that herdr already resumed (`unnamed`), `continue` **adopts** it:
 - it names the agent again;
 - it re-sends the member's standing instructions as a message;
-- it reports that the agent may be on a different model than the brief says. To apply the brief's model and thinking, exit that agent and run `devteam.py continue <name>`.
+- it reports that the agent may be on a different model than the brief says. To apply the brief's model and thinking, exit that agent and run `ateam.py continue <name>`.
 
 For a member whose agent is gone, `continue` starts the agent again in the member's own pane and reopens the harness session herdr recorded for that pane, so the member keeps its context: Claude `--resume`, Codex `resume`, pi `--session`, omp `--resume`, OpenCode `--session`.
 

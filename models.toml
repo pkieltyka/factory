@@ -1,4 +1,4 @@
-# Model facts devteam.py cannot ask the harness for, and fallback models by tier.
+# Model facts ateam.py cannot ask the harness for, and fallback models by tier.
 #
 # Availability is checked live where the harness can tell us:
 #   codex     ~/.codex/models_cache.json (models and the thinking levels each supports)
@@ -18,7 +18,7 @@ omp = ["off", "minimal", "low", "medium", "high", "xhigh", "max", "auto"]
 # opencode passes thinking as the model variant (`provider/model#high`); valid names depend on the model.
 
 # Models for members that set a `tier` (or none, using their role's tier) instead of a `model`.
-# First entry wins; `devteam.py up --pick N` takes the Nth.
+# First entry wins; `ateam.py up --pick N` takes the Nth.
 [tiers.claude]
 top = ["claude-fable-5-2", "claude-opus-5-5"]
 mid = ["claude-sonnet-5-5"]
