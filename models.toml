@@ -1,0 +1,46 @@
+# Model facts team.py cannot ask the harness for, and fallback models by tier.
+#
+# Availability is checked live where the harness can tell us:
+#   codex     ~/.codex/models_cache.json (models and the thinking levels each supports)
+#   pi, omp   `pi --list-models` / `omp models` (only providers you have configured, local ones included)
+#   opencode  `opencode models`
+#   claude    no listing command, so ids are checked against `claude_models` below.
+
+# Claude Code model ids (aliases opus, sonnet, haiku and fable are accepted too). Add new ones here.
+claude_models = ["claude-fable-5-2", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"]
+
+# Thinking levels each harness accepts. Codex levels come from its model cache instead.
+# `never_thinking` in team.toml removes levels on top of this (max/ultra for claude and codex by default).
+[thinking]
+claude = ["low", "medium", "high", "xhigh", "max"]
+pi = ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
+omp = ["off", "minimal", "low", "medium", "high", "xhigh", "max", "auto"]
+# opencode passes thinking as the model variant (`provider/model#high`); valid names depend on the model.
+
+# Models for members that set a `tier` (or none, using their role's tier) instead of a `model`.
+# First entry wins; `team.py up --pick N` takes the Nth.
+[tiers.claude]
+top = ["claude-fable-5-2", "claude-opus-5-5"]
+mid = ["claude-sonnet-5-5"]
+fast = ["claude-haiku-5-5"]
+
+[tiers.codex]
+top = ["gpt-6-astra"]
+mid = ["gpt-6-luna"]
+fast = ["gpt-6-sol"]
+
+# pi and omp: `vendor/model` ids resolve to whichever configured provider serves them.
+[tiers.pi]
+top = ["openai/gpt-6-astra"]
+mid = ["z-ai/glm-5.3", "moonshotai/kimi-k3", "x-ai/grok-4.7"]
+fast = ["z-ai/glm-5.3-flash", "deepseek/deepseek-v4.1-flash"]
+
+[tiers.opencode]
+top = ["openrouter/openai/gpt-6-astra"]
+mid = ["openrouter/z-ai/glm-5.3"]
+fast = ["openrouter/z-ai/glm-5.3-flash"]
+
+# Optional, USD per million tokens, for panes whose harness records no dollars (Codex always,
+# Claude Code until its session exits). pi and omp record real dollars and ignore this.
+[prices]
+# "gpt-6-astra" = { input = 0.0, output = 0.0, cache_read = 0.0 }

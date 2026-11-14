@@ -1,0 +1,53 @@
+# Example project formation: copy to ./agent-team.toml in the repo (or run `team.py init` and edit).
+# Only the keys you set change; everything else comes from the skill's team.toml and roles/*.md.
+# Top-level keys first: in TOML, a key written after a [table] header belongs to that table.
+
+board = "TODO.md"
+
+[lead]
+name = "cto"
+harness = "claude"
+model = "claude-fable-5-2"
+thinking = "medium"
+notes = "Orchestrator and lead architect. Owns architecture and the big decisions, hands out work, does the final review, and is the only one who commits. The human speaks through {lead}."
+
+[members.lead-dev]
+harness = "codex"
+model = "gpt-6.1-sol"
+thinking = "high"
+notes = "Lead Go developer. Owns the Go core: the wrapper layer over the `gh` CLI, data models, sync and refresh, error handling, tests."
+works_with = ["frontend-dev"]
+
+[members.frontend-dev]
+harness = "claude"
+model = "claude-opus-5-5"
+thinking = "medium"
+notes = "Frontend / TUI developer. Owns the Bubble Tea v2 UI: layout, views, navigation, keybindings, styling."
+works_with = ["lead-dev"]
+
+# Two backend developers on different model families.
+[members.backend-dev-1]
+role = "backend-dev"
+model = "gpt-6-luna"            # GPT -> runs in Codex
+thinking = "medium"
+
+[members.backend-dev-2]
+role = "backend-dev"
+model = "z-ai/glm-5.3"          # not Claude or GPT -> runs in pi (via whichever provider serves it)
+thinking = "high"
+
+[members.reviewer]
+harness = "pi"
+model = "z-ai/glm-5.3"
+thinking = "high"
+
+# A local model: serve it (vLLM, Ollama, llama.cpp), add it to omp's or pi's model config,
+# and `team.py check` finds which provider serves it.
+[members.pm]
+harness = "omp"
+model = "nvidia/Qwen3.8-Flash-Next-NVFP4"
+thinking = "low"
+
+[teams]
+default = ["lead-dev", "frontend-dev", "reviewer", "pm"]
+backend = ["lead-dev", "backend-dev-1", "backend-dev-2", "reviewer", "pm"]
