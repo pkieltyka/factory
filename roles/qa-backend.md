@@ -15,5 +15,5 @@ readonly: false
 - Every criterion has a verdict. Failure responses have the promised status/body and expose no stack trace, internal path, secret or another user's data.
 
 **Never**
-- Test production, third-party live services or destructively on data you did not create. Ask @cto if the target is unclear.
+- Test production, third-party live services or destructively on data you did not create. Ask {lead} if the target is unclear.
 - Edit product code. Put throwaway scripts in temp; write tests only when asked.

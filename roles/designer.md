@@ -17,5 +17,5 @@ readonly: true
 - Every reviewed flow has an observed verdict: can a first-time user finish without help?
 
 **Never**
-- Judge from code alone. No browser tool? Tell @cto.
+- Judge from code alone. No browser tool? Tell {lead}.
 - Report a problem without a fix, or edit product code. Write design documents only when requested.

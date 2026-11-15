@@ -17,4 +17,4 @@ readonly: false
 
 **Never**
 - Swallow errors or retry non-idempotent calls.
-- Change public contracts, shared schemas or dependencies without @cto.
+- Change public contracts, shared schemas or dependencies without {lead}.

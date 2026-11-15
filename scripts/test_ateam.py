@@ -329,8 +329,8 @@ def kind(call):
 
 class UpTests(unittest.TestCase):
     def test_ui_team_launches_in_the_team_tab_and_is_briefed(self):
-        with Env(UI.replace("+++\n", '+++\n[lead]\nname = "boss"\n[tabs]\nteam = "crew"\n', 1)) as e:
-            self.assertEqual(ateam.Config(e.repo).lead["name"], "cto")
+        with Env(UI.replace("+++\n", '+++\n[tabs]\nteam = "crew"\n', 1)) as e:  # [tabs] is ignored: labels are fixed
+            self.assertEqual(ateam.Config(e.repo).lead["name"], "cto")  # the default name
             e.run("up", cwd=e.repo / "sub")  # team-brief.md is found from a subdirectory too
             fs = e.fake_state()
             self.assertEqual((fs["panes"]["w1:p1"]["name"], fs["panes"]["w1:p1"]["label"]), ("cto", "cto"))
@@ -981,6 +981,27 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(set(t["permissions"]), set(ateam.LEVELS), h)
             self.assertIn(t["prompt"], ("file", "pointer", "message"), h)
             self.assertIn(h, ateam.CODE)
+
+    def test_orchestrator_table_and_name(self):
+        team = '[members.lead-dev]\nharness = "codex"\nmodel = "gpt-6-luna"\n'
+        with Env(team_brief('[orchestrator]\nname = "boss"\nharness = "claude"\n' + team, "## Workflow\n\n1. {lead} hands out work.\n")) as e:
+            e.run("up")
+            lead = e.fake_state()["panes"]["w1:p1"]
+            self.assertEqual((lead["name"], lead["label"]), ("boss", "boss"))  # its @name, pane label and agent name
+            self.assertRegex(e.run("status").stdout, r"@boss +orchestrator")
+            brief = dict(e.prompts())["lead-dev"]
+            self.assertIn("# Team brief (from @boss)", brief)
+            self.assertIn("1. @boss hands out work.", brief)
+            prompt = e.run("prompt", "lead-dev").stdout
+            self.assertIn("the orchestrator (@boss)", prompt)  # roles and the member prompt follow the name
+            self.assertNotIn("@cto", prompt)
+            for settings, why in (('[lead]\nname = "boss"\n', "rename [lead] to [orchestrator]"),
+                                  ('[orchestrator]\nname = "Boss!"\n', "[orchestrator] name 'Boss!' must be"),
+                                  ('[orchestrator]\nname = "lead-dev"\n', "not a member's name")):
+                e.write_brief(team_brief(settings + team))
+                result = e.run("check", check=False)
+                self.assertEqual(result.returncode, 1, settings)
+                self.assertIn(why, result.stderr)
 
     def test_member_requires_explicit_harness(self):
         with Env('+++\n[members.lead-dev]\nmodel = "gpt-6-luna"\n+++\n') as e:

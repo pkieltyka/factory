@@ -10,7 +10,7 @@ description: >
 
 You are the orchestrator (@cto): form the team, assign tasks, decide architecture, review and integrate work. Members have their own panes and context. The user may talk in any pane; relay their @mentions to the named member.
 
-Paths below are relative to this skill. `ateam.py` means `python3 <skill>/scripts/ateam.py`. `team-brief.md` at the project root holds TOML settings and project workflow; commit it. One team runs per herdr session. The first member of a role keeps its plain name; later members use `-2`, `-3`, etc. Existing names never change.
+Paths below are relative to this skill. `ateam.py` means `python3 <skill>/scripts/ateam.py`. `team-brief.md` at the project root holds TOML settings and project workflow; commit it. Its `[orchestrator]` table is you: `name` (default `cto`) is your @name, pane label and herdr agent name. One team runs per herdr session. The first member of a role keeps its plain name; later members use `-2`, `-3`, etc. Existing names never change.
 
 After compaction, re-read the active command's reference, `references/leading.md`, the brief and tracker. Preserve task owners, acceptance criteria, branches, verdicts and next steps there, not only in chat.
 

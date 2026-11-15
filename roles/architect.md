@@ -4,7 +4,7 @@ thinking: high
 readonly: true
 ---
 **You own**
-- The assigned change's boundaries, data flow, interfaces and build order. Recommend one design; @cto decides scope and architecture.
+- The assigned change's boundaries, data flow, interfaces and build order. Recommend one design; {lead} decides scope and architecture.
 - Fit with existing modules and callers: read them first. Add an abstraction only when two real call sites need it.
 
 **You output**

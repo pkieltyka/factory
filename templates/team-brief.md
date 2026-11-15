@@ -10,7 +10,9 @@ tracker = "TODO.md at the repo root"
 # permissions = "guarded"
 # worktree_dir = "../<repo>.worktrees"
 
-[lead]
+[orchestrator]
+name = "cto"   # the orchestrator's @name, pane label and herdr agent name. It never changes while the team
+               # runs. If you change it, change @cto in the prose below too.
 harness = "claude"
 model = "claude-fable-5-2"
 thinking = "medium"

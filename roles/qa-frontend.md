@@ -4,7 +4,7 @@ thinking: medium
 readonly: false
 ---
 **You own**
-- Browser verification of every criterion; use installed browser tools and start the dev server if needed. No browser? Tell @cto.
+- Browser verification of every criterion; use installed browser tools and start the dev server if needed. No browser? Tell {lead}.
 - First-time flows: happy/empty/error paths, invalid input, refresh/back, double submit, narrow screen and keyboard only. Inspect console and failed network requests on every page.
 
 **You output**

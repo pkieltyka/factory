@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""a-team: a software team of coding agents in herdr, one team per herdr session. You are the lead (CTO);
+"""a-team: a software team of coding agents in herdr, one team per herdr session. You are the orchestrator (CTO);
 each member runs in its own pane of the team tab, on its own harness, model and thinking level.
 
 The team is team-brief.md at the repo root: settings in +++ TOML front matter +++, then prose. herdr holds the
@@ -28,7 +28,7 @@ LEVELS = ("full", "guarded")
 PROBE_TIMEOUT = 60
 SETTLE = float(os.environ.get("ATEAM_SETTLE", 8))  # seconds a member may take to get past a start-up notice
 BRIEF = "team-brief.md"
-LEAD = "cto"  # the orchestrator's @name
+LEAD = "cto"  # the orchestrator's @name, unless `[orchestrator] name` in the brief says otherwise
 TABS = {"lead": "a-team orchestrator", "team": "a-team workers"}  # herdr tab labels
 
 
@@ -92,8 +92,13 @@ class Config:
                              " (or `ateam.py init`) first.")
         else:
             self.team, self.body = {}, ""
-        self.lead = {**self.team.get("lead", {}), "name": LEAD}
+        if "lead" in self.team:
+            raise SystemExit(f"{self.brief_file}: rename [lead] to [orchestrator]")
+        self.lead = {"name": LEAD, **self.team.get("orchestrator", {})}  # the orchestrator; `lead` in this code
         self.members = self.team.get("members", {})
+        if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", str(self.lead["name"])) or self.lead["name"] in self.members:
+            raise SystemExit(f"{self.brief_file}: [orchestrator] name {self.lead['name']!r} must be lowercase letters,"
+                             " digits, - or _ (32 at most) and not a member's name")
         if "teams" in self.team:  # a brief from before: starting "everyone in the brief" would start its whole catalog
             raise SystemExit(f"{self.brief_file}: [teams] is no longer used. The members in the brief are the team:"
                              " remove [teams] and the members you do not want.")
@@ -506,7 +511,7 @@ def render_team_brief(cfg, members, lead, closing=None):
            "| Name | Agent | Role |" + (" Works in |" if trees else ""), "|---|---|---|" + ("---|" if trees else "")]
     lead_agent = ", ".join(x for x in (TABLE.get(L.get("harness"), {}).get("label", L.get("harness")),
                                        L.get("model"), L.get("thinking")) if x)
-    out.append(f"| **@{lead}** | {lead_agent} | {L.get('notes') or 'Orchestrator and lead.'} |"
+    out.append(f"| **@{lead}** | {lead_agent} | {L.get('notes') or 'Orchestrator.'} |"
                + (" the main checkout |" if trees else ""))
     for m in members:
         meta, _ = cfg.roles[m["role"]]
@@ -522,7 +527,7 @@ def render_team_brief(cfg, members, lead, closing=None):
                 " review, name your branch."]
     names = ", ".join("`" + m["name"] + "`" for m in members)
     out += ["", "## Talking to each other", "",
-            f"Everyone has an @name, which is also their herdr pane's name: {names}, and `{lead}` for the lead."
+            f"Everyone has an @name, which is also their herdr pane's name: {names}, and `{lead}` for the orchestrator."
             " Message anyone with `herdr agent prompt <name> '[from @you] ...'`; your standing instructions say how.",
             "", closing or "That is the whole team brief. No reply needed."]
     return "\n".join(out).replace("{lead}", f"@{lead}") + "\n"
@@ -566,7 +571,7 @@ def herdr(*args, check=True, timeout=HERDR_TIMEOUT):
 
 def require_herdr():
     if os.environ.get("HERDR_ENV") != "1":
-        raise SystemExit("not inside herdr (HERDR_ENV != 1). Start herdr and run this from the lead's pane.")
+        raise SystemExit("not inside herdr (HERDR_ENV != 1). Start herdr and run this from the orchestrator's pane.")
 
 
 class Team:
@@ -606,23 +611,23 @@ class Team:
 
 
 def ensure_lead(cfg, tab=False):
-    """Name the lead's agent and label its pane after `[lead] name`, e.g. `cto`; when launching, label its tab
+    """Name the orchestrator's agent and label its pane after `[orchestrator] name`; when launching, label its tab
     too. Returns the name."""
     pane = os.environ.get("HERDR_PANE_ID")
     if not pane:
-        raise SystemExit("HERDR_PANE_ID is not set; run this from the lead's herdr pane.")
+        raise SystemExit("HERDR_PANE_ID is not set; run this from the orchestrator's herdr pane.")
     got = herdr("agent", "get", pane, check=False)
     info = got.get("agent") or {}
     if "error" in got and "not_found" not in got["error"]:  # herdr itself failed: say that, not "no agent"
         raise SystemExit(f"herdr agent get {pane}: {got['error']}")
     if not info:
-        raise SystemExit(f"herdr sees no agent in this pane ({pane}). Run ateam.py from the lead agent's pane.")
+        raise SystemExit(f"herdr sees no agent in this pane ({pane}). Run ateam.py from the orchestrator's pane.")
     name = cfg.lead["name"]
     if info.get("name") != name:
         clash = [a for a in herdr("agent", "list").get("agents", []) if a.get("name") == name]
         if clash:
             raise SystemExit(f"another agent is already named @{name} ({clash[0].get('pane_id')}). One team runs per"
-                             f" herdr session: rename that agent, change [lead] name in {BRIEF}, or use another session.")
+                             f" herdr session: rename that agent, change [orchestrator] name in {BRIEF}, or use another session.")
         herdr("agent", "rename", pane, name)
         print(f"named this pane's agent @{name}")
     herdr("pane", "rename", pane, name, check=False)
@@ -933,7 +938,7 @@ def cmd_continue(args):
                + (f", check the tracker ({cfg.tracker})" if cfg.tracker else "")
                + f", then tell @{lead} in one line what you were doing and what you will do next. Send it:"
                f" `herdr agent prompt {lead} '[from @you] ...'`. A reply in your own pane does not reach @{lead}.")
-    # With names, only those members are re-briefed. With none the lead is catching up, so everyone answers.
+    # With names, only those members are re-briefed. With none the orchestrator is catching up, so everyone answers.
     report_failed(failed, team, send_brief(cfg, team, lead, names=set(names) - set(failed) if args.names else None,
                                            closing=closing))
 
@@ -944,7 +949,7 @@ def cmd_status(args):
     team = Team(cfg)
     rows = [("Member", "Role", "Harness", "Model", "Thinking", "Status", "Pane")]
     lead = cfg.lead["name"]
-    rows.append(("@" + lead, "lead", cfg.lead.get("harness", ""), cfg.lead.get("model", ""), cfg.lead.get("thinking", ""),
+    rows.append(("@" + lead, "orchestrator", cfg.lead.get("harness", ""), cfg.lead.get("model", ""), cfg.lead.get("thinking", ""),
                  team.status(lead), (team.pane(lead) or {}).get("pane_id", "")))
     for name in cfg.members:
         p = plan(cfg, name)
@@ -962,7 +967,7 @@ def cmd_status(args):
 
 
 def cmd_wait(args):
-    """Block until the lead is needed. Run it in the background after handing out work. It returns when a
+    """Block until the orchestrator is needed. Run it in the background after handing out work. It returns when a
     member that was working stops (its report may not have been sent), when a named member is not working,
     when a member is blocked, gone or closed, when herdr cannot tell what a member is doing, or when nobody
     is working any more."""
@@ -1027,11 +1032,11 @@ def cmd_brief(args):
         if send_brief(cfg, team, lead, names=set(names) or None):
             sys.exit(1)
         return
-    print(render_team_brief(cfg, [plan(cfg, n) for n in cfg.members], LEAD))
+    print(render_team_brief(cfg, [plan(cfg, n) for n in cfg.members], cfg.lead["name"]))
 
 
 def cmd_say(args):
-    """Message members as the lead: `say all ...` or `say lead-dev frontend-dev ...`."""
+    """Message members as the orchestrator: `say all ...` or `say lead-dev frontend-dev ...`."""
     require_herdr()
     cfg = cfg_of(args)
     lead = ensure_lead(cfg)
@@ -1115,7 +1120,7 @@ def main(argv=None):
     bf.add_argument("--send", action="store_true")
     common(bf)
 
-    sy = sub.add_parser("say", help="message members as the lead")
+    sy = sub.add_parser("say", help="message members as the orchestrator")
     sy.add_argument("to", nargs="+", help="member names, or `all`; the last word is the message unless --file")
     sy.add_argument("--file", help="send this file's contents")
     common(sy)

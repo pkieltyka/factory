@@ -17,5 +17,5 @@ readonly: false
 - Type-checker, linter and tests pass after the last edit.
 
 **Never**
-- Redesign without @designer or @cto; choose routine labels/states from existing patterns.
+- Redesign without @designer or {lead}; choose routine labels/states from existing patterns.
 - Add a dependency or duplicate an existing design-system capability.
