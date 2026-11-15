@@ -968,16 +968,16 @@ def cmd_status(args):
 
 def cmd_wait(args):
     """Block until the orchestrator is needed. Run it in the background after handing out work. It returns when a
-    member that was working stops (its report may not have been sent), when a named member is not working,
-    when a member is blocked, gone or closed, when herdr cannot tell what a member is doing, or when nobody
-    is working any more."""
+    member that was working stops (its report may not have been sent), when a member is blocked, gone or
+    closed, when herdr cannot tell what a member is doing, or when nobody is working any more. With names,
+    only those members count: what the rest of the team does never ends the wait."""
     require_herdr()
     cfg = cfg_of(args)
     watch = [n.lstrip("@") for n in args.names]
     deadline, seen, worked, looks = time.monotonic() + args.timeout, None, set(), 0
     while True:
         team = Team(cfg)
-        state = {n: team.status(n) for n in cfg.members if team.pane(n)}
+        state = {n: team.status(n) for n in cfg.members if (not watch or n in watch) and team.pane(n)}
         if seen is None:  # the members this watch is about: a pane that closes later is noticed
             missing = [n for n in watch if n not in state]
             if missing or not state:
@@ -1110,7 +1110,7 @@ def main(argv=None):
     common(st)
 
     wt = sub.add_parser("wait", help="return when a member stops, is blocked or is gone, or nobody is working")
-    wt.add_argument("names", nargs="*", help="also return when one of these is not working")
+    wt.add_argument("names", nargs="*", help="watch only these members (default: every member)")
     wt.add_argument("--timeout", type=float, default=1800, help="seconds before giving up (exit 4)")
     wt.add_argument("--interval", type=float, default=5, help="seconds between looks")
     common(wt)

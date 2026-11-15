@@ -25,24 +25,27 @@ Members send reports by herdr message; local final replies are not delivered. Ch
 
 | Status or watcher result | Action |
 |---|---|
-| `working` | Continue independent work. |
+| `working` | Keep waiting. |
 | `idle` / `done`, or an observed worker stops | Check its report; if absent, read the pane. |
 | `blocked` | Inspect the question; resolve within existing authorization, asking the user only for a new decision. |
 | `gone` / closed pane | Recover with `ateam.py continue <name>`. |
 | `unknown` | Inspect; it does not prove completion. |
 | Nobody working | Assign the next work or resolve dependencies. |
 
-Keep `wait` in the background while work is out; restart it after each return. It catches blocked/gone/closed/unknown members and working-to-idle/done transitions. `wait <names>` also returns when a named member is not working. Timeout is in seconds (default 1800, exit 4); `--timeout` changes it. Never wait synchronously on a member that might need you.
+After assigning work, run one background `wait` and yield until it or a message arrives. No status polling or "still waiting" updates. Restart the watcher only after it returns; do not run duplicate watchers.
+
+With names, `wait <names>` watches only those members; without names it watches the whole team. It returns for blocked/gone/closed/unknown members, working-to-idle/done transitions, or nobody working; a named idle/done member also returns after the second look. Timeout is in seconds (default 1800, exit 4); `--timeout` changes it. Never wait synchronously on a member that might need you.
 
 ## Review and integrate
 
 - Obtain peer review against the task and exact diff/commit; resolve findings before your final review. QA verifies applicable criteria and retests fixes; @product can check acceptance.
 - Shared checkout: members leave changes uncommitted; you review and commit. Worktree: the developer commits its branch; you review and merge. Check both `git diff <main>...<branch>` and `git -C <path> status`.
+- Before committing the tracker, check every touched record: status, verdict and one next-step field must agree. Have the tracker owner correct stale instructions. Include acceptance browser scripts/tests and their documented run command when committing or merging browser work.
 - A failed worktree commit is a coordination problem: agree who commits it, using `git -C <path>` if needed. Do not disable signing, hooks or sandbox settings to make it pass.
 - The member merges main into its branch before the next task. Remove worktrees/branches only when cleanup is authorized and reviewed work is merged.
 
 ## Keep state current
 
-Edit the brief when formation, settings or project direction change; `ateam.py check`, then `brief --send`. Restart members for changed launch settings as in [cmd_continue.md](cmd_continue.md). For an unrelated task or important review, `ateam.py continue <name> --fresh --restart` starts a fresh session.
+When a decision changes scope, ownership, commit rules or settings, update the brief at that moment; do not leave the decision only in chat. Run `ateam.py check`, then `ateam.py brief --send <affected names>` to notify only affected members. Keep orchestrator model/thinking accurate. Restart members for changed launch settings as in [cmd_continue.md](cmd_continue.md). For an unrelated task or important review, `ateam.py continue <name> --fresh --restart` starts a fresh session.
 
 Keep the team small. Roles marked read-only are constrained by instructions, not enforced permissions. Do not close or relabel panes/tabs unless authorized; a-team locates members by their labels. Usage accounting belongs to each harness, not a-team.

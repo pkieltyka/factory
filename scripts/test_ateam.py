@@ -61,6 +61,8 @@ FAKE_HERDR = textwrap.dedent(r'''
                 target = next(k for k, p in panes.items() if p.get("label") == change["name"])
                 if change.get("close"):
                     del panes[target]
+                elif change.get("exit"):
+                    panes[target].update(agent=None, name=None, agent_status="unknown", agent_session=None)
                 else:
                     panes[target]["agent_status"] = change["status"]
 
@@ -823,6 +825,44 @@ class WaitTests(unittest.TestCase):
             self.assertIn("@lead-dev stopped (done)", result.stdout)
             self.assertEqual(e.pane_of("reviewer")["agent_status"], "working")
 
+    def test_named_wait_ignores_other_members(self):
+        for change in (*({"status": s} for s in ("idle", "done", "blocked", "unknown")),
+                       {"close": True}, {"exit": True}):
+            with self.subTest(change=change), Env() as e:
+                e.run("up", "lead-dev", "reviewer", "--no-brief")
+                for name in ("lead-dev", "reviewer"):
+                    e.update(name, agent_status="working")
+                state = e.fake_state()
+                state["on_second_poll"] = {"name": "reviewer", **change}
+                e.write_fake(state)
+                result = e.run("wait", "@lead-dev", "--interval", "0.01", "--timeout", "1", check=False)
+                self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
+                self.assertIn("still working: @lead-dev", result.stdout)
+                self.assertNotIn("reviewer", result.stdout)
+                self.assertGreaterEqual(e.fake_state()["polls"], 2)  # the unrelated transition really happened
+
+    def test_named_wait_notices_selected_members(self):
+        changes = [({"status": s}, s) for s in ("idle", "done", "blocked", "unknown")]
+        for change, expected in changes + [({"close": True}, "closed"), ({"exit": True}, "gone")]:
+            with self.subTest(change=change), Env() as e:
+                e.run("up", "lead-dev", "reviewer", "pm", "--no-brief")
+                for name in ("lead-dev", "reviewer", "pm"):
+                    e.update(name, agent_status="working")
+                state = e.fake_state()
+                state["on_second_poll"] = {"name": "reviewer", **change}
+                e.write_fake(state)
+                result = e.run("wait", "lead-dev", "@reviewer", "--interval", "0.01", "--timeout", "2")
+                self.assertIn("@reviewer", result.stdout)
+                self.assertIn(expected, result.stdout)
+                self.assertNotIn("@pm", result.stdout)
+        with Env() as e:
+            e.run("up", "lead-dev", "--no-brief")
+            e.update("lead-dev", agent_status="working")
+            for name in ("reviewer", "cto"):
+                result = e.run("wait", "lead-dev", name, "--timeout", "0.2", "--interval", "0.01", check=False)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(f"not started: {name}", result.stderr)
+
     def test_wait_reports_disappearance_and_unknown(self):
         for change, expected in (({"close": True}, "closed"), ({"status": "unknown"}, "unknown")):
             with self.subTest(change=change), Env() as e:
@@ -1140,9 +1180,14 @@ class LiveFlags(unittest.TestCase):
         for harness, (argv, flags) in self.FLAGS.items():
             if not shutil.which(harness):
                 continue
-            p = subprocess.run([harness, *argv], capture_output=True, text=True, timeout=60)
+            # Claude's help can truncate when piped; a regular file preserves the full output.
+            with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as output:
+                p = subprocess.run([harness, *argv], stdout=output, stderr=subprocess.STDOUT, timeout=60)
+                output.seek(0)
+                help_text = output.read()
+            self.assertEqual(p.returncode, 0, f"{harness} --help failed: {help_text}")
             for f in flags:
-                self.assertIn(f, p.stdout + p.stderr, f"{harness} --help no longer mentions {f}")
+                self.assertIn(f, help_text, f"{harness} --help no longer mentions {f}")
 
 
 if __name__ == "__main__":

@@ -30,5 +30,6 @@ With no brief, run `ateam.py init`. Edit the brief:
 - Keep the chosen members, each with explicit harness, model and project-specific `notes`. Use `worktree = true` for separate developers. `up` starts every member in the brief; there are no named rosters.
 - Set `tracker` to actionable instructions (repo file, GitHub Issues, Linear or another tool), or omit it. @pm owns it when present; otherwise you track tasks.
 - Keep the workflow short: project-specific responsibilities, review and integration. End with `## Project`: what, for whom, stack. Detailed tasks go in messages.
+- Match the orchestrator's model/thinking to the current session, not the template defaults. Check the rendered brief against standing instructions: shared-checkout members leave commits to you; worktree members commit their own branches. Scope and ownership must agree throughout.
 
 Run `ateam.py check`. Resolve each failure without substituting unapproved models or harnesses; unknown Claude IDs only warn. Preview with `ateam.py brief`, show the result, and commit when authorized. Next: `/a-team up`.

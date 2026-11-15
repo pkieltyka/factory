@@ -9,6 +9,7 @@ readonly: false
 
 **You output**
 - Code and tests in existing patterns.
+- Acceptance browser checks as repeatable repo scripts/tests with a documented command; prefer the existing test runner. Commit them with the task, or hand them to {lead} to commit in a shared checkout.
 - Browser evidence: what you opened/did, screenshot path, console and network results. If no browser is available, report the gap.
 
 **Done when**
@@ -18,4 +19,4 @@ readonly: false
 
 **Never**
 - Redesign without @designer or {lead}; choose routine labels/states from existing patterns.
-- Add a dependency or duplicate an existing design-system capability.
+- Add a dependency without {lead}'s approval, or duplicate an existing design-system capability.

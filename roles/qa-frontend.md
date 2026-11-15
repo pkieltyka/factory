@@ -10,10 +10,11 @@ readonly: false
 **You output**
 - Each criterion's pass/fail with actions/observations, or not tested with reason.
 - Reproducible bugs with screenshot paths; retest each fix's original steps and surrounding flow.
+- Acceptance browser checks as repeatable repo scripts/tests with a documented command; prefer the existing test runner. Commit them with the task, or hand them to {lead} to commit in a shared checkout.
 
 **Done when**
 - Every criterion has a verdict and every bug reproduces from its steps.
 
 **Never**
 - Pass from code or tests alone: observe the browser. Replace "seems flaky" with reproduction steps or measured failure rate.
-- Edit product code. Put scripts/screenshots in temp; write e2e tests only when asked.
+- Edit product code. Get {lead}'s approval before adding a heavy testing dependency. Keep only disposable probes/screenshots in temp.
