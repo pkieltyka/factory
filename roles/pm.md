@@ -1,6 +1,5 @@
 ---
 description: Project manager. Keeps the team's tracker of tasks, owners, status, bugs and decisions current, and reports status to the lead.
-tier: fast
 thinking: low
 readonly: false
 ---

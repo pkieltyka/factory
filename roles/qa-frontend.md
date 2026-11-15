@@ -1,6 +1,5 @@
 ---
 description: Frontend QA. Drives the app in a real browser, tests user flows end to end, and reports bugs with reproduction steps and screenshots.
-tier: mid
 thinking: medium
 readonly: false
 ---

@@ -1,0 +1,96 @@
+# One table per harness: everything ateam.py knows about a harness that is plain data.
+# What cannot be data (listing its models, building its launch command, reading its session file) is that
+# harness's block in scripts/ateam.py. Adding a harness: one table here, one block there, one fake in the tests.
+#
+#   label        the name shown in rosters
+#   install      what to tell the user when the binary is missing
+#   models       recommended models, strongest first. `ateam.py harnesses` reports which of them this machine
+#                can use. A new model on codex, pi, omp or opencode needs no change: their lists are read live.
+#                Claude Code has no listing command, so for claude this is also the list of known ids.
+#   thinking     levels the harness accepts (codex: read per model from its cache; opencode: per-model variants)
+#   never        levels a-team refuses even where the harness accepts them. `[never_thinking]` in a team brief
+#                replaces it for that team.
+#   prompt       how a member receives its standing instructions:
+#                  file     the harness appends a file to its system prompt
+#                  pointer  a one-line system instruction names the file; the full text also goes in the first message
+#                  message  the first message only
+#   sessions     glob under $HOME for a session file, given its id as {id}; `cost` reads it
+#   [x.permissions]   native flags for each permission level of the team brief: ask | auto | full
+#                  ask    the harness as the user configured it: normally the member stops for approvals
+#                  auto   runs unattended, with whatever guard the harness offers (the default)
+#                  full   no sandbox and no approvals
+
+[claude]
+label = "Claude Code"
+install = "Install Claude Code (https://code.claude.com/docs) and log in once by running `claude`."
+models = ["claude-fable-5-2", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"]
+aliases = ["fable", "opus", "sonnet", "haiku"]
+thinking = ["low", "medium", "high", "xhigh", "max"]
+never = ["max"]
+prompt = "file"
+sessions = ".claude/projects/*/{id}.jsonl"
+
+[claude.permissions]
+ask = []
+auto = ["--permission-mode", "auto"]   # a classifier reviews each action; falls back to asking where auto mode is unavailable
+full = ["--permission-mode", "bypassPermissions"]   # Claude Code shows a warning dialog the first time
+
+[codex]
+label = "Codex"
+install = "Install the Codex CLI (`npm i -g @openai/codex`) and log in once by running `codex`."
+models = ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna", "gpt-6-sol"]
+never = ["max", "ultra"]
+prompt = "pointer"
+sessions = ".codex/sessions/*/*/*/rollout-*{id}.jsonl"
+
+# Network access stays on in every sandboxed level: herdr's socket needs it, so without it a member cannot
+# message anyone. --approve-for-me cannot be combined with -s; it uses the workspace-write sandbox itself.
+[codex.permissions]
+ask = ["-s", "workspace-write", "-c", "sandbox_workspace_write.network_access=true"]
+auto = ["--approve-for-me", "-c", "sandbox_workspace_write.network_access=true"]
+full = ["--dangerously-bypass-approvals-and-sandbox"]
+
+[pi]
+label = "pi"
+install = "Install pi (`npm i -g @earendil-works/pi-coding-agent`) and configure a provider (`pi auth --help`)."
+models = ["openai/gpt-6-astra", "z-ai/glm-5.3", "moonshotai/kimi-k3", "x-ai/grok-4.7", "z-ai/glm-5.3-flash", "deepseek/deepseek-v4.1-flash"]
+thinking = ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
+never = []
+prompt = "file"
+sessions = ".pi/agent/sessions/*/*_{id}.jsonl"
+
+[pi.permissions]   # pi has no sandbox and never asks: every level is the same
+ask = []
+auto = []
+full = []
+
+[omp]
+label = "omp"
+install = "Install oh-my-pi so `omp` is on PATH, and configure a provider."
+models = ["openai/gpt-6-astra", "z-ai/glm-5.3", "moonshotai/kimi-k3", "x-ai/grok-4.7", "z-ai/glm-5.3-flash", "deepseek/deepseek-v4.1-flash"]
+thinking = ["off", "minimal", "low", "medium", "high", "xhigh", "max", "auto"]
+never = []
+prompt = "file"
+sessions = ".omp/agent/sessions/*/*_{id}.jsonl"
+
+[omp.permissions]
+ask = ["--approval-mode", "always-ask"]
+auto = ["--approval-mode", "yolo"]
+full = ["--approval-mode", "yolo"]
+
+[opencode]
+label = "OpenCode"
+install = "Install OpenCode v2 or later (https://opencode.ai) so `opencode` is on PATH."
+models = ["openrouter/openai/gpt-6-astra", "openrouter/z-ai/glm-5.3", "openrouter/z-ai/glm-5.3-flash"]
+never = []
+prompt = "message"
+
+[opencode.permissions]
+ask = []
+auto = ["--auto"]
+full = ["--auto"]
+
+# Optional, USD per million tokens, for sessions whose harness records no dollars (Codex always, Claude Code
+# until its session exits). A team brief can add its own [prices]. pi and omp record real dollars.
+[prices]
+# "gpt-6-astra" = { input = 0.0, output = 0.0, cache_read = 0.0 }

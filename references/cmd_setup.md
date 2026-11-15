@@ -23,7 +23,14 @@ Guide the user to a team for this repo and write it to `team-brief.md` at the re
    - *local:* models the user serves themselves, run through pi or omp
 
    Also ask whether cost or speed matters more.
-5. **Tracking (when there is a pm):** where @pm keeps tasks, owners, status and bugs:
+5. **Permissions:** how much members may do without asking.
+   - *auto* (recommended): they run unattended, guarded where the harness can
+   - *ask:* they stop for approvals, and you bring each one to the user
+   - *full:* no sandbox and no approvals
+
+   Say that pi and omp members never ask, at any level.
+6. **Worktrees:** will developers build separate things in parallel? Then each of those gets a git worktree of its own. Developers working on the same thing share the main checkout.
+7. **Tracking (when there is a pm):** where @pm keeps tasks, owners, status and bugs:
    - a `TODO.md` file in the repo
    - GitHub Issues, and optionally a GitHub Project board, via `gh`
    - Linear, via its MCP tools or CLI
@@ -34,24 +41,15 @@ Use the harness's question tool if it has one, with your recommendation first.
 
 ## 3. Propose the formation
 
-Show a table: @name, role, harness, model, thinking, and one line of why. Rules of thumb:
+Show a table: @name, role, harness, model, thinking, and one line of why. Start from the template's members (`templates/team-brief.md`) and the models `ateam.py harnesses` reported as available. Rules of thumb:
 
-| Role | Default pick | Why |
-|---|---|---|
-| architect | Claude Fable, high | the hardest judgment calls |
-| product | Claude Opus, medium | product sense and writing |
-| lead-dev | Codex gpt-6.1-sol or gpt-6-luna, high | a strong, steady implementer |
-| backend-dev | GLM 5.3 via pi, medium; or Codex Luna | volume coding at lower cost |
-| frontend-dev | Claude Opus, medium | UI judgment |
-| designer | Claude Sonnet, high | critique; read-only |
-| reviewer | a different model family from the main developers, high | different blind spots catch more bugs |
-| pm | DeepSeek V4.1 Flash or a local model, low | bookkeeping |
-| qa-frontend | Claude Sonnet, medium | browser tools work best in Claude Code |
-| qa-backend | GLM 5.3 Flash via pi, medium | curl and test runs |
-
-- Thinking: high for the architect, reviewer and designer; medium for developers; low for the pm and runner. Never max or ultra on Claude or Codex (`never_thinking`).
-- Two members with the same role get numbered names (`backend-dev-1`, `backend-dev-2`) and `role = "backend-dev"`.
+- The strongest models go where judgment matters most: architect, lead-dev, reviewer. Cheaper, faster ones do volume and bookkeeping: backend-dev, pm, qa-backend.
+- The reviewer runs on a different model family from the main developers: different blind spots catch more bugs.
+- Roles that need a browser (qa-frontend, designer) work best in Claude Code.
+- Thinking: high for the architect, reviewer and designer; medium for developers; low for the pm. The highest levels on Claude and Codex are refused by default (`never` in `harnesses.toml`).
+- Names: a role's only member has the role's name (`@reviewer`). Several of a role are all numbered: `[members.backend-dev-1]` and `[members.backend-dev-2]`, each with `role = "backend-dev"`.
 - If the user chose a mixed team, spread models across families. Leave the lead's model as it is: the lead is you.
+- For a lean team, you can keep the tracker yourself instead of adding a pm.
 
 Adjust until the user agrees.
 
@@ -61,6 +59,7 @@ Adjust until the user agrees.
    - **Settings:**
      - keep only the chosen members, and set each one's harness, model and thinking;
      - add `notes` saying what each member owns on this project;
+     - set `permissions`, and `worktree = true` on the members that get their own worktree;
      - set `tracker` to the user's answer in words a member can act on, e.g. `"GitHub Issues on owner/repo via gh issue"`, or remove it for none;
      - set `[teams] default` to the chosen roster.
    - **Prose:**

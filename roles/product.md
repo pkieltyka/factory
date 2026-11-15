@@ -1,6 +1,5 @@
 ---
 description: Product lead. Shapes what we build and why: user problems, product ideas, scope and priorities, roadmap, and go-to-market. Never edits code.
-tier: top
 thinking: high
 readonly: true
 ---

@@ -2,14 +2,18 @@
 # team-brief.md: the whole team in one file at the repo root. Settings in this block, prose below the
 # closing +++ (role details, workflow, and a short project section at the end). ateam.py launches members
 # from the settings; every member receives the brief with a roster table built from them, so nothing drifts.
+# One team runs per herdr session.
 #
 # Member fields (the table key is the @name: lowercase, digits, - or _):
-#   role      a role in the skill's roles/ (defaults to the name)
-#   harness   claude | codex | pi | omp | opencode (v2+). Omitted: Claude model -> claude, GPT -> codex, else pi
-#   model     exact model id. Omitted: the role's tier from the skill's models.toml
-#   tier      top | mid | fast, used only without a model
-#   thinking  thinking level. Omitted: the role's default
-#   notes     what this member owns on this team; the Role column of the roster
+#   role         a role in the skill's roles/ (defaults to the name)
+#   harness      claude | codex | pi | omp | opencode (v2+). Omitted: Claude model -> claude, GPT -> codex, else pi
+#   model        exact model id; `ateam.py harnesses` lists what this machine can use
+#   thinking     thinking level. Omitted: the role's default
+#   notes        what this member owns on this team; the Role column of the roster
+#   permissions  ask | auto | full, for this member only (see below)
+#   worktree     true: its own git worktree on branch a-team/<name>. "some/branch": a worktree of that branch;
+#                members that name the same branch share it. Omitted: the main checkout, shared with the team
+#   args         extra native flags for its harness, e.g. args = ["--search"]
 # Two of the same role get distinct names: [members.backend-dev-2] role = "backend-dev".
 # Top-level keys must come before the first [table].
 
@@ -19,18 +23,29 @@
 #   "Linear team ENG, via the Linear MCP tools"
 #   "the `todo` CLI (`todo --help`)"
 tracker = "TODO.md at the repo root"
-lead_commits = true   # only the lead runs git commit / git push
+lead_commits = true   # only the lead runs git commit, merge and push
+
+# How much members may do without asking. Each harness maps a level to its own flags (the skill's harnesses.toml).
+#   "ask"   no flags: each harness as you have configured it, which normally means members stop for approvals
+#   "auto"  members run unattended, guarded where the harness can: Claude Code's auto mode, Codex's sandbox
+#           with automatic review of what leaves it. pi and omp have no guard: they never ask.
+#   "full"  no sandbox and no approvals anywhere
+permissions = "auto"
+
+# worktree_dir = "../<repo>.worktrees"   # where members' worktrees go; this is the default
+# [tabs]                                 # herdr tab labels; these are the defaults
+# lead = "a-team driver"                 #   your own tab
+# team = "a-team workers"                #   the one tab that holds every member's pane
+# [never_thinking]                       # thinking levels this team never uses; the default is in harnesses.toml
+# claude = ["max"]
+# codex = ["max", "ultra"]
 
 [lead]
 name = "cto"
 harness = "claude"
 model = "claude-fable-5-2"
 thinking = "medium"
-notes = "Orchestrator and lead architect. Owns architecture and the big decisions, hands out work, does the final review, and is the only one who commits. The human speaks through @cto."
-
-[never_thinking]      # levels never used, even if a member asks for them
-claude = ["max", "ultra"]
-codex = ["max", "ultra"]
+notes = "Orchestrator and lead architect. Owns architecture and the big decisions, hands out work, does the final review, and is the only one who commits. The human talks to @cto, and can also talk to any member in its pane."
 
 [members.architect]
 harness = "claude"
@@ -93,16 +108,16 @@ full = ["architect", "product", "lead-dev", "backend-dev", "frontend-dev", "desi
 ## Role details
 
 - **@lead-dev** and **@frontend-dev** agree on the interface between the core and the UI before either builds against it, and keep each other posted when it changes.
-- **@reviewer**: when @cto asks for a review, read the diff (`git status`, `git diff`, new untracked files), build and test where that helps, and report findings ordered by severity, each with `file:line` and a concrete failure scenario. Read-only: you report, the developers fix.
+- **@reviewer**: when {lead} or a developer asks for a review, read the diff (`git status`, `git diff`, new untracked files), build and test where that helps, and report findings ordered by severity, each with `file:line` and a concrete failure scenario. Read-only: you report, the developers fix.
 - **@pm** owns the tracker: short, current, ordered by priority, with an owner and status on every item. Only @pm updates it; teammates ask @pm to add or change items.
 
 ## Workflow
 
-1. @cto sets direction and hands out tasks; @pm records them in the tracker.
-2. Developers implement and leave their work uncommitted.
-3. @reviewer does the first-pass review of the diff; the developers fix what it finds.
-4. @cto does the final review and commits. Nobody else runs `git commit` or `git push`.
+1. {lead} sets direction and hands out tasks; @pm records them in the tracker.
+2. Developers implement and leave their work uncommitted: in the main checkout, or in their own worktree if they have one.
+3. Developers ask @reviewer directly for a first-pass review of their diff, and fix what it finds.
+4. {lead} does the final review and commits; a worktree's branch is then merged into the main checkout. Nobody else runs `git commit`, `git merge` or `git push`.
 
 ## Project
 
-<!-- One to three sentences: what we are building, for whom, and the stack. Details come from @cto. -->
+<!-- One to three sentences: what we are building, for whom, and the stack. Details come from the lead. -->

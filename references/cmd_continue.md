@@ -7,7 +7,7 @@ Use this when members' agents exited, herdr restarted, or your own session was l
 Your own context may be new. Read:
 1. `team-brief.md`: who is on the team, how you work, and the project.
 2. The tracker the brief names, if any: what is done, in progress, or blocked.
-3. `git status` and `git log --oneline -10`: uncommitted work and recent commits.
+3. `git status`, `git log --oneline -10` and `git worktree list`: uncommitted work, recent commits, and members' branches.
 4. Spec or plan documents the project uses (for example `specs/`), if any.
 
 ## 2. See what is running
@@ -17,45 +17,40 @@ ateam.py status
 ```
 
 Each member's pane carries its @name. A member is:
-- `idle`, `working` or `blocked`: running;
-- `... (unnamed)`: running, but herdr resumed it after a restart (see below);
+- `idle`, `working`, `blocked` or `done`: running;
+- `... (unnamed)`: running, but herdr brought it back after a restart without its name (see below);
 - `gone`: its pane is there but its agent is not;
 - missing from the list: its pane was closed.
 
-**After a herdr restart**, herdr itself resumes every agent whose session its integration recorded (Claude, Codex, pi, omp, OpenCode), in the restored panes. This is on by default; `[session] resume_agents_on_restore` in herdr's config controls it. Two things are lost:
-- agent names, which do not survive a restart, so these members show as `(unnamed)`;
-- the member's flags: herdr resumes with the bare resume command, so the agent runs on its harness's default model and without its appended system prompt.
-
-**If no member panes show up at all** after a restart, the pane labels did not survive it; herdr's docs do not say whether they do. The agents are still there, resumed in unlabeled panes in this repo:
-1. List them with `herdr pane list`.
-2. Ask each one who it is: `herdr agent prompt <pane> "[from @cto] Which team member are you? Reply with your @name only."`. Each one's context says who it is.
-3. Label each pane: `herdr pane rename <pane> <name>`.
-4. Then run `continue`.
+**After a herdr restart**, herdr restores the panes with their labels, and resumes every agent whose session its integration recorded. This is on by default; `[session] resume_agents_on_restore` in herdr's config controls it. An agent that comes back without its name may also be running without the model, thinking and permissions the brief gives it.
 
 ## 3. Bring the members back
 
 ```bash
-ateam.py continue                # every member with a pane whose agent is gone
+ateam.py continue                # every member with a pane; everyone is re-briefed
 ateam.py continue lead-dev       # just these (also members whose pane was closed)
 ateam.py continue --fresh        # new sessions instead of resuming
 ```
 
-For a member that herdr already resumed (`unnamed`), `continue` **adopts** it:
-- it names the agent again;
-- it re-sends the member's standing instructions as a message;
-- it reports that the agent may be on a different model than the brief says. To apply the brief's model and thinking, exit that agent and run `ateam.py continue <name>`.
+For a member whose agent is gone, `continue` starts the agent again in the member's own pane and reopens its last harness session, so the member keeps its context: Claude `--resume`, Codex `resume`, pi `--session`, omp `--resume`, OpenCode `--session`. herdr forgets a pane's session when its agent exits, so a-team notes each agent's session whenever a command looks at the team (`~/.cache/a-team/<repo>/sessions.jsonl`), and resumes from that.
 
-For a member whose agent is gone, `continue` starts the agent again in the member's own pane and reopens the harness session herdr recorded for that pane, so the member keeps its context: Claude `--resume`, Codex `resume`, pi `--session`, omp `--resume`, OpenCode `--session`.
-
-- Settings come from the brief **as it is now**, so edited models and thinking levels take effect.
+- Settings come from the brief **as it is now**, so edited models, thinking levels and permissions take effect.
 - A member whose harness changed starts fresh: a session cannot move across harnesses.
-- A member whose pane was closed gets a new labeled pane and a fresh session.
+- A member whose pane was closed gets a new pane in the team tab, and its session back if one was noted. Its worktree, if it has one, is kept.
+- A member whose session was never noted (it exited before any command looked at the team) starts fresh.
 - It runs the same check as `up` and launches nothing if any member fails. Handle that as in `cmd_up.md`.
+- If a member does not come up because its session cannot be resumed, run `ateam.py continue <name> --fresh`.
 
-Then it re-sends the team brief to every running member, plus a note asking each to re-read it, check the tracker, and tell you in one line what it was doing and what comes next.
+For a member that herdr already resumed without its name (`unnamed`), `continue` **adopts** it: it names the agent again and sends it its standing instructions with the brief. To put it back on the brief's model, thinking and permissions, exit that agent and run `ateam.py continue <name>`.
+
+Then it sends the team brief, ending with a request to re-read it, check the tracker, and tell you in one line what the member was doing and what comes next. With names, only those members get it. With no names you are catching up, so every running member does.
 
 ## 4. Resume the work
 
-- Collect the one-line answers. Compare them with the tracker and `git status`, and fix any mismatch with @pm.
+- Collect the one-line answers. Compare them with the tracker, `git status` and members' branches, and fix any mismatch with @pm.
 - Members that started fresh lost their context. Re-brief them on the project and their task.
 - Tell the user where things stand: done, in progress, blocked, next. Then continue as in `leading.md`.
+
+## To change a running member's model, thinking or permissions
+
+Edit the brief, ask the user, then exit that member's agent in its pane (its own quit command, for example `/exit` in Claude Code or `/quit` in Codex, typed with `herdr agent prompt <name> '/exit'`). When `ateam.py status` shows it `gone`, run `ateam.py continue <name>`. It resumes its session in the same pane with the new settings.
