@@ -1,70 +1,53 @@
 ---
 name: a-team
 description: >
-  Commands: setup, up, continue, status, wait, brief, say, or bare /a-team for what to do next.
-
-  A software team of coding agents in herdr, with you as the lead (CTO / orchestrator).
-  Each member (architect, product, lead-dev, backend-dev, frontend-dev, designer, reviewer, pm,
-  qa-frontend, qa-backend) runs on its own harness, model and thinking level (Claude Code,
-  Codex, pi, omp, OpenCode v2). Members and the user talk to each other with @mentions.
-
-  Use when the user wants to: set up or change a dev team for a repo, launch it, brief it, hand it
-  work, bring it back after sessions were lost, or check on it. Requires herdr.
+  Form, launch and lead a software team in herdr across Claude Code, Codex, pi, omp
+  and OpenCode. Commands: setup, up, continue, status, wait, brief, say, or bare
+  /a-team. Use for team formation, delegation, peer review and session recovery.
 ---
 
 # a-team
 
-You are the **lead**: the CTO and orchestrator. The human talks to you, and may also type in any member's pane. You form the team, brief it, hand out work, review, merge and commit. Members are full agents in their own herdr panes, named after their roles. They keep their own context and message each other directly by @name with `herdr agent prompt`.
+You are the orchestrator (@cto): form the team, assign tasks, decide architecture, review and integrate work. Members have their own panes and context. The user may talk in any pane; relay their @mentions to the named member.
 
-`scripts/ateam.py`, `roles/`, `harnesses.toml` and `references/` are relative to this skill's directory. Commands below write `ateam.py` for `python3 <skill>/scripts/ateam.py`.
+Paths below are relative to this skill. `ateam.py` means `python3 <skill>/scripts/ateam.py`. `team-brief.md` at the project root holds TOML settings and project workflow; commit it. One team runs per herdr session. The first member of a role keeps its plain name; later members use `-2`, `-3`, etc. Existing names never change.
 
-## If this conversation was compacted
+After compaction, re-read the active command's reference, `references/leading.md`, the brief and tracker. Preserve task owners, acceptance criteria, branches, verdicts and next steps there, not only in chat.
 
-The command references hold the steps and rules. Do not assume they remain in context after compaction. **If you are partway through a command, re-read its reference before your next action.** Also re-read `references/leading.md` before handing out more work. When compacting, keep: which `/a-team` command is running and its step, the members' @names, what each member is working on, and the project details you have given them.
+## Before launch
 
-## The team is one file, plus herdr
-
-- **`team-brief.md`** at the repo root is the team: settings in `+++` TOML front matter (lead, members with role, harness, model and thinking, `permissions`, `tracker`, teams), then prose (role details, workflow, and a short `## Project` section at the end). Members receive it with a roster table built from the settings when it is sent, so nothing drifts. Commit it.
-- **herdr** knows the rest. One team runs per herdr session. Your tab is labeled `a-team orchestrator`, and one more tab, `a-team workers`, holds every member as a pane in a balanced grid (`[tabs]` in the brief changes the labels). Each pane is labeled with its member's @name and its agent carries that name, so `herdr pane list` shows who is on the team and which harness session each one has.
-- **Names** follow one rule everywhere: the first member keeps the role's name (`@backend-dev`); later members get `@backend-dev-2`, `@backend-dev-3`, and so on. Names never change while a member exists.
-- **The tracker** is wherever the team brief's `tracker` says @pm keeps tasks and bugs: a markdown file, GitHub Issues, Linear, a todo CLI, or none.
-- The project in the brief is a few sentences. You give members the details in messages, and again after a restart.
-- Outside the repo, `~/.cache/a-team/<repo>/` holds one small prompt file per member, rewritten at each launch, and `sessions.jsonl`: the harness sessions each agent has had. herdr forgets a pane's session when its agent exits, so that list is what `continue` resumes from. Nothing else is stored.
+- Require `HERDR_ENV=1`; otherwise stop and tell the user to run inside herdr.
+- Install herdr integration once per chosen harness: `herdr integration install <harness>`; session recovery depends on it.
+- The orchestrator (@cto) needs herdr's socket, harness config directories, `~/.cache/a-team`, and any worktree parent. Report sandbox access failures; do not change the user's sandbox or retry around its restrictions. Run shell commands standalone so command exemptions match: no `cd &&`, pipe, redirect or trailing `echo`.
+- Members default to `full`, intended for a safe sandbox/VM. Claude uses bypass-permissions while retaining inherited sandbox settings; Codex disables approvals and its sandbox; pi/omp/OpenCode allow unattended commands. `guarded` uses Claude auto mode or Codex's workspace sandbox with automatic review; it changes nothing for the others.
+- Full Claude members permit Unix sockets inside an inherited sandbox: all sockets on Linux, `HERDR_SOCKET_PATH` on macOS (all sockets if absent). The macOS form is not live-tested. Guarded only exempts standalone messaging commands. Unknown startup questions and higher-level policy can still block.
 
 ## Commands
 
-### `/a-team setup`
-Form a team for this repo with the user: project, team size, model mix, and how @pm tracks work. It checks what this machine can run and writes `team-brief.md`. Run it again to change the team.
-→ Read [references/cmd_setup.md](references/cmd_setup.md)
+| Request | Action |
+|---|---|
+| `setup` | Read [references/cmd_setup.md](references/cmd_setup.md); form or change the team. |
+| `up` | Follow Launch below, then [references/leading.md](references/leading.md). |
+| `continue` / `cont` | Read [references/cmd_continue.md](references/cmd_continue.md); `--restart` reapplies settings to running members. |
+| `status` / `wait` | Run the command; interpret results using [references/leading.md](references/leading.md). |
+| `brief` | `ateam.py brief --send [names]` resends the brief; without `--send`, preview it. |
+| `say` | `ateam.py say <names|all> "message"`, or `--file <path>`. Check delivery failures. |
 
-### `/a-team up`
-Check every member, launch each in a pane of the team tab, and send the team brief. Nothing launches if any member fails the check. Run it again after a partial launch: it skips members that are running.
-→ Read [references/cmd_up.md](references/cmd_up.md), then [references/leading.md](references/leading.md)
+Bare `/a-team`: no brief → setup; otherwise run `status`. No members → up; gone → continue; blocked → inspect and resolve within existing authorization; running → continue the user's work or ask for the next task if none is known.
 
-### `/a-team continue` (or `cont`)
-After members' agents exited, herdr restarted, or your own session was lost. Missing members restart in their labeled panes, resuming their harness sessions with the current settings. Then they are re-briefed and you collect where each one was.
-→ Read [references/cmd_continue.md](references/cmd_continue.md), then [references/leading.md](references/leading.md)
+## Launch
 
-### `/a-team status` and `/a-team wait`
-Who is running, idle, blocked or gone; a background watch that returns when a member needs you.
-→ Read [references/cmd_status.md](references/cmd_status.md)
+```bash
+ateam.py up                       # every member in the brief
+ateam.py up reviewer pm           # selected members
+```
 
-### `/a-team brief` and `/a-team say`
-`ateam.py brief --send [names]` resends the team brief, for example after editing it. `ateam.py say <names|all> "..."` (or `--file`) messages members as you. Both say which members did not get the message.
-→ Working with the team: [references/leading.md](references/leading.md)
+`up` checks every selected member before starting any. If checks fail, report the problem/fix and resolve it; do not substitute models, harnesses or effort levels without the user's authorization. Unknown Claude models warn instead of failing preflight; Claude rejects invalid IDs at launch.
 
-### Bare `/a-team`: router
-Run `ateam.py status` and route:
-- No `team-brief.md` → offer `/a-team setup`.
-- Brief but nothing running → offer `/a-team up`.
-- Members gone → offer `/a-team continue`.
-- A member blocked → read its pane and take what it asks to the user.
-- Team running → show status, then ask what to work on next and hand it out (`leading.md`).
+On success, the script labels the orchestrator tab `a-team orchestrator`, creates a balanced `a-team workers` tab, prepares worktrees, starts members and sends their briefs. Re-running `up` skips live members.
 
-## Before any command that talks to herdr
+- Failed start: read the reported pane, fix the cause, then `ateam.py up <name>`.
+- Undelivered brief: resolve the error and `ateam.py brief --send <name>` before assigning work. Failed starts or briefing exit 3; preflight failures exit 2.
+- Known startup dialogs are answered automatically. For any other dialog, read `herdr agent read <name> --source visible`; resolve it within existing authorization or ask for the missing decision, then resend the brief.
 
-- `test "$HERDR_ENV" = 1` must pass. If it fails, tell the user to start herdr and run you inside a pane, then stop.
-- `ateam.py` needs herdr's socket and each harness's own config directory. If your harness sandboxes shell commands, those calls fail with `Operation not permitted` or `read-only file system`. Tell the user what to allow (in Claude Code: `herdr *` and `python3 <skill>/scripts/ateam.py *` in `sandbox.excludedCommands`, or `/sandbox` off). Do not retry around it.
-- Run each `ateam.py` and `herdr` command on its own: no pipe, redirect or `cd ... &&`. A sandbox exclusion or permission rule matches the whole command line, so `ateam.py up 2>&1 | tail` is not covered by a rule for `ateam.py`.
-- Members use unattended permission modes, on the assumption that the machine is a sandbox or a VM. Existing harness sandbox settings can still apply (`cmd_up.md`, Permissions). Messaging uses herdr directly. `up` also starts Claude Code members with `herdr agent prompt` allowed outside a sandbox the user has turned on.
-- One-time per harness, so herdr tracks state and sessions: `herdr integration install claude` (and `codex`, `pi`, `omp`, `opencode`). `continue` depends on the session herdr reports for each agent.
+Check `status`, then assign self-contained tasks as in `leading.md`. Add members only in the brief: use the next stable role name, explicit harness/model, and `role` for numbered names. Run `check`, then `up <name>`. Change running members in the brief and restart with `continue <name> --restart`. Names are never reassigned or renumbered; the orchestrator is always @cto and tab labels are fixed.

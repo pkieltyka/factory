@@ -1,27 +1,17 @@
-# One table per harness: everything ateam.py knows about a harness that is plain data.
-# What cannot be data (listing its models, building its launch command, reading its session file) is that
-# harness's block in scripts/ateam.py. Adding a harness: one table here, one block there, one fake in the tests.
+# One table per harness: what ateam.py knows about it that is plain data. What cannot be data (listing its
+# models, building its launch command) is that harness's block in scripts/ateam.py.
 #
-#   label        the name shown in rosters
-#   install      what to tell the user when the binary is missing
-#   models       recommended models, strongest first. `ateam.py harnesses` reports which of them this machine
-#                can use. A new model on codex, pi, omp or opencode needs no change: their lists are read live.
-#                Claude Code has no listing command, so for claude this is also the list of known ids.
-#   aliases      claude only: short names Claude Code accepts in place of a full model id ("opus"), so a brief
-#                may use them. The other harnesses list their models live and need no such key.
+#   label, install   the name in rosters; what to tell the user when the binary is missing
+#   models       recommended models, strongest first; `ateam.py harnesses` says which this machine can use.
+#                Claude Code has no listing command, so for claude these are the ids `check` knows.
+#   aliases      claude only: short names Claude Code takes in place of a model id ("opus")
 #   thinking     levels the harness accepts (codex: read per model from its cache; opencode: per-model variants)
-#   never        levels a-team refuses even where the harness accepts them. `[never_thinking]` in a team brief
-#                replaces it for that team.
-#   prompt       how a member receives its standing instructions:
-#                  file     the harness appends a file to its system prompt
-#                  pointer  a one-line system instruction names the file; the full text also goes in the first message
-#                  message  the first message only
-#   dialogs      questions the harness asks at start that `up` answers itself, so nobody has to: text that is
-#                on the screen, then the keys that accept it (herdr key names)
-#   [x.permissions]   native flags for each permission level of the team brief: full | guarded
-#                  full     never stops for approval, no sandbox (the default). For a sandbox or VM.
-#                  guarded  still unattended, behind whatever guard the harness has. Only Claude Code and
-#                           Codex have one; on the others it is the same as full.
+#   never        levels a-team refuses even where the harness accepts them
+#   prompt       how a member gets its standing instructions: `file` (appended to the system prompt),
+#                `pointer` (a system line names the file; the text also goes in the first message), `message`
+#   dialogs      start-up questions `up` answers itself: text on the screen, then the herdr keys that accept it
+#   [x.permissions]  native flags per permission level. `full` (default) never stops for approval and adds no
+#                sandbox. `guarded` keeps the harness's own guard; only Claude Code and Codex have one.
 
 [claude]
 label = "Claude Code"
