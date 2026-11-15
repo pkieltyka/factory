@@ -6,7 +6,7 @@
 #
 # Member fields (the table key is the @name: lowercase, digits, - or _):
 #   role         a role in the skill's roles/ (defaults to the name)
-#   harness      claude | codex | pi | omp | opencode (v2+). Omitted: Claude model -> claude, GPT -> codex, else pi
+#   harness      claude | codex | pi | omp | opencode (v2+); required
 #   model        exact model id; `ateam.py harnesses` lists what this machine can use
 #   thinking     thinking level. Omitted: the role's default
 #   notes        what this member owns on this team; the Role column of the roster
@@ -14,7 +14,8 @@
 #   worktree     true: its own git worktree on branch a-team/<name>. "some/branch": a worktree of that branch;
 #                members that name the same branch share it. Omitted: the main checkout, shared with the team
 #   args         extra native flags for its harness, e.g. args = ["--search"]
-# Two of the same role get distinct names: [members.backend-dev-2] role = "backend-dev".
+# The first keeps [members.backend-dev]. Later members are [members.backend-dev-2], -3, ...
+# with role = "backend-dev". Existing names never change.
 # Top-level keys must come before the first [table].
 
 # Where @pm tracks tasks, owners, status and bugs, in words members can act on. Leave it out for no tracker.
@@ -23,10 +24,9 @@
 #   "Linear team ENG, via the Linear MCP tools"
 #   "the `todo` CLI (`todo --help`)"
 tracker = "TODO.md at the repo root"
-lead_commits = true   # only the lead runs git commit, merge and push
 
-# Members never stop to ask for approval: every harness runs with no sandbox and no permission prompts
-# ("full", the default). That is meant for a machine that is itself a sandbox or a VM.
+# Members use unattended permission modes ("full", the default), intended for a sandbox or VM.
+# Existing harness sandbox settings can still apply; startup or policy questions can still block.
 # On a machine that is not, "guarded" keeps Claude Code and Codex members behind their own guard (auto mode;
 # a sandbox with automatic review). They still run unattended but can stop and ask. pi, omp and OpenCode
 # have no such guard, so for them it changes nothing.
@@ -34,7 +34,7 @@ lead_commits = true   # only the lead runs git commit, merge and push
 
 # worktree_dir = "../<repo>.worktrees"   # where members' worktrees go; this is the default
 # [tabs]                                 # herdr tab labels; these are the defaults
-# lead = "a-team driver"                 #   your own tab
+# lead = "a-team orchestrator"                 #   your own tab
 # team = "a-team workers"                #   the one tab that holds every member's pane
 # [never_thinking]                       # thinking levels this team never uses; the default is in harnesses.toml
 # claude = ["max"]
@@ -45,7 +45,7 @@ name = "cto"
 harness = "claude"
 model = "claude-fable-5-2"
 thinking = "medium"
-notes = "Orchestrator and lead architect. Owns architecture and the big decisions, hands out work, does the final review, and is the only one who commits. The human talks to @cto, and can also talk to any member in its pane."
+notes = "Orchestrator and lead architect. Owns architecture and the big decisions, hands out work, does the final review, commits the shared checkout and merges reviewed worktree branches. The human talks to @cto, and can also talk to any member in its pane."
 
 [members.architect]
 harness = "claude"
@@ -59,7 +59,7 @@ thinking = "medium"
 
 [members.lead-dev]
 harness = "codex"
-model = "gpt-6.1-sol"
+model = "gpt-6-astra"
 thinking = "high"
 
 [members.backend-dev]
@@ -79,7 +79,7 @@ thinking = "high"
 
 [members.reviewer]
 harness = "codex"
-model = "gpt-6-astra"
+model = "gpt-6-luna"
 thinking = "high"
 
 [members.pm]
@@ -99,7 +99,8 @@ thinking = "medium"
 
 # Rosters. `ateam.py up` with no names launches `default`.
 [teams]
-default = ["lead-dev", "frontend-dev", "reviewer", "pm"]
+default = ["lead-dev", "reviewer", "pm"]
+ui = ["lead-dev", "frontend-dev", "reviewer", "pm"]
 planning = ["product", "architect", "pm"]
 backend = ["lead-dev", "backend-dev", "qa-backend", "reviewer", "pm"]
 frontend = ["frontend-dev", "designer", "qa-frontend", "reviewer", "pm"]
@@ -107,15 +108,16 @@ full = ["architect", "product", "lead-dev", "backend-dev", "frontend-dev", "desi
 +++
 ## Role details
 
-- **@lead-dev** and **@frontend-dev** agree on the interface between the core and the UI before either builds against it, and keep each other posted when it changes.
-- **@reviewer** reviews every task before {lead} sees it. A review request carries the task and its acceptance criteria.
-- **@pm** owns the tracker: short, current, ordered by priority, with an owner and status on every item. Only @pm updates it; teammates ask @pm to add or change items.
+- {lead} owns architecture decisions. For a non-trivial change, **@lead-dev** proposes or challenges the design before building; {lead} decides. Routine implementation choices stay with the developer.
+- Include **@frontend-dev** only for a UI project (`ui` roster, or add it to `default`). It and **@lead-dev** agree on shared interfaces before building against them.
+- **@reviewer** reviews every task before {lead} sees it. A review request carries the task, its acceptance criteria and the commit or diff to review.
+- **@pm** owns the tracker: short, current, ordered by priority, with owner, status, acceptance criteria, branch or commit, review verdict and next step on each task. Only @pm updates it; teammates ask @pm to add or change items.
 
 ## Workflow
 
 1. {lead} sets direction and hands out tasks, each with its acceptance criteria; @pm records them in the tracker.
 2. Developers implement. In the main checkout they leave their work uncommitted; in a worktree of their own they commit on their branch.
-3. Developers ask @reviewer directly to review their diff or branch, and fix what it finds until it says `approve`.
+3. Developers ask @reviewer directly to review their diff or branch, and fix what it finds until its report says `status: approve`. They send completion reports to {lead} with `herdr agent prompt`; local replies are not delivered.
 4. {lead} does the final review, commits what is in the main checkout, and merges each reviewed branch. Nobody else merges or pushes.
 
 ## Project

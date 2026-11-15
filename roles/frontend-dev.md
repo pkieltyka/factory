@@ -19,5 +19,5 @@ readonly: false
 - Type-checker, linter and tests pass after your last edit.
 
 **Never**
-- Redesign a flow or invent copy on your own: ask @designer, or {lead}.
+- Redesign a flow without @designer or {lead}. Ordinary labels and states follow the existing patterns; make those choices within your task and state material assumptions.
 - Add a dependency, or a second way to do what the design system already does.

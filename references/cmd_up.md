@@ -23,33 +23,34 @@ ateam.py up --dry-run            # check and print the plan only
 - Ask whether to fix the setup or change the member in the brief. Never swap in another model, harness or thinking level yourself, and never launch the others without the user's go-ahead.
 
 On success, `up`:
-1. names your agent and your pane after `[lead] name` (`cto`), and labels your tab `a-team driver`;
+1. names your agent and your pane after `[lead] name` (`cto`), and labels your tab `a-team orchestrator`;
 2. opens one tab, `a-team workers`, for the whole team. Each member gets a pane there, labeled with its @name. A new pane always splits the largest one, so the panes stay a balanced grid;
 3. creates the git worktree of a member that has one, and starts that member in it;
 4. starts each member with its standing instructions (its role, how to talk, the report form, the tracker, the commit rule, where the brief lives) and its permission level;
 5. sends each new member the team brief. Members that were already running get one line saying who joined.
 
-**`--role`** adds one more member of a role and names it by the rule: the role's only member is `@backend-dev`; from the second on they are all numbered. So adding a second backend-dev renames the first to `@backend-dev-1` (in the brief, its pane and its agent, and it is told) and starts `@backend-dev-2`. The new member starts from the first one's harness, model and thinking unless you pass others.
+**`--role`** adds a member without renaming anyone: `@backend-dev`, then `@backend-dev-2`, `@backend-dev-3`. It starts from the first member's harness, model and thinking unless you supply creation flags. To change an existing member, edit the brief and restart it with `continue`; launch overrides are only for a new `--role` member.
 
 ## 3. If a member does not start
 
-`up` keeps going with the other members, prints what herdr reported for each one that failed, and exits non-zero.
+`up` reports failed starts or undelivered briefs and exits non-zero. For an undelivered brief, resolve the reported cause and run `ateam.py brief --send <name>` before assigning work.
 
 - **"did not come up"**: read the pane it names (`herdr pane read <pane> --source recent-unwrapped --lines 60`), tell the user what you see, fix the cause, and run `ateam.py up <name>` again. `up` skips members that are already running.
 - **"started but is waiting on a dialog"**: the member stopped at a question `up` does not know. `up` answers the first-run questions it does know by itself (trusting the folder, on Claude Code and Codex; they are listed as `dialogs` in `harnesses.toml`), and waits a few seconds so a notice that clears by itself is not reported. Read what is on its screen (`herdr agent read <name> --source visible`; herdr cannot read further back while an agent is blocked) and take the question to the user. Once it is answered, run `ateam.py brief --send <name>`.
 
 ## 4. Permissions
 
-Members never stop to ask for approval. That is the default, `full`: every harness runs with no sandbox and no permission prompts, and `up` clears the first-run questions. It assumes the machine is itself a sandbox or a VM. Messages between members need no approval on any harness.
+The default, `full`, uses each harness's unattended permission mode, and `up` clears known first-run questions. Existing harness sandbox settings and higher-level policies can still apply, and an unknown startup question can still block. It assumes the machine is itself a sandbox or a VM. Messages between members need no approval on any harness.
 
 One stricter level exists for a machine that is not a sandbox: `permissions = "guarded"` in the brief, for the team or for one member.
 
 | Harness | `full` (default) | `guarded` |
 |---|---|---|
-| Claude Code | bypass-permissions mode | auto mode: a classifier reviews each action, and can stop and ask |
+| Claude Code | bypass-permissions mode; keeps an inherited sandbox | auto mode: a classifier reviews each action, and can stop and ask |
 | Codex | no sandbox, no approvals | its workspace sandbox, with automatic review of what leaves it |
 | pi, omp, OpenCode | every command runs | the same: they have no guard |
 
+- At `full`, Claude's inherited sandbox permits Unix sockets so wrapped messaging commands can reach herdr: all Unix sockets on Linux, the `HERDR_SOCKET_PATH` socket on macOS (all sockets if that variable is absent). The macOS path form has not been live-tested. `guarded` adds no socket allowance; standalone messaging commands use the command exemption.
 - The flags are in the skill's `harnesses.toml`. Native flags a member needs beyond them go in its `args` in the brief, so `continue` applies them again.
 - A `guarded` member can still end up blocked. `ateam.py wait` tells you when one is.
 - Trusting a folder is saved by the harness (Claude Code and Codex each keep their own list), so it is asked once per folder: the repo, and each worktree.

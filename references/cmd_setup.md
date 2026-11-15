@@ -13,7 +13,8 @@ Guide the user to a team for this repo and write it to `team-brief.md` at the re
 1. **The project, in two or three sentences:** what it is, who it is for, and the stack if you could not tell.
 2. **Kind:** backend, frontend, full-stack, or other (CLI, library, data, infra). Propose your guess from step 1.
 3. **Size:**
-   - *lean:* lead-dev and reviewer. Below four members a pm is optional: you can keep the tracker yourself
+   - *default:* lead-dev (Codex gpt-6-astra), reviewer (Codex gpt-6-luna), pm (pi deepseek/deepseek-v4.1-flash); add frontend-dev (Claude Code claude-opus-5-5) only for a UI. The orchestrator uses Claude Code Opus or Fable. Propose this formation first; keep the current lead session unless the user requests a change.
+   - *lean:* lead-dev and reviewer, with the lead keeping the tracker
    - *standard:* lead-dev, one or two developers for the kind, reviewer, pm, and a QA member for the kind
    - *full:* architect, product, lead-dev, backend-dev, frontend-dev, designer, reviewer, pm, qa-frontend, qa-backend
 4. **Model mix:**
@@ -23,7 +24,7 @@ Guide the user to a team for this repo and write it to `team-brief.md` at the re
    - *local:* models the user serves themselves, run through pi or omp
 
    Also ask whether cost or speed matters more.
-5. **Permissions:** not a question. Tell the user that members run with no sandbox and no approval prompts, which assumes this machine is itself a sandbox or a VM. If they say it is not, set `permissions = "guarded"` (`cmd_up.md`).
+5. **Permissions:** not a question. Tell the user that members use unattended permission modes intended for a sandbox or VM; existing harness sandbox settings can still apply. If they say it is not, set `permissions = "guarded"` (`cmd_up.md`).
 6. **Worktrees:** will developers build separate things in parallel? Then each of those gets a git worktree of its own. Developers working on the same thing share the main checkout.
 7. **Tracking (when there is a pm):** where @pm keeps tasks, owners, status and bugs:
    - a `TODO.md` file in the repo
@@ -38,13 +39,15 @@ Use the harness's question tool if it has one, with your recommendation first.
 
 Show a table: @name, role, harness, model, thinking, and one line of why. Start from the template's members (`templates/team-brief.md`) and the models `ateam.py harnesses` reported as available. Rules of thumb:
 
-- The strongest models go where judgment matters most: architect, lead-dev, reviewer. Cheaper, faster ones do volume and bookkeeping: backend-dev, pm, qa-backend.
-- The reviewer runs on a different model family from the main developers: different blind spots catch more bugs.
+- Start from the default formation above. Optional catalog roles are added for concrete work, not automatically.
+- Tip for custom teams: a reviewer on a different model family from the code's author can catch different mistakes. The default reviewer stays on Codex Luna; it differs from the Claude frontend developer, but not the Codex lead developer.
 - designer, qa-frontend and frontend-dev need a browser tool in their harness (a browser MCP, Playwright or `agent-browser`): they judge and test the running app. Put them on a harness that has one, and ask the user if you cannot tell.
 - With a product member, it writes each feature's acceptance criteria. Without one, you do, in the task.
 - Thinking: high for the architect, reviewer and designer; medium for developers; low for the pm. The highest levels on Claude and Codex are refused by default (`never` in `harnesses.toml`).
-- Names: a role's only member has the role's name (`@reviewer`). Several of a role are all numbered: `[members.backend-dev-1]` and `[members.backend-dev-2]`, each with `role = "backend-dev"`.
+- Names are stable: the first member is `@backend-dev`; later ones are `@backend-dev-2`, `@backend-dev-3`, each with `role = "backend-dev"`. Never rename an existing member.
 - If the user chose a mixed team, spread models across families. Leave the lead's model as it is: the lead is you.
+
+No architect is required by default. The orchestrator owns architecture decisions; lead-dev proposes or challenges non-trivial designs before building. Add an architect for larger systems.
 
 Adjust until the user agrees.
 
@@ -52,7 +55,7 @@ Adjust until the user agrees.
 
 1. With no brief yet, run `ateam.py init`. It writes the template, with every role defined, to the repo root. Then edit `team-brief.md`:
    - **Settings:**
-     - keep only the chosen members, and set each one's harness, model and thinking;
+     - keep only the chosen members (the template also offers a catalog), and set each one's required harness, model and thinking;
      - add `notes` saying what each member owns on this project;
      - set `worktree = true` on the members that get their own worktree;
      - set `tracker` to the user's answer in words a member can act on, e.g. `"GitHub Issues on owner/repo via gh issue"`, or remove it for none;

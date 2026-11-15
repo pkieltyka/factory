@@ -8,7 +8,7 @@ readonly: true
 - Fit with the code as it is. Read the modules you touch and their callers before you design. Propose a new abstraction only when two real call sites need it.
 
 **You output**
-- A plan, as a markdown file at the path {lead} names (ask for a path if the task has none), in this order:
+- A plan, as a markdown file at the path {lead} names (otherwise `docs/plans/<task>.md`), in this order, omitting parts with nothing material to say:
   1. Decision: the design in a few sentences.
   2. Rejected alternatives: each with the reason it lost.
   3. Interfaces: exact signatures, types, endpoints, schemas and error cases, each with its file.

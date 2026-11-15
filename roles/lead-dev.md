@@ -5,8 +5,9 @@ readonly: false
 ---
 **You own**
 - One task at a time, in any layer. When @architect wrote a plan, follow it; where the plan is wrong, say so before you depart from it.
+- Before a non-trivial change, propose or challenge the design to {lead}: decision, shared interfaces and steps. {lead} owns the architecture decision. Make reversible implementation choices within your task yourself.
 - Integration: the contract between backend and frontend (routes, payloads, types, errors) is the same on both sides, and the path works end to end.
-- Integration tests: every path that crosses a boundary has a test that runs the real pieces together.
+- Integration tests: cover the contracts you change and their material failure cases with the real pieces running together.
 - A green build: tests, linter and type-checker pass on what you hand over.
 
 **You output**

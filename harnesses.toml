@@ -16,7 +16,6 @@
 #                  file     the harness appends a file to its system prompt
 #                  pointer  a one-line system instruction names the file; the full text also goes in the first message
 #                  message  the first message only
-#   sessions     glob under $HOME for a session file, given its id as {id}; `cost` reads it
 #   dialogs      questions the harness asks at start that `up` answers itself, so nobody has to: text that is
 #                on the screen, then the keys that accept it (herdr key names)
 #   [x.permissions]   native flags for each permission level of the team brief: full | guarded
@@ -32,7 +31,6 @@ aliases = ["fable", "opus", "sonnet", "haiku"]
 thinking = ["low", "medium", "high", "xhigh", "max"]
 never = ["max"]
 prompt = "file"
-sessions = ".claude/projects/*/{id}.jsonl"
 
 # Both questions start on "No, exit". The bypass warning is normally skipped by a setting `up` passes.
 dialogs = [["Yes, I trust this folder", ["down", "enter"]], ["Yes, I accept", ["down", "enter"]]]
@@ -47,7 +45,6 @@ install = "Install the Codex CLI (`npm i -g @openai/codex`) and log in once by r
 models = ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna", "gpt-6-sol"]
 never = ["max", "ultra"]
 prompt = "pointer"
-sessions = ".codex/sessions/*/*/*/rollout-*{id}.jsonl"
 dialogs = [["Trust and continue", ["enter"]]]   # asked once per new folder, a worktree included
 
 # guarded: the workspace-write sandbox, with automatic review of what leaves it. Network access stays on:
@@ -63,7 +60,6 @@ models = ["openai/gpt-6-astra", "z-ai/glm-5.3", "moonshotai/kimi-k3", "x-ai/grok
 thinking = ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
 never = []
 prompt = "file"
-sessions = ".pi/agent/sessions/*/*_{id}.jsonl"
 
 [pi.permissions]   # pi has no sandbox and no approvals
 full = []
@@ -76,7 +72,6 @@ models = ["openai/gpt-6-astra", "z-ai/glm-5.3", "moonshotai/kimi-k3", "x-ai/grok
 thinking = ["off", "minimal", "low", "medium", "high", "xhigh", "max", "auto"]
 never = []
 prompt = "file"
-sessions = ".omp/agent/sessions/*/*_{id}.jsonl"
 
 [omp.permissions]   # omp's stricter modes ask before every command, a message to a teammate included
 full = ["--approval-mode", "yolo"]
@@ -92,8 +87,3 @@ prompt = "message"
 [opencode.permissions]   # --auto approves whatever the user's own rules do not deny
 full = ["--auto"]
 guarded = ["--auto"]
-
-# Optional, USD per million tokens, for sessions whose harness records no dollars (Codex always, Claude Code
-# until its session exits). A team brief can add its own [prices]. pi and omp record real dollars.
-[prices]
-# "gpt-6-astra" = { input = 0.0, output = 0.0, cache_read = 0.0 }

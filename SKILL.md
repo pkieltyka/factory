@@ -1,7 +1,7 @@
 ---
 name: a-team
 description: >
-  Commands: setup, up, continue, status, wait, cost, brief, say, or bare /a-team for what to do next.
+  Commands: setup, up, continue, status, wait, brief, say, or bare /a-team for what to do next.
 
   A software team of coding agents in herdr, with you as the lead (CTO / orchestrator).
   Each member (architect, product, lead-dev, backend-dev, frontend-dev, designer, reviewer, pm,
@@ -9,7 +9,7 @@ description: >
   Codex, pi, omp, OpenCode v2). Members and the user talk to each other with @mentions.
 
   Use when the user wants to: set up or change a dev team for a repo, launch it, brief it, hand it
-  work, bring it back after sessions were lost, check on it, or see what it costs. Requires herdr.
+  work, bring it back after sessions were lost, or check on it. Requires herdr.
 ---
 
 # a-team
@@ -20,16 +20,16 @@ You are the **lead**: the CTO and orchestrator. The human talks to you, and may 
 
 ## If this conversation was compacted
 
-The command references hold the steps and rules; compaction keeps only this file. **If you are partway through a command, re-read its reference before your next action.** Also re-read `references/leading.md` before handing out more work. When compacting, keep: which `/a-team` command is running and its step, the members' @names, what each member is working on, and the project details you have given them.
+The command references hold the steps and rules. Do not assume they remain in context after compaction. **If you are partway through a command, re-read its reference before your next action.** Also re-read `references/leading.md` before handing out more work. When compacting, keep: which `/a-team` command is running and its step, the members' @names, what each member is working on, and the project details you have given them.
 
 ## The team is one file, plus herdr
 
 - **`team-brief.md`** at the repo root is the team: settings in `+++` TOML front matter (lead, members with role, harness, model and thinking, `permissions`, `tracker`, teams), then prose (role details, workflow, and a short `## Project` section at the end). Members receive it with a roster table built from the settings when it is sent, so nothing drifts. Commit it.
-- **herdr** knows the rest. One team runs per herdr session. Your tab is labeled `a-team driver`, and one more tab, `a-team workers`, holds every member as a pane in a balanced grid (`[tabs]` in the brief changes the labels). Each pane is labeled with its member's @name and its agent carries that name, so `herdr pane list` shows who is on the team and which harness session each one has.
-- **Names** follow one rule everywhere: a role's only member has the role's name (`@reviewer`); several of a role are all numbered (`@backend-dev-1`, `@backend-dev-2`).
+- **herdr** knows the rest. One team runs per herdr session. Your tab is labeled `a-team orchestrator`, and one more tab, `a-team workers`, holds every member as a pane in a balanced grid (`[tabs]` in the brief changes the labels). Each pane is labeled with its member's @name and its agent carries that name, so `herdr pane list` shows who is on the team and which harness session each one has.
+- **Names** follow one rule everywhere: the first member keeps the role's name (`@backend-dev`); later members get `@backend-dev-2`, `@backend-dev-3`, and so on. Names never change while a member exists.
 - **The tracker** is wherever the team brief's `tracker` says @pm keeps tasks and bugs: a markdown file, GitHub Issues, Linear, a todo CLI, or none.
 - The project in the brief is a few sentences. You give members the details in messages, and again after a restart.
-- Outside the repo, `~/.cache/a-team/<repo>/` holds one small prompt file per member, rewritten at each launch, and `sessions.jsonl`: the harness sessions each agent has had. herdr forgets a pane's session when its agent exits, so that list is what `continue` resumes from and what `cost` adds up. Nothing else is stored.
+- Outside the repo, `~/.cache/a-team/<repo>/` holds one small prompt file per member, rewritten at each launch, and `sessions.jsonl`: the harness sessions each agent has had. herdr forgets a pane's session when its agent exits, so that list is what `continue` resumes from. Nothing else is stored.
 
 ## Commands
 
@@ -45,8 +45,8 @@ Check every member, launch each in a pane of the team tab, and send the team bri
 After members' agents exited, herdr restarted, or your own session was lost. Missing members restart in their labeled panes, resuming their harness sessions with the current settings. Then they are re-briefed and you collect where each one was.
 → Read [references/cmd_continue.md](references/cmd_continue.md), then [references/leading.md](references/leading.md)
 
-### `/a-team status`, `/a-team wait` and `/a-team cost`
-Who is running, idle, blocked or gone; a background watch that returns when a member needs you; tokens and dollars per agent.
+### `/a-team status` and `/a-team wait`
+Who is running, idle, blocked or gone; a background watch that returns when a member needs you.
 → Read [references/cmd_status.md](references/cmd_status.md)
 
 ### `/a-team brief` and `/a-team say`
@@ -66,5 +66,5 @@ Run `ateam.py status` and route:
 - `test "$HERDR_ENV" = 1` must pass. If it fails, tell the user to start herdr and run you inside a pane, then stop.
 - `ateam.py` needs herdr's socket and each harness's own config directory. If your harness sandboxes shell commands, those calls fail with `Operation not permitted` or `read-only file system`. Tell the user what to allow (in Claude Code: `herdr *` and `python3 <skill>/scripts/ateam.py *` in `sandbox.excludedCommands`, or `/sandbox` off). Do not retry around it.
 - Run each `ateam.py` and `herdr` command on its own: no pipe, redirect or `cd ... &&`. A sandbox exclusion or permission rule matches the whole command line, so `ateam.py up 2>&1 | tail` is not covered by a rule for `ateam.py`.
-- Members run with no approval prompts and no sandbox of their own, on the assumption that the machine is a sandbox or a VM (`cmd_up.md`, Permissions). So they reach herdr and message each other without asking anyone. `up` also starts Claude Code members with `herdr agent prompt` allowed outside a sandbox the user has turned on.
-- One-time per harness, so herdr tracks state and sessions: `herdr integration install claude` (and `codex`, `pi`, `omp`, `opencode`). `continue` and `cost` depend on the session herdr reports for each agent.
+- Members use unattended permission modes, on the assumption that the machine is a sandbox or a VM. Existing harness sandbox settings can still apply (`cmd_up.md`, Permissions). Messaging uses herdr directly. `up` also starts Claude Code members with `herdr agent prompt` allowed outside a sandbox the user has turned on.
+- One-time per harness, so herdr tracks state and sessions: `herdr integration install claude` (and `codex`, `pi`, `omp`, `opencode`). `continue` depends on the session herdr reports for each agent.

@@ -32,9 +32,10 @@ ateam.py continue lead-dev       # just these (also members whose pane was close
 ateam.py continue --fresh        # new sessions instead of resuming
 ```
 
-For a member whose agent is gone, `continue` starts the agent again in the member's own pane and reopens its last harness session, so the member keeps its context: Claude `--resume`, Codex `resume`, pi `--session`, omp `--resume`, OpenCode `--session`. herdr forgets a pane's session when its agent exits, so a-team notes each agent's session whenever a command looks at the team (`~/.cache/a-team/<repo>/sessions.jsonl`), and resumes from that.
+For a member whose agent is gone, `continue` starts the agent again in its pane when the shell is still in the configured directory, or a replacement pane otherwise and reopens its last harness session, so the member keeps its context: Claude `--resume`, Codex `resume`, pi `--session`, omp `--resume`, OpenCode `--session`. herdr forgets a pane's session when its agent exits, so a-team notes each agent's session whenever a command looks at the team (`~/.cache/a-team/<repo>/sessions.jsonl`), and resumes from that.
 
 - Settings come from the brief **as it is now**, so edited models, thinking levels and permissions take effect.
+- If the configured worktree changes, or the old shell moved to another directory, the member gets a new pane in the configured checkout. The old pane loses its member label and remains a plain shell.
 - A member whose harness changed starts fresh: a session cannot move across harnesses.
 - A member whose pane was closed gets a new pane in the team tab, and its session back if one was noted. Its worktree, if it has one, is kept.
 - A member whose session was never noted (it exited before any command looked at the team) starts fresh.
@@ -53,4 +54,4 @@ Then it sends the team brief, ending with a request to re-read it, check the tra
 
 ## To change a running member's model, thinking or permissions
 
-Edit the brief, ask the user, then exit that member's agent in its pane (its own quit command, for example `/exit` in Claude Code or `/quit` in Codex, typed with `herdr agent prompt <name> '/exit'`). When `ateam.py status` shows it `gone`, run `ateam.py continue <name>`. It resumes its session in the same pane with the new settings.
+Once the settings change is authorized, edit the brief, then exit that member's agent in its pane (its own quit command, for example `/exit` in Claude Code or `/quit` in Codex, typed with `herdr agent prompt <name> '/exit'`). When `ateam.py status` shows it `gone`, run `ateam.py continue <name>`. It resumes its session in the same pane with the new settings.
