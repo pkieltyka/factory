@@ -9,9 +9,10 @@ The team is one file at the repo root, `team-brief.md`: TOML front matter (lead,
 This repo:
 
 - `SKILL.md`: the router; `references/cmd_*.md` hold each command's steps; `references/leading.md` covers working with the team.
-- `roles/*.md`: role rules. Frontmatter: `description`, `thinking`, `readonly`.
+- `roles/*.md`: one file per role, each with the same four parts: what you own, what you output, when it is done, what you never do. Frontmatter: `description`, `thinking`, `readonly`. `{lead}` becomes the lead's @name.
+- `templates/member-prompt.md`: the standing instructions every member gets around its role: how to talk to the team, the report form, the rules.
 - `templates/team-brief.md`: the default formation that `ateam.py init` writes to the repo root.
-- `harnesses.toml`: one table per harness with everything that is plain data: label, install hint, recommended models, thinking levels, how the member gets its instructions, the flags for each permission level, where sessions live.
+- `harnesses.toml`: one table per harness with everything that is plain data: label, install hint, recommended models, thinking levels, how the member gets its instructions, the flags for each permission level, the start-up questions `up` answers by itself, where sessions live.
 - `scripts/ateam.py`: the commands. Each harness has one block of code for what cannot be data: resolving a model, building the launch arguments, reading a session's usage.
 
 Adding a model costs nothing on Codex, pi, omp and OpenCode (their lists are read live) and one line in `harnesses.toml` for Claude Code. Adding a harness is one table, one code block, and one fake in the tests.

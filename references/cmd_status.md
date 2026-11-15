@@ -14,7 +14,7 @@ One row per member, you included: role, harness, model and thinking from the bri
 
 Panes are found by the label a-team gave them: the member's @name.
 
-- `blocked`: the member is waiting on an approval or a question. Read its screen (`herdr agent read <name> --source visible`; herdr cannot read further back while an agent is blocked) and ask the user before answering it with `herdr agent send-keys`.
+- `blocked`: the member is waiting on a question. That is rare: members run without approval prompts. Read its screen (`herdr agent read <name> --source visible`; herdr cannot read further back while an agent is blocked) and ask the user before answering it with `herdr agent send-keys`.
 - `gone` → `/a-team continue`.
 - The brief changed?
   - Prose only: `ateam.py brief --send`.

@@ -12,12 +12,13 @@ ateam.py wait                                     # in the background: returns w
 ```
 
 - Every message starts with `[from @name]`; `say` adds yours. Members reply the same way.
-- `say` prints who did not get the message. herdr refuses a prompt to an agent that is waiting on an approval: read that pane, settle it with the user, and send again.
-- Members do not see your conversation with the user. Each task is self-contained: goal, files, constraints, and what "done" means (tests to run, what to report).
+- `say` prints who did not get the message. herdr refuses a prompt to an agent that is waiting on a question: read that pane, settle it with the user, and send again.
+- Members do not see your conversation with the user. Each task is self-contained: goal, files, constraints, and its acceptance criteria: the behaviors that must hold for it to be done. @product writes them if the team has one; otherwise you do. Developers build to them, and @reviewer and QA check against them.
 - One task per member at a time. Run independent work in parallel and dependent work in order.
 - If the team has a @pm, tell it about every task you hand out and every task that finishes, so the tracker stays true.
 - When the user writes `@reviewer look at X` in your pane, relay it to that member with the context it needs.
 - Scope and architecture questions come to you. Settle them, or take them to the user. Members do not settle them between themselves.
+- With an @architect on the team, give it the design of any change that spans modules and decide on its recommendation. Do not design the same change yourself in parallel.
 
 ## Members talk to each other
 
@@ -30,8 +31,8 @@ ateam.py wait                                     # in the background: returns w
 
 1. You set direction and hand out tasks; @pm records them in the tracker.
 2. Developers implement. In the main checkout they leave their work uncommitted. In a worktree of their own they commit on their branch.
-3. Developers ask @reviewer to review their diff or branch, or you do: send it the developer's summary, not your own guess. Developers fix what it finds.
-4. QA members test changed flows and endpoints and report bugs to @pm and you.
+3. Developers ask @reviewer to review their diff or branch, or you do: send it the task, its acceptance criteria and the developer's report, not your own guess. Developers fix what it finds until its last line is `approve`.
+4. QA members give a pass or fail for each acceptance criterion, report bugs to @pm and you, and re-test each bug once it is fixed. @product, if the team has one, does the acceptance check of a finished feature.
 5. You do the final review. Then you commit what is in the main checkout, and merge each reviewed branch into it.
 
 Follow the team brief's *Workflow* when it differs from this.
@@ -49,7 +50,8 @@ Members in the main checkout share one working tree: fine for work on the same t
 
 ## Get results back
 
-- Members report by messaging you: `[from @lead-dev] done: ...` arrives as your next turn. Do not wait for it in the foreground.
+- Members report by messaging you: `[from @lead-dev] status: done ...` arrives as your next turn. Do not wait for it in the foreground.
+- Every report has the same lines: status, changed, ran, risks, next. A report with no `ran` line means nothing was checked: ask what was run before you accept it.
 - Keep `ateam.py wait` running in the background while work is out (`cmd_status.md`). It returns when a member is blocked or gone, when a member you named stops, or when nobody is working, so a member stuck at a prompt does not go unnoticed.
 - Read a pane: `herdr agent read <name> --source recent-unwrapped --lines 120`.
 - Never `--wait` on a member that might be waiting on you.
@@ -70,4 +72,4 @@ Members in the main checkout share one working tree: fine for work on the same t
 - Do not close panes, tabs or workspaces unless the user asks, and only member panes (labeled with a member's @name). Do not relabel member panes: the labels are how a-team finds the team.
 - Keep the team as small as the work needs. Add a member when there is parallel work for it.
 - Read-only roles (architect, product, designer, reviewer) are read-only by their instructions, not by their harness: they can still build, run tests, and write a document you ask for. Nothing stops a member's shell from writing.
-- pi and omp members run every command without asking, whatever the permission level. Give them tasks and inputs you trust.
+- Members run every command without asking (`cmd_up.md`, Permissions). Give them tasks and inputs you trust.

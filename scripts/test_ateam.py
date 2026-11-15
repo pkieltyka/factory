@@ -82,7 +82,12 @@ FAKE_HERDR = textwrap.dedent(r'''
         out({"type": "pane_layout", "layout": {"tab_id": tab, "panes": [
             {"pane_id": p["pane_id"], "rect": p["rect"]} for p in panes.values() if p["tab_id"] == tab]}})
     if a[:2] == ["pane", "read"]:
-        save(); print(f"...\nAllow this command? (y/n)  [{a[2]}]"); sys.exit(0)  # plain text, like herdr
+        asks = panes[a[2]].get("dialog", ["Allow this command? (y/n)"])[0]
+        save(); print(f"...\n{asks}  [{a[2]}]"); sys.exit(0)  # plain text, like herdr
+    if a[:2] == ["pane", "send-keys"]:
+        if panes[a[2]].pop("dialog", [0, 0])[1] == a[3:]:  # the keys that accept
+            panes[a[2]]["agent_status"] = "idle"
+        out({"type": "ok"})
     if a[:2] == ["agent", "start"]:
         name, kind, pane = a[2], opt("--kind"), opt("--pane")
         how = dict(x.split(":")[::-1] for x in os.environ.get("FAKE_START_FAIL", "").split(",") if x).get(name)
@@ -90,8 +95,13 @@ FAKE_HERDR = textwrap.dedent(r'''
             fail("pane_busy")
         if how == "dead":
             fail("timeout", "agent did not appear")
-        panes[pane].update(agent=kind, name=name, agent_status="blocked" if how == "blocked" else "idle")
-        if how in ("blocked", "banner"):  # a banner clears by itself: the agent is idle a moment later
+        panes[pane].update(agent=kind, name=name, agent_status="idle" if how in (None, "banner") else "blocked")
+        if how == "dialog":  # a first-run question the harness table knows
+            panes[pane]["dialog"] = {"codex": ["> 1. Trust and continue  2. Back", ["enter"]]}.get(
+                kind, ["> No, exit\n  Yes, I trust this folder", ["down", "enter"]])
+            if kind == "codex":  # herdr 0.9.5 calls Codex ready while its trust question is up
+                panes[pane]["agent_status"] = how = "idle"
+        if how in ("blocked", "banner", "dialog"):  # a banner clears by itself: the agent is idle a moment later
             fail("agent_not_ready", "agent is waiting on a dialog")
         out({"type": "agent_started", "agent": view(panes[pane], "agent")})
     if a[:2] == ["agent", "prompt"]:
@@ -303,12 +313,10 @@ class UpTests(unittest.TestCase):
             self.assertEqual({n: kind(c) for n, c in starts.items()},
                              {"lead-dev": "codex", "frontend-dev": "claude", "reviewer": "codex", "pm": "pi"})
             cache = e.root / "cache/a-team"
-            for name in ("lead-dev", "reviewer"):  # Codex: sandboxed, herdr reachable, never hard read-only
+            for name in ("lead-dev", "reviewer"):  # Codex: never stops to ask, never hard read-only
                 argv = native(starts[name])
                 self.assertEqual(flag(argv, "-m"), {"lead-dev": "gpt-6.1-sol", "reviewer": "gpt-6-astra"}[name])
-                self.assertIn("--approve-for-me", argv)
-                self.assertIn("sandbox_workspace_write.network_access=true", argv)
-                self.assertNotIn("-s", argv)  # --approve-for-me cannot be combined with -s
+                self.assertEqual(argv[-1], "--dangerously-bypass-approvals-and-sandbox")
                 pointer = tomllib.loads(next(v for v in argv if v.startswith("developer_instructions=")))["developer_instructions"]
                 self.assertIn(f"You are @{name}", pointer)
                 prompt_file = pathlib.Path(pointer.split(" are in ")[1].split(". Read")[0])
@@ -317,7 +325,8 @@ class UpTests(unittest.TestCase):
             settings = json.loads(flag(fe, "--settings"))
             self.assertIn("Bash(herdr agent prompt *)", settings["permissions"]["allow"])
             self.assertIn("herdr agent prompt *", settings["sandbox"]["excludedCommands"])
-            self.assertEqual(flag(fe, "--permission-mode"), "auto")
+            self.assertEqual(flag(fe, "--permission-mode"), "bypassPermissions")  # the default never stops to ask
+            self.assertTrue(settings["skipDangerousModePermissionPrompt"])  # nor at its first-run warning
             self.assertNotIn("--disallowedTools", fe)
             prompt = pathlib.Path(flag(fe, "--append-system-prompt-file")).read_text()
             for needle in ("Never run `git commit`", "Only @pm updates the tracker (TODO.md at the repo root)",
@@ -383,9 +392,11 @@ class UpTests(unittest.TestCase):
 
     def test_up_can_be_run_again_after_a_partial_launch(self):
         with Env() as e:
-            p = e.run("up", check=False, FAKE_START_FAIL="dead:frontend-dev,blocked:pm,banner:reviewer")
+            p = e.run("up", check=False, FAKE_START_FAIL="dead:frontend-dev,blocked:pm,banner:reviewer,dialog:lead-dev")
             self.assertEqual(p.returncode, 3)
             self.assertIn("started @reviewer", p.stdout)  # a start-up notice that clears is not a failure
+            self.assertIn("started @lead-dev", p.stdout)  # a question the harness table knows is answered
+            self.assertEqual([c[3:] for c in e.calls("pane", "send-keys")], [["enter"]])
             self.assertIn("@frontend-dev did not come up: timeout: agent did not appear", p.stdout)  # herdr's reason is shown
             self.assertIn("ateam.py up frontend-dev", p.stdout)
             self.assertIn("@pm started but is waiting on a dialog: agent_not_ready", p.stdout)
@@ -500,7 +511,7 @@ class UpTests(unittest.TestCase):
 
     def test_permissions_and_extra_args_come_from_the_brief(self):
         with Env(team_brief('''
-            permissions = "ask"
+            permissions = "guarded"
             [members.lead-dev]
             model = "gpt-6-luna"
             args = ["--search"]
@@ -513,15 +524,17 @@ class UpTests(unittest.TestCase):
             harness = "omp"
             model = "z-ai/glm-5.3"
         ''')) as e:
-            e.run("up", "lead-dev", "frontend-dev", "reviewer", "pm", "--no-brief")
+            e.run("up", "lead-dev", "frontend-dev", "reviewer", "pm", "--no-brief", FAKE_START_FAIL="dialog:frontend-dev")
             starts = {n: native(c) for n, c in e.starts().items()}
-            self.assertEqual(starts["lead-dev"][-5:], ["-s", "workspace-write", "-c", "sandbox_workspace_write.network_access=true", "--search"])
-            self.assertNotIn("--permission-mode", starts["frontend-dev"])
+            self.assertEqual(starts["lead-dev"][-4:], ["--approve-for-me", "-c", "sandbox_workspace_write.network_access=true", "--search"])
+            self.assertNotIn("-s", starts["lead-dev"])  # --approve-for-me cannot be combined with -s
+            self.assertEqual(flag(starts["frontend-dev"], "--permission-mode"), "auto")
+            self.assertEqual([c[3:] for c in e.calls("pane", "send-keys")], [["down", "enter"]])  # Claude's trust question
             self.assertEqual(starts["reviewer"][-1], "--dangerously-bypass-approvals-and-sandbox")
-            self.assertEqual(starts["pm"][-2:], ["--approval-mode", "always-ask"])
+            self.assertEqual(starts["pm"][-2:], ["--approval-mode", "yolo"])  # omp has no guard that lets messages through
             self.assertIn("--permission-mode bypassPermissions", e.run("up", "frontend-dev", "--permissions", "full", "--dry-run").stdout)
             e.write_brief(team_brief('permissions = "yolo"\n[members.pm]\n'))
-            self.assertIn("must be one of ask, auto, full", e.run("show", check=False).stderr)
+            self.assertIn("must be one of full, guarded", e.run("show", check=False).stderr)
 
     def test_one_of_a_role_has_the_role_name_and_several_are_numbered(self):
         with Env() as e:
@@ -773,7 +786,7 @@ class ConfigTests(unittest.TestCase):
                 p = ateam.plan(cfg, name)
                 self.assertIn(p["harness"], ateam.HARNESSES, name)
                 self.assertIn(p["model"], ateam.TABLE[p["harness"]]["models"], name)  # the template uses recommended models
-                self.assertEqual(p["permissions"], "auto")
+                self.assertEqual(p["permissions"], "full")
             self.assertEqual(cfg.tracker, "TODO.md at the repo root")
             self.assertIn("## Project", cfg.body)
             out = e.run("show").stdout
@@ -834,6 +847,15 @@ class ConfigTests(unittest.TestCase):
             prompt = e.run("prompt", "reviewer").stdout
             self.assertIn("You are read-only", prompt)
             self.assertIn("build and run", prompt)  # by prompt only: a reviewer can still build and test
+            self.assertIn("## Reports", prompt)
+            self.assertIn("when @cto or a developer asks", prompt)  # {lead} in a role becomes the lead's @name
+
+    def test_every_role_has_the_same_four_parts(self):
+        for path in sorted((ateam.SKILL / "roles").glob("*.md")):
+            _, body = ateam.parse_role(path)
+            heads = [line for line in body.splitlines() if line.startswith("**")]
+            self.assertEqual(heads, ["**You own**", "**You output**", "**Done when**", "**Never**"], path.name)
+            self.assertNotIn("LSP", body, path.name)  # nothing harness-specific in a role
 
     def test_session_id_from_ref(self):
         self.assertEqual(ateam.session_id({"kind": "id", "value": "abc"}), "abc")
@@ -972,8 +994,10 @@ class HerdrContract(unittest.TestCase):
 class LiveFlags(unittest.TestCase):
     """Harness flags drift between releases. Each installed harness's --help must still name what we pass."""
     FLAGS = {
-        "claude": (["--help"], ["--model", "--effort", "--append-system-prompt", "--name", "--settings", "--permission-mode", "--resume"]),
-        "codex": (["--help"], ["--model", "--config", "--sandbox", "--approve-for-me", "--dangerously-bypass-approvals-and-sandbox", "resume"]),
+        "claude": (["--help"], ["--model", "--effort", "--append-system-prompt", "--name", "--settings", "--permission-mode",
+                                '"auto"', '"bypassPermissions"', "--resume"]),
+        "codex": (["--help"], ["--model", "--config", "--approve-for-me",
+                               "--dangerously-bypass-approvals-and-sandbox", "resume"]),
         "pi": (["--help"], ["--model", "--thinking", "--append-system-prompt", "--name", "--session", "--list-models"]),
         "omp": (["--help"], ["--model", "--thinking", "--append-system-prompt", "--resume", "--approval-mode"]),
         "opencode": (["--help"], ["--standalone", "--session", "--auto", "models"]),

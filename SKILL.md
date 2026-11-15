@@ -34,7 +34,7 @@ The command references hold the steps and rules; compaction keeps only this file
 ## Commands
 
 ### `/a-team setup`
-Form a team for this repo with the user: project, team size, model mix, permissions, and how @pm tracks work. It checks what this machine can run and writes `team-brief.md`. Run it again to change the team.
+Form a team for this repo with the user: project, team size, model mix, and how @pm tracks work. It checks what this machine can run and writes `team-brief.md`. Run it again to change the team.
 → Read [references/cmd_setup.md](references/cmd_setup.md)
 
 ### `/a-team up`
@@ -66,5 +66,5 @@ Run `ateam.py status` and route:
 - `test "$HERDR_ENV" = 1` must pass. If it fails, tell the user to start herdr and run you inside a pane, then stop.
 - `ateam.py` needs herdr's socket and each harness's own config directory. If your harness sandboxes shell commands, those calls fail with `Operation not permitted` or `read-only file system`. Tell the user what to allow (in Claude Code: `herdr *` and `python3 <skill>/scripts/ateam.py *` in `sandbox.excludedCommands`, or `/sandbox` off). Do not retry around it.
 - Run each `ateam.py` and `herdr` command on its own: no pipe, redirect or `cd ... &&`. A sandbox exclusion or permission rule matches the whole command line, so `ateam.py up 2>&1 | tail` is not covered by a rule for `ateam.py`.
-- Members reach herdr on their own: `up` starts Claude Code members with `herdr agent prompt` allowed outside their sandbox, and Codex members with network access on in theirs, which herdr's socket needs. pi, omp and OpenCode have no sandbox.
+- Members run with no approval prompts and no sandbox of their own, on the assumption that the machine is a sandbox or a VM (`cmd_up.md`, Permissions). So they reach herdr and message each other without asking anyone. `up` also starts Claude Code members with `herdr agent prompt` allowed outside a sandbox the user has turned on.
 - One-time per harness, so herdr tracks state and sessions: `herdr integration install claude` (and `codex`, `pi`, `omp`, `opencode`). `continue` and `cost` depend on the session herdr reports for each agent.

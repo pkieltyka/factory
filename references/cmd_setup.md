@@ -13,7 +13,7 @@ Guide the user to a team for this repo and write it to `team-brief.md` at the re
 1. **The project, in two or three sentences:** what it is, who it is for, and the stack if you could not tell.
 2. **Kind:** backend, frontend, full-stack, or other (CLI, library, data, infra). Propose your guess from step 1.
 3. **Size:**
-   - *lean:* lead-dev, reviewer, and pm if they want tracking
+   - *lean:* lead-dev and reviewer. Below four members a pm is optional: you can keep the tracker yourself
    - *standard:* lead-dev, one or two developers for the kind, reviewer, pm, and a QA member for the kind
    - *full:* architect, product, lead-dev, backend-dev, frontend-dev, designer, reviewer, pm, qa-frontend, qa-backend
 4. **Model mix:**
@@ -23,12 +23,7 @@ Guide the user to a team for this repo and write it to `team-brief.md` at the re
    - *local:* models the user serves themselves, run through pi or omp
 
    Also ask whether cost or speed matters more.
-5. **Permissions:** how much members may do without asking.
-   - *auto* (recommended): they run unattended, guarded where the harness can
-   - *ask:* they stop for approvals, and you bring each one to the user
-   - *full:* no sandbox and no approvals
-
-   Say that pi and omp members never ask, at any level.
+5. **Permissions:** not a question. Tell the user that members run with no sandbox and no approval prompts, which assumes this machine is itself a sandbox or a VM. If they say it is not, set `permissions = "guarded"` (`cmd_up.md`).
 6. **Worktrees:** will developers build separate things in parallel? Then each of those gets a git worktree of its own. Developers working on the same thing share the main checkout.
 7. **Tracking (when there is a pm):** where @pm keeps tasks, owners, status and bugs:
    - a `TODO.md` file in the repo
@@ -45,11 +40,11 @@ Show a table: @name, role, harness, model, thinking, and one line of why. Start 
 
 - The strongest models go where judgment matters most: architect, lead-dev, reviewer. Cheaper, faster ones do volume and bookkeeping: backend-dev, pm, qa-backend.
 - The reviewer runs on a different model family from the main developers: different blind spots catch more bugs.
-- Roles that need a browser (qa-frontend, designer) work best in Claude Code.
+- designer, qa-frontend and frontend-dev need a browser tool in their harness (a browser MCP, Playwright or `agent-browser`): they judge and test the running app. Put them on a harness that has one, and ask the user if you cannot tell.
+- With a product member, it writes each feature's acceptance criteria. Without one, you do, in the task.
 - Thinking: high for the architect, reviewer and designer; medium for developers; low for the pm. The highest levels on Claude and Codex are refused by default (`never` in `harnesses.toml`).
 - Names: a role's only member has the role's name (`@reviewer`). Several of a role are all numbered: `[members.backend-dev-1]` and `[members.backend-dev-2]`, each with `role = "backend-dev"`.
 - If the user chose a mixed team, spread models across families. Leave the lead's model as it is: the lead is you.
-- For a lean team, you can keep the tracker yourself instead of adding a pm.
 
 Adjust until the user agrees.
 
@@ -59,7 +54,7 @@ Adjust until the user agrees.
    - **Settings:**
      - keep only the chosen members, and set each one's harness, model and thinking;
      - add `notes` saying what each member owns on this project;
-     - set `permissions`, and `worktree = true` on the members that get their own worktree;
+     - set `worktree = true` on the members that get their own worktree;
      - set `tracker` to the user's answer in words a member can act on, e.g. `"GitHub Issues on owner/repo via gh issue"`, or remove it for none;
      - set `[teams] default` to the chosen roster.
    - **Prose:**

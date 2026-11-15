@@ -10,7 +10,7 @@
 #   model        exact model id; `ateam.py harnesses` lists what this machine can use
 #   thinking     thinking level. Omitted: the role's default
 #   notes        what this member owns on this team; the Role column of the roster
-#   permissions  ask | auto | full, for this member only (see below)
+#   permissions  full | guarded, for this member only (see below)
 #   worktree     true: its own git worktree on branch a-team/<name>. "some/branch": a worktree of that branch;
 #                members that name the same branch share it. Omitted: the main checkout, shared with the team
 #   args         extra native flags for its harness, e.g. args = ["--search"]
@@ -25,12 +25,12 @@
 tracker = "TODO.md at the repo root"
 lead_commits = true   # only the lead runs git commit, merge and push
 
-# How much members may do without asking. Each harness maps a level to its own flags (the skill's harnesses.toml).
-#   "ask"   no flags: each harness as you have configured it, which normally means members stop for approvals
-#   "auto"  members run unattended, guarded where the harness can: Claude Code's auto mode, Codex's sandbox
-#           with automatic review of what leaves it. pi and omp have no guard: they never ask.
-#   "full"  no sandbox and no approvals anywhere
-permissions = "auto"
+# Members never stop to ask for approval: every harness runs with no sandbox and no permission prompts
+# ("full", the default). That is meant for a machine that is itself a sandbox or a VM.
+# On a machine that is not, "guarded" keeps Claude Code and Codex members behind their own guard (auto mode;
+# a sandbox with automatic review). They still run unattended but can stop and ask. pi, omp and OpenCode
+# have no such guard, so for them it changes nothing.
+# permissions = "guarded"
 
 # worktree_dir = "../<repo>.worktrees"   # where members' worktrees go; this is the default
 # [tabs]                                 # herdr tab labels; these are the defaults
@@ -108,15 +108,15 @@ full = ["architect", "product", "lead-dev", "backend-dev", "frontend-dev", "desi
 ## Role details
 
 - **@lead-dev** and **@frontend-dev** agree on the interface between the core and the UI before either builds against it, and keep each other posted when it changes.
-- **@reviewer**: when {lead} or a developer asks for a review, read the diff (`git status`, `git diff`, new untracked files), build and test where that helps, and report findings ordered by severity, each with `file:line` and a concrete failure scenario. Read-only: you report, the developers fix.
+- **@reviewer** reviews every task before {lead} sees it. A review request carries the task and its acceptance criteria.
 - **@pm** owns the tracker: short, current, ordered by priority, with an owner and status on every item. Only @pm updates it; teammates ask @pm to add or change items.
 
 ## Workflow
 
-1. {lead} sets direction and hands out tasks; @pm records them in the tracker.
-2. Developers implement and leave their work uncommitted: in the main checkout, or in their own worktree if they have one.
-3. Developers ask @reviewer directly for a first-pass review of their diff, and fix what it finds.
-4. {lead} does the final review and commits; a worktree's branch is then merged into the main checkout. Nobody else runs `git commit`, `git merge` or `git push`.
+1. {lead} sets direction and hands out tasks, each with its acceptance criteria; @pm records them in the tracker.
+2. Developers implement. In the main checkout they leave their work uncommitted; in a worktree of their own they commit on their branch.
+3. Developers ask @reviewer directly to review their diff or branch, and fix what it finds until it says `approve`.
+4. {lead} does the final review, commits what is in the main checkout, and merges each reviewed branch. Nobody else merges or pushes.
 
 ## Project
 

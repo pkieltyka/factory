@@ -7,6 +7,8 @@
 #   models       recommended models, strongest first. `ateam.py harnesses` reports which of them this machine
 #                can use. A new model on codex, pi, omp or opencode needs no change: their lists are read live.
 #                Claude Code has no listing command, so for claude this is also the list of known ids.
+#   aliases      claude only: short names Claude Code accepts in place of a full model id ("opus"), so a brief
+#                may use them. The other harnesses list their models live and need no such key.
 #   thinking     levels the harness accepts (codex: read per model from its cache; opencode: per-model variants)
 #   never        levels a-team refuses even where the harness accepts them. `[never_thinking]` in a team brief
 #                replaces it for that team.
@@ -15,10 +17,12 @@
 #                  pointer  a one-line system instruction names the file; the full text also goes in the first message
 #                  message  the first message only
 #   sessions     glob under $HOME for a session file, given its id as {id}; `cost` reads it
-#   [x.permissions]   native flags for each permission level of the team brief: ask | auto | full
-#                  ask    the harness as the user configured it: normally the member stops for approvals
-#                  auto   runs unattended, with whatever guard the harness offers (the default)
-#                  full   no sandbox and no approvals
+#   dialogs      questions the harness asks at start that `up` answers itself, so nobody has to: text that is
+#                on the screen, then the keys that accept it (herdr key names)
+#   [x.permissions]   native flags for each permission level of the team brief: full | guarded
+#                  full     never stops for approval, no sandbox (the default). For a sandbox or VM.
+#                  guarded  still unattended, behind whatever guard the harness has. Only Claude Code and
+#                           Codex have one; on the others it is the same as full.
 
 [claude]
 label = "Claude Code"
@@ -30,10 +34,12 @@ never = ["max"]
 prompt = "file"
 sessions = ".claude/projects/*/{id}.jsonl"
 
+# Both questions start on "No, exit". The bypass warning is normally skipped by a setting `up` passes.
+dialogs = [["Yes, I trust this folder", ["down", "enter"]], ["Yes, I accept", ["down", "enter"]]]
+
 [claude.permissions]
-ask = []
-auto = ["--permission-mode", "auto"]   # a classifier reviews each action; falls back to asking where auto mode is unavailable
-full = ["--permission-mode", "bypassPermissions"]   # Claude Code shows a warning dialog the first time
+full = ["--permission-mode", "bypassPermissions"]
+guarded = ["--permission-mode", "auto"]   # a classifier reviews each action; it can still stop and ask
 
 [codex]
 label = "Codex"
@@ -42,13 +48,13 @@ models = ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna", "gpt-6-sol"]
 never = ["max", "ultra"]
 prompt = "pointer"
 sessions = ".codex/sessions/*/*/*/rollout-*{id}.jsonl"
+dialogs = [["Trust and continue", ["enter"]]]   # asked once per new folder, a worktree included
 
-# Network access stays on in every sandboxed level: herdr's socket needs it, so without it a member cannot
-# message anyone. --approve-for-me cannot be combined with -s; it uses the workspace-write sandbox itself.
+# guarded: the workspace-write sandbox, with automatic review of what leaves it. Network access stays on:
+# herdr's socket needs it, so without it a member cannot message anyone.
 [codex.permissions]
-ask = ["-s", "workspace-write", "-c", "sandbox_workspace_write.network_access=true"]
-auto = ["--approve-for-me", "-c", "sandbox_workspace_write.network_access=true"]
 full = ["--dangerously-bypass-approvals-and-sandbox"]
+guarded = ["--approve-for-me", "-c", "sandbox_workspace_write.network_access=true"]
 
 [pi]
 label = "pi"
@@ -59,10 +65,9 @@ never = []
 prompt = "file"
 sessions = ".pi/agent/sessions/*/*_{id}.jsonl"
 
-[pi.permissions]   # pi has no sandbox and never asks: every level is the same
-ask = []
-auto = []
+[pi.permissions]   # pi has no sandbox and no approvals
 full = []
+guarded = []
 
 [omp]
 label = "omp"
@@ -73,10 +78,9 @@ never = []
 prompt = "file"
 sessions = ".omp/agent/sessions/*/*_{id}.jsonl"
 
-[omp.permissions]
-ask = ["--approval-mode", "always-ask"]
-auto = ["--approval-mode", "yolo"]
+[omp.permissions]   # omp's stricter modes ask before every command, a message to a teammate included
 full = ["--approval-mode", "yolo"]
+guarded = ["--approval-mode", "yolo"]
 
 [opencode]
 label = "OpenCode"
@@ -85,10 +89,9 @@ models = ["openrouter/openai/gpt-6-astra", "openrouter/z-ai/glm-5.3", "openroute
 never = []
 prompt = "message"
 
-[opencode.permissions]
-ask = []
-auto = ["--auto"]
+[opencode.permissions]   # --auto approves whatever the user's own rules do not deny
 full = ["--auto"]
+guarded = ["--auto"]
 
 # Optional, USD per million tokens, for sessions whose harness records no dollars (Codex always, Claude Code
 # until its session exits). A team brief can add its own [prices]. pi and omp record real dollars.
