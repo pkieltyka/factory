@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""a-team: a software team of coding agents in herdr, one team per herdr session. You are the orchestrator (CTO);
+"""a-team: a software team of coding agents in herdr, one team per herdr session. You are the operator (CTO);
 each member runs in its own pane of the team tab, on its own harness, model and thinking level.
 
-The team is team-brief.md at the repo root: settings in +++ TOML front matter +++, then prose. herdr holds the
+A project has two files at its root. TEAM.md is the brief every member reads: the project and how the team
+works; it is committed and shared. team.toml is one person's formation: the operator, the members and their
+harnesses and models; it is not committed (team.toml.sample is, as the project's suggestion). herdr holds the
 rest: a member's pane is labeled with its @name and its agent carries that name. Harnesses are described in
 harnesses.toml. `ateam.py --help` lists the commands.
 """
 import argparse
 import collections
+import getpass
 import hashlib
 import json
 import os
@@ -27,9 +30,12 @@ HARNESSES = tuple(TABLE)
 LEVELS = ("full", "guarded")
 PROBE_TIMEOUT = 60
 SETTLE = float(os.environ.get("ATEAM_SETTLE", 8))  # seconds a member may take to get past a start-up notice
-BRIEF = "team-brief.md"
-LEAD = "cto"  # the orchestrator's @name, unless `[orchestrator] name` in the brief says otherwise
-TABS = {"lead": "a-team orchestrator", "team": "a-team workers"}  # herdr tab labels
+BRIEF = "TEAM.md"              # the brief: shared and committed
+CONF = "team.toml"             # one person's formation: not committed
+SAMPLE = "team.toml.sample"    # the project's suggested formation: committed, copied to team.toml by `init`
+LEGACY = "team-brief.md"       # the single file of earlier versions: found only to say how to split it
+OPERATOR = "operator"  # the operator's @name, unless `[operator] name` in team.toml says otherwise
+TABS = {"operator": "a-team operator", "team": "a-team workers"}  # herdr tab labels
 
 
 class Problem(Exception):
@@ -43,25 +49,24 @@ class Problem(Exception):
 # ================================================================ files
 
 def find_root(cwd):
-    """The directory holding team-brief.md, searching up from cwd; else cwd itself."""
+    """The directory holding the team's files, searching up from cwd; else cwd itself."""
     cwd = pathlib.Path(cwd).resolve()
     for d in (cwd, *cwd.parents):
-        if (d / BRIEF).is_file():
+        if any((d / name).is_file() for name in (CONF, BRIEF, LEGACY)):
             return d
     return cwd
 
 
-def parse_front(text, path):
-    """'+++\\n<toml>\\n+++\\n<body>' -> (settings, body)."""
-    if not text.startswith("+++\n"):
-        raise SystemExit(f"{path}: must start with a +++ line, then TOML settings, then +++")
-    head, sep, body = text[4:].partition("\n+++\n")
-    if not sep:
-        raise SystemExit(f"{path}: no closing +++ line after the settings")
-    try:
-        return tomllib.loads(head), body.strip()
-    except tomllib.TOMLDecodeError as e:
-        raise SystemExit(f"{path}: settings: {e}")
+def refuse_legacy(root):
+    """With an old team-brief.md and not both new files, stop before anything is read or written: defaults
+    would quietly replace the team it describes."""
+    if (root / LEGACY).is_file() and not ((root / BRIEF).is_file() and (root / CONF).is_file()):
+        raise SystemExit(f"{root / LEGACY} is the single-file brief of earlier versions; nothing was written."
+                         f" Split it by hand:\n"
+                         f"  1. Move the settings between its +++ lines to {CONF}.\n"
+                         f"  2. In {CONF}, rename [lead] or [orchestrator] to [operator] and remove `tracker`.\n"
+                         f"  3. Move the prose to {BRIEF}, and say there where tasks are tracked.\n"
+                         f"  4. Delete {LEGACY}, add {CONF} to .gitignore, and run `ateam.py check`.")
 
 
 def parse_role(path):
@@ -83,39 +88,45 @@ def parse_role(path):
 class Config:
     def __init__(self, cwd, require=True):
         self.root = find_root(cwd)
-        self.brief_file = self.root / BRIEF
+        self.brief_file, self.conf_file = self.root / BRIEF, self.root / CONF
         self.roles = {p.stem: parse_role(p) for p in sorted((SKILL / "roles").glob("*.md"))}
-        if self.brief_file.is_file():
-            self.team, self.body = parse_front(self.brief_file.read_text(), self.brief_file)
-        elif require:
-            raise SystemExit(f"no {BRIEF} in {self.root} or above. Run `/a-team setup`"
-                             " (or `ateam.py init`) first.")
-        else:
-            self.team, self.body = {}, ""
-        if "lead" in self.team:
-            raise SystemExit(f"{self.brief_file}: rename [lead] to [orchestrator]")
-        self.lead = {"name": LEAD, **self.team.get("orchestrator", {})}  # the orchestrator; `lead` in this code
+        missing = [f.name for f in (self.brief_file, self.conf_file) if not f.is_file()]
+        if missing and require:
+            refuse_legacy(self.root)
+            raise SystemExit(f"no {' or '.join(missing)} in {self.root} or above. Run `/a-team setup`, or"
+                             f" `ateam.py init`, which writes what is missing and copies the project's {SAMPLE} to"
+                             f" {CONF} if there is one.")
+        try:
+            self.team = tomllib.loads(self.conf_file.read_text()) if self.conf_file.is_file() else {}
+        except tomllib.TOMLDecodeError as e:
+            raise SystemExit(f"{self.conf_file}: {e}")
+        self.body = self.brief_file.read_text().strip() if self.brief_file.is_file() else ""
+        for old in ("lead", "orchestrator"):
+            if old in self.team:
+                raise SystemExit(f"{self.conf_file}: rename [{old}] to [operator]")
+        self.operator = {"name": OPERATOR, **self.team.get("operator", {})}
         self.members = self.team.get("members", {})
-        if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", str(self.lead["name"])) or self.lead["name"] in self.members:
-            raise SystemExit(f"{self.brief_file}: [orchestrator] name {self.lead['name']!r} must be lowercase letters,"
+        if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", str(self.operator["name"])) or self.operator["name"] in self.members:
+            raise SystemExit(f"{self.conf_file}: [operator] name {self.operator['name']!r} must be lowercase letters,"
                              " digits, - or _ (32 at most) and not a member's name")
-        if "teams" in self.team:  # a brief from before: starting "everyone in the brief" would start its whole catalog
-            raise SystemExit(f"{self.brief_file}: [teams] is no longer used. The members in the brief are the team:"
+        try:  # whose team this is: the first part of its worktree branches, so two people's never collide
+            self.user = str(self.team.get("user") or getpass.getuser())
+        except (KeyError, OSError):
+            self.user = ""
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", self.user):
+            raise SystemExit(f"{self.conf_file}: set `user` to your name for branches, e.g. user = \"peter\"")
+        if "teams" in self.team:  # from before: starting "every member" would start a whole catalog
+            raise SystemExit(f"{self.conf_file}: [teams] is no longer used. The members in {CONF} are the team:"
                              " remove [teams] and the members you do not want.")
         for name, m in self.members.items():
             role = m.get("role", name)
             if role not in self.roles:
                 raise SystemExit(f"member {name!r}: no role {role!r}; roles are {sorted(self.roles)}")
             if len(name) > 32 or not re.fullmatch(re.escape(role) + r"(-[1-9]\d*)?", name):  # names never change
-                raise SystemExit(f"{self.brief_file}: member {name!r} has role {role!r}. A role's first member is named"
+                raise SystemExit(f"{self.conf_file}: member {name!r} has role {role!r}. A role's first member is named"
                                  f" @{role}; more of that role are @{role}-2, @{role}-3, ... (32 characters at most)")
             if m.get("harness") not in TABLE:
-                raise SystemExit(f"{self.brief_file}: member {name!r} needs `harness`, one of: {', '.join(TABLE)}")
-
-    @property
-    def tracker(self):
-        """Where @pm tracks work, as the brief describes it (a file, GitHub Issues, Linear, a CLI), or None."""
-        return self.team.get("tracker") or None
+                raise SystemExit(f"{self.conf_file}: member {name!r} needs `harness`, one of: {', '.join(TABLE)}")
 
     @property
     def cache(self):
@@ -126,7 +137,7 @@ class Config:
 
     @property
     def worktree_dir(self):
-        """Where members' git worktrees live: next to the repo unless the brief sets `worktree_dir`."""
+        """Where members' git worktrees live: next to the repo unless team.toml sets `worktree_dir`."""
         return (self.root / (self.team.get("worktree_dir") or f"../{self.root.name}.worktrees")).resolve()
 
     @property
@@ -140,7 +151,7 @@ class Config:
 
 
 def plan(cfg, name):
-    """A member's settings from the brief, before availability checks."""
+    """A member's settings from team.toml, before availability checks."""
     m = cfg.members[name]
     role = m.get("role", name)
     meta, _ = cfg.roles[role]
@@ -148,7 +159,7 @@ def plan(cfg, name):
     if permissions not in LEVELS:
         raise SystemExit(f"@{name}: permissions {permissions!r} must be one of {', '.join(LEVELS)}")
     worktree = m.get("worktree")
-    branch = (f"a-team/{name}" if worktree is True else worktree) or None
+    branch = (f"{cfg.user}/{name}" if worktree is True else worktree) or None
     where = cfg.worktree_dir / re.sub(r"[^A-Za-z0-9._-]+", "-", branch) if branch else cfg.root
     return {"name": name, "role": role, "harness": m["harness"], "model": m.get("model"),
             "thinking": str(m.get("thinking") or meta["thinking"]),
@@ -255,6 +266,10 @@ class Checker:
                 out[path] = line[18:]
         return out
 
+    def git(self, *args):
+        """Exit status of a git command in the repository."""
+        return subprocess.run(["git", "-C", str(self.cfg.root), *args], capture_output=True).returncode
+
     def check_worktree(self, p):
         """A member's worktree is its own branch's checkout and nobody else's. Two branch names can map to
         one path (`feature/a` and `feature-a`), and a path can hold something else already."""
@@ -262,7 +277,11 @@ class Checker:
         if not self.probe("git", self.has_commits):
             raise Problem(f"a worktree needs a git repository with a commit in {self.cfg.root}",
                           "Run `git init` and make a first commit, or remove `worktree` from this member.")
-        change = f"Change `worktree` for one of them in {BRIEF}."
+        git = self.git
+        if git("check-ref-format", "--branch", branch):
+            raise Problem(f"{branch!r} is not a branch name git accepts",
+                          f"Change `user`, or this member's `worktree`, in {CONF}.")
+        change = f"Change `worktree` for one of them in {CONF}."
         for other in (plan(self.cfg, n) for n in self.cfg.members if n != p["name"]):
             if other["dir"] == path and other["branch"] != branch:
                 raise Problem(f"its worktree for branch {branch} would be {path}, which is also the worktree of"
@@ -270,14 +289,21 @@ class Checker:
         trees = self.probe("worktrees", self.worktrees)
         if path in trees and trees[path] != branch:
             raise Problem(f"the worktree {path} is on branch {trees[path] or '(none)'}, not {branch}",
-                          f"Run `git -C {path} switch {branch}`, or change this member's `worktree` in {BRIEF}.")
+                          f"Run `git -C {path} switch {branch}`, or change this member's `worktree` in {CONF}.")
         if path not in trees and pathlib.Path(path).exists():
             raise Problem(f"the worktree path {path} exists but is not a checkout of this repository",
-                          f"Move it away, or set `worktree_dir` in {BRIEF}.")
+                          f"Move it away, or set `worktree_dir` in {CONF}.")
+        # Defaults used to be a-team/<name>. A member on `worktree = true` whose new default branch does not exist
+        # yet, while its old checkout is still there, may be leaving unmerged work behind. A branch that
+        # team.toml names is a decision and is left alone.
+        old, implicit = f"a-team/{p['name']}", self.cfg.members[p["name"]].get("worktree") is True
+        if implicit and branch != old and old in trees.values() and git("rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"):
+            raise Problem(f"this member has an earlier worktree on branch {old}, which may hold unmerged work",
+                          f'Set `worktree = "{old}"` for it in {CONF} to keep using it, or merge and remove it first.')
         held = [t for t, b in trees.items() if b == branch and t != path]
         if held:
             raise Problem(f"the worktree branch {branch} is already checked out in {held[0]}",
-                          f"Give this member a branch of its own: `worktree = true`, or another branch name, in {BRIEF}.")
+                          f"Give this member a branch of its own: `worktree = true`, or another branch name, in {CONF}.")
 
     def check(self, p):
         """-> member dict with a launch-ready model, or raises Problem."""
@@ -287,7 +313,7 @@ class Checker:
         if not shutil.which(harness):
             raise Problem(f"{harness} is not installed (not on PATH)", TABLE[harness]["install"])
         if not model:
-            raise Problem("no model set", f"Set `model` for this member in {BRIEF}; `ateam.py harnesses` lists"
+            raise Problem("no model set", f"Set `model` for this member in {CONF}; `ateam.py harnesses` lists"
                                           " what this machine can use.")
         never = TABLE[harness].get("never", [])
         if thinking in never:
@@ -305,6 +331,12 @@ class Checker:
 
 def check_all(cfg, plans):
     """-> (ready members, [(member, Problem)])."""
+    if (cfg.root / LEGACY).is_file():
+        print(f"note: {cfg.root / LEGACY} is no longer read; {BRIEF} and {CONF} replace it. Delete it.", file=sys.stderr)
+    generic = {"root", "ubuntu", "runner", "user", "admin", "ec2-user", "vscode", "codespace", "node"}
+    if "user" not in cfg.team and cfg.user in generic and any(p["branch"] == f"{cfg.user}/{p['name']}" for p in plans):
+        print(f"note: worktree branches will start with {cfg.user!r}, this machine's user name, which other people's"
+              f" machines may share. Set `user` in {CONF}, e.g. user = \"peter\".", file=sys.stderr)
     checker, ready, problems = Checker(cfg), [], []
     for p in plans:
         try:
@@ -330,7 +362,7 @@ def report_problems(problems):
         print(f"- @{p['name']} ({p['role']}, {p['harness']} {p['model'] or '?'}, thinking {p['thinking']}):")
         print(f"    problem: {e.what}")
         print(f"    fix:     {e.fix}")
-    print(f"\nFix these, or change the member in {BRIEF}, then run again.")
+    print(f"\nFix these, or change the member in {CONF}, then run again.")
 
 
 # ================================================================ harness code: one block per harness
@@ -415,7 +447,7 @@ def argv_codex(m, prompt_file, resume):
                f" {prompt_file}. Read that file before your first task, and again whenever your context was"
                " compacted or you are unsure of the rules.")
     # -C: a resumed session goes back to the directory it was started in, whatever the pane's is. Naming the
-    # member's directory keeps it where the brief says, also after its worktree changed.
+    # member's directory keeps it where team.toml says, also after its worktree changed.
     argv = ["-m", m["model"], "-C", m["dir"], "-c", f"model_reasoning_effort={json.dumps(m['thinking'])}",
             "-c", f"developer_instructions={json.dumps(pointer)}"]
     return (["resume", session_id(resume)] if resume else []) + argv, {}
@@ -463,7 +495,7 @@ CODE = {
 
 def launch_argv(m, prompt_file, resume=None):
     """-> (native argv after `--`, pane env): the harness's own arguments, then the member's permission level
-    and any extra `args` from the brief."""
+    and any extra `args` from team.toml."""
     argv, env = CODE[m["harness"]].argv(m, prompt_file, resume)
     return argv + TABLE[m["harness"]]["permissions"][m["permissions"]] + m["args"], env
 
@@ -474,7 +506,7 @@ def tag(name):
     return f"[from @{name}]"
 
 
-def member_prompt(m, lead, cfg):
+def member_prompt(m, operator, cfg):
     """Standing instructions for one member: templates/member-prompt.md, filled in with who it is, its role,
     where it works, and the rules that depend on that."""
     if m["branch"]:
@@ -482,44 +514,43 @@ def member_prompt(m, lead, cfg):
                  f" `{cfg.root}`, on branch `{cfg.main_branch}`. Stay in your worktree and on your branch.")
         rules = [f"- Commit your work on `{m['branch']}` as you go, in small commits with clear messages. That is the"
                  f" only branch you commit to. Never push, and never merge into or check out another branch:"
-                 f" @{lead} reviews your branch and merges it. Before a new task, bring your branch up to date"
+                 f" @{operator} reviews your branch and merges it. Before a new task, bring your branch up to date"
                  f" with `git merge {cfg.main_branch}`. If a commit fails (for example your sandbox blocks git),"
-                 f" tell @{lead} or the teammate concerned and agree who commits it for you."]
+                 f" tell @{operator} or the teammate concerned and agree who commits it for you."]
     else:
         where = f"You work in `{cfg.root}`, the checkout you share with every teammate who has no worktree of their own."
-        rules = [f"- Never run `git commit`, `git merge` or `git push`; @{lead} commits."]
+        rules = [f"- Never run `git commit`, `git merge` or `git push`; @{operator} commits."]
     if m["readonly"]:
         rules.append("- You are read-only: do not edit the project's files. You may read anything, build and run"
-                     f" tests. Write only scratch files outside the repo, or a document @{lead} asks you for.")
+                     f" tests. Write only scratch files outside the repo, or a document @{operator} asks you for.")
     text = (SKILL / "templates/member-prompt.md").read_text()
-    for key, value in {"role_rules": cfg.roles[m["role"]][1], "name": m["name"], "role": m["role"], "lead": f"@{lead}",
-                       "tracker": f" Only @pm updates the tracker ({cfg.tracker})." if cfg.tracker else "",
+    for key, value in {"role_rules": cfg.roles[m["role"]][1], "name": m["name"], "role": m["role"], "operator": f"@{operator}",
                        "brief": str(cfg.brief_file), "where": where, "rules": "\n".join(rules),
                        "instructions": str(cfg.cache / f"{m['name']}.md")}.items():
         text = text.replace("{" + key + "}", value)
     return text.rstrip() + "\n"
 
 
-def render_team_brief(cfg, members, lead, closing=None):
-    """The team brief as sent: roster built from the settings now, then the brief's prose, then the names."""
-    L = cfg.lead
+def render_team_brief(cfg, members, operator, closing=None):
+    """The team brief as sent: a roster built from team.toml now, then TEAM.md, then the names."""
+    L = cfg.operator
     trees = any(m["branch"] for m in members)
-    out = [f"# Team brief (from @{lead})", "",
+    out = [f"# Team brief (from @{operator})", "",
            f"We are a team of {len(members) + 1} agents, each in its own herdr pane, working on the repo"
            f" `{cfg.root}`. This brief lives in `{BRIEF}` at its root.", "",
            "## Roles", "",
            "| Name | Agent | Role |" + (" Works in |" if trees else ""), "|---|---|---|" + ("---|" if trees else "")]
-    lead_agent = ", ".join(x for x in (TABLE.get(L.get("harness"), {}).get("label", L.get("harness")),
+    operator_agent = ", ".join(x for x in (TABLE.get(L.get("harness"), {}).get("label", L.get("harness")),
                                        L.get("model"), L.get("thinking")) if x)
-    out.append(f"| **@{lead}** | {lead_agent} | {L.get('notes') or 'Orchestrator.'} |"
+    out.append(f"| **@{operator}** | {operator_agent} | {L.get('notes') or 'Operator.'} |"
                + (" the main checkout |" if trees else ""))
     for m in members:
         meta, _ = cfg.roles[m["role"]]
         where = f" branch `{m['branch']}` in `{m['dir']}` |" if m["branch"] else " the main checkout |"
         out.append(f"| **@{m['name']}** | {TABLE[m['harness']]['label']}, {m['model']}, {m['thinking']}"
                    f" | {m.get('notes') or meta['description']} |" + (where if trees else ""))
-    if cfg.body:
-        out += ["", cfg.body]
+    if cfg.body:  # TEAM.md without its own title and its notes to whoever edits it
+        out += ["", re.sub(r"\A# .*\n+", "", re.sub(r"<!--.*?-->\n?", "", cfg.body, flags=re.S)).strip()]
     if trees:
         out += ["", "## Worktrees", "",
                 f"To review a teammate's branch: `git diff {cfg.main_branch}...<branch>` shows its commits, from any"
@@ -527,19 +558,19 @@ def render_team_brief(cfg, members, lead, closing=None):
                 " review, name your branch."]
     names = ", ".join("`" + m["name"] + "`" for m in members)
     out += ["", "## Talking to each other", "",
-            f"Everyone has an @name, which is also their herdr pane's name: {names}, and `{lead}` for the orchestrator."
+            f"Everyone has an @name, which is also their herdr pane's name: {names}, and `{operator}` for the operator."
             " Message anyone with `herdr agent prompt <name> '[from @you] ...'`; your standing instructions say how.",
             "", closing or "That is the whole team brief. No reply needed."]
-    return "\n".join(out).replace("{lead}", f"@{lead}") + "\n"
+    return "\n".join(out) + "\n"
 
 
-def message_for(cfg, m, members, lead, closing=None):
+def message_for(cfg, m, members, operator, closing=None):
     """What a member is sent: its standing instructions when its harness cannot hold them as a system prompt
     (or when asked), then the team brief."""
-    brief = render_team_brief(cfg, members, lead, closing)
+    brief = render_team_brief(cfg, members, operator, closing)
     if TABLE[m["harness"]]["prompt"] == "file":
         return brief
-    return f"{tag(lead)} Your standing instructions, then the team brief.\n\n{member_prompt(m, lead, cfg)}\n{brief}"
+    return f"{tag(operator)} Your standing instructions, then the team brief.\n\n{member_prompt(m, operator, cfg)}\n{brief}"
 
 
 # ================================================================ herdr: the team is the panes labeled with member names
@@ -571,7 +602,7 @@ def herdr(*args, check=True, timeout=HERDR_TIMEOUT):
 
 def require_herdr():
     if os.environ.get("HERDR_ENV") != "1":
-        raise SystemExit("not inside herdr (HERDR_ENV != 1). Start herdr and run this from the orchestrator's pane.")
+        raise SystemExit("not inside herdr (HERDR_ENV != 1). Start herdr and run this from the operator's pane.")
 
 
 class Team:
@@ -598,7 +629,7 @@ class Team:
         return bool(p and p.get("agent"))
 
     def members(self):
-        """Member plans for the brief's members that are running, in brief order."""
+        """Member plans for the members that are running, in team.toml order."""
         return [plan(self.cfg, n) for n in self.cfg.members if self.live(n)]
 
     def status(self, name):
@@ -610,29 +641,29 @@ class Team:
         return p.get("agent_status", "?")
 
 
-def ensure_lead(cfg, tab=False):
-    """Name the orchestrator's agent and label its pane after `[orchestrator] name`; when launching, label its tab
+def ensure_operator(cfg, tab=False):
+    """Name the operator's agent and label its pane after `[operator] name`; when launching, label its tab
     too. Returns the name."""
     pane = os.environ.get("HERDR_PANE_ID")
     if not pane:
-        raise SystemExit("HERDR_PANE_ID is not set; run this from the orchestrator's herdr pane.")
+        raise SystemExit("HERDR_PANE_ID is not set; run this from the operator's herdr pane.")
     got = herdr("agent", "get", pane, check=False)
     info = got.get("agent") or {}
     if "error" in got and "not_found" not in got["error"]:  # herdr itself failed: say that, not "no agent"
         raise SystemExit(f"herdr agent get {pane}: {got['error']}")
     if not info:
-        raise SystemExit(f"herdr sees no agent in this pane ({pane}). Run ateam.py from the orchestrator's pane.")
-    name = cfg.lead["name"]
+        raise SystemExit(f"herdr sees no agent in this pane ({pane}). Run ateam.py from the operator's pane.")
+    name = cfg.operator["name"]
     if info.get("name") != name:
         clash = [a for a in herdr("agent", "list").get("agents", []) if a.get("name") == name]
         if clash:
             raise SystemExit(f"another agent is already named @{name} ({clash[0].get('pane_id')}). One team runs per"
-                             f" herdr session: rename that agent, change [orchestrator] name in {BRIEF}, or use another session.")
+                             f" herdr session: rename that agent, change [operator] name in {CONF}, or use another session.")
         herdr("agent", "rename", pane, name)
         print(f"named this pane's agent @{name}")
     herdr("pane", "rename", pane, name, check=False)
     if tab and os.environ.get("HERDR_TAB_ID"):
-        herdr("tab", "rename", os.environ["HERDR_TAB_ID"], TABS["lead"], check=False)
+        herdr("tab", "rename", os.environ["HERDR_TAB_ID"], TABS["operator"], check=False)
     return name
 
 
@@ -672,12 +703,12 @@ def place(team, m, env):
     return herdr("pane", "split", anchor, "--direction", direction, *flags)["pane"]["pane_id"]
 
 
-def launch(cfg, team, m, lead, timeout, resume=None):
+def launch(cfg, team, m, operator, timeout, resume=None):
     """Start one member in its own labeled pane: the one it had if that is free, else a new pane in the team
     tab. -> None, or why it did not come up."""
     prompt_file = cfg.cache / f"{m['name']}.md"
     prompt_file.parent.mkdir(parents=True, exist_ok=True)
-    prompt_file.write_text(member_prompt(m, lead, cfg))  # written fresh at each launch
+    prompt_file.write_text(member_prompt(m, operator, cfg))  # written fresh at each launch
     argv, env = launch_argv(m, prompt_file, resume)
     err = ensure_worktree(cfg, m) if m["branch"] else None
     if err:
@@ -739,14 +770,14 @@ def deliver(team, texts, what):
     return failed
 
 
-def send_brief(cfg, team, lead, names=None, closing=None):
+def send_brief(cfg, team, operator, names=None, closing=None):
     """The team brief to running members (all, or only `names`). -> {member: reason} for failed deliveries."""
     members = team.members()
     targets = [m for m in members if names is None or m["name"] in names]
     if not targets:
         print("no members running")
         return {}
-    return deliver(team, {m["name"]: message_for(cfg, m, members, lead, closing) for m in targets},
+    return deliver(team, {m["name"]: message_for(cfg, m, members, operator, closing) for m in targets},
                    "the team brief")
 
 
@@ -781,7 +812,7 @@ def past_sessions(cfg):
 def remember_sessions(cfg, team):
     """Note each agent's current harness session, unless it is the one noted last."""
     last, new = past_sessions(cfg), []
-    for name in [cfg.lead["name"], *cfg.members]:
+    for name in [cfg.operator["name"], *cfg.members]:
         ref = (team.pane(name) or {}).get("agent_session") or {}
         if ref.get("value") and ref["value"] != last.get(name, {}).get("value"):
             new.append({"member": name, **{k: ref.get(k) for k in ("agent", "kind", "value")}})
@@ -798,12 +829,12 @@ def cfg_of(args, require=True):
 
 
 def selected(cfg, names):
-    """Plans for the named members, or for every member of the brief."""
+    """Plans for the named members, or for every member in team.toml."""
     names = [n.lstrip("@") for n in names] or list(cfg.members)
     strangers = [n for n in names if n not in cfg.members]
     if strangers:
-        raise SystemExit(f"{', '.join(strangers)}: not a member in {BRIEF} (members: {', '.join(cfg.members)})."
-                         " To add a member, add its table to the brief.")
+        raise SystemExit(f"{', '.join(strangers)}: not a member in {CONF} (members: {', '.join(cfg.members)})."
+                         f" To add a member, add its table to {CONF}.")
     return [plan(cfg, n) for n in names]
 
 
@@ -816,18 +847,39 @@ def print_plan(plans, extra_col=None):
 
 
 def cmd_init(args):
-    dest = find_root(pathlib.Path(args.cwd or os.getcwd())) / BRIEF
-    try:
-        top = subprocess.run(["git", "-C", str(dest.parent), "rev-parse", "--show-toplevel"],
-                             capture_output=True, text=True).stdout.strip()
-        if top and not dest.exists():
-            dest = pathlib.Path(top) / BRIEF  # the repo root, not a subdirectory
-    except OSError:
-        pass
-    if dest.exists() and not args.force:
-        raise SystemExit(f"{dest} exists; edit it, or pass --force to replace it")
-    dest.write_text((SKILL / "templates/team-brief.md").read_text())
-    print(f"wrote {dest}; edit the members, tracker and prose, then run `ateam.py check`")
+    """Write what the project lacks: TEAM.md and team.toml.sample (shared), and this person's own team.toml, copied
+    from the project's sample. team.toml goes in .gitignore. Nothing that exists is replaced."""
+    root = find_root(pathlib.Path(args.cwd or os.getcwd()))
+
+    def git(*a):  # -> exit status, or None without git
+        try:
+            return subprocess.run(["git", "-C", str(root), *a], capture_output=True, text=True)
+        except OSError:
+            return None
+    top = git("rev-parse", "--show-toplevel")
+    if top and top.stdout.strip() and not any((root / n).exists() for n in (CONF, BRIEF, LEGACY)):
+        root = pathlib.Path(top.stdout.strip())  # the repo root, not a subdirectory
+    refuse_legacy(root)
+    for name, source in ((BRIEF, SKILL / "templates" / BRIEF), (SAMPLE, SKILL / "templates" / CONF), (CONF, root / SAMPLE)):
+        if (root / name).exists():
+            print(f"kept  {root / name}")
+            continue
+        (root / name).write_text(source.read_text())
+        print(f"wrote {root / name}")
+        user = tomllib.loads(source.read_text()).get("user") if name == CONF else None
+        if user:  # the sample is shared; whose branches these are is not
+            print(f"note: {SAMPLE} sets user = {user!r}, so your worktree branches start with it. Confirm that, or"
+                  f" change `user` in {CONF}.")
+    ignore = root / ".gitignore"
+    lines = ignore.read_text().splitlines() if ignore.exists() else []
+    rules = git("check-ignore", "-q", "--no-index", CONF)  # what the rules really do: 0 ignored, 1 not, else no repository
+    if not (rules.returncode == 0 if rules and rules.returncode in (0, 1) else CONF in lines):  # a later `!team.toml` undoes a line
+        ignore.write_text("\n".join(lines + [CONF]) + "\n")
+        print(f"added {CONF} to {ignore}: it is yours; {SAMPLE} is what the project shares")
+    tracked = git("ls-files", "--error-unmatch", CONF)
+    if tracked and tracked.returncode == 0:
+        print(f"note: git already tracks {CONF}, and .gitignore does not change that. `git rm --cached {CONF}` stops it.")
+    print(f"Edit {BRIEF} (project, workflow, where tasks are tracked) and {CONF} (your members), then run `ateam.py check`.")
 
 
 def cmd_harnesses(args):
@@ -874,7 +926,7 @@ def cmd_up(args):
     plans = selected(cfg, args.names)
     ready = checked(cfg, plans)  # every member must pass first
     require_herdr()
-    lead = ensure_lead(cfg, tab=True)
+    operator = ensure_operator(cfg, tab=True)
     team = Team(cfg)
     running = [m["name"] for m in ready if team.live(m["name"])]
     if running:  # so `up` can be run again after a partial launch
@@ -886,7 +938,7 @@ def cmd_up(args):
                          " session: rename that agent, or use another session.")
     started, failed = [], {}
     for m in todo:
-        err = launch(cfg, team, m, lead, args.timeout)
+        err = launch(cfg, team, m, operator, args.timeout)
         if err:
             failed[m["name"]] = err
         else:
@@ -896,11 +948,11 @@ def cmd_up(args):
         print("next: ateam.py brief --send")
     elif started:
         new = {m["name"] for m in started}
-        undelivered = send_brief(cfg, team, lead, names=new)
+        undelivered = send_brief(cfg, team, operator, names=new)
         others = [m["name"] for m in team.members() if m["name"] not in new and m["name"] not in failed]
         if others:  # the rest of the team hears who joined, without the whole brief again
             joined = "; ".join(f"@{m['name']} ({m['role']}, {TABLE[m['harness']]['label']} {m['model']})" for m in started)
-            deliver(team, {n: f"{tag(lead)} Joined the team: {joined}. No reply needed." for n in others}, "the news")
+            deliver(team, {n: f"{tag(operator)} Joined the team: {joined}. No reply needed." for n in others}, "the news")
     report_failed(failed, team, undelivered)
 
 
@@ -908,16 +960,16 @@ def cmd_continue(args):
     """Bring members back after their agents exited, resuming their sessions; with --restart, running ones too."""
     require_herdr()
     cfg = cfg_of(args)
-    lead = ensure_lead(cfg)
+    operator = ensure_operator(cfg)
     team = Team(cfg)
     names = [n.lstrip("@") for n in args.names] or [n for n in cfg.members if team.pane(n)]
     if not names:
-        raise SystemExit(f"no member panes from {BRIEF} in this herdr session; start the team with `ateam.py up`")
+        raise SystemExit(f"no member panes from {CONF} in this herdr session; start the team with `ateam.py up`")
     unknown = [n for n in names if n not in cfg.members]
     if unknown:
-        raise SystemExit(f"not in {BRIEF}: {', '.join(unknown)}")
+        raise SystemExit(f"not in {CONF}: {', '.join(unknown)}")
     restart = [n for n in names if args.restart and team.live(n)]
-    ready = checked(cfg, [plan(cfg, n) for n in names if n in restart or not team.live(n)])  # the brief's settings now
+    ready = checked(cfg, [plan(cfg, n) for n in names if n in restart or not team.live(n)])  # with team.toml's settings as they are now
     failed = {}
     past = past_sessions(cfg)
     for m in ready:
@@ -927,19 +979,18 @@ def cmd_continue(args):
             herdr("pane", "close", team.panes.pop(m["name"])["pane_id"])
         elif not team.pane(m["name"]):
             print(f"@{m['name']} has no pane any more; it gets a new one")
-        err = launch(cfg, team, m, lead, args.timeout, resume=resume)
+        err = launch(cfg, team, m, operator, args.timeout, resume=resume)
         if err:
             failed[m["name"]] = err + (f". If its session cannot be resumed, run: ateam.py continue {m['name']} --fresh"
                                        if resume else "")
     if not ready:
         print("every member is running")
     team = Team(cfg)
-    closing = (f"We are picking up where we left off. Re-read `{BRIEF}`"
-               + (f", check the tracker ({cfg.tracker})" if cfg.tracker else "")
-               + f", then tell @{lead} in one line what you were doing and what you will do next. Send it:"
-               f" `herdr agent prompt {lead} '[from @you] ...'`. A reply in your own pane does not reach @{lead}.")
-    # With names, only those members are re-briefed. With none the orchestrator is catching up, so everyone answers.
-    report_failed(failed, team, send_brief(cfg, team, lead, names=set(names) - set(failed) if args.names else None,
+    closing = (f"We are picking up where we left off. Re-read `{BRIEF}`, check the tracker it names"
+               f", then tell @{operator} in one line what you were doing and what you will do next. Send it:"
+               f" `herdr agent prompt {operator} '[from @you] ...'`. A reply in your own pane does not reach @{operator}.")
+    # With names, only those members are re-briefed. With none the operator is catching up, so everyone answers.
+    report_failed(failed, team, send_brief(cfg, team, operator, names=set(names) - set(failed) if args.names else None,
                                            closing=closing))
 
 
@@ -948,9 +999,9 @@ def cmd_status(args):
     cfg = cfg_of(args)
     team = Team(cfg)
     rows = [("Member", "Role", "Harness", "Model", "Thinking", "Status", "Pane")]
-    lead = cfg.lead["name"]
-    rows.append(("@" + lead, "orchestrator", cfg.lead.get("harness", ""), cfg.lead.get("model", ""), cfg.lead.get("thinking", ""),
-                 team.status(lead), (team.pane(lead) or {}).get("pane_id", "")))
+    operator = cfg.operator["name"]
+    rows.append(("@" + operator, "operator", cfg.operator.get("harness", ""), cfg.operator.get("model", ""), cfg.operator.get("thinking", ""),
+                 team.status(operator), (team.pane(operator) or {}).get("pane_id", "")))
     for name in cfg.members:
         p = plan(cfg, name)
         pane = team.pane(name)
@@ -963,11 +1014,11 @@ def cmd_status(args):
         if hit:
             print(f"\n{', '.join(hit)} {hint}")
     if not any(team.pane(n) for n in cfg.members):
-        print(f"\nNo member of {BRIEF} has been started. Next: `ateam.py check`, then `ateam.py up`.")
+        print(f"\nNo member of {CONF} has been started. Next: `ateam.py check`, then `ateam.py up`.")
 
 
 def cmd_wait(args):
-    """Block until the orchestrator is needed. Run it in the background after handing out work. It returns when a
+    """Block until the operator is needed. Run it in the background after handing out work. It returns when a
     member that was working stops (its report may not have been sent), when a member is blocked, gone or
     closed, when herdr cannot tell what a member is doing, or when nobody is working any more. With names,
     only those members count: what the rest of the team does never ends the wait."""
@@ -1024,22 +1075,22 @@ def cmd_brief(args):
     names = [n.lstrip("@") for n in args.names]
     if args.send:
         require_herdr()
-        lead = ensure_lead(cfg)
+        operator = ensure_operator(cfg)
         team = Team(cfg)
         missing = [n for n in names if not team.live(n)]
         if missing:
             raise SystemExit(f"not running: {', '.join(missing)}")
-        if send_brief(cfg, team, lead, names=set(names) or None):
+        if send_brief(cfg, team, operator, names=set(names) or None):
             sys.exit(1)
         return
-    print(render_team_brief(cfg, [plan(cfg, n) for n in cfg.members], cfg.lead["name"]))
+    print(render_team_brief(cfg, [plan(cfg, n) for n in cfg.members], cfg.operator["name"]))
 
 
 def cmd_say(args):
-    """Message members as the orchestrator: `say all ...` or `say lead-dev frontend-dev ...`."""
+    """Message members as the operator: `say all ...` or `say lead-dev frontend-dev ...`."""
     require_herdr()
     cfg = cfg_of(args)
-    lead = ensure_lead(cfg)
+    operator = ensure_operator(cfg)
     team = Team(cfg)
     text = pathlib.Path(args.file).read_text() if args.file else args.message
     if not text:
@@ -1048,7 +1099,7 @@ def cmd_say(args):
     missing = [n for n in names if not team.live(n)]
     if missing or not names:
         raise SystemExit(f"not running: {', '.join(missing) or 'any member'}")
-    if deliver(team, {n: f"{tag(lead)} {text}" for n in names}, "your message"):
+    if deliver(team, {n: f"{tag(operator)} {text}" for n in names}, "your message"):
         sys.exit(1)
 
 
@@ -1056,7 +1107,7 @@ def cmd_prompt(args):
     cfg = cfg_of(args)
     p = selected(cfg, [args.name])[0]
     print(f"# @{p['name']} ({p['role']}) on {p['harness']} {p['model']}, thinking {p['thinking']}\n")
-    print(member_prompt(p, cfg.lead["name"], cfg))
+    print(member_prompt(p, cfg.operator["name"], cfg))
 
 
 # ================================================================ output helpers
@@ -1074,17 +1125,16 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def common(sp):
-        sp.add_argument("--cwd", help="where to look for team-brief.md (default: here, then parent directories)")
+        sp.add_argument("--cwd", help="where to look for TEAM.md and team.toml (default: here, then parent directories)")
 
     def launching(sp):
         sp.add_argument("--timeout", type=int, default=60000, help="ms to wait for each agent to be ready")
         common(sp)
 
     def selection(sp):
-        sp.add_argument("names", nargs="*", help="member names (default: every member of the brief)")
+        sp.add_argument("names", nargs="*", help="member names (default: every member in team.toml)")
 
-    it = sub.add_parser("init", help="write team-brief.md at the repo root from the template")
-    it.add_argument("--force", action="store_true")
+    it = sub.add_parser("init", help="write the TEAM.md, team.toml.sample and team.toml a project lacks")
     common(it)
 
     common(sub.add_parser("harnesses", help="installed harnesses and which recommended models they can use"))
@@ -1094,7 +1144,7 @@ def main(argv=None):
     common(ck)
 
     up = sub.add_parser("up", help="check, launch each member in a pane of the team tab, send the team brief",
-                        epilog="Native harness flags go in the member's `args` in team-brief.md.")
+                        epilog="Native harness flags go in the member's `args` in team.toml.")
     selection(up)
     up.add_argument("--no-brief", action="store_true", help="do not send the team brief afterwards")
     launching(up)
@@ -1103,7 +1153,7 @@ def main(argv=None):
     co.add_argument("names", nargs="*", help="only these members")
     co.add_argument("--fresh", action="store_true", help="start new sessions instead of resuming")
     co.add_argument("--restart", action="store_true",
-                    help="also restart members that are running, so they get the brief's settings (after a herdr restart)")
+                    help="also restart members that are running, so they get team.toml's settings (after a herdr restart)")
     launching(co)
 
     st = sub.add_parser("status", help="members and whether they are running")
@@ -1120,7 +1170,7 @@ def main(argv=None):
     bf.add_argument("--send", action="store_true")
     common(bf)
 
-    sy = sub.add_parser("say", help="message members as the orchestrator")
+    sy = sub.add_parser("say", help="message members as the operator")
     sy.add_argument("to", nargs="+", help="member names, or `all`; the last word is the message unless --file")
     sy.add_argument("--file", help="send this file's contents")
     common(sy)

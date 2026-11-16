@@ -1,16 +1,21 @@
 # Setup
 
-Start from the existing brief, if present; change only what the user requested.
+A project has `TEAM.md` (the shared brief, committed) and `team.toml` (your own formation, not committed). `team.toml.sample` is the project's suggested formation.
+
+- **The project already has `TEAM.md`:** someone set the team up. Run `ateam.py init`; it copies `team.toml.sample` to your `team.toml`. Ask only what the user wants different for themselves (other models or harnesses, one model for everything, fewer members) and edit `team.toml`. Check `user`, a top-level key above `[operator]`: it is the first part of this person's worktree branches. `init` prints it when the sample sets one. Leave `TEAM.md` alone unless they ask.
+- **Only an old `team-brief.md` exists:** `ateam.py` stops and prints how to split it by hand into `team.toml` and `TEAM.md`. Do that; never run `init` to get past it.
+- **Neither file exists:** follow the steps below.
+- **Both exist:** change only what the user requested.
 
 1. Inspect the repo's stack, UI and existing tracker. Run `ateam.py harnesses`; recommend available models and report missing-harness fixes.
-2. Propose the default below. Infer known facts; ask in one round only for missing project scope, UI needs, parallel work/worktrees and tracker choice. Custom formations, model mixes and trackers remain available.
-3. Show name, role, harness, model, thinking and project responsibility. Adjust until agreed; keep the current orchestrator session unless the user requests a change.
+2. Propose the default below. Infer known facts; ask in one round only for missing project scope, UI needs, parallel work/worktrees and where tasks are tracked. Custom formations, model mixes and trackers remain available.
+3. Show name, role, harness, model, thinking and project responsibility. Adjust until agreed; keep the current operator session unless the user requests a change.
 
 ## Default formation
 
 | Member | Harness/model |
 |---|---|
-| @cto | Current orchestrator; Claude Code Opus or Fable recommended |
+| @operator | Current operator; Claude Code Opus or Fable recommended |
 | @lead-dev | Codex gpt-6-astra |
 | @reviewer | Codex gpt-6-luna |
 | @pm | pi deepseek/deepseek-v4.1-flash |
@@ -25,11 +30,20 @@ Start from the existing brief, if present; change only what the user requested.
 
 ## Write and validate
 
-With no brief, run `ateam.py init`. Edit the brief:
+Run `ateam.py init`. It writes what is missing (`TEAM.md`, `team.toml.sample`, your `team.toml`), replaces nothing, and adds `team.toml` to `.gitignore`.
 
-- Keep the chosen members, each with explicit harness, model and project-specific `notes`. Use `worktree = true` for separate developers. `up` starts every member in the brief; there are no named rosters.
-- Set `tracker` to actionable instructions (repo file, GitHub Issues, Linear or another tool), or omit it. @pm owns it when present; otherwise you track tasks.
-- Keep the workflow short: project-specific responsibilities, review and integration. End with `## Project`: what, for whom, stack. Detailed tasks go in messages.
-- Match the orchestrator's model/thinking to the current session, not the template defaults. Check the rendered brief against standing instructions: shared-checkout members leave commits to you; worktree members commit their own branches. Scope and ownership must agree throughout.
+Edit `team.toml`, your formation:
 
-Run `ateam.py check`. Resolve each failure without substituting unapproved models or harnesses; unknown Claude IDs only warn. Preview with `ateam.py brief`, show the result, and commit when authorized. Next: `/a-team up`.
+- Keep the chosen members, each with explicit harness, model and project-specific `notes`. `up` starts every member in it; there are no named rosters.
+- Use `worktree = true` for developers who work in parallel: each gets branch `<user>/<member>` (for example `peter/lead-dev`), so two people's branches do not collide when their `user` differs. `user` is a top-level key above `[operator]` and defaults to the system user name; set it when that name is generic (`root`, `ubuntu`).
+- Match the operator's model/thinking to the current session, not the template defaults.
+
+Edit `TEAM.md`, the shared brief. Write it by role, so it holds for any person's formation:
+
+- `## Project`: what, for whom, stack. Detailed tasks go in messages.
+- `## Tasks`: where tasks and bugs are tracked and with what tool, in words a member can act on (a repo file, GitHub Issues with `gh`, Linear, another CLI). A file suits one person; several people on the repo need a shared tool. @pm owns the tracker when present; otherwise you track tasks.
+- `## Workflow`: short. Review and integration rules, and who commits: shared-checkout members leave commits to you; worktree members commit their own branches. It must not contradict the standing instructions.
+
+When the formation should be the project's suggestion, copy `team.toml` to `team.toml.sample` and make the copy portable: remove `user` and `worktree_dir`, and any worktree branch or path that carries a person's name.
+
+Run `ateam.py check`. Resolve each failure without substituting unapproved models or harnesses; unknown Claude IDs only warn. Preview with `ateam.py brief`, show the result, and commit `TEAM.md` and `team.toml.sample` when authorized; never `team.toml`. Next: `/a-team up`.

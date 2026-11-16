@@ -21,7 +21,10 @@ SCRIPT = pathlib.Path(__file__).with_name("ateam.py")
 spec = importlib.util.spec_from_file_location("ateam", SCRIPT)
 ateam = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ateam)
-TEMPLATE = (ateam.SKILL / "templates/team-brief.md").read_text()
+os.environ["LOGNAME"] = "ada"  # whose team the tests run as: the first part of worktree branches
+# Fixtures are written as `+++ settings +++ prose`; Env.write_brief puts them on disk as team.toml and TEAM.md.
+TEMPLATE = ("+++\n" + (ateam.SKILL / "templates/team.toml").read_text().strip() + "\n+++\n"
+            + (ateam.SKILL / "templates/TEAM.md").read_text())
 GIT = shutil.which("git")
 
 FAKE_HERDR = textwrap.dedent(r'''
@@ -193,7 +196,7 @@ CODEX_CACHE = {"models": [
 ]}
 
 
-def team_brief(settings, body="## Workflow\n\n1. @cto hands out work.\n"):
+def team_brief(settings, body="## Workflow\n\n1. @operator hands out work.\n"):
     return "+++\n" + textwrap.dedent(settings).strip() + "\n+++\n" + body
 
 
@@ -222,7 +225,7 @@ UI = formation({n: CATALOG_MEMBERS[n] for n in ("lead-dev", "frontend-dev", "rev
 
 class Env:
     """A temp repo with a ten-role fixture brief by default, a fake herdr, fake harnesses,
-    a Codex model cache, and the lead (a claude agent) in pane w1:p1 of tab w1:t1."""
+    a Codex model cache, and the operator (a claude agent) in pane w1:p1 of tab w1:t1."""
 
     def __init__(self, brief=CATALOG, harnesses=("claude", "codex", "pi", "omp", "opencode"), models=MODELS, git=False):
         self.tmp = tempfile.TemporaryDirectory()
@@ -244,9 +247,9 @@ class Env:
                 (bin_ / name).write_text(body)
                 (bin_ / name).chmod(0o755)
         self.fake = self.root / "herdr.json"
-        lead = {"pane_id": "w1:p1", "tab_id": "w1:t1", "workspace_id": "w1", "label": None, "agent": "claude",
+        operator = {"pane_id": "w1:p1", "tab_id": "w1:t1", "workspace_id": "w1", "label": None, "agent": "claude",
                 "name": None, "agent_status": "working", "rect": {"x": 0, "y": 0, "width": 200, "height": 50}}
-        self.write_fake({"calls": [], "next": 1, "tabs": {"w1:t1": "1"}, "panes": {"w1:p1": lead}})
+        self.write_fake({"calls": [], "next": 1, "tabs": {"w1:t1": "1"}, "panes": {"w1:p1": operator}})
         self.env = {**os.environ, "HERDR_BIN": str(bin_ / "herdr"), "FAKE_HERDR": str(self.fake),
                     "HERDR_ENV": "1", "HERDR_PANE_ID": "w1:p1", "HERDR_TAB_ID": "w1:t1", "HERDR_WORKSPACE_ID": "w1",
                     "PATH": str(bin_), "HOME": str(self.home), "XDG_CACHE_HOME": str(self.root / "cache"),
@@ -260,7 +263,10 @@ class Env:
                                env={**self.env, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"})
 
     def write_brief(self, text):
-        (self.repo / "team-brief.md").write_text(text)
+        """A fixture's settings become team.toml and its prose TEAM.md."""
+        head, _, body = text.removeprefix("+++\n").partition("\n+++\n")
+        (self.repo / "team.toml").write_text(head + "\n")
+        (self.repo / "TEAM.md").write_text(body)
 
     def write_fake(self, s):
         self.fake.write_text(json.dumps(s))
@@ -332,17 +338,17 @@ def kind(call):
 class UpTests(unittest.TestCase):
     def test_ui_team_launches_in_the_team_tab_and_is_briefed(self):
         with Env(UI.replace("+++\n", '+++\n[tabs]\nteam = "crew"\n', 1)) as e:  # [tabs] is ignored: labels are fixed
-            self.assertEqual(ateam.Config(e.repo).lead["name"], "cto")  # the default name
-            e.run("up", cwd=e.repo / "sub")  # team-brief.md is found from a subdirectory too
+            self.assertEqual(ateam.Config(e.repo).operator["name"], "operator")  # the default name
+            e.run("up", cwd=e.repo / "sub")  # the team's files are found from a subdirectory too
             fs = e.fake_state()
-            self.assertEqual((fs["panes"]["w1:p1"]["name"], fs["panes"]["w1:p1"]["label"]), ("cto", "cto"))
-            self.assertEqual(fs["tabs"], {"w1:t1": "a-team orchestrator", "w1:t2": "a-team workers"})  # the lead's tab, and one for the team
+            self.assertEqual((fs["panes"]["w1:p1"]["name"], fs["panes"]["w1:p1"]["label"]), ("operator", "operator"))
+            self.assertEqual(fs["tabs"], {"w1:t1": "a-team operator", "w1:t2": "a-team workers"})  # the operator's tab, and one for the team
             tab = e.calls("tab", "create")
             self.assertEqual(len(tab), 1)
             self.assertEqual((flag(tab[0], "--cwd"), flag(tab[0], "--workspace")), (str(e.repo), "w1"))
             self.assertTrue(all("--no-focus" in c and flag(c, "--cwd") == str(e.repo) for c in tab + e.calls("pane", "split")))
             labels = {p["label"]: (k, p["tab_id"]) for k, p in fs["panes"].items()}
-            self.assertEqual(labels, {"cto": ("w1:p1", "w1:t1"), "lead-dev": ("w1:p2", "w1:t2"), "frontend-dev": ("w1:p3", "w1:t2"),
+            self.assertEqual(labels, {"operator": ("w1:p1", "w1:t1"), "lead-dev": ("w1:p2", "w1:t2"), "frontend-dev": ("w1:p3", "w1:t2"),
                                       "reviewer": ("w1:p4", "w1:t2"), "pm": ("w1:p5", "w1:t2")})
             sizes = {(p["rect"]["width"], p["rect"]["height"]) for p in fs["panes"].values() if p["tab_id"] == "w1:t2"}
             self.assertEqual(sizes, {(100, 25)})  # four members: a 2 x 2 grid
@@ -370,7 +376,7 @@ class UpTests(unittest.TestCase):
             self.assertTrue(settings["skipDangerousModePermissionPrompt"])  # nor at its first-run warning
             self.assertNotIn("--disallowedTools", fe)
             prompt = pathlib.Path(flag(fe, "--append-system-prompt-file")).read_text()
-            self.assertIn(str(e.repo / "team-brief.md"), prompt)
+            self.assertIn(str(e.repo / "TEAM.md"), prompt)
             self.assertNotIn("{instructions}", prompt)
             self.assertEqual(flag(native(starts["pm"]), "--model"), "openrouter/deepseek/deepseek-v4.1-flash")
 
@@ -378,14 +384,14 @@ class UpTests(unittest.TestCase):
             self.assertNotIn("unnamed", status)
             sent = dict(e.prompts())
             self.assertEqual(set(sent), {"lead-dev", "frontend-dev", "reviewer", "pm"})  # one message each
-            self.assertTrue(sent["frontend-dev"].startswith("# Team brief (from @cto)"))  # its instructions are its system prompt
-            self.assertTrue(sent["reviewer"].startswith("[from @cto] Your standing instructions"))  # Codex gets them here too
+            self.assertTrue(sent["frontend-dev"].startswith("# Team brief (from @operator)"))  # its instructions are its system prompt
+            self.assertTrue(sent["reviewer"].startswith("[from @operator] Your standing instructions"))  # Codex gets them here too
             self.assertIn("You are read-only", sent["reviewer"])
             for text in sent.values():
                 for needle in ("| **@lead-dev** | Codex, gpt-6-astra, high |", "## Workflow", "No reply needed."):
                     self.assertIn(needle, text)
                 self.assertNotIn("+++", text)
-            self.assertEqual(sorted(p.name for p in e.repo.iterdir()), ["sub", "team-brief.md"])  # nothing else
+            self.assertEqual(sorted(p.name for p in e.repo.iterdir()), ["TEAM.md", "sub", "team.toml"])  # nothing else
 
     def test_ten_members_stay_a_balanced_grid(self):
         with Env() as e:
@@ -406,7 +412,7 @@ class UpTests(unittest.TestCase):
             cfg.root = pathlib.Path(deep)
             resume = {"agent": "codex", "kind": "id", "value": "01a1cbc6-e708-7623-986f-cc2e07efa28f"}
             for name in cfg.members:
-                m = {**ateam.plan(cfg, name), "permissions": "full", "branch": "a-team/" + name}
+                m = {**ateam.plan(cfg, name), "permissions": "full", "branch": "ada/" + name}
                 m["model"] = "openrouter/" + m["model"] if m["harness"] == "pi" else m["model"]
                 argv, _ = ateam.launch_argv(m, pathlib.Path("/Users/someone/.cache/a-team") / cfg.cache.name / f"{name}.md", resume)
                 self.assertLess(len(shlex.join([m["harness"], *argv]).encode("utf-8")), 900, name)
@@ -450,7 +456,7 @@ class UpTests(unittest.TestCase):
             self.assertTrue(next(t for n, t in later if n == "frontend-dev").startswith("# Team brief"))
             for name in ("lead-dev", "reviewer", "pm"):  # the others hear who joined, not the whole brief again
                 text = next(t for n, t in later if n == name)
-                self.assertTrue(text.startswith("[from @cto] Joined the team: @frontend-dev (frontend-dev, Claude Code"), text)
+                self.assertTrue(text.startswith("[from @operator] Joined the team: @frontend-dev (frontend-dev, Claude Code"), text)
             self.assertEqual(len(e.calls("tab", "create")), 1)  # the failed member's pane was reused
             self.assertEqual(len([p for p in e.fake_state()["panes"].values() if p["label"] == "frontend-dev"]), 1)
             e.run("brief", "--send", "pm")
@@ -598,25 +604,25 @@ class UpTests(unittest.TestCase):
                     "role": "backend-dev", "harness": "codex", "model": "gpt-6-luna",
                 } for i in range(2, number + 1)}}
                 e.write_brief(formation(members))
-                original_brief = (e.repo / "team-brief.md").read_bytes()
+                original_brief = (e.repo / "team.toml").read_bytes()
                 self.assertIn(f"started @{name}", e.run("up", name).stdout)
-                self.assertEqual((e.repo / "team-brief.md").read_bytes(), original_brief)
+                self.assertEqual((e.repo / "team.toml").read_bytes(), original_brief)
                 self.assertEqual(ateam.Config(e.repo).members["backend-dev"], original_settings)
                 self.assertEqual({k: e.pane_of("backend-dev")[k] for k in ("pane_id", "name", "label", "cwd")},
                                  {k: first[k] for k in ("pane_id", "name", "label", "cwd")})
                 self.assertEqual(original_prompt.read_text(), original_text)
-            self.assertEqual(e.calls("agent", "rename"), [["agent", "rename", "w1:p1", "cto"]])
+            self.assertEqual(e.calls("agent", "rename"), [["agent", "rename", "w1:p1", "operator"]])
             self.assertNotIn("backend-dev-1", ateam.Config(e.repo).members)
 
     def test_existing_member_settings_only_come_from_the_brief(self):
         with Env(git=True) as e:
-            original = (e.repo / "team-brief.md").read_bytes()
+            original = (e.repo / "team.toml").read_bytes()
             for args in (("--role", "reviewer"), ("--model", "gpt-6-luna"), ("--harness", "claude"),
                          ("--thinking", "low"), ("--worktree",), ("--team", "ui")):
                 p = e.run("up", "lead-dev", *args, check=False)
                 self.assertEqual(p.returncode, 2)
                 self.assertIn("unrecognized arguments", p.stderr)
-            self.assertEqual((e.repo / "team-brief.md").read_bytes(), original)
+            self.assertEqual((e.repo / "team.toml").read_bytes(), original)
             self.assertEqual(e.starts(), {})
 
     def test_up_and_continue_fail_when_brief_delivery_fails(self):
@@ -638,8 +644,8 @@ class UpTests(unittest.TestCase):
             e.run("say", "all", "--file", str(note))
             e.run("say", "@pm", "add a todo: ship it")
             sent = e.prompts()
-            self.assertIn(("lead-dev", "[from @cto] Priorities changed: ship the list view first.\n"), sent)
-            self.assertIn(("pm", "[from @cto] add a todo: ship it"), sent)
+            self.assertIn(("lead-dev", "[from @operator] Priorities changed: ship the list view first.\n"), sent)
+            self.assertIn(("pm", "[from @operator] add a todo: ship it"), sent)
             self.assertIn("not running: reviewer", e.run("say", "reviewer", "hi", check=False).stderr)
             e.update("pm", agent_status="blocked")  # herdr refuses a prompt to an agent waiting on an approval
             p = e.run("say", "all", "status?", check=False)
@@ -693,21 +699,21 @@ class WorktreeTests(unittest.TestCase):
         with Env(team_brief(self.BRIEF), git=True) as e:
             out = e.run("up", "backend-dev", "backend-dev-2", "frontend-dev", "reviewer").stdout
             trees = e.root / "repo.worktrees"
-            self.assertEqual(sorted(p.name for p in trees.iterdir()), ["a-team-backend-dev", "feature-login"])  # one is shared
+            self.assertEqual(sorted(p.name for p in trees.iterdir()), ["ada-backend-dev", "feature-login"])  # one is shared
             self.assertEqual(out.count("created worktree"), 2)
             branch = lambda d: subprocess.run([GIT, "-C", str(d), "rev-parse", "--abbrev-ref", "HEAD"],
                                               capture_output=True, text=True).stdout.strip()
-            self.assertEqual((branch(trees / "a-team-backend-dev"), branch(trees / "feature-login")),
-                             ("a-team/backend-dev", "feature/login"))
+            self.assertEqual((branch(trees / "ada-backend-dev"), branch(trees / "feature-login")),
+                             ("ada/backend-dev", "feature/login"))
             where = {n: e.pane_of(n)["cwd"] for n in ("backend-dev", "backend-dev-2", "frontend-dev", "reviewer")}
-            self.assertEqual(where, {"backend-dev": str(trees / "a-team-backend-dev"), "backend-dev-2": str(trees / "feature-login"),
+            self.assertEqual(where, {"backend-dev": str(trees / "ada-backend-dev"), "backend-dev-2": str(trees / "feature-login"),
                                      "frontend-dev": str(trees / "feature-login"), "reviewer": str(e.repo)})
             prompt = e.run("prompt", "backend-dev").stdout
-            self.assertIn("Commit your work on `a-team/backend-dev`", prompt)
+            self.assertIn("Commit your work on `ada/backend-dev`", prompt)
             self.assertIn("`git merge main`", prompt)
             self.assertIn("agree who commits it for you", prompt)
             self.assertNotIn("Never run `git commit`", prompt)
-            self.assertIn("Never run `git commit`", e.run("prompt", "reviewer").stdout)  # the lead owns commits in the shared checkout
+            self.assertIn("Never run `git commit`", e.run("prompt", "reviewer").stdout)  # the operator owns commits in the shared checkout
             brief = next(t for n, t in e.prompts() if n == "reviewer")
             self.assertIn("| branch `feature/login` in `" + str(trees / "feature-login") + "` |", brief)
             self.assertIn("`git diff main...<branch>`", brief)
@@ -720,7 +726,7 @@ class WorktreeTests(unittest.TestCase):
             "role": "reviewer", "harness": "codex", "model": "gpt-6-luna", "worktree": True,
         }}), git=True) as e:
             e.run("up", "reviewer-2", "--no-brief")  # the existing reviewer keeps its name
-            self.assertTrue((e.root / "repo.worktrees/a-team-reviewer-2").is_dir())
+            self.assertTrue((e.root / "repo.worktrees/ada-reviewer-2").is_dir())
             self.assertIs(ateam.Config(e.repo).members["reviewer-2"]["worktree"], True)
         with Env(team_brief(self.BRIEF)) as e:  # not a git repository
             p = e.run("up", "backend-dev", check=False)
@@ -746,7 +752,7 @@ class WorktreeTests(unittest.TestCase):
         for existing in ("directory", "wrong-branch"):
             with self.subTest(existing=existing), Env(git=True) as e:
                 e.write_brief(CATALOG.replace('[members.lead-dev]', '[members.lead-dev]\nworktree = true'))
-                target = e.root / "repo.worktrees/a-team-lead-dev"
+                target = e.root / "repo.worktrees/ada-lead-dev"
                 if existing == "directory":
                     target.mkdir(parents=True)
                 else:
@@ -756,6 +762,53 @@ class WorktreeTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
                 self.assertIn("worktree", result.stdout)
                 self.assertEqual(e.starts(), {})
+
+    def test_an_earlier_default_branch_is_not_silently_left_behind(self):
+        with Env(CATALOG.replace('[members.lead-dev]', '[members.lead-dev]\nworktree = "a-team/lead-dev"'), git=True) as e:
+            e.run("up", "lead-dev", "--no-brief")  # a checkout from before branches carried the user's name
+            e.kill("lead-dev")
+            e.write_brief(CATALOG.replace('[members.lead-dev]', '[members.lead-dev]\nworktree = true'))
+            p = e.run("continue", "lead-dev", check=False)
+            self.assertEqual(p.returncode, 2)
+            self.assertIn("earlier worktree on branch a-team/lead-dev", p.stdout)
+            self.assertIn('worktree = "a-team/lead-dev"', p.stdout)
+            self.assertEqual(len(e.calls("agent", "start")), 1)  # nothing was started in a fresh checkout
+
+    def test_branch_names_git_rejects_fail_the_check(self):
+        team = ('[members.reviewer]\nharness = "codex"\nmodel = "gpt-6-luna"\n'
+                '[members.lead-dev]\nharness = "codex"\nmodel = "gpt-6-luna"\nworktree = {}\n')
+        cases = [(f'user = "{u}"\n', "true") for u in (".ada", "ada..x", "ada.lock", "-ada")] + [("", '"feature//x"'), ("", '"x.lock"')]
+        for settings, worktree in cases:
+            with self.subTest(settings=settings, worktree=worktree), Env(team_brief(settings + team.format(worktree)), git=True) as e:
+                for command in ("check", "up"):
+                    p = e.run(command, check=False)
+                    self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+                    self.assertIn("is not a branch name git accepts", p.stdout)
+                    self.assertIn("Change `user`, or this member's `worktree`", p.stdout)
+                self.assertEqual(e.starts(), {})  # the reviewer, checked first, was not started either
+        with Env(team_brief(team.format("true")), git=True) as e:  # a running member is not closed for a bad restart
+            e.run("up", "--no-brief")
+            pane = e.pane_of("lead-dev")["pane_id"]
+            e.write_brief(team_brief('user = ".ada"\n' + team.format("true")))
+            p = e.run("continue", "lead-dev", "--restart", check=False)
+            self.assertEqual(p.returncode, 2)
+            self.assertEqual(e.calls("pane", "close"), [])
+            self.assertEqual(e.pane_of("lead-dev")["pane_id"], pane)
+
+    def test_the_earlier_branch_guard_leaves_deliberate_choices_alone(self):
+        old = CATALOG.replace('[members.lead-dev]', '[members.lead-dev]\nworktree = "a-team/lead-dev"')
+        with Env(old, git=True) as e:
+            e.run("up", "lead-dev", "--no-brief")  # a checkout from before branches carried the user's name
+            e.kill("lead-dev")
+            e.write_brief(CATALOG.replace('[members.lead-dev]', '[members.lead-dev]\nworktree = "feature/explicit-next"'))
+            self.assertIn("ok", e.run("check", "lead-dev").stdout)  # an explicit branch is a decision, not a migration
+            e.write_brief(CATALOG.replace('[members.lead-dev]', '[members.lead-dev]\nworktree = "ada/lead-dev"'))
+            self.assertIn("ok", e.run("check", "lead-dev").stdout)  # ... also when it is spelled like the default
+            e.write_brief(CATALOG.replace('[members.lead-dev]', '[members.lead-dev]\nworktree = true'))
+            self.assertEqual(e.run("check", "lead-dev", check=False).returncode, 2)  # the implicit default is guarded
+            subprocess.run([GIT, "-C", str(e.repo), "branch", "ada/lead-dev"], check=True, capture_output=True)
+            e.write_brief(CATALOG.replace('[members.lead-dev]', '[members.lead-dev]\nworktree = true'))
+            self.assertIn("ok", e.run("check", "lead-dev").stdout)  # the new default branch already exists
 
     def test_continue_moves_member_to_newly_configured_worktree(self):
         with Env(git=True) as e:
@@ -767,7 +820,7 @@ class WorktreeTests(unittest.TestCase):
             e.run("continue", "lead-dev")
             current = e.pane_of("lead-dev")
             self.assertNotEqual(current["pane_id"], old_id)
-            self.assertEqual(current["cwd"], str(e.root / "repo.worktrees/a-team-lead-dev"))
+            self.assertEqual(current["cwd"], str(e.root / "repo.worktrees/ada-lead-dev"))
             self.assertIsNone(e.fake_state()["panes"][old_id]["label"])
             self.assertEqual(native(e.starts()["lead-dev"])[:2], ["resume", "saved-codex"])
             # Codex restores its saved tool cwd unless explicitly overridden, even in a new pane.
@@ -858,7 +911,7 @@ class WaitTests(unittest.TestCase):
         with Env() as e:
             e.run("up", "lead-dev", "--no-brief")
             e.update("lead-dev", agent_status="working")
-            for name in ("reviewer", "cto"):
+            for name in ("reviewer", "operator"):
                 result = e.run("wait", "lead-dev", name, "--timeout", "0.2", "--interval", "0.01", check=False)
                 self.assertEqual(result.returncode, 1)
                 self.assertIn(f"not started: {name}", result.stderr)
@@ -887,7 +940,7 @@ class ContinueTests(unittest.TestCase):
             e.set_session("frontend-dev", {"source": "herdr:claude", "agent": "claude", "kind": "id", "value": "cl-1"})
             e.set_session("pm", {"source": "herdr:pi", "agent": "pi", "kind": "path", "value": "/s/2026_pi-1.jsonl"})
             self.assertIn("every member is running", e.run("continue").stdout)  # named, running members are left alone
-            self.assertEqual(e.calls("agent", "rename"), [["agent", "rename", "w1:p1", "cto"]])
+            self.assertEqual(e.calls("agent", "rename"), [["agent", "rename", "w1:p1", "operator"]])
             e.kill("lead-dev", "frontend-dev", "pm")
             panes_before = {n: e.pane_of(n)["pane_id"] for n in ("lead-dev", "frontend-dev", "pm")}
             # The brief changed while they were gone: lead-dev moves to Luna.
@@ -909,8 +962,8 @@ class ContinueTests(unittest.TestCase):
             self.assertEqual(sorted(n for n, _ in sent), ["frontend-dev", "lead-dev", "pm"])  # one message each
             for _, text in sent:
                 self.assertIn("picking up where we left off", text)
-                self.assertIn("herdr agent prompt cto", text)
-                self.assertIn("A reply in your own pane does not reach @cto", text)
+                self.assertIn("herdr agent prompt operator", text)
+                self.assertIn("A reply in your own pane does not reach @operator", text)
                 self.assertIn("# Team brief", text)
                 self.assertNotIn("No reply needed", text)
 
@@ -924,7 +977,7 @@ class ContinueTests(unittest.TestCase):
             e.run("up", "--no-brief")
             old = e.pane_of("lead-dev")["pane_id"]
             others = {n: {k: v for k, v in e.pane_of(n).items() if k != "rect"}
-                      for n in ("cto", "reviewer", "frontend-dev", "pm")}
+                      for n in ("operator", "reviewer", "frontend-dev", "pm")}
             e.set_session("lead-dev", {"agent": "codex", "kind": "id", "value": "restart-session"})
             e.write_brief(UI.replace('model = "gpt-6-astra"', 'model = "missing-model"'))
             failed = e.run("continue", "lead-dev", "--restart", check=False)
@@ -943,7 +996,7 @@ class ContinueTests(unittest.TestCase):
             self.assertNotIn(old, e.fake_state()["panes"])
             self.assertNotEqual(e.pane_of("lead-dev")["pane_id"], old)
             self.assertEqual([n for n, _ in e.prompts()[before:]], ["lead-dev"])
-            self.assertIn("herdr agent prompt cto", e.prompts()[-1][1])
+            self.assertIn("herdr agent prompt operator", e.prompts()[-1][1])
             self.assertEqual({n: {k: v for k, v in e.pane_of(n).items() if k != "rect"} for n in others}, others)
             e.run("continue", "lead-dev", "--fresh", "--restart")
             self.assertNotIn("resume", native(e.starts()["lead-dev"]))
@@ -1011,7 +1064,9 @@ class ConfigTests(unittest.TestCase):
                 self.assertIn(p["harness"], ateam.HARNESSES, name)
                 self.assertIn(p["model"], ateam.TABLE[p["harness"]]["models"], name)  # the template uses recommended models
                 self.assertEqual(p["permissions"], "full")
-            self.assertEqual(cfg.tracker, "TODO.md at the repo root")
+            self.assertEqual(cfg.operator["name"], "operator")
+            self.assertIn("tracked in `TODO.md`", cfg.body)  # where tasks live is prose in TEAM.md, not a setting
+            self.assertNotIn("tracker", cfg.team)
             self.assertEqual(list(cfg.members), ["lead-dev", "reviewer", "pm"])
             self.assertEqual(cfg.members["lead-dev"]["model"], "gpt-6-astra")
             self.assertEqual(cfg.members["reviewer"]["model"], "gpt-6-luna")
@@ -1022,22 +1077,28 @@ class ConfigTests(unittest.TestCase):
             self.assertIn(t["prompt"], ("file", "pointer", "message"), h)
             self.assertIn(h, ateam.CODE)
 
-    def test_orchestrator_table_and_name(self):
+    def test_operator_table_and_name(self):
         team = '[members.lead-dev]\nharness = "codex"\nmodel = "gpt-6-luna"\n'
-        with Env(team_brief('[orchestrator]\nname = "boss"\nharness = "claude"\n' + team, "## Workflow\n\n1. {lead} hands out work.\n")) as e:
+        stock = (ateam.SKILL / "templates/TEAM.md").read_text()  # the shared brief people really get
+        with Env(team_brief('[operator]\nname = "boss"\nharness = "claude"\n' + team, stock)) as e:
             e.run("up")
-            lead = e.fake_state()["panes"]["w1:p1"]
-            self.assertEqual((lead["name"], lead["label"]), ("boss", "boss"))  # its @name, pane label and agent name
-            self.assertRegex(e.run("status").stdout, r"@boss +orchestrator")
+            pane = e.fake_state()["panes"]["w1:p1"]
+            self.assertEqual((pane["name"], pane["label"]), ("boss", "boss"))  # its @name, pane label and agent name
+            self.assertRegex(e.run("status").stdout, r"@boss +operator")
             brief = dict(e.prompts())["lead-dev"]
             self.assertIn("# Team brief (from @boss)", brief)
-            self.assertIn("1. @boss hands out work.", brief)
+            self.assertIn("1. The operator assigns tasks", brief)  # the shared brief names the role ...
+            self.assertNotIn("@operator", brief)                   # ... never one person's operator
+            e.write_brief(team_brief(team, "## Workflow\n\n{operator} and {name} stay as written.\n"))
+            self.assertIn("{operator} and {name} stay as written.", e.run("brief").stdout)  # TEAM.md is sent as it is
+            e.write_brief(team_brief('[operator]\nname = "boss"\nharness = "claude"\n' + team, stock))
             prompt = e.run("prompt", "lead-dev").stdout
-            self.assertIn("the orchestrator (@boss)", prompt)  # roles and the member prompt follow the name
-            self.assertNotIn("@cto", prompt)
-            for settings, why in (('[lead]\nname = "boss"\n', "rename [lead] to [orchestrator]"),
-                                  ('[orchestrator]\nname = "Boss!"\n', "[orchestrator] name 'Boss!' must be"),
-                                  ('[orchestrator]\nname = "lead-dev"\n', "not a member's name")):
+            self.assertIn("led by its operator, @boss", prompt)  # roles and the member prompt follow the name
+            self.assertNotIn("@operator", prompt)
+            for settings, why in (('[lead]\nname = "boss"\n', "rename [lead] to [operator]"),
+                                  ('[orchestrator]\nname = "boss"\n', "rename [orchestrator] to [operator]"),
+                                  ('[operator]\nname = "Boss!"\n', "[operator] name 'Boss!' must be"),
+                                  ('[operator]\nname = "lead-dev"\n', "not a member's name")):
                 e.write_brief(team_brief(settings + team))
                 result = e.run("check", check=False)
                 self.assertEqual(result.returncode, 1, settings)
@@ -1049,12 +1110,56 @@ class ConfigTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("harness", result.stderr + result.stdout)
 
-    def test_no_tracker(self):
-        with Env(formation({
-            'pm': {'harness': 'claude'},
-        })) as e:
-            self.assertIsNone(ateam.Config(e.repo).tracker)
-            self.assertNotIn("tracker", e.run("prompt", "pm").stdout.split("## Talking to the team")[1])
+    def test_brief_and_formation_are_two_files(self):
+        team = '[members.lead-dev]\nharness = "codex"\nmodel = "gpt-6-luna"\nworktree = true\n'
+        with Env(team_brief(team, "# Team\n\n<!-- for the editor -->\n## Tasks\n\nGitHub Issues on o/r, with `gh issue`.\n"), git=True) as e:
+            sent = e.run("brief").stdout
+            self.assertIn("GitHub Issues on o/r", sent)       # TEAM.md is the prose of the brief ...
+            self.assertNotIn("\n# Team\n", sent)              # ... without its own title
+            self.assertNotIn("for the editor", sent)           # ... and without its comments
+            self.assertIn("branch `ada/lead-dev`", sent)       # worktree branches start with the user's name
+            self.assertIn("The team brief says where tasks are tracked", e.run("prompt", "lead-dev").stdout)
+            e.write_brief(team_brief('user = "peter"\n' + team))
+            self.assertEqual(ateam.plan(ateam.Config(e.repo), "lead-dev")["branch"], "peter/lead-dev")
+            e.write_brief(team_brief(team))  # a VM or CI user name that someone else's machine may share: a note, not a failure
+            generic = e.run("check", LOGNAME="root")
+            self.assertIn("note: worktree branches will start with 'root'", generic.stderr)
+            self.assertIn("Set `user` in team.toml", generic.stderr)
+            self.assertNotIn("note:", e.run("check").stderr)               # an ordinary system user name
+            e.write_brief(team_brief('user = "root"\n' + team))
+            self.assertNotIn("note:", e.run("check", LOGNAME="root").stderr)  # chosen in team.toml
+            e.write_brief(team_brief(team.replace("worktree = true\n", "")))
+            self.assertNotIn("note:", e.run("check", LOGNAME="root").stderr)  # no branch depends on it
+            e.write_brief(team_brief('user = "a b"\n' + team))
+            self.assertIn("set `user`", e.run("check", check=False).stderr)
+            (e.repo / "team.toml").unlink()                    # a teammate's clone: the brief is there, the formation is not
+            p = e.run("check", check=False)
+            self.assertEqual(p.returncode, 1)
+            self.assertIn("no team.toml in", p.stderr)
+            self.assertIn("ateam.py init", p.stderr)
+
+    def test_an_old_single_file_brief_is_never_replaced_by_defaults(self):
+        old = '+++\npermissions = "guarded"\n[lead]\nname = "boss"\n[members.reviewer]\nharness = "codex"\n+++\n## Project\n\nOurs.\n'
+        for present in ((), ("TEAM.md",), ("team.toml",)):  # only the old file, and two half-done migrations
+            with self.subTest(present=present), Env(brief=None) as e:
+                (e.repo / "team-brief.md").write_text(old)
+                for name in present:
+                    (e.repo / name).write_text("# Team\n" if name == "TEAM.md" else '[members.pm]\nharness = "pi"\n')
+                before = sorted(p.name for p in e.repo.iterdir())
+                for command in (["check"], ["init"], ["up"]):
+                    for cwd in (e.repo, e.repo / "sub"):  # also found from a subdirectory
+                        p = e.run(*command, check=False, cwd=cwd)
+                        self.assertEqual(p.returncode, 1, command)
+                        self.assertIn("team-brief.md is the single-file brief of earlier versions; nothing was written", p.stderr)
+                        self.assertIn("rename [lead] or [orchestrator] to [operator] and remove `tracker`", p.stderr)
+                self.assertEqual(sorted(p.name for p in e.repo.iterdir()), before)  # nothing was written
+                self.assertEqual((e.repo / "team-brief.md").read_text(), old)
+                self.assertEqual(e.starts(), {})
+        with Env(team_brief('[members.pm]\nharness = "pi"\nmodel = "z-ai/glm-5.3"\n')) as e:  # migrated, old file left behind
+            (e.repo / "team-brief.md").write_text(old)
+            p = e.run("check")
+            self.assertIn("team-brief.md is no longer read", p.stderr)
+            self.assertIn("Delete it", p.stderr)
 
     def test_brief_validation(self):
         cases = [
@@ -1062,8 +1167,7 @@ class ConfigTests(unittest.TestCase):
             (team_brief('[members.Bad]\nharness = "claude"\nrole = "pm"'), "role"),
             (team_brief('[members.pm]\nharness = "claude"\n[teams]\ndefault = ["pm", "ghost"]'), "[teams] is no longer used"),
             (formation({"backend-dev-" + "2" * 25: {"role": "backend-dev", "harness": "codex"}}), "member"),
-            ("no front matter\n", "must start with a +++ line"),
-            ("+++\ntracker = 'x'\n", "no closing +++"),
+            (team_brief("members = [unclosed"), "team.toml:"),
             (team_brief('[members.dev]\nrole = "backend-dev"\nharness = "codex"'), "role"),
         ]
         for brief, error in cases:
@@ -1077,12 +1181,46 @@ class ConfigTests(unittest.TestCase):
         })) as e:
             self.assertIn("@backend-dev-2", e.run("check", "backend-dev", "backend-dev-2").stdout)
 
+    @unittest.skipUnless(GIT, "git is not installed")
     def test_init(self):
         with Env(brief=None) as e:
-            e.run("init", cwd=e.repo / "sub")
-            self.assertEqual((e.repo / "sub/team-brief.md").read_text(), TEMPLATE)  # no git: where you are
-            self.assertIn("exists", e.run("init", cwd=e.repo / "sub", check=False).stderr)
-            e.run("init", "--force", cwd=e.repo / "sub")
+            (e.root / "bin/git").symlink_to(GIT)
+            subprocess.run([GIT, "init", "-q", str(e.repo)], check=True, capture_output=True)
+            out = e.run("init", cwd=e.repo / "sub").stdout     # in a repository: at its root
+            self.assertEqual(sorted(p.name for p in e.repo.iterdir() if p.name != ".git"),
+                             [".gitignore", "TEAM.md", "sub", "team.toml", "team.toml.sample"])
+            self.assertEqual((e.repo / "team.toml").read_text(), (ateam.SKILL / "templates/team.toml").read_text())
+            self.assertEqual((e.repo / ".gitignore").read_text(), "team.toml\n")
+            self.assertEqual(out.count("wrote"), 3)
+            e.run("check", "lead-dev")                         # what init writes is a team that checks
+            # a teammate: the shared files are there, edited; only their own team.toml is missing
+            (e.repo / "team.toml.sample").write_text('[members.pm]\nharness = "pi"\nmodel = "z-ai/glm-5.3"\n')
+            (e.repo / "TEAM.md").write_text("# Team\n\nOurs.\n")
+            (e.repo / "team.toml").unlink()
+            out = e.run("init").stdout
+            self.assertEqual((out.count("kept"), out.count("wrote")), (2, 1))
+            self.assertEqual(list(ateam.Config(e.repo).members), ["pm"])        # copied from the project's sample
+            self.assertEqual((e.repo / "TEAM.md").read_text(), "# Team\n\nOurs.\n")
+            self.assertEqual((e.repo / ".gitignore").read_text(), "team.toml\n")  # listed once
+            self.assertEqual(e.run("init").stdout.count("wrote"), 0)             # nothing is ever replaced
+            self.assertNotIn("sets user", out)
+            # the project's sample names a user: whose branches these are is said, not guessed
+            (e.repo / "team.toml.sample").write_text('user = "peter"\n[members.pm]\nharness = "pi"\nmodel = "z-ai/glm-5.3"\n')
+            (e.repo / "team.toml").unlink()
+            out = e.run("init", LOGNAME="jane").stdout
+            self.assertIn("team.toml.sample sets user = 'peter'", out)
+            self.assertIn("change `user` in team.toml", out)
+            # a later negation undoes the ignore line: what git really does decides
+            (e.repo / ".gitignore").write_text("team.toml\n!team.toml\n")
+            self.assertIn("added team.toml", e.run("init").stdout)
+            self.assertEqual((e.repo / ".gitignore").read_text(), "team.toml\n!team.toml\nteam.toml\n")
+            self.assertNotIn("added team.toml", e.run("init").stdout)
+            self.assertNotIn("already tracks", e.run("init").stdout)
+            subprocess.run([GIT, "-C", str(e.repo), "add", "-f", "team.toml"], check=True, capture_output=True)
+            self.assertIn("git already tracks team.toml", e.run("init").stdout)  # ignoring it does not untrack it
+        with Env(brief=None) as e:
+            e.run("init", cwd=e.repo / "sub")                  # no repository: where you are
+            self.assertTrue((e.repo / "sub/team.toml").is_file())
 
     def test_brief_preview_and_member_prompt(self):
         with Env() as e:
@@ -1096,7 +1234,7 @@ class ConfigTests(unittest.TestCase):
             self.assertIn("## Reports", prompt)
             self.assertNotIn("{instructions}", prompt)
             self.assertIn("reviewer.md", prompt)
-            self.assertNotIn("{lead}", prompt)
+            self.assertNotIn("{operator}", prompt)
 
     def test_every_role_has_the_same_four_parts(self):
         for path in sorted((ateam.SKILL / "roles").glob("*.md")):

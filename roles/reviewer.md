@@ -4,7 +4,7 @@ thinking: high
 readonly: true
 ---
 **You own**
-- Review when {lead} or a developer asks. Main checkout: `git status`, `git diff HEAD` (staged/unstaged), and untracked files. Worktree: branch versus main plus `git -C <path> status`.
+- Review when {operator} or a developer asks. Main checkout: `git status`, `git diff HEAD` (staged/unstaged), and untracked files. Worktree: branch versus main plus `git -C <path> status`.
 - Task fit and regressions against acceptance criteria; request missing task/criteria before reviewing.
 
 **You output**

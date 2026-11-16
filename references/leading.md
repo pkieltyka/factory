@@ -1,6 +1,6 @@
 # Orchestrating the team
 
-Read after compaction and before assigning work. Follow the brief's workflow; you own scope, architecture and final integration.
+Read after compaction and before assigning work. Follow the workflow in `TEAM.md`; you own scope, architecture and final integration.
 
 ## Assign and coordinate
 
@@ -13,7 +13,7 @@ Read after compaction and before assigning work. Follow the brief's workflow; yo
 ```bash
 ateam.py say lead-dev "<goal, constraints, acceptance criteria>"
 ateam.py say all --file /tmp/update.md
-herdr agent prompt lead-dev '[from @cto] ...'   # standalone; never --wait
+herdr agent prompt lead-dev '[from @operator] ...'   # standalone; never --wait
 ateam.py wait                                 # run in the background
 ```
 
@@ -21,7 +21,7 @@ ateam.py wait                                 # run in the background
 
 Members send reports by herdr message; local final replies are not delivered. Check the reported tests before accepting work. Failed sends remain pending: inspect the recipient's pane, resolve the cause and resend.
 
-`ateam.py status` lists every member of the brief, including those not started. Settings shown come from the brief. Read a stopped member with `herdr agent read <name> --source recent-unwrapped --lines 80`; for a blocked member use `--source visible`.
+`ateam.py status` lists every member in `team.toml`, including those not started. Settings shown come from it. Read a stopped member with `herdr agent read <name> --source recent-unwrapped --lines 80`; for a blocked member use `--source visible`.
 
 | Status or watcher result | Action |
 |---|---|
@@ -46,6 +46,6 @@ With names, `wait <names>` watches only those members; without names it watches 
 
 ## Keep state current
 
-When a decision changes scope, ownership, commit rules or settings, update the brief at that moment; do not leave the decision only in chat. Run `ateam.py check`, then `ateam.py brief --send <affected names>` to notify only affected members. Keep orchestrator model/thinking accurate. Restart members for changed launch settings as in [cmd_continue.md](cmd_continue.md). For an unrelated task or important review, `ateam.py continue <name> --fresh --restart` starts a fresh session.
+When a decision changes scope, ownership, commit rules or settings, write it down at that moment; do not leave it only in chat. What the whole project follows goes in `TEAM.md` (through the repo's normal review when other people share it); your own formation and settings go in `team.toml`. Run `ateam.py check`, then `ateam.py brief --send <affected names>` to notify only affected members. Keep operator model/thinking accurate. Restart members for changed launch settings as in [cmd_continue.md](cmd_continue.md). For an unrelated task or important review, `ateam.py continue <name> --fresh --restart` starts a fresh session.
 
 Keep the team small. Roles marked read-only are constrained by instructions, not enforced permissions. Do not close or relabel panes/tabs unless authorized; a-team locates members by their labels. Usage accounting belongs to each harness, not a-team.
