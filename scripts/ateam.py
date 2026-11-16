@@ -118,6 +118,10 @@ class Config:
         if "teams" in self.team:  # from before: starting "every member" would start a whole catalog
             raise SystemExit(f"{self.conf_file}: [teams] is no longer used. The members in {CONF} are the team:"
                              " remove [teams] and the members you do not want.")
+        unknown = self.team.keys() - {"user", "permissions", "worktree_dir", "operator", "members"}
+        if unknown:
+            raise SystemExit(f"{self.conf_file}: unknown top-level key(s): {sorted(unknown)};"
+                             " operator fields belong under [operator].")
         for name, m in self.members.items():
             role = m.get("role", name)
             if role not in self.roles:

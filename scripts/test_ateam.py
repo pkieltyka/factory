@@ -337,7 +337,7 @@ def kind(call):
 
 class UpTests(unittest.TestCase):
     def test_ui_team_launches_in_the_team_tab_and_is_briefed(self):
-        with Env(UI.replace("+++\n", '+++\n[tabs]\nteam = "crew"\n', 1)) as e:  # [tabs] is ignored: labels are fixed
+        with Env(UI) as e:
             self.assertEqual(ateam.Config(e.repo).operator["name"], "operator")  # the default name
             e.run("up", cwd=e.repo / "sub")  # the team's files are found from a subdirectory too
             fs = e.fake_state()
@@ -1104,6 +1104,16 @@ class ConfigTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 1, settings)
                 self.assertIn(why, result.stderr)
 
+    def test_unknown_top_level_keys_fail(self):
+        for key in ("name", "harness", "model", "thinking", "notes", "typo"):
+            brief = CATALOG.replace("+++\n", f'+++\n{key} = "misplaced"\n', 1)
+            with self.subTest(key=key), Env(brief) as e:
+                for command in ("check", "brief"):
+                    result = e.run(command, check=False)
+                    self.assertEqual(result.returncode, 1, command)
+                    self.assertIn(f"{e.repo / 'team.toml'}: unknown top-level key(s): ['{key}']", result.stderr)
+                    self.assertIn("operator fields belong under [operator]", result.stderr)
+
     def test_member_requires_explicit_harness(self):
         with Env('+++\n[members.lead-dev]\nmodel = "gpt-6-luna"\n+++\n') as e:
             result = e.run("check", "lead-dev", check=False)
@@ -1166,6 +1176,7 @@ class ConfigTests(unittest.TestCase):
             (team_brief('[members.wizard]\nharness = "claude"'), "no role 'wizard'"),
             (team_brief('[members.Bad]\nharness = "claude"\nrole = "pm"'), "role"),
             (team_brief('[members.pm]\nharness = "claude"\n[teams]\ndefault = ["pm", "ghost"]'), "[teams] is no longer used"),
+            (team_brief('[tabs]\nteam = "crew"'), "unknown top-level key(s): ['tabs']"),
             (formation({"backend-dev-" + "2" * 25: {"role": "backend-dev", "harness": "codex"}}), "member"),
             (team_brief("members = [unclosed"), "team.toml:"),
             (team_brief('[members.dev]\nrole = "backend-dev"\nharness = "codex"'), "role"),
@@ -1235,6 +1246,19 @@ class ConfigTests(unittest.TestCase):
             self.assertNotIn("{instructions}", prompt)
             self.assertIn("reviewer.md", prompt)
             self.assertNotIn("{operator}", prompt)
+
+    def test_brief_operator_details_and_fallbacks(self):
+        operator = {"harness": "claude", "model": "claude-opus-5-5", "thinking": "medium"}
+        agent = "Claude Code, claude-opus-5-5, medium"
+        notes = "Decides scope and architecture."
+        for brief, expected in (
+            (formation(CATALOG_MEMBERS, operator={**operator, "notes": notes}), f"{agent} | {notes}"),
+            (formation(CATALOG_MEMBERS, operator=operator), f"{agent} | Operator."),
+            (formation(CATALOG_MEMBERS, operator={**operator, "notes": ""}), f"{agent} | Operator."),
+            (CATALOG, " | Operator."),
+        ):
+            with self.subTest(expected=expected), Env(brief) as e:
+                self.assertIn(f"| **@operator** | {expected} |", e.run("brief").stdout)
 
     def test_every_role_has_the_same_four_parts(self):
         for path in sorted((ateam.SKILL / "roles").glob("*.md")):
