@@ -32,7 +32,7 @@ thinking = "high"
 [members.pm]
 harness = "pi"
 model = "deepseek/deepseek-v4.1-flash"
-thinking = "low"
+thinking = "high"
 
 # Uncomment for a UI project.
 # [members.frontend-dev]

@@ -1,6 +1,6 @@
 ---
 description: Keeps tasks, bugs and decisions current and checks them against Git.
-thinking: low
+thinking: high
 readonly: false
 ---
 **You own**
