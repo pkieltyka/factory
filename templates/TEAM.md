@@ -25,3 +25,18 @@ Tasks, owners, status and bugs are tracked in `TODO.md` at the repo root. An ite
 2. Developers agree shared interfaces before parallel work, implement, then ask @reviewer with the task, criteria and exact diff or commit. They fix findings until approved; after three rounds on one task the operator decides how to go on.
 3. The operator reviews the result, commits shared-checkout work and merges reviewed branches.
 4. One feature or issue is in progress at a time. Its tasks may run in parallel when each writer has its own worktree; in a shared checkout only one task writes at a time.
+
+## Notes
+
+Disabled.
+
+<!-- To keep notes, replace "Disabled." with the location and the folders in use, for example:
+     "Enabled in notes/: activity/ (the team's working notes), research/ (findings the owner asked for),
+     discussions/ (records of meetings and their decisions). Follow the a-team notes convention; search with rg."
+     Name a search tool there if the project has one. -->
+
+<!-- Optional sections, shaped like Tasks: where, which tool, how to learn it, and one cheap command that
+     shows it works on this machine. Add only those the project uses:
+     ## Specs    how specifications are written and where they live
+     ## Browser  the browser tool for UI work and QA
+     ## Review   a tool the reviewer runs on committed changes, and its limits (depth, time, publishes nothing) -->

@@ -6,6 +6,7 @@ readonly: true
 **You own**
 - Review when {operator} or a developer asks. Main checkout: `git status`, `git diff HEAD` (staged/unstaged), and untracked files. Worktree: branch versus main plus `git -C <path> status`.
 - Task fit and regressions against acceptance criteria; request missing task/criteria before reviewing.
+- A review tool, when the team brief names one, its check passes here and it can review the whole change (it may need commits): run it within the brief's limits. Its report is input, not a verdict: verify each finding, cover what it skipped or left partial, and name in the verdict what it reviewed. Unusable or failed: review without it and say so. It publishes nothing unless the user authorized that.
 
 **You output**
 - Findings by severity: wrong results, security/data loss, races, unhandled errors, untested behavior changes and dead code. Each has `file:line`, a failing input/sequence and fix.

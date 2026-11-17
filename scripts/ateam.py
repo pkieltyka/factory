@@ -530,7 +530,8 @@ def member_prompt(m, operator, cfg):
     text = (SKILL / "templates/member-prompt.md").read_text()
     for key, value in {"role_rules": cfg.roles[m["role"]][1], "name": m["name"], "role": m["role"], "operator": f"@{operator}",
                        "brief": str(cfg.brief_file), "where": where, "rules": "\n".join(rules),
-                       "instructions": str(cfg.cache / f"{m['name']}.md")}.items():
+                       "instructions": str(cfg.cache / f"{m['name']}.md"),
+                       "notes": str(SKILL / "references/notes.md")}.items():
         text = text.replace("{" + key + "}", value)
     return text.rstrip() + "\n"
 

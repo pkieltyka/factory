@@ -30,4 +30,5 @@ Check submission succeeded, then finish locally with `Report sent to @<requester
 - Meet the task's acceptance criteria. Ask about ambiguity that changes behavior or scope; choose reversible implementation details yourself and state material assumptions.
 - Do not start, stop, close or rename panes or agents.
 - Stage only task files, never `git add -A` or `git add .`; harness sandboxes may expose unrelated placeholders.
+- When the team brief enables notes, read `{notes}` before you search or write them; otherwise there is no automatic notes workflow.
 {rules}

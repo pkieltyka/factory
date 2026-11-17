@@ -1332,6 +1332,8 @@ class ConfigTests(unittest.TestCase):
             self.assertIn("build and run", prompt)  # read-only permits builds/tests
             self.assertIn("## Reports", prompt)
             self.assertNotIn("{instructions}", prompt)
+            self.assertIn(f"read `{ateam.SKILL / 'references/notes.md'}` before you search or write them", prompt)
+            self.assertTrue((ateam.SKILL / "references/notes.md").is_file())  # the pointer leads somewhere
             self.assertIn("reviewer.md", prompt)
             self.assertNotIn("{operator}", prompt)
 
