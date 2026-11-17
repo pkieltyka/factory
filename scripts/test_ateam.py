@@ -663,6 +663,9 @@ class UpTests(unittest.TestCase):
                 self.assertNotIn("Traceback", missing.stderr)
             status = e.run("status").stdout
             self.assertEqual(status.count("not started"), len(CATALOG_MEMBERS) + 1)
+            self.assertIn("No member of team.toml has a pane in this herdr session. "
+                          "A team that ran before: `ateam.py continue`. "
+                          "A new team: `ateam.py check`, then `ateam.py up`.", status)
             for command in ("cost", "show"):
                 self.assertEqual(e.run(command, check=False).returncode, 2)
             for option in ("--dry-run", "--trust-models", "--effort"):
@@ -933,6 +936,86 @@ class WaitTests(unittest.TestCase):
 
 
 class ContinueTests(unittest.TestCase):
+    def test_no_member_panes_and_no_cache_starts_the_whole_team_fresh(self):
+        with Env(UI) as e:
+            self.assertEqual(list((e.root / "cache/a-team").glob("*/sessions.jsonl")), [])
+            out = e.run("continue").stdout
+            self.assertIn("no member panes in this herdr session: continuing every member in team.toml", out)
+            self.assertEqual(set(e.starts()), {"lead-dev", "frontend-dev", "reviewer", "pm"})
+            for call in e.starts().values():
+                self.assertTrue({"resume", "--resume", "--session"}.isdisjoint(native(call)))
+            tabs = e.calls("tab", "create")
+            self.assertEqual(len(tabs), 1)
+            self.assertEqual(flag(tabs[0], "--label"), "a-team workers")
+            self.assertIn(["tab", "rename", "w1:t1", "a-team operator"], e.calls("tab", "rename"))
+            self.assertEqual(len(e.prompts()), 4)
+            for _, text in e.prompts():
+                self.assertIn("starting in a new session", text)
+                self.assertIn("do not start anything yet", text)
+                self.assertIn("No reply needed", text)
+                self.assertNotIn("picking up where we left off", text)
+            self.assertIn("fresh sessions, no earlier context: @lead-dev, @frontend-dev, @reviewer, @pm. "
+                          "Send each its task, criteria and the evidence so far.", out)
+
+    def test_no_member_panes_resumes_noted_sessions(self):
+        with Env(UI) as e:
+            e.run("up", "--no-brief")
+            e.set_session("lead-dev", {"agent": "codex", "kind": "id", "value": "cx-1"})
+            e.set_session("pm", {"agent": "pi", "kind": "path", "value": "/s/p.jsonl"})
+            e.run("status")
+            e.close("lead-dev", "frontend-dev", "reviewer", "pm")
+            out = e.run("continue").stdout
+            self.assertEqual(len(e.calls("agent", "start")), 8)
+            by = {n: native(c) for n, c in e.starts().items()}
+            self.assertEqual(by["lead-dev"][:2], ["resume", "cx-1"])
+            self.assertEqual(flag(by["pm"], "--session"), "/s/p.jsonl")
+            for name in ("frontend-dev", "reviewer"):
+                self.assertTrue({"resume", "--resume", "--session"}.isdisjoint(by[name]))
+            sent = dict(e.prompts())
+            self.assertEqual(len(sent), 4)
+            for name in ("lead-dev", "pm"):
+                self.assertIn("picking up where we left off", sent[name])
+                self.assertNotIn("No reply needed", sent[name])
+            for name in ("frontend-dev", "reviewer"):
+                self.assertIn("starting in a new session", sent[name])
+            self.assertIn("fresh sessions, no earlier context: @frontend-dev, @reviewer. Send each", out)
+
+    def test_some_panes_gone_continues_only_members_with_panes(self):
+        with Env(UI) as e:
+            e.run("up", "--no-brief")
+            e.kill("lead-dev")
+            e.close("reviewer")
+            out = e.run("continue").stdout
+            self.assertEqual([c[2] for c in e.calls("agent", "start")[4:]], ["lead-dev"])
+            self.assertIn("no pane, not continued: @reviewer. To bring them back: ateam.py continue reviewer", out)
+            self.assertNotIn("no member panes", out)
+            self.assertEqual(len(e.calls("tab", "rename")), 1)  # only up labels the operator's tab
+            sent = dict(e.prompts())
+            self.assertEqual(set(sent), {"lead-dev", "frontend-dev", "pm"})
+            for name in ("frontend-dev", "pm"):
+                self.assertIn("picking up where we left off", sent[name])
+
+    def test_continue_without_members_says_so(self):
+        with Env(formation({})) as e:
+            result = e.run("continue", check=False)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("no members in team.toml; add one, then run `ateam.py up`", result.stderr)
+            self.assertEqual(e.starts(), {})
+
+    def test_cold_continue_checks_every_member_before_launch(self):
+        with Env(UI.replace('model = "gpt-6-luna"', 'model = "missing-model"')) as e:
+            result = e.run("continue", check=False)
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(e.starts(), {})
+            self.assertEqual(e.calls("tab", "create"), [])
+
+    def test_failed_fresh_launch_is_not_reported_as_fresh(self):
+        with Env(UI) as e:
+            result = e.run("continue", check=False, FAKE_START_FAIL="dead:lead-dev")
+            self.assertEqual(result.returncode, 3)
+            self.assertIn("fresh sessions, no earlier context: @frontend-dev, @reviewer, @pm. Send each", result.stdout)
+            self.assertEqual({n for n, _ in e.prompts()}, {"frontend-dev", "reviewer", "pm"})
+
     def test_brings_members_back_in_their_panes_and_sessions(self):
         with Env() as e:
             e.run("up", "lead-dev", "frontend-dev", "pm", "--no-brief")
@@ -997,9 +1080,11 @@ class ContinueTests(unittest.TestCase):
             self.assertNotEqual(e.pane_of("lead-dev")["pane_id"], old)
             self.assertEqual([n for n, _ in e.prompts()[before:]], ["lead-dev"])
             self.assertIn("herdr agent prompt operator", e.prompts()[-1][1])
+            self.assertIn("picking up where we left off", e.prompts()[-1][1])
             self.assertEqual({n: {k: v for k, v in e.pane_of(n).items() if k != "rect"} for n in others}, others)
             e.run("continue", "lead-dev", "--fresh", "--restart")
             self.assertNotIn("resume", native(e.starts()["lead-dev"]))
+            self.assertIn("starting in a new session", e.prompts()[-1][1])
 
     def test_closed_pane_or_changed_harness_starts_fresh(self):
         with Env() as e:
@@ -1016,6 +1101,9 @@ class ContinueTests(unittest.TestCase):
             self.assertNotIn("resume", by["reviewer"])
             self.assertEqual(e.pane_of("reviewer")["pane_id"], "w1:p4")  # a new, labeled pane
             self.assertEqual(e.pane_of("reviewer")["tab_id"], e.pane_of("pm")["tab_id"])  # in the team tab
+            for _, text in e.prompts():
+                self.assertIn("starting in a new session", text)
+            self.assertIn("fresh sessions, no earlier context: @pm, @reviewer. Send each", out)
 
     def test_opencode_member_gets_a_new_pane_and_the_old_label_is_cleared(self):
         with Env(formation({

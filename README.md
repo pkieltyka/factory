@@ -8,7 +8,7 @@ Requires Python 3.11+, herdr, and the chosen harnesses; Git is required for work
 ln -s "$PWD" ~/.claude/skills/a-team
 ```
 
-Run `/a-team setup`, then `/a-team up`. Setup writes two files at the project root: `TEAM.md`, the brief every member reads (project, where tasks are tracked, workflow), committed and shared; and `team.toml`, your own formation (operator, members, harnesses, models), which is not committed. `team.toml.sample` is committed as the project's suggestion, so each person on a shared repo can run a different formation. herdr holds the panes. `/a-team continue` resumes noted sessions.
+Run `/a-team setup`, then `/a-team up`. Setup writes two files at the project root: `TEAM.md`, the brief every member reads (project, where tasks are tracked, workflow), committed and shared; and `team.toml`, your own formation (operator, members, harnesses, models), which is not committed. `team.toml.sample` is committed as the project's suggestion, so each person on a shared repo can run a different formation. herdr holds the panes. `/a-team continue` brings the team back, resuming noted sessions, and works out where the project stands from `TEAM.md`, the tracker and Git.
 
 ```bash
 python3 scripts/ateam.py harnesses      # available harnesses and recommended models

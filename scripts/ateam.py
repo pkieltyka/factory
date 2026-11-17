@@ -775,13 +775,15 @@ def deliver(team, texts, what):
 
 
 def send_brief(cfg, team, operator, names=None, closing=None):
-    """The team brief to running members (all, or only `names`). -> {member: reason} for failed deliveries."""
+    """The team brief to running members (all, or only `names`). Closing is text or {member: text}.
+    -> {member: reason} for failed deliveries."""
     members = team.members()
     targets = [m for m in members if names is None or m["name"] in names]
     if not targets:
         print("no members running")
         return {}
-    return deliver(team, {m["name"]: message_for(cfg, m, members, operator, closing) for m in targets},
+    return deliver(team, {m["name"]: message_for(cfg, m, members, operator,
+                         closing.get(m["name"]) if isinstance(closing, dict) else closing) for m in targets},
                    "the team brief")
 
 
@@ -968,13 +970,23 @@ def cmd_continue(args):
     team = Team(cfg)
     names = [n.lstrip("@") for n in args.names] or [n for n in cfg.members if team.pane(n)]
     if not names:
-        raise SystemExit(f"no member panes from {CONF} in this herdr session; start the team with `ateam.py up`")
+        names = list(cfg.members)
+        if not names:
+            raise SystemExit(f"no members in {CONF}; add one, then run `ateam.py up`")
+        print(f"no member panes in this herdr session: continuing every member in {CONF}")
+        if os.environ.get("HERDR_TAB_ID"):
+            herdr("tab", "rename", os.environ["HERDR_TAB_ID"], TABS["operator"], check=False)
+    elif not args.names:
+        missing = [n for n in cfg.members if n not in names]
+        if missing:
+            print(f"no pane, not continued: {', '.join('@' + n for n in missing)}."
+                  f" To bring them back: ateam.py continue {' '.join(missing)}")
     unknown = [n for n in names if n not in cfg.members]
     if unknown:
         raise SystemExit(f"not in {CONF}: {', '.join(unknown)}")
     restart = [n for n in names if args.restart and team.live(n)]
     ready = checked(cfg, [plan(cfg, n) for n in names if n in restart or not team.live(n)])  # with team.toml's settings as they are now
-    failed = {}
+    failed, fresh = {}, []
     past = past_sessions(cfg)
     for m in ready:
         ref = (team.pane(m["name"]) or {}).get("agent_session") or past.get(m["name"])
@@ -987,15 +999,25 @@ def cmd_continue(args):
         if err:
             failed[m["name"]] = err + (f". If its session cannot be resumed, run: ateam.py continue {m['name']} --fresh"
                                        if resume else "")
+        elif not resume:
+            fresh.append(m["name"])
     if not ready:
         print("every member is running")
     team = Team(cfg)
-    closing = (f"We are picking up where we left off. Re-read `{BRIEF}`, check the tracker it names"
-               f", then tell @{operator} in one line what you were doing and what you will do next. Send it:"
-               f" `herdr agent prompt {operator} '[from @you] ...'`. A reply in your own pane does not reach @{operator}.")
-    # With names, only those members are re-briefed. With none the operator is catching up, so everyone answers.
-    report_failed(failed, team, send_brief(cfg, team, operator, names=set(names) - set(failed) if args.names else None,
-                                           closing=closing))
+    pickup_text = (f"We are picking up where we left off. Re-read `{BRIEF}`, check the tracker it names"
+                   f", then tell @{operator} in one line what you were doing and what you will do next. Send it:"
+                   f" `herdr agent prompt {operator} '[from @you] ...'`. A reply in your own pane does not reach @{operator}.")
+    fresh_text = (f"You are starting in a new session and know nothing of the work so far. Re-read `{BRIEF}`"
+                  f" and do not start anything yet: @{operator} will send your task, its criteria and the evidence"
+                  " so far. No reply needed.")
+    closing = {name: fresh_text if name in fresh else pickup_text for name in cfg.members}
+    # With names, only those members are re-briefed. With none, every running member is re-briefed.
+    undelivered = send_brief(cfg, team, operator, names=set(names) - set(failed) if args.names else None,
+                            closing=closing)
+    if fresh:
+        print(f"fresh sessions, no earlier context: {', '.join('@' + n for n in fresh)}."
+              " Send each its task, criteria and the evidence so far.")
+    report_failed(failed, team, undelivered)
 
 
 def cmd_status(args):
@@ -1018,7 +1040,8 @@ def cmd_status(args):
         if hit:
             print(f"\n{', '.join(hit)} {hint}")
     if not any(team.pane(n) for n in cfg.members):
-        print(f"\nNo member of {CONF} has been started. Next: `ateam.py check`, then `ateam.py up`.")
+        print(f"\nNo member of {CONF} has a pane in this herdr session. A team that ran before: `ateam.py continue`."
+              " A new team: `ateam.py check`, then `ateam.py up`.")
 
 
 def cmd_wait(args):

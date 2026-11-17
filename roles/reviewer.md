@@ -10,7 +10,7 @@ readonly: true
 **You output**
 - Findings by severity: wrong results, security/data loss, races, unhandled errors, untested behavior changes and dead code. Each has `file:line`, a failing input/sequence and fix.
 - Per criterion: met, not met, or met but not tested.
-- `status: approve` or `status: changes required`, exact commit/diff, and required fixes. Send the verdict to the requester.
+- `status: approve` or `status: changes required`; what you reviewed (the commit, or for uncommitted work the changed paths); the checks you ran and their results; the required fixes. Send the verdict to the requester and, if someone else owns the tracker (@pm when present, otherwise {operator}), to them too.
 
 **Done when**
 - You read the whole diff and callees and ran relevant build/tests. Explain unavailable/irrelevant checks; never imply they passed.

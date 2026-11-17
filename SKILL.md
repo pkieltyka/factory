@@ -35,7 +35,7 @@ Message teammates only with `ateam.py say` or `herdr agent prompt`, never throug
 | `brief` | `ateam.py brief --send [names]` resends the brief; without `--send`, preview it. |
 | `say` | `ateam.py say <names|all> "message"`, or `--file <path>`. Check delivery failures. |
 
-Bare `/a-team`: no `TEAM.md` or `team.toml` → setup; otherwise run `status`. No members → up; gone → continue; blocked → inspect and resolve within existing authorization; running → continue the user's work or ask for the next task if none is known.
+Bare `/a-team`: no `TEAM.md` or `team.toml` → setup; otherwise run `status`. No members → continue when the tracker or Git shows unfinished work, otherwise up; gone → continue; blocked → inspect and resolve within existing authorization; running → continue the user's work or ask for the next task if none is known.
 
 ## Launch
 
