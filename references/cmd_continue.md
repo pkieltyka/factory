@@ -18,10 +18,11 @@ ateam.py continue lead-dev --fresh --restart  # new session
 - After a herdr restart, run `continue --restart`: herdr restores names and sessions but omits a-team launch settings and standing-instruction flags.
 - Failed resume: inspect the error and use `continue <name> --fresh` if the saved session cannot reopen.
 - Failed brief delivery exits 3: resolve the cause and `ateam.py brief --send <name>`.
+- `continue` and `up` delete this herdr session's inbox when no member is live and nothing in it is unread; unread messages are kept and announced.
 
 ## Reconcile before assigning
 
-Read in this order: `TEAM.md`, `team.toml` and project plans; the tracker; Git (`git status`, `git log --oneline -10`, `git worktree list`, each worktree's `git -C <path> status` and `git diff <main>...<branch>`, and PRs and CI when the project has them); last, members' replies. Where they disagree, Git and CI outrank the tracker, and the tracker outranks anyone's memory, yours included. Have the tracker's owner correct a stale record; do not act on it.
+Read in this order: `TEAM.md`, `team.toml` and project plans; the tracker; Git (`git status`, `git log --oneline -10`, `git worktree list`, each worktree's `git -C <path> status` and `git diff <main>...<branch>`, and PRs and CI when the project has them); last, members' replies and the unread messages `wait` prints. Where they disagree, Git and CI outrank the tracker, and the tracker outranks anyone's memory, yours included. Have the tracker's owner correct a stale record; do not act on it.
 
 - Match every uncommitted change to an in-progress item before any member writes. A change no item explains is not built on, committed or discarded: ask the user.
 - A verdict covers only the commit or paths it names. Ask for a new review when the record has no verdict or no checks, when the branch moved past the reviewed commit, or when approved work was never committed.

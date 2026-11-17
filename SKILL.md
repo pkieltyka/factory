@@ -14,7 +14,7 @@ Paths below are relative to this skill. `ateam.py` means `python3 <skill>/script
 
 After compaction, re-read the active command's reference, `references/leading.md`, `TEAM.md` and the tracker. Preserve task owners, acceptance criteria, branches, verdicts and next steps there, not only in chat.
 
-Message teammates only with `ateam.py say` or `herdr agent prompt`, never through a harness's own messaging (e.g. Claude Code's `SendMessage`): herdr works across harnesses and permission modes.
+Message teammates only with `ateam.py say` or `herdr agent prompt`, never through a harness's own messaging (e.g. Claude Code's `SendMessage`): herdr works across harnesses and permission modes. One exception: on the inbox route (a Claude Code operator) members reach you with `ateam.py inbox send`, which `wait` prints; nothing is typed into your pane. See `references/leading.md`.
 
 ## Before launch
 
@@ -22,7 +22,7 @@ Message teammates only with `ateam.py say` or `herdr agent prompt`, never throug
 - Install herdr integration once per chosen harness: `herdr integration install <harness>`; session recovery depends on it.
 - The operator needs herdr's socket, harness config directories, `~/.cache/a-team`, and any worktree parent. If your own sandbox blocks one of a-team's own commands (`ateam.py`, `herdr`, a `git worktree` operation), you may retry that one command outside the sandbox when your harness allows it, and you say so in your report to the user. Never edit the user's sandbox settings; every other command keeps the normal rules, and a block you cannot get past is reported, not worked around. Run shell commands standalone so command exemptions match: no `cd &&`, pipe, redirect or trailing `echo`.
 - Members default to `full`, intended for a safe sandbox/VM. Claude uses bypass-permissions while retaining inherited sandbox settings; Codex disables approvals and its sandbox; pi/omp/OpenCode allow unattended commands. `guarded` uses Claude auto mode or Codex's workspace sandbox with automatic review; it changes nothing for the others.
-- Full Claude members permit Unix sockets inside an inherited sandbox: all sockets on Linux, `HERDR_SOCKET_PATH` on macOS (all sockets if absent). The macOS form is not live-tested. Guarded only exempts standalone messaging commands. Unknown startup questions and higher-level policy can still block.
+- Full Claude members permit Unix sockets inside an inherited sandbox: all sockets on Linux, `HERDR_SOCKET_PATH` on macOS (all sockets if absent). The macOS form is not live-tested. Guarded only exempts standalone messaging commands, the inbox command included. Unknown startup questions and higher-level policy can still block.
 
 ## Commands
 

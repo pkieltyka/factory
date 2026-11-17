@@ -10,15 +10,20 @@ harnesses.toml. `ateam.py --help` lists the commands.
 """
 import argparse
 import collections
+import datetime
+import fcntl
 import getpass
 import hashlib
 import json
 import os
 import pathlib
 import re
+import shlex
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 import tomllib
 
@@ -105,6 +110,9 @@ class Config:
             if old in self.team:
                 raise SystemExit(f"{self.conf_file}: rename [{old}] to [operator]")
         self.operator = {"name": OPERATOR, **self.team.get("operator", {})}
+        harness = self.operator.get("harness")
+        if harness is not None and (not isinstance(harness, str) or harness not in TABLE):
+            raise SystemExit(f"[operator] harness {harness!r} is not one of {', '.join(TABLE)}")
         self.members = self.team.get("members", {})
         if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", str(self.operator["name"])) or self.operator["name"] in self.members:
             raise SystemExit(f"{self.conf_file}: [operator] name {self.operator['name']!r} must be lowercase letters,"
@@ -233,6 +241,220 @@ def resolve_listed(model, listed, harness):
     raise Problem(f"{harness} has no model {base} configured", fix + " `ateam.py harnesses` lists what it can use.")
 
 
+
+
+class InboxDamage(ValueError):
+    def __init__(self, path, line, reason):
+        super().__init__(f"inbox needs repair: {path}, line {line}: {reason}. This session runs on typed messages."
+                         " After repairing the file, run ateam.py continue --restart.")
+
+
+class Inbox:
+    """Session-local transport. Hold the stable lock for file operations, never while waiting on agents."""
+    def __init__(self, cfg):
+        self.directory = cfg.cache
+        session = os.environ.get("HERDR_SESSION") or "default"
+        key = re.sub(r"[^A-Za-z0-9_.-]", "-", session)[:24] + "-" + hashlib.sha1(session.encode()).hexdigest()[:8]
+        self.path = self.directory / f"inbox-{key}.jsonl"
+        self.state_path = self.path.with_suffix(".json")
+        self.lock_path = self.path.with_suffix(".lock")
+
+    @staticmethod
+    def private_open(path, flags):
+        fd = os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise OSError(f"not a regular file: {path}")
+            os.fchmod(fd, 0o600)
+            return fd
+        except BaseException:
+            os.close(fd)
+            raise
+
+    def __enter__(self):
+        for path in (self.directory.parent, self.directory):
+            path.mkdir(parents=True, exist_ok=True, mode=0o700)
+            if not stat.S_ISDIR(path.stat().st_mode):
+                raise OSError(f"not a directory: {path}")
+            if stat.S_IMODE(path.stat().st_mode) != 0o700:
+                path.chmod(0o700)
+        self.lock = self.private_open(self.lock_path, os.O_CREAT | os.O_RDWR)
+        try:
+            fcntl.flock(self.lock, fcntl.LOCK_EX)
+            raw = self.read(self.state_path)
+            self.state = {"mode": "typed", "seen": 0} if raw is None else self.decode(raw, self.state_path, 1)
+            if (not isinstance(self.state, dict) or self.state.get("mode") not in ("inbox", "typed")
+                    or type(self.state.get("seen")) is not int or self.state["seen"] < 0):
+                raise InboxDamage(self.state_path, 1, "expected mode and non-negative integer seen")
+            self.rows = []
+            raw = self.read(self.path) or b""
+            if raw and not raw.endswith(b"\n"):
+                raise InboxDamage(self.path, raw.count(b"\n") + 1, "incomplete line")
+            last = 0
+            for n, line in enumerate(raw.splitlines(), 1):
+                row = self.decode(line, self.path, n)
+                if (not isinstance(row, dict) or type(row.get("id")) is not int or row["id"] <= last
+                        or not all(isinstance(row.get(k), str) for k in ("at", "from", "text"))):
+                    raise InboxDamage(self.path, n, "expected increasing positive id and at/from/text strings")
+                self.rows.append(row)
+                last = row["id"]
+            return self
+        except BaseException:
+            os.close(self.lock)
+            raise
+
+    def __exit__(self, *_):
+        os.close(self.lock)
+
+    def read(self, path):
+        try:
+            fd = self.private_open(path, os.O_RDONLY)
+        except FileNotFoundError:
+            return None
+        with os.fdopen(fd, "rb") as f:
+            return f.read()
+
+    @staticmethod
+    def decode(raw, path, line):
+        try:
+            return json.loads(raw)
+        except (ValueError, UnicodeError) as e:
+            raise InboxDamage(path, line, str(e)) from e
+
+    @property
+    def unread(self):
+        return [r for r in self.rows if r["id"] > self.state["seen"]]
+
+    @property
+    def highest(self):
+        return max([self.state["seen"], *(r["id"] for r in self.rows)])
+
+    def sync_directory(self):
+        fd = os.open(self.directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def replace(self, path, data):
+        fd, name = tempfile.mkstemp(prefix=path.name + ".", dir=self.directory)
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(name, path)
+            self.sync_directory()
+        finally:
+            pathlib.Path(name).unlink(missing_ok=True)
+
+    def save_state(self):
+        self.replace(self.state_path, (json.dumps(self.state) + "\n").encode())
+
+    def remove_seen(self):
+        unread = self.unread
+        if len(unread) != len(self.rows):
+            self.replace(self.path, b"".join((json.dumps(r, ensure_ascii=False) + "\n").encode() for r in unread))
+            self.rows = unread
+
+    def acknowledge(self, seen):
+        if seen < 0 or seen > self.highest:
+            raise ValueError(f"invalid inbox id {seen}; highest is {self.highest}")
+        if seen > self.state["seen"]:
+            self.state["seen"] = seen
+            self.save_state()  # A crash before removing the lines cannot make them unread again.
+        self.remove_seen()
+
+
+def message_route(cfg):
+    """Previews outside herdr and damaged transport files use the original typed instructions."""
+    if os.environ.get("HERDR_ENV") != "1" or getattr(cfg, "inbox_unavailable", False):
+        return "typed"
+    try:
+        with Inbox(cfg) as inbox:
+            return inbox.state["mode"]
+    except (InboxDamage, OSError):
+        return "typed"
+
+
+def configure_messages(cfg, team, operator, restart=()):
+    conf, live = cfg.operator.get("harness"), (team.pane(operator) or {}).get("agent")
+    mode = TABLE[conf]["operator_messages"] if conf and conf == live else "typed"
+    reason = (f"[operator] harness is not set in {CONF}" if not conf else
+              f"{CONF} says {conf}, herdr sees {live} in this pane" if conf != live else "")
+    try:
+        with Inbox(cfg) as inbox:
+            previous = inbox.state["mode"]
+            if not restart and not any(team.live(n) for n in cfg.members):
+                inbox.remove_seen()
+                if inbox.unread:
+                    print(f"{len(inbox.unread)} unread from the earlier team; ateam.py wait prints them")
+                else:
+                    inbox.path.unlink(missing_ok=True)
+                    inbox.state_path.unlink(missing_ok=True)
+                    inbox.sync_directory()
+                    inbox.state["seen"] = 0
+            inbox.state["mode"] = mode
+            inbox.save_state()
+    except (InboxDamage, OSError) as e:
+        print(str(e) if isinstance(e, InboxDamage) else
+              f"inbox unavailable: {str(e).rstrip('.')}. This session runs on typed messages."
+              " After fixing it, run ateam.py continue --restart.")
+        mode, previous = "typed", "typed"
+        cfg.inbox_unavailable = True  # Later rendering in this invocation must not reselect the stored route.
+    if mode == "inbox":
+        print(f"members reach @{operator} through the inbox (ateam.py inbox send); wait prints their messages")
+    else:
+        print(f"members reach @{operator} by typed herdr messages" + (": " + reason if reason else ""))
+    if mode != previous and any(team.live(n) and n not in restart for n in cfg.members):
+        print(f"the route to @{operator} changed to {mode}: run ateam.py continue --restart so running members get it")
+
+
+def cmd_inbox_send(args):
+    cfg = cfg_of(args)
+    if args.sender not in cfg.members:
+        raise SystemExit(f"not a member of {CONF}: {args.sender}")
+    if bool(args.file) == (args.message is not None):
+        raise SystemExit("give a message or --file, not both")
+    try:
+        text = pathlib.Path(args.file).read_text() if args.file else args.message
+    except (OSError, UnicodeError) as e:
+        raise SystemExit(f"cannot read message file {args.file}: {e}") from None
+    if not text.strip():
+        raise SystemExit("give a non-empty message")
+    started = False
+    try:
+        with Inbox(cfg) as inbox:
+            if inbox.state["mode"] != "inbox":
+                raise ValueError("the operator takes typed messages in this session; this member has inbox instructions,"
+                                 f" restart it with ateam.py continue {args.sender} --restart")
+            inbox.remove_seen()
+            row = {"id": inbox.highest + 1, "at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                   "from": args.sender, "text": text}
+            payload = (json.dumps(row, ensure_ascii=False) + "\n").encode()
+            fd = inbox.private_open(inbox.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
+            try:
+                started = True
+                while payload:
+                    written = os.write(fd, payload)
+                    if written == 0:
+                        raise OSError("inbox write made no progress")
+                    payload = payload[written:]
+                os.fsync(fd)
+                inbox.sync_directory()
+            finally:
+                os.close(fd)
+        print(f"queued #{row['id']}")
+    except (OSError, ValueError) as e:
+        if started:
+            print(f"not confirmed: {e}. The message may or may not be stored. Do not send it again by any route.",
+                  file=sys.stderr)
+            raise SystemExit(1)
+        reason = str(e).rstrip(".")
+        print(f"not stored: {reason}. Nothing was queued. Send it typed, once:", file=sys.stderr)
+        fallback = f"{tag(args.sender)} Inbox unavailable: {reason}.\n{text}\n"
+        print(shlex.join(["herdr", "agent", "prompt", cfg.operator["name"], fallback]), file=sys.stderr)
+        raise SystemExit(5)
 
 
 class Checker:
@@ -392,17 +614,19 @@ def records(path):
 
 
 # ---- claude
-def claude_settings(level):
+def claude_settings(level, inbox=False):
     """Inline settings for a member. herdr's messaging commands run outside a sandbox the user has turned on,
     when they are the whole command line. At `full` herdr's socket is also allowed inside it, so a message gets
     through in any command shape (Linux can only allow every Unix socket; macOS can name herdr's). The last key
     skips the warning Claude Code shows the first time it starts in bypassPermissions mode."""
     sandbox = {"excludedCommands": ["herdr agent prompt *", "herdr agent list"]}
+    if inbox:
+        sandbox["excludedCommands"].append(shlex.join(["python3", str(SKILL / "scripts/ateam.py"), "inbox", "send"]) + " *")
     if level == "full":
         sock = os.environ.get("HERDR_SOCKET_PATH")
         sandbox["network"] = {"allowUnixSockets": [sock]} if sys.platform == "darwin" and sock else {"allowAllUnixSockets": True}
     return json.dumps({"sandbox": sandbox, "skipDangerousModePermissionPrompt": True,
-                       "permissions": {"allow": ["Bash(herdr agent prompt *)", "Bash(herdr agent list)"]}},
+                       "permissions": {"allow": [f"Bash({cmd})" for cmd in sandbox["excludedCommands"]]}},
                       separators=(",", ":"))
 
 
@@ -419,7 +643,7 @@ def model_claude(checker, model, harness):
 
 def argv_claude(m, prompt_file, resume):
     argv = ["--model", m["model"], "--effort", m["thinking"], "--append-system-prompt-file", str(prompt_file),
-            "--name", m["name"], "--settings", claude_settings(m["permissions"])]
+            "--name", m["name"], "--settings", claude_settings(m["permissions"], bool(m.get("inbox_dir")))]
     return argv + (["--resume", session_id(resume)] if resume else []), {}
 
 
@@ -454,6 +678,8 @@ def argv_codex(m, prompt_file, resume):
     # member's directory keeps it where team.toml says, also after its worktree changed.
     argv = ["-m", m["model"], "-C", m["dir"], "-c", f"model_reasoning_effort={json.dumps(m['thinking'])}",
             "-c", f"developer_instructions={json.dumps(pointer)}"]
+    if m["permissions"] == "guarded" and m.get("inbox_dir"):
+        argv += ["--add-dir", m["inbox_dir"]]
     return (["resume", session_id(resume)] if resume else []) + argv, {}
 
 
@@ -528,6 +754,18 @@ def member_prompt(m, operator, cfg):
         rules.append("- You are read-only: do not edit the project's files. You may read anything, build and run"
                      f" tests. Write only scratch files outside the repo, or a document @{operator} asks you for.")
     text = (SKILL / "templates/member-prompt.md").read_text()
+    inbox = message_route(cfg) == "inbox"
+    to_operator = "" if not inbox else """
+To reach {operator}, do not use herdr. Run this as a standalone command, your message as one single-quoted argument or `--file <path>`:
+```bash
+{inbox_send} '<message>'
+```
+It queues the message without typing into {operator}'s pane. `queued #N` means stored, not read: finish with `Report queued for {operator}`, not "sent". `not stored` prints a herdr command: run it once, as printed. Any other failure: do not send the message again by any route; say so in your pane and stop. In Reports below, "keep it pending" and the `agent_blocked` retry apply to herdr messages only.
+"""
+    text = text.replace("{teammates}", "teammates other than {operator}" if inbox else "teammates")
+    text = text.replace("{to_operator}", to_operator)
+    text = text.replace("{inbox_send}", shlex.join(["python3", str(SKILL / "scripts/ateam.py"), "inbox", "send",
+                                                   "--cwd", str(cfg.root), "--from", m["name"]]))
     for key, value in {"role_rules": cfg.roles[m["role"]][1], "name": m["name"], "role": m["role"], "operator": f"@{operator}",
                        "brief": str(cfg.brief_file), "where": where, "rules": "\n".join(rules),
                        "instructions": str(cfg.cache / f"{m['name']}.md"),
@@ -562,9 +800,13 @@ def render_team_brief(cfg, members, operator, closing=None):
                 " checkout, and `git -C <its path> status` shows what it has not committed yet. When you ask for a"
                 " review, name your branch."]
     names = ", ".join("`" + m["name"] + "`" for m in members)
+    messaging = " Message anyone with `herdr agent prompt <name> '[from @you] ...'`; your standing instructions say how."
+    if message_route(cfg) == "inbox":
+        messaging = (" Message a teammate with `herdr agent prompt <name> '[from @you] ...'` and "
+                     f"`{operator}` with the inbox command in your standing instructions; they say how.")
     out += ["", "## Talking to each other", "",
             f"Everyone has an @name, which is also their herdr pane's name: {names}, and `{operator}` for the operator."
-            " Message anyone with `herdr agent prompt <name> '[from @you] ...'`; your standing instructions say how.",
+            + messaging,
             "", closing or "That is the whole team brief. No reply needed."]
     return "\n".join(out) + "\n"
 
@@ -714,6 +956,8 @@ def launch(cfg, team, m, operator, timeout, resume=None):
     prompt_file = cfg.cache / f"{m['name']}.md"
     prompt_file.parent.mkdir(parents=True, exist_ok=True)
     prompt_file.write_text(member_prompt(m, operator, cfg))  # written fresh at each launch
+    if message_route(cfg) == "inbox":
+        m = {**m, "inbox_dir": str(cfg.cache)}
     argv, env = launch_argv(m, prompt_file, resume)
     err = ensure_worktree(cfg, m) if m["branch"] else None
     if err:
@@ -944,6 +1188,7 @@ def cmd_up(args):
     if taken:
         raise SystemExit(f"an agent outside this team is already named {', '.join(taken)}. One team runs per herdr"
                          " session: rename that agent, or use another session.")
+    configure_messages(cfg, team, operator)
     started, failed = [], {}
     for m in todo:
         err = launch(cfg, team, m, operator, args.timeout)
@@ -988,6 +1233,7 @@ def cmd_continue(args):
         raise SystemExit(f"not in {CONF}: {', '.join(unknown)}")
     restart = [n for n in names if args.restart and team.live(n)]
     ready = checked(cfg, [plan(cfg, n) for n in names if n in restart or not team.live(n)])  # with team.toml's settings as they are now
+    configure_messages(cfg, team, operator, restart=names if args.restart else ())
     failed, fresh = {}, []
     past = past_sessions(cfg)
     for m in ready:
@@ -1009,6 +1255,9 @@ def cmd_continue(args):
     pickup_text = (f"We are picking up where we left off. Re-read `{BRIEF}`, check the tracker it names"
                    f", then tell @{operator} in one line what you were doing and what you will do next. Send it:"
                    f" `herdr agent prompt {operator} '[from @you] ...'`. A reply in your own pane does not reach @{operator}.")
+    if message_route(cfg) == "inbox":
+        pickup_text = pickup_text.replace(f"Send it: `herdr agent prompt {operator} '[from @you] ...'`.",
+                                          "Send it with the inbox command in your standing instructions.")
     fresh_text = (f"You are starting in a new session and know nothing of the work so far. Re-read `{BRIEF}`"
                   f" and do not start anything yet: @{operator} will send your task, its criteria and the evidence"
                   " so far. No reply needed.")
@@ -1036,6 +1285,12 @@ def cmd_status(args):
         rows.append(("@" + name, p["role"], p["harness"], p["model"] or "?", p["thinking"], team.status(name),
                      (pane or {}).get("pane_id", "")))
     print_table(rows)
+    try:
+        with Inbox(cfg) as inbox:
+            suffix = f"; {len(inbox.unread)} unread (ateam.py wait prints them)" if inbox.unread else ""
+            print(f"operator messages: {inbox.state['mode']}{suffix}")
+    except (OSError, ValueError) as e:
+        print(f"inbox unavailable: {e}" if isinstance(e, OSError) else str(e))
     for state, hint in (("blocked", "blocked: waiting on an approval or a question. Read the pane and ask the user."),
                         ("gone", "gone: `ateam.py continue` brings them back in their panes and sessions.")):
         hit = [r[0] for r in rows[2:] if state in r[5]]
@@ -1050,12 +1305,33 @@ def cmd_wait(args):
     """Block until the operator is needed. Run it in the background after handing out work. It returns when a
     member that was working stops (its report may not have been sent), when a member is blocked, gone or
     closed, when herdr cannot tell what a member is doing, or when nobody is working any more. With names,
-    only those members count: what the rest of the team does never ends the wait."""
+    only those members' lifecycle changes count. Inbox messages from any member always end the wait."""
     require_herdr()
     cfg = cfg_of(args)
     watch = [n.lstrip("@") for n in args.names]
     deadline, seen, worked, looks = time.monotonic() + args.timeout, None, set(), 0
+    warned = False
     while True:
+        try:
+            with Inbox(cfg) as inbox:
+                if args.seen is not None:
+                    inbox.acknowledge(args.seen)
+                    args.seen = None
+                unread = inbox.unread
+            if unread:
+                for row in unread:
+                    print(f"#{row['id']} from @{row['from']} at {row['at']}")
+                    print("\n".join("    " + line for line in row["text"].splitlines()))
+                print(f"{len(unread)} unread. After you have acted on or recorded them:"
+                      f" ateam.py wait --seen {unread[-1]['id']}")
+                return
+        except (OSError, ValueError) as e:
+            if args.seen is not None:
+                print(e, file=sys.stderr)
+                raise SystemExit(2)
+            if not warned:
+                print(f"inbox unavailable: {e}" if isinstance(e, OSError) else str(e), flush=True)
+                warned = True
         team = Team(cfg)
         state = {n: team.status(n) for n in cfg.members if (not watch or n in watch) and team.pane(n)}
         if seen is None:  # the members this watch is about: a pane that closes later is noticed
@@ -1192,7 +1468,15 @@ def main(argv=None):
     wt.add_argument("names", nargs="*", help="watch only these members (default: every member)")
     wt.add_argument("--timeout", type=float, default=1800, help="seconds before giving up (exit 4)")
     wt.add_argument("--interval", type=float, default=5, help="seconds between looks")
+    wt.add_argument("--seen", type=int, help="acknowledge and delete inbox messages through this id, then wait")
     common(wt)
+
+    ib = sub.add_parser("inbox", help="send messages to an inbox operator without typing into its pane")
+    send = ib.add_subparsers(dest="inbox_cmd", required=True).add_parser("send", help="queue a message")
+    send.add_argument("--from", dest="sender", required=True, help="your member name")
+    send.add_argument("message", nargs="?")
+    send.add_argument("--file", help="send this file's contents")
+    common(send)
 
     bf = sub.add_parser("brief", help="print the team brief as members get it, or --send it")
     bf.add_argument("names", nargs="*", help="with --send: only these members")
@@ -1213,7 +1497,7 @@ def main(argv=None):
         args.message = None if args.file else (args.to.pop() if len(args.to) > 1 else None)
     {"init": cmd_init, "harnesses": cmd_harnesses, "check": cmd_check, "up": cmd_up,
      "continue": cmd_continue, "status": cmd_status, "wait": cmd_wait, "brief": cmd_brief, "say": cmd_say,
-     "prompt": cmd_prompt}[args.cmd](args)
+     "prompt": cmd_prompt, "inbox": cmd_inbox_send}[args.cmd](args)
 
 
 if __name__ == "__main__":

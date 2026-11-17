@@ -4,6 +4,8 @@ Two test classes touch real tools and skip when they cannot: HerdrContract reads
 schema, and LiveFlags (ATEAM_LIVE=1, outside any sandbox) greps each installed harness's --help for the
 flags ateam.py passes."""
 import importlib.util
+import contextlib
+import io
 import json
 import os
 import pathlib
@@ -14,6 +16,7 @@ import sys
 import tempfile
 import textwrap
 import tomllib
+import types
 import unittest
 from unittest.mock import patch
 
@@ -275,7 +278,10 @@ class Env:
         return json.loads(self.fake.read_text())
 
     def run(self, *args, check=True, cwd=None, **env):
-        p = subprocess.run([sys.executable, str(SCRIPT), args[0], "--cwd", str(cwd or self.repo), *args[1:]],
+        command = list(args)
+        at = 2 if args[0] == "inbox" else 1
+        command[at:at] = ["--cwd", str(cwd or self.repo)]
+        p = subprocess.run([sys.executable, str(SCRIPT), *command],
                            capture_output=True, text=True, env={**self.env, **env})
         if check and p.returncode:
             raise AssertionError(p.stderr + p.stdout)
@@ -863,6 +869,390 @@ class WorktreeTests(unittest.TestCase):
             self.assertEqual(e.pane_of("lead-dev")["cwd"], str(e.repo))
 
 
+class InboxTests(unittest.TestCase):
+    def prepare(self, e, mode="inbox"):
+        with patch.dict(os.environ, e.env), ateam.Inbox(ateam.Config(e.repo)) as inbox:
+            inbox.state["mode"] = mode
+            inbox.save_state()
+            return inbox
+
+    def send(self, e, text="done", **env):
+        return e.run("inbox", "send", "--from", "lead-dev", text, **env)
+
+    def invoke(self, e):
+        args = types.SimpleNamespace(cwd=str(e.repo), sender="lead-dev", message="literal '$herdr' @pm.", file=None)
+        out, err = io.StringIO(), io.StringIO()
+        with patch.dict(os.environ, e.env), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                ateam.cmd_inbox_send(args)
+                code = 0
+            except SystemExit as ex:
+                code = ex.code
+        return code, out.getvalue(), err.getvalue()
+
+    def test_operator_route_and_generated_text_for_every_member_harness(self):
+        members = {"lead-dev": {**CATALOG_MEMBERS["lead-dev"], "permissions": "guarded"},
+                   "architect": CATALOG_MEMBERS["architect"], "pm": CATALOG_MEMBERS["pm"],
+                   "reviewer": {"harness": "omp", "model": "openai/gpt-6-astra", "thinking": "high"},
+                   "backend-dev": {"harness": "opencode", "model": "openrouter/z-ai/glm-5.3", "thinking": "high"}}
+        with Env(formation(members, operator={"harness": "claude"})) as e:
+            self.assertIn("through the inbox", e.run("up").stdout)
+            for name in members:
+                prompt = e.run("prompt", name).stdout
+                self.assertIn("teammates other than @operator", prompt)
+                self.assertIn("Report queued for @operator", prompt)
+                self.assertIn(f"--cwd {e.repo} --from {name}", prompt)
+                self.assertNotIn("{to_operator}", prompt)
+            self.assertIn("with the inbox command", e.run("brief").stdout)
+            e.run("continue")
+            for name, text in e.prompts()[-len(members):]:
+                self.assertIn("Send it with the inbox command", text, name)
+                self.assertNotIn("Send it: `herdr agent prompt operator", text)
+            starts = {c[2]: c for c in e.calls("agent", "start")}
+            claude = starts["architect"]
+            settings = json.loads(claude[claude.index("--settings") + 1])
+            prefix = f"python3 {SCRIPT} inbox send *"
+            self.assertIn(prefix, settings["sandbox"]["excludedCommands"])
+            self.assertIn(f"Bash({prefix})", settings["permissions"]["allow"])
+            codex = starts["lead-dev"]
+            with patch.dict(os.environ, e.env):
+                cache = str(ateam.Config(e.repo).cache)
+            self.assertEqual(codex[codex.index("--add-dir") + 1], cache)
+            self.assertIn("Message teammates only", e.run("prompt", "lead-dev", HERDR_ENV="").stdout)
+
+    def test_typed_text_unchanged_and_mismatches_visible(self):
+        with Env(UI) as e:
+            prompt, brief = e.run("prompt", "lead-dev").stdout, e.run("brief").stdout
+            self.assertIn("harness is not set", e.run("up").stdout)
+            e.run("continue")
+            closing = dict(e.prompts())["lead-dev"].split("We are picking up")[1]
+            e.write_brief(formation({n: CATALOG_MEMBERS[n] for n in ("lead-dev", "frontend-dev", "reviewer", "pm")},
+                                    operator={"harness": "codex"}))
+            e.update("operator", agent="codex")
+            e.run("continue")
+            self.assertEqual(prompt, e.run("prompt", "lead-dev").stdout)
+            # The Roles row changes with configuration; the generated messaging sentence does not.
+            self.assertEqual(brief.split("## Talking to each other")[1],
+                             e.run("brief").stdout.split("## Talking to each other")[1])
+            self.assertEqual(closing, dict(e.prompts())["lead-dev"].split("We are picking up")[1])
+            e.write_brief(formation({"lead-dev": CATALOG_MEMBERS["lead-dev"]}, operator={"harness": "claude"}))
+            self.assertIn("team.toml says claude, herdr sees codex", e.run("continue").stdout)
+            e.update("operator", agent="claude")
+            self.assertIn("route to @operator changed to inbox", e.run("continue").stdout)
+            self.assertNotIn("route to @operator changed", e.run("continue", "--restart").stdout)
+            e.write_brief(formation({"lead-dev": CATALOG_MEMBERS["lead-dev"]}, operator={"harness": "unknown"}))
+            self.assertIn("[operator] harness 'unknown' is not one of", e.run("check", check=False).stderr)
+        self.assertNotIn("inbox", ateam.claude_settings("guarded"))
+
+    def test_worktree_uses_explicit_main_root_and_rejects_invalid_messages(self):
+        with Env(formation({"lead-dev": {**CATALOG_MEMBERS["lead-dev"], "worktree": True}},
+                           operator={"harness": "claude"}), git=True) as e:
+            e.run("up")
+            with patch.dict(os.environ, e.env):
+                cfg = ateam.Config(e.repo)
+                worktree = ateam.plan(cfg, "lead-dev")["dir"]
+                inbox = ateam.Inbox(cfg)
+            command = [sys.executable, str(SCRIPT), "inbox", "send", "--cwd", str(e.repo), "--from", "lead-dev", "hi"]
+            calls = e.calls()
+            for i in (1, 2):
+                result = subprocess.run(command, cwd=worktree, env=e.env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f"queued #{i}", result.stdout)
+            before = inbox.path.read_bytes()
+            for sender, text in (("nobody", "hi"), ("lead-dev", "  ")):
+                self.assertNotEqual(e.run("inbox", "send", "--from", sender, text, check=False).returncode, 0)
+            self.assertEqual(inbox.path.read_bytes(), before)
+            self.assertEqual(e.calls(), calls)
+
+    def test_payloads_replay_acknowledgement_and_ids(self):
+        with Env() as e:
+            inbox = self.prepare(e)
+            text = "line one\nUnicode: café 日本語\n@pm.\n"
+            self.assertIn("queued #1", self.send(e, text).stdout)
+            note = e.root / "message.txt"
+            note.write_text(text)
+            self.assertIn("queued #2", e.run("inbox", "send", "--from", "reviewer", "--file", str(note)).stdout)
+            self.assertEqual(e.calls(), [])  # sending and reading files did not touch Herdr
+            first = e.run("wait").stdout  # no members have started: inbox wins
+            self.assertEqual(first, e.run("wait").stdout)
+            self.assertIn("    Unicode: café 日本語", first)
+            self.assertIn("wait --seen 2", first)
+            rows = [json.loads(s) for s in inbox.path.read_text().splitlines()]
+            self.assertEqual([r["text"] for r in rows], [text, text])
+            self.assertRegex(rows[0]["at"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+            e.run("wait", "--seen", "2", check=False)  # acknowledges, then no members to watch
+            self.assertEqual(inbox.path.read_bytes(), b"")
+            self.assertIn("queued #3", self.send(e).stdout)
+            e.run("wait", "--seen", "1")  # an old acknowledgement cannot move seen backwards
+            before = (inbox.path.read_bytes(), inbox.state_path.read_bytes())
+            self.assertEqual(e.run("wait", "--seen", "9", check=False).returncode, 2)
+            self.assertEqual(before, (inbox.path.read_bytes(), inbox.state_path.read_bytes()))
+            self.assertIn("1 unread", e.run("status").stdout)
+
+    def test_concurrent_sends_and_acknowledgement(self):
+        with Env() as e:
+            inbox = self.prepare(e)
+            self.send(e)
+            inode = inbox.lock_path.stat().st_ino
+            base = [sys.executable, str(SCRIPT)]
+            commands = [["inbox", "send", "--cwd", str(e.repo), "--from", "lead-dev", str(n)] for n in range(6)]
+            commands.append(["wait", "--cwd", str(e.repo), "--seen", "1"])
+            processes = [subprocess.Popen(base + cmd, env=e.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                          text=True) for cmd in commands]
+            for p in processes:
+                p.communicate(timeout=15)
+            rows = [json.loads(s) for s in inbox.path.read_text().splitlines()]
+            self.assertEqual([r["id"] for r in rows], list(range(2, 8)))
+            self.assertEqual({r["text"] for r in rows}, {str(n) for n in range(6)})
+            self.assertEqual(inode, inbox.lock_path.stat().st_ino)
+
+    def test_failures_never_call_herdr_and_fallback_quotes_payload(self):
+        with Env() as e:
+            inbox = self.prepare(e, "typed")
+            for state in ("typed", "missing", "symlink"):
+                if state == "missing":
+                    inbox.state_path.unlink()
+                if state == "symlink":
+                    self.prepare(e)
+                    target = e.root / "untouched"
+                    target.write_text("secret")
+                    inbox.path.symlink_to(target)
+                result = self.send(e, "text with ' quotes; $(false)\n$herdr", check=False)
+                self.assertEqual(result.returncode, 5, result.stderr)
+                command = result.stderr.split("Send it typed, once:\n", 1)[1]
+                argv = shlex.split(command)
+                self.assertEqual(argv[:4], ["herdr", "agent", "prompt", "operator"])
+                self.assertTrue(argv[4].endswith("text with ' quotes; $(false)\n$herdr\n"))
+                if state == "symlink":
+                    self.assertEqual(target.read_text(), "secret")
+            self.assertEqual(e.calls(), [])
+        with Env() as e:
+            self.prepare(e)
+            with patch.object(ateam.Inbox, "private_open", side_effect=PermissionError("denied")):
+                code, out, err = self.invoke(e)
+            self.assertEqual(code, 5)
+            self.assertIn("herdr agent prompt", err)
+            with patch.object(ateam.os, "fsync", side_effect=OSError("failed fsync")):
+                code, out, err = self.invoke(e)
+            self.assertEqual(code, 1)
+            self.assertIn("not confirmed", err)
+            self.assertNotIn("herdr agent prompt", err)
+            self.assertEqual(e.calls(), [])
+
+    def test_short_writes_and_private_modes(self):
+        with Env() as e:
+            inbox = self.prepare(e)
+            inbox.directory.chmod(0o755)
+            inbox.state_path.chmod(0o644)
+            inbox.lock_path.chmod(0o644)
+            write = os.write
+            with patch.object(ateam.os, "write", side_effect=lambda fd, data: write(fd, data[:3])):
+                code, out, err = self.invoke(e)
+            self.assertEqual((code, err), (0, ""))
+            self.assertIn("queued #1", out)
+            self.assertEqual(inbox.directory.stat().st_mode & 0o777, 0o700)
+            for path in (inbox.path, inbox.state_path, inbox.lock_path):
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(json.loads(inbox.path.read_text())["text"], "literal '$herdr' @pm.")
+
+    def test_interrupted_acknowledgement_is_reconciled_on_next_send(self):
+        with Env() as e:
+            inbox = self.prepare(e)
+            self.send(e, "one")
+            self.send(e, "two")
+            with patch.dict(os.environ, e.env), ateam.Inbox(ateam.Config(e.repo)) as current:
+                replace = current.replace
+                def interrupt(path, data):
+                    if path == current.path:
+                        raise OSError("crash after state commit")
+                    return replace(path, data)
+                with patch.object(current, "replace", side_effect=interrupt), self.assertRaises(OSError):
+                    current.acknowledge(1)
+            before = inbox.path.read_bytes()
+            self.assertNotIn("    one", e.run("wait").stdout)
+            self.assertEqual(before, inbox.path.read_bytes())
+            self.assertIn("queued #3", self.send(e, "three").stdout)
+            self.assertEqual([r["id"] for r in map(json.loads, inbox.path.read_text().splitlines())], [2, 3])
+
+    def test_damage_refuses_send_and_seen_but_lifecycle_wait_survives(self):
+        for damaged in ("inbox", "state"):
+            with self.subTest(damaged=damaged), Env(UI) as e:
+                e.run("up", "--no-brief")
+                inbox = self.prepare(e)
+                self.send(e)
+                path = inbox.path if damaged == "inbox" else inbox.state_path
+                path.write_bytes(b'{"torn":')
+                before = (inbox.path.read_bytes(), inbox.state_path.read_bytes())
+                failure = self.send(e, check=False)
+                self.assertEqual(failure.returncode, 5)
+                self.assertNotIn("--restart..", failure.stderr)
+                self.assertEqual(e.run("wait", "--seen", "1", check=False).returncode, 2)
+                result = e.run("wait", "--interval", "0.01")
+                self.assertEqual(result.stdout.count("inbox needs repair"), 1)
+                self.assertIn("nobody is working", result.stdout)
+                self.assertIn("inbox needs repair", e.run("status").stdout)
+                self.assertEqual(before, (inbox.path.read_bytes(), inbox.state_path.read_bytes()))
+                for cmd in ("up", "continue"):
+                    fake = e.fake_state()
+                    fake["panes"] = {"w1:p1": fake["panes"]["w1:p1"]}
+                    e.write_fake(fake)
+                    result = e.run(cmd)
+                    self.assertIn("inbox needs repair", result.stdout)
+                    self.assertIn("started @lead-dev", result.stdout)
+                    self.assertIn("Message teammates only", e.run("prompt", "lead-dev").stdout)
+                    self.assertEqual(before, (inbox.path.read_bytes(), inbox.state_path.read_bytes()))
+
+    def test_unavailable_inbox_degrades_but_cache_directories_may_be_symlinks(self):
+        brief = formation({"lead-dev": CATALOG_MEMBERS["lead-dev"]}, operator={"harness": "claude"})
+        with Env(brief) as e:
+            inbox = self.prepare(e)
+            target = e.root / "external-state"
+            inbox.state_path.rename(target)
+            inbox.state_path.symlink_to(target)
+            before = target.read_bytes()
+            self.assertIn("inbox unavailable:", e.run("up").stdout)
+            self.assertIn("inbox unavailable:", e.run("continue").stdout)
+            self.assertIn("Message teammates only", e.run("prompt", "lead-dev").stdout)
+            self.assertIn("Message anyone with", e.run("brief").stdout)
+            self.assertIn("inbox unavailable:", e.run("status").stdout)
+            waiting = e.run("wait", "--interval", "0.01").stdout
+            self.assertEqual(waiting.count("inbox unavailable:"), 1)
+            self.assertTrue(inbox.state_path.is_symlink())
+            self.assertEqual(target.read_bytes(), before)
+            with patch.dict(os.environ, e.env), patch.object(ateam.Inbox, "__enter__", side_effect=PermissionError("denied")):
+                self.assertEqual(ateam.message_route(ateam.Config(e.repo)), "typed")
+        for parent in (False, True):
+            with self.subTest(parent=parent), Env(brief) as e:
+                inbox = self.prepare(e)
+                path = inbox.directory.parent if parent else inbox.directory
+                target = e.root / "linked-cache"
+                path.rename(target)
+                path.symlink_to(target, target_is_directory=True)
+                target.chmod(0o755)
+                self.assertIn("through the inbox", e.run("up").stdout)
+                self.assertIn("queued #1", self.send(e).stdout)
+                self.assertTrue(path.is_symlink())
+                self.assertEqual(target.stat().st_mode & 0o777, 0o700)
+
+    def test_failed_route_setup_latches_typed_for_launch_and_brief(self):
+        brief = formation({"lead-dev": CATALOG_MEMBERS["lead-dev"]}, operator={"harness": "claude"})
+        with Env(brief) as e:
+            inbox = self.prepare(e)
+            before = inbox.state_path.read_bytes()
+            args = types.SimpleNamespace(cwd=str(e.repo), names=[], timeout=1000, no_brief=False)
+            unlink = pathlib.Path.unlink
+            def denied(path, *a, **kw):
+                if path == inbox.state_path:
+                    raise PermissionError("state unlink denied")
+                return unlink(path, *a, **kw)
+            out = io.StringIO()
+            with patch.dict(os.environ, e.env), patch.object(ateam, "HERDR", e.env["HERDR_BIN"]), \
+                    patch.object(pathlib.Path, "unlink", denied), contextlib.redirect_stdout(out):
+                cfg = ateam.Config(e.repo)
+                with patch.object(ateam, "cfg_of", return_value=cfg):
+                    ateam.cmd_up(args)
+                self.assertEqual(ateam.message_route(cfg), "typed")
+                prompt = ateam.member_prompt(ateam.plan(cfg, "lead-dev"), "operator", cfg)
+                self.assertIn("Message teammates only", prompt)
+                self.assertNotIn("To reach @operator, do not use herdr", prompt)
+            self.assertIn("inbox unavailable: state unlink denied. This session runs on typed messages."
+                          " After fixing it, run ateam.py continue --restart.", out.getvalue())
+            self.assertIn("by typed herdr messages", out.getvalue())
+            self.assertIn("started @lead-dev", out.getvalue())
+            self.assertIn("Message anyone with", dict(e.prompts())["lead-dev"])
+            self.assertNotIn("--add-dir", e.calls("agent", "start")[0])
+            self.assertEqual(inbox.state_path.read_bytes(), before)
+
+    def test_message_file_read_errors_are_clean_and_do_not_queue(self):
+        with Env() as e:
+            inbox = self.prepare(e)
+            before = inbox.state_path.read_bytes()
+            missing, invalid = e.root / "missing", e.root / "invalid-utf8"
+            invalid.write_bytes(b"\xff\xfe")
+            for path in (missing, invalid, e.root):
+                result = e.run("inbox", "send", "--from", "lead-dev", "--file", str(path), check=False)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(f"cannot read message file {path}:", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertNotIn("herdr agent prompt", result.stderr)
+                self.assertFalse(inbox.path.exists())
+                self.assertEqual(inbox.state_path.read_bytes(), before)
+            self.assertEqual(e.calls(), [])
+
+    def test_cold_retention_clears_only_acknowledged_in_current_session(self):
+        brief = formation({"lead-dev": CATALOG_MEMBERS["lead-dev"]}, operator={"harness": "claude"})
+        for cmd in ("up", "continue"):
+            for acknowledge in (False, True):
+                with self.subTest(cmd=cmd, acknowledge=acknowledge), Env(brief) as e:
+                    inbox = self.prepare(e)
+                    self.send(e, "earlier message")
+                    if acknowledge:
+                        e.run("wait", "--seen", "1", check=False)
+                    with patch.dict(os.environ, {**e.env, "HERDR_SESSION": "another/session"}):
+                        with ateam.Inbox(ateam.Config(e.repo)) as other:
+                            other.state["mode"] = "typed"
+                            other.save_state()
+                        other.path.write_bytes(b"untouched")
+                    before_other = (other.path.read_bytes(), other.state_path.read_bytes())
+                    inode = inbox.lock_path.stat().st_ino
+                    result = e.run(cmd)
+                    self.assertEqual(inbox.lock_path.stat().st_ino, inode)
+                    self.assertEqual(before_other, (other.path.read_bytes(), other.state_path.read_bytes()))
+                    state = json.loads(inbox.state_path.read_text())
+                    self.assertEqual(state, {"mode": "inbox", "seen": 0})
+                    if acknowledge:
+                        self.assertFalse(inbox.path.exists())
+                        self.assertNotIn("unread from the earlier team", result.stdout)
+                        self.assertIn("queued #1", self.send(e).stdout)
+                    else:
+                        self.assertIn("1 unread from the earlier team", result.stdout)
+                        self.assertIn("earlier message", e.run("wait").stdout)
+
+    def test_partial_restart_and_failed_query_do_not_clear(self):
+        brief = formation({"lead-dev": CATALOG_MEMBERS["lead-dev"], "reviewer": CATALOG_MEMBERS["reviewer"]},
+                          operator={"harness": "claude"})
+        with Env(brief) as e:
+            e.run("up", "lead-dev")
+            inbox = self.prepare(e)
+            self.send(e)
+            e.run("wait", "--seen", "1", "--interval", "0.01")
+            inode = inbox.lock_path.stat().st_ino
+            for command in (("up", "reviewer"), ("continue", "reviewer"), ("continue", "--restart")):
+                e.run(*command)
+                self.assertTrue(inbox.path.exists())
+                self.assertEqual(json.loads(inbox.state_path.read_text())["seen"], 1)
+                self.assertEqual(inbox.lock_path.stat().st_ino, inode)
+            # Even a restart with no members live must not clear acknowledged transport state.
+            fake = e.fake_state()
+            fake["panes"] = {"w1:p1": fake["panes"]["w1:p1"]}
+            e.write_fake(fake)
+            e.run("continue", "--restart")
+            self.assertEqual(json.loads(inbox.state_path.read_text())["seen"], 1)
+            before = (inbox.path.read_bytes(), inbox.state_path.read_bytes())
+            args = types.SimpleNamespace(cwd=str(e.repo), names=[], restart=False, fresh=False, timeout=1000)
+            with patch.dict(os.environ, e.env), patch.object(ateam, "ensure_operator", return_value="operator"), \
+                    patch.object(ateam, "Team", side_effect=SystemExit("query failed")):
+                with self.assertRaisesRegex(SystemExit, "query failed"):
+                    ateam.cmd_continue(args)
+            self.assertEqual(before, (inbox.path.read_bytes(), inbox.state_path.read_bytes()))
+
+    def test_named_watch_wakes_on_any_sender_and_sessions_are_isolated(self):
+        with Env(UI) as e:
+            e.run("up", "--no-brief")
+            inbox = self.prepare(e)
+            e.update("lead-dev", agent_status="working")
+            watcher = subprocess.Popen([sys.executable, str(SCRIPT), "wait", "lead-dev", "--cwd", str(e.repo),
+                                        "--interval", "0.05", "--timeout", "5"], env=e.env,
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            e.run("inbox", "send", "--from", "reviewer", "question")
+            out, err = watcher.communicate(timeout=10)
+            self.assertEqual(watcher.returncode, 0, err)
+            self.assertIn("from @reviewer", out)
+            other = e.run("wait", "--interval", "0.01", "--timeout", "0.1", check=False, HERDR_SESSION="other")
+            self.assertNotIn("question", other.stdout)
+            self.assertIn("question", e.run("wait").stdout)
+
+
 class WaitTests(unittest.TestCase):
     def test_wait_returns_when_the_lead_is_needed(self):
         with Env() as e:
@@ -1186,6 +1576,7 @@ class ConfigTests(unittest.TestCase):
         for h, t in ateam.TABLE.items():  # every harness has the same shape, and code to go with it
             self.assertEqual(set(t["permissions"]), set(ateam.LEVELS), h)
             self.assertIn(t["prompt"], ("file", "pointer", "message"), h)
+            self.assertIn(t["operator_messages"], ("inbox", "typed"), h)
             self.assertIn(h, ateam.CODE)
 
     def test_operator_table_and_name(self):
@@ -1493,7 +1884,7 @@ class LiveFlags(unittest.TestCase):
     FLAGS = {
         "claude": (["--help"], ["--model", "--effort", "--append-system-prompt", "--name", "--settings", "--permission-mode",
                                 '"auto"', '"bypassPermissions"', "--resume"]),
-        "codex": (["--help"], ["--model", "--config", "--cd", "--approve-for-me",
+        "codex": (["--help"], ["--model", "--config", "--cd", "--approve-for-me", "--add-dir",
                                "--dangerously-bypass-approvals-and-sandbox", "resume"]),
         "pi": (["--help"], ["--model", "--thinking", "--append-system-prompt", "--name", "--session", "--list-models"]),
         "omp": (["--help"], ["--model", "--thinking", "--append-system-prompt", "--resume", "--approval-mode"]),
