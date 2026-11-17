@@ -13,7 +13,7 @@ Principles: keep it small and simple. Prefer deleting words and code to adding t
 
 ## Tasks
 
-Tasks and bugs are GitHub Issues on `pkieltyka/herdr-a-team`, managed with the `todos` CLI. Run `todos skill` once to read how it works, and always pass `--json`. Never run `todos rm`; close instead. Board commands may fail until the token has project scope; issues work regardless.
+Tasks and bugs are GitHub Issues on `pkieltyka/herdr-a-team`, managed with the `todos` CLI. Run `todos skill` once to read how it works, and always pass `--json`. Never run `todos rm`; close instead. An issue in the board's Todo column is ready and may be started without asking; only the owner moves issues to Todo, never the team. Backlog is not ready.
 
 ## Workflow
 
