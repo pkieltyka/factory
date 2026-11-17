@@ -3,3 +3,5 @@ __pycache__/
 # Private notes, never committed
 notes/private/
 team.toml
+.codegenie
+
