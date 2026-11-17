@@ -113,6 +113,8 @@ class Config:
         harness = self.operator.get("harness")
         if harness is not None and (not isinstance(harness, str) or harness not in TABLE):
             raise SystemExit(f"[operator] harness {harness!r} is not one of {', '.join(TABLE)}")
+        if self.operator.get("messages", "inbox") not in ("inbox", "typed"):
+            raise SystemExit(f"[operator] messages {self.operator['messages']!r} must be inbox or typed")
         self.members = self.team.get("members", {})
         if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", str(self.operator["name"])) or self.operator["name"] in self.members:
             raise SystemExit(f"{self.conf_file}: [operator] name {self.operator['name']!r} must be lowercase letters,"
@@ -384,8 +386,10 @@ def operator_wait(cfg, route):
 
 def configure_messages(cfg, team, operator, restart=()):
     conf, live = cfg.operator.get("harness"), (team.pane(operator) or {}).get("agent")
-    mode = "inbox" if conf and conf == live else "typed"
-    reason = (f"[operator] harness is not set in {CONF}" if not conf else
+    typed = cfg.operator.get("messages", "inbox") == "typed"
+    mode = "inbox" if not typed and conf and conf == live else "typed"
+    reason = (f'[operator] messages = "typed" in {CONF}' if typed else
+              f"[operator] harness is not set in {CONF}" if not conf else
               f"{CONF} says {conf}, herdr sees {live} in this pane" if conf != live else "")
     try:
         with Inbox(cfg) as inbox:

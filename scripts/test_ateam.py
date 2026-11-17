@@ -946,6 +946,51 @@ class InboxTests(unittest.TestCase):
             self.assertIn("[operator] harness 'unknown' is not one of", e.run("check", check=False).stderr)
         self.assertNotIn("inbox", ateam.claude_settings("guarded"))
 
+    def test_operator_messages_opt_out(self):
+        members = {"lead-dev": {**CATALOG_MEMBERS["lead-dev"], "permissions": "guarded"},
+                   "architect": CATALOG_MEMBERS["architect"]}
+        for harness in ("claude", "codex"):
+            with self.subTest(harness=harness), Env(formation(members, operator={"harness": harness,
+                                                                                 "messages": "typed"})) as e:
+                e.update(None, agent=harness)
+                before = e.run("prompt", "lead-dev").stdout
+                self.assertIn('by typed herdr messages: [operator] messages = "typed" in team.toml',
+                              e.run("up").stdout)
+                self.assertEqual(before, e.run("prompt", "lead-dev").stdout)
+                self.assertIn("operator messages: typed", e.run("status").stdout)
+                starts = {c[2]: c for c in e.calls("agent", "start")}
+                self.assertNotIn("--add-dir", starts["lead-dev"])
+                self.assertNotIn("inbox send", " ".join(starts["architect"]))
+                with patch.dict(os.environ, e.env):
+                    with ateam.Inbox(ateam.Config(e.repo)) as inbox:
+                        self.assertEqual(inbox.state["mode"], "typed")
+                for name in members:
+                    e.update(name, agent_status="done")
+                self.assertNotIn("End your turn", e.run("wait", "--interval", "0").stdout)
+
+                e.write_brief(formation(members, operator={"harness": harness, "messages": "inbox"}))
+                self.assertIn("route to @operator changed to inbox", e.run("continue").stdout)
+                explicit = e.run("prompt", "lead-dev").stdout
+                e.write_brief(formation(members, operator={"harness": harness}))
+                self.assertIn("through the inbox", e.run("continue").stdout)
+                self.assertEqual(explicit, e.run("prompt", "lead-dev").stdout)
+                self.send(e, "pending before opt-out")
+                with patch.dict(os.environ, e.env):
+                    path = ateam.Inbox(ateam.Config(e.repo)).path
+                pending = path.read_bytes()
+                e.write_brief(formation(members, operator={"harness": harness, "messages": "typed"}))
+                self.assertIn("route to @operator changed to typed", e.run("continue").stdout)
+                self.assertEqual(pending, path.read_bytes())
+                self.assertIn("pending before opt-out", e.run("wait").stdout)
+                e.run("wait", "--seen", "1", "--interval", "0", check=False)
+                self.assertEqual(path.read_bytes(), b"")
+
+        for value in ("invalid", "", True, 1, ["typed"]):
+            with self.subTest(value=value), Env(formation(members, operator={"messages": value})) as e:
+                result = e.run("check", check=False)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"[operator] messages {value!r} must be inbox or typed", result.stderr)
+
     def test_operator_wait_modes_and_timeout_defaults(self):
         def timeout(e, expected, explicit=None):
             args = types.SimpleNamespace(cwd=str(e.repo), names=[], seen=None, timeout=explicit, interval=0)
@@ -976,6 +1021,10 @@ class InboxTests(unittest.TestCase):
                 timeout(e, seconds)
                 timeout(e, 7, explicit=7)
                 self.prepare(e, "typed")
+                timeout(e, 1800)
+                e.write_brief(formation({"lead-dev": CATALOG_MEMBERS["lead-dev"]},
+                                        operator={"harness": harness, "messages": "typed"}))
+                e.run("continue")
                 timeout(e, 1800)
         with Env() as e:
             self.prepare(e)

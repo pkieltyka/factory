@@ -388,6 +388,27 @@ When the configured operator harness matches its live pane, members' messages to
 - A foreground operator that ends its turn has no watcher: the same accepted gap as before.
 - OMP is proven on two cycles, on a non-default model (its default provider has no key on this machine) and with an 1810 s command limit accepted; a watcher that actually runs the full 1800 s was not tested.
 
+## Opt-out (#25): typed messages by choice
+
+A person who prefers the old route sets it in their own `team.toml`:
+
+```toml
+[operator]
+messages = "typed"   # "inbox" or "typed"; absent means inbox
+```
+
+- `Config` rejects any other value, next to the harness check: `[operator] messages <x> must be inbox or typed`.
+- `configure_messages` applies it before the live-kind match: with `typed` the route is typed on any harness. The effective route is stored as today, so every later reader follows it; nothing else reads the key.
+- `up` and `continue` print `members reach @<operator> by typed herdr messages: [operator] messages = "typed" in team.toml`. `status` prints `operator messages: typed` with the usual unread count. Changing the key while a member runs gives the existing `the route to @<operator> changed ...: run ateam.py continue --restart` line.
+- Unchanged by it: unread inbox messages and their acknowledgement (`wait` still prints them), the cold clear, the damage and unavailable fallbacks, the typed text for members, no inbox grant in Claude settings or Codex arguments, and `wait`'s 1800 s default with no foreground hint.
+- Docs: one commented line under `[operator]` in `templates/team.toml` (`# messages = "typed"   # members type into your pane with herdr instead of using the inbox`), `messages` among the operator fields named in `README.md`, and the two sentences of its first paragraph (from #24) gain "By default" and the explicit choice, so the opening does not contradict the new field:
+
+```markdown
+By default, when the configured operator harness matches its live pane, members' messages to the operator go to an inbox that `ateam.py wait` reads, so nothing is typed into the pane you type in. An explicit typed choice, an unset or mismatched harness, or a damaged or unavailable inbox, uses typed messages instead.
+```
+
+Tests: an invalid value fails `check`; no key and `messages = "inbox"` behave alike; a Claude operator with live kind `claude` and `messages = "typed"` gets the typed line with that reason, typed member text, state `typed`, no inbox grants and 1800 s; changing the key with a member running prints the restart line; unread messages survive the switch and are still printed by `wait`; a Codex operator with `messages = "typed"` gets no foreground default or hint.
+
 ## Decided
 
 By the owner, through @operator (2026-11-17):
@@ -412,3 +433,4 @@ After the inbox runs on every operator harness (#24, 2026-11-17), by the owner:
 - `wait` defaults to 60 s on a foreground harness while the inbox route is in effect (the owner found five minutes too long), and 1800 s otherwise.
 - A foreground operator does not wait while no member is working: it ends its turn on the "nobody is working" return.
 - Message ids are printed as `message 12`, never `#12`; they stay integers in the file and for `--seen`.
+- `[operator] messages = "typed"` in `team.toml` opts a person out of the inbox (#25); absent or `"inbox"` keeps it.
