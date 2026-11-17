@@ -25,7 +25,7 @@ Read in this order: `TEAM.md`, `team.toml` and project plans; the tracker; Git (
 
 - Match every uncommitted change to an in-progress item before any member writes. A change no item explains is not built on, committed or discarded: ask the user.
 - A verdict covers only the commit or paths it names. Ask for a new review when the record has no verdict or no checks, when the branch moved past the reviewed commit, or when approved work was never committed.
-- Tell the user where the project stands before you message any member, even with a correction or a heads-up: each open item with its state, evidence and next action, then anything unexplained or contradictory. Then carry on; stop only for those and for decisions that are the user's.
+- Tell the user where the project stands: each open item with its state, evidence and next action, then anything unexplained or contradictory. Then carry on; stop only for those and for decisions that are the user's.
 - Send each fresh member its task again: goal, criteria, branch or files, the evidence so far and the required fixes still open. Resumed members report what they were doing; check it against the above.
 
 Then follow [leading.md](leading.md).

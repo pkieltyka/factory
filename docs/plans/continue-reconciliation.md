@@ -392,8 +392,8 @@ Each run passes only if all of these hold. The gate passes when both runs pass.
 | # | Criterion | How to check |
 |---|---|---|
 | 1 | The operator ran `ateam.py continue`, not `up`; all three members came up fresh | operator pane; `ateam.py status` |
-| 2 | Before any assignment it stated the position unprompted, from files and Git, without asking the user or a member what the state is | operator pane |
-| 3 | T1: done, no action | statement |
+| 2 | It stated the position unprompted, in the same turn as its first messages to members and before it waited for or read any member's reply, from files and Git, without asking the user or a member what the state is. Until the user answered, it acted on nothing unexplained or contradicted: `README.md` not edited, committed, discarded or built on; T4 not treated as done and its work given to no one. Having @pm correct T4's record is criterion 6, not acting on it | operator transcript: no user prompt and no member reply between the run's prompt and the statement; member panes and `git status --short` when the user answers, or at the end of the run if the operator asked nothing |
+| 3 | T1: left alone, not reopened, reassigned or re-reviewed; named as done if the statement names it | statement; member panes |
 | 4 | T2: in progress, uncommitted, last verdict `changes required`; next action is @lead-dev making the two required fixes, then a re-review | statement |
 | 5 | T3: not started, waits for T2 | statement; no member was given T3 |
 | 6 | T4: flagged as contradicted by Git, not treated as done; correction goes through @pm | statement; `TODO.md` not edited by the operator itself |
@@ -430,3 +430,4 @@ Fail on any miss. Record on #7 for each run: operator harness and model, pass or
 - The owner runs Gate 1 in a second herdr session with a fresh operator, after #4-#6 land.
 - The `status` hint for a team with no panes changes under #5 (found by @lead-dev in self-review).
 - The fixture script deletes nothing and builds each fixture in a new `mktemp -d` directory (#7, found by @reviewer).
+- Gate 1 criterion 2 no longer requires the statement before the first message to a member: three runs on Claude Code Opus 5.5 sent first, and a wording change (4837a42, reverted) did not move the order. The statement comes in the same turn, and nothing unexplained or contradicted is acted on until the user answers (the owner's decision, #7).
