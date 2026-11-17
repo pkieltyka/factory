@@ -90,7 +90,7 @@ python3 <skill>/scripts/ateam.py inbox send --cwd <main root> --from <name> --fi
 | Outcome | Exit | Output | Member does |
 |---|---|---|---|
 | Stored | 0 | `queued #<id>` | Finishes as usual. Queued means stored, not read. |
-| Definitely not stored: state says `typed`; no state file for this session; a damaged inbox or state; a mode, symlink or write error **before the append began** | 5 | `not stored: <full reason>. Nothing was queued. Send it typed, once, exactly as printed:` then one line: `herdr agent prompt <operator> <shell-quoted text>`. The text is `[from @<name>] Inbox unavailable: <cause>.`, a newline, the message, a final newline. | Runs the printed command once, exactly as printed, and checks its result. |
+| Definitely not stored: state says `typed`; no state file for this session; a damaged inbox or state; a mode, symlink or write error **before the append began** | 5 | `not stored: <full reason>. Nothing was queued. Send it typed, once, exactly as printed:` then one line: `herdr agent prompt <operator> <shell-quoted text>`. The text is `[from @<name>]: Inbox unavailable: <cause>.`, a newline, the message, a final newline. | Runs the printed command once, exactly as printed, and checks its result. |
 | Anything else (an error after the append began, a failed `fsync`) | 1 | `not confirmed: <error>. The message may or may not be stored. Do not send it again by any route.` | Says so in its pane and stops. |
 
 `<cause>` is one of three fixed words, so the first line of the typed message is short enough to be copied whole; the full reason, with its path, stays on the "not stored" line in the member's pane:
@@ -161,7 +161,7 @@ It queues the message without typing into {operator}'s pane. `queued #N` means s
 **Brief**, `render_team_brief`, last sentence of "Talking to each other". Typed: unchanged. Inbox:
 
 ```text
-Message a teammate with `herdr agent prompt <name> '[from @you] ...'` and `<operator>` with the inbox command in your standing instructions; they say how.
+Message a teammate with `herdr agent prompt <name> '[from @you]: ...'` and `<operator>` with the inbox command in your standing instructions; they say how.
 ```
 
 **Continue closing**, `pickup_text` in `cmd_continue`. Typed: unchanged. Inbox: the sentence that starts "Send it:" and names the herdr command becomes:
@@ -231,7 +231,7 @@ Inbox send
 9. Multiline and Unicode text, and `--file`, come back exactly from `wait`.
 10. Two sends at once (two processes) leave two whole lines with different ids.
 11. No herdr call is made by `inbox send` in any outcome (assert on the fake's call log).
-12. State `typed`, no state file, a damaged inbox, an unwritable cache directory and a symlink at the inbox path each give exit 5, write nothing, and print a command whose text is exactly `[from @<name>] Inbox unavailable: <cause>.` (`no inbox route`, `needs repair` or `cannot write`), a newline and the original message, round-tripped through the shell; the "not stored" line keeps the full reason.
+12. State `typed`, no state file, a damaged inbox, an unwritable cache directory and a symlink at the inbox path each give exit 5, write nothing, and print a command whose text is exactly `[from @<name>]: Inbox unavailable: <cause>.` (`no inbox route`, `needs repair` or `cannot write`), a newline and the original message, round-tripped through the shell; the "not stored" line keeps the full reason.
 13. A failure injected after the append began gives exit 1 and no herdr command; a stored message (exit 0) prints no herdr command either. A short write is completed before "queued" is printed.
 14. Unknown `--from` and an empty message are errors.
 

@@ -747,7 +747,7 @@ def launch_argv(m, prompt_file, resume=None):
 # ================================================================ briefs
 
 def tag(name):
-    return f"[from @{name}]"
+    return f"[from @{name}]:"
 
 
 def member_prompt(m, operator, cfg):
@@ -814,9 +814,9 @@ def render_team_brief(cfg, members, operator, closing=None):
                 " checkout, and `git -C <its path> status` shows what it has not committed yet. When you ask for a"
                 " review, name your branch."]
     names = ", ".join("`" + m["name"] + "`" for m in members)
-    messaging = " Message anyone with `herdr agent prompt <name> '[from @you] ...'`; your standing instructions say how."
+    messaging = " Message anyone with `herdr agent prompt <name> '[from @you]: ...'`; your standing instructions say how."
     if message_route(cfg) == "inbox":
-        messaging = (" Message a teammate with `herdr agent prompt <name> '[from @you] ...'` and "
+        messaging = (" Message a teammate with `herdr agent prompt <name> '[from @you]: ...'` and "
                      f"`{operator}` with the inbox command in your standing instructions; they say how.")
     out += ["", "## Talking to each other", "",
             f"Everyone has an @name, which is also their herdr pane's name: {names}, and `{operator}` for the operator."
@@ -1268,9 +1268,9 @@ def cmd_continue(args):
     team = Team(cfg)
     pickup_text = (f"We are picking up where we left off. Re-read `{BRIEF}`, check the tracker it names"
                    f", then tell @{operator} in one line what you were doing and what you will do next. Send it:"
-                   f" `herdr agent prompt {operator} '[from @you] ...'`. A reply in your own pane does not reach @{operator}.")
+                   f" `herdr agent prompt {operator} '[from @you]: ...'`. A reply in your own pane does not reach @{operator}.")
     if message_route(cfg) == "inbox":
-        pickup_text = pickup_text.replace(f"Send it: `herdr agent prompt {operator} '[from @you] ...'`.",
+        pickup_text = pickup_text.replace(f"Send it: `herdr agent prompt {operator} '[from @you]: ...'`.",
                                           "Send it with the inbox command in your standing instructions.")
     fresh_text = (f"You are starting in a new session and know nothing of the work so far. Re-read `{BRIEF}`"
                   f" and do not start anything yet: @{operator} will send your task, its criteria and the evidence"
