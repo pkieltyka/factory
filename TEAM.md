@@ -22,4 +22,4 @@ Tasks and bugs are GitHub Issues on `pkieltyka/herdr-a-team`, managed with the `
 
 ## Notes
 
-Enabled in `notes/`: `activity/` (the team's working notes), `research/` (findings the owner asked for), `discussions/` (records of meetings and their decisions). Follow the a-team notes convention; search with rg. `notes/private/` is the owner's and is never searched, indexed or cited.
+Enabled in `notes/`: `activity/` (the team's working notes), `research/` (findings the owner asked for), `discussions/` (records of meetings and their decisions). Follow the a-team notes convention; search with rg. `notes/private/` holds each person's own notes, ignored by Git. That person's team may read and search it, under the private-folder rule of the notes convention.
