@@ -1820,6 +1820,8 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual((e.repo / ".gitignore").read_text(), "team.toml\n")
             self.assertEqual(out.count("wrote"), 3)
             e.run("check", "lead-dev")                         # what init writes is a team that checks
+            self.assertIn("The operator may assign an item marked `ready` without asking the user",
+                          e.run("brief").stdout)
             # a teammate: the shared files are there, edited; only their own team.toml is missing
             (e.repo / "team.toml.sample").write_text('[members.pm]\nharness = "pi"\nmodel = "z-ai/glm-5.3"\n')
             (e.repo / "TEAM.md").write_text("# Team\n\nOurs.\n")
@@ -1856,6 +1858,9 @@ class ConfigTests(unittest.TestCase):
             self.assertIn("No reply needed.", text)
             self.assertNotIn("Works in", text)  # no worktrees on this team
             prompt = e.run("prompt", "reviewer").stdout
+            self.assertIn("Start a task only when @operator or the user assigns it to you; an item the brief or "
+                          "tracker marks ready is not an assignment. A teammate's request for a review or advice "
+                          "needs none.", prompt)
             self.assertIn("You are read-only", prompt)
             self.assertIn("build and run", prompt)  # read-only permits builds/tests
             self.assertIn("## Reports", prompt)

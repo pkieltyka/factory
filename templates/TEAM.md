@@ -4,7 +4,7 @@
 
 ## Tasks
 
-Tasks, owners, status and bugs are tracked in `TODO.md` at the repo root. An item marked `ready` may be started without asking; only a person marks it, never the team.
+Tasks, owners, status and bugs are tracked in `TODO.md` at the repo root. The operator may assign an item marked `ready` without asking the user; only a person marks it, never the team.
 
 ## Workflow
 
