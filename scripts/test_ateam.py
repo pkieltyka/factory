@@ -1380,6 +1380,50 @@ class ListingTests(unittest.TestCase):
         self.assertEqual(ateam.listed_models(omp), ["openrouter/z-ai/glm-5.3", "openrouter/z-ai/glm-5.3-flash", "ollama/qwen3:8b"])
 
 
+@unittest.skipUnless(GIT, "git is not installed")
+class GateFixtureTests(unittest.TestCase):
+    def test_each_build_is_fresh_and_preserves_existing_fixtures_and_caches(self):
+        with tempfile.TemporaryDirectory(prefix="gate1 test ") as directory:
+            parent = pathlib.Path(directory)
+            env = {**os.environ, "XDG_CACHE_HOME": str(parent / "cache"), "GIT_CONFIG_GLOBAL": os.devnull,
+                   "GIT_CONFIG_NOSYSTEM": "1", "PYTHONDONTWRITEBYTECODE": "1"}
+            unrelated = parent / "cache/a-team/ateam-gate1-unrelated/sessions.jsonl"
+            unrelated.parent.mkdir(parents=True)
+            unrelated.write_text("unrelated session")
+            fixtures, caches = [], []
+
+            def run(*args, cwd=parent):
+                return subprocess.run(args, cwd=cwd, env=env, check=True, capture_output=True, text=True)
+
+            for _ in range(2):
+                before = set(parent.glob("ateam-gate1.*"))
+                run("bash", str(ateam.SKILL / "scripts/gate1-setup.sh"), str(ateam.SKILL), str(parent))
+                created = set(parent.glob("ateam-gate1.*")) - before
+                self.assertEqual(len(created), 1)
+                repo = created.pop()
+                fixtures.append(repo)
+                with patch.dict(os.environ, env):
+                    cache = ateam.Config(repo).cache
+                self.assertNotIn(cache, caches)
+                self.assertFalse(cache.exists())
+                caches.append(cache)
+                self.assertEqual(run(GIT, "rev-list", "--count", "HEAD", cwd=repo).stdout.strip(), "3")
+                self.assertEqual(set(run(GIT, "status", "--short", cwd=repo).stdout.splitlines()),
+                                 {" M README.md", " M slug.py", "?? test_slug_length.py"})
+                tests = run(sys.executable, "-m", "unittest", cwd=repo)
+                self.assertIn("Ran 3 tests", tests.stderr)
+                result = run(sys.executable, "-c",
+                             'from slug import slugify; print(slugify("hello world", max_length=6))', cwd=repo)
+                self.assertEqual(result.stdout.strip(), "hello-")
+                cache.mkdir(parents=True)
+                (cache / "sessions.jsonl").write_text("previous fixture session")
+                (repo / "preserve-me").write_text("previous fixture")
+            self.assertEqual(unrelated.read_text(), "unrelated session")
+            for repo, cache in zip(fixtures, caches):
+                self.assertEqual((repo / "preserve-me").read_text(), "previous fixture")
+                self.assertEqual((cache / "sessions.jsonl").read_text(), "previous fixture session")
+
+
 class HerdrContract(unittest.TestCase):
     """The fields ateam.py reads must exist where it reads them. The fake above follows the same split."""
 

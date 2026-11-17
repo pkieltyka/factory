@@ -218,17 +218,15 @@ A behavioural test of the operator following A1-A3, on real herdr and real harne
 
 ### Fixture
 
-#7 adds `scripts/gate1-setup.sh` with exactly this content (verified: it builds, the three tests pass, `slugify("hello world", max_length=6)` returns `hello-`, commit `0f3a9c1` does not exist):
+#7 adds `scripts/gate1-setup.sh` with exactly this content (verified: it builds, the three tests pass, `slugify("hello world", max_length=6)` returns `hello-`, commit `0f3a9c1` does not exist; two runs give two directories). It deletes nothing: each run builds the fixture in a new directory, so the session cache for that path has never existed. An earlier version removed `ateam-gate1-*` from the cache, which would also have removed other fixtures' sessions (found by @reviewer):
 
 ```bash
 #!/usr/bin/env bash
 # Gate 1 fixture: a small repo left mid-task, with no team running and no session cache.
-# Usage: gate1-setup.sh <a-team skill dir> [parent dir]     (re-running rebuilds it from scratch)
+# Usage: gate1-setup.sh <a-team skill dir> [parent dir]     (each run builds a new directory)
 set -euo pipefail
 SKILL=$(cd "$1" && pwd)
-GATE=${2:-${TMPDIR:-/tmp}}/ateam-gate1
-rm -rf "$GATE" "${XDG_CACHE_HOME:-$HOME/.cache}"/a-team/ateam-gate1-*
-mkdir -p "$GATE"
+GATE=$(mktemp -d "${2:-${TMPDIR:-/tmp}}/ateam-gate1.XXXXXX")
 cd "$GATE"
 git init -q -b main
 g() { git -c user.name=gate1 -c user.email=gate1@example.invalid -c commit.gpgsign=false "$@"; }
@@ -380,10 +378,10 @@ The team is the template's: @lead-dev, @reviewer, @pm, tracker `TODO.md`.
 
 Preconditions: A1-A3 are in the skill the operator's harness loads. A herdr session with **no a-team panes**: not the session this team runs in, because a-team finds members by pane label across the whole herdr session.
 
-1. `bash scripts/gate1-setup.sh <skill dir>`. Note the printed path (`$GATE`).
+1. `bash scripts/gate1-setup.sh <skill dir>`. It builds a new directory each time; note the printed path (`$GATE`). Old fixture directories stay in the temp dir until you remove them.
 2. In `$GATE/team.toml` set `[operator]` to the session that will run; change member models only if `python3 <skill dir>/scripts/ateam.py check --cwd $GATE` fails.
 3. In the clean herdr session start a **new** operator session in `$GATE`: no resumed conversation, and it has not seen this plan or the fixture script.
-4. Type exactly the run's prompt and nothing else. **Run A:** `/a-team continue`. **Run B** (rebuild the fixture with step 1 and close run A's panes first): `/a-team`.
+4. Type exactly the run's prompt and nothing else. **Run A:** `/a-team continue`. **Run B** (close run A's panes, run step 1 again for a new fixture directory, and start the new operator session there): `/a-team`.
 5. Do not answer or hint until the operator has stated where the project stands, or 15 minutes have passed. If it asks about `README.md` answer "mine, leave it"; about T4 answer "not done, reopen it". End the run once @lead-dev has its assignment.
 6. Keep as evidence: `herdr agent read <operator name> --source recent-unwrapped --lines 200`, the same for lead-dev with `--lines 80`, `git -C $GATE status --short`, and `ateam.py status --cwd $GATE`.
 
@@ -431,3 +429,4 @@ Fail on any miss. Record on #7 for each run: operator harness and model, pass or
 - The reviewer copies its verdict to the tracker's owner, and cold `continue` labels the operator's tab.
 - The owner runs Gate 1 in a second herdr session with a fresh operator, after #4-#6 land.
 - The `status` hint for a team with no panes changes under #5 (found by @lead-dev in self-review).
+- The fixture script deletes nothing and builds each fixture in a new `mktemp -d` directory (#7, found by @reviewer).
