@@ -1864,6 +1864,7 @@ class ConfigTests(unittest.TestCase):
             self.assertIn("You are read-only", prompt)
             self.assertIn("build and run", prompt)  # read-only permits builds/tests
             self.assertIn("## Reports", prompt)
+            self.assertIn("learned: <what a later task would otherwise get wrong>", prompt)
             self.assertIn("Never end a message on a word that starts with @ or $, even before a full stop: "
                           "some harnesses complete it and the message stays unsent.", prompt)
             self.assertIn("`agent_prompted` means sent", prompt)
