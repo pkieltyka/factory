@@ -38,13 +38,13 @@ Edit `team.toml`, your formation:
 - Use `worktree = true` for developers who work in parallel: each gets branch `<user>/<member>` (for example `peter/lead-dev`), so two people's branches do not collide when their `user` differs. `user` is a top-level key above `[operator]` and defaults to the system user name; set it when that name is generic (`root`, `ubuntu`).
 - Match the operator's model/thinking to the current session, not the template defaults.
 
-Edit `TEAM.md`, the shared brief. Write it by role, so it holds for any person's formation:
+Edit `TEAM.md`, the shared brief, as plain Markdown without comments. Write it by role ("the operator", never an @name), so it holds for any person's formation:
 
 - `## Project`: what, for whom, stack. Detailed tasks go in messages.
-- `## Tasks`: where tasks and bugs are tracked and with what tool, in words a member can act on (a repo file, GitHub Issues with `gh`, Linear, another CLI). A file suits one person; several people on the repo need a shared tool. @pm owns the tracker when present; otherwise you track tasks. Say what marks an item ready to start and who sets it.
+- `## Tasks`: where tasks and bugs are tracked and with what tool, in words a member can act on (a repo file, GitHub Issues with `gh`, Linear, another CLI). A file suits one person; several people on the repo need a shared tool, with the person's name next to the member's in an item's owner (`peter/@lead-dev`). @pm owns the tracker when present; otherwise you track tasks. Say what marks an item ready to start and who sets it.
 - `## Workflow`: short. Review and integration rules, and who commits: shared-checkout members leave commits to you; worktree members commit their own branches. It must not contradict the standing instructions. Keep or change its defaults: one feature at a time, one writing task per shared checkout, three review rounds.
-- `## Notes`: `Disabled.`, or the example in the template's comment with the folders the user chose. You may recommend notes; never enable them unasked, and on a rerun keep what is there.
-- `## Specs`, `## Browser`, `## Review`: only for a tool the project uses, in that tool's own words: where, which tool, how to learn it, one cheap check command. Run the check before you write the section.
+- `## Notes`: `Disabled.`, or the location and the folders the user chose, for example "Enabled in `notes/`: `activity/` (the team's working notes), `research/` (findings the owner asked for), `discussions/` (records of meetings and their decisions). Follow the a-team notes convention; search with rg." Name the project's search tool instead of rg if it has one. You may recommend notes; never enable them unasked, and on a rerun keep what is there.
+- `## Specs` (how specifications are written and where they live), `## Browser` (the browser tool for UI work and QA), `## Review` (a tool the reviewer runs on committed changes, and its limits: depth, time, publishes nothing): only for a tool the project uses, in that tool's own words: where, which tool, how to learn it, one cheap check command. Run the check before you write the section.
 
 When the formation should be the project's suggestion, copy `team.toml` to `team.toml.sample` and make the copy portable: remove `user` and `worktree_dir`, and any worktree branch or path that carries a person's name.
 

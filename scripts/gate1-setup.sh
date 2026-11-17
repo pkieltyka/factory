@@ -36,7 +36,9 @@ python3 - <<'EOF'
 import pathlib, re
 p = pathlib.Path("TEAM.md")
 project = "slug: a one-function Python library that turns text into URL slugs. Standard library only. Tests: `python3 -m unittest`."
-p.write_text(re.sub(r"(## Project\n\n)<!--.*?-->", lambda m: m.group(1) + project, p.read_text(), count=1, flags=re.S))
+text, n = re.subn(r"(## Project\n\n).*?(?=## )", lambda m: m.group(1) + project + "\n\n", p.read_text(), count=1, flags=re.S)
+assert n == 1
+p.write_text(text)
 EOF
 printf '# Tasks\n\nNothing recorded yet.\n' > TODO.md
 g add -A

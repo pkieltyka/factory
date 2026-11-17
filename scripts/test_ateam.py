@@ -1410,6 +1410,7 @@ class GateFixtureTests(unittest.TestCase):
                 self.assertFalse(cache.exists())
                 caches.append(cache)
                 self.assertEqual(run(GIT, "rev-list", "--count", "HEAD", cwd=repo).stdout.strip(), "3")
+                self.assertIn("slug: a one-function", (repo / "TEAM.md").read_text())
                 self.assertEqual(set(run(GIT, "status", "--short", cwd=repo).stdout.splitlines()),
                                  {" M README.md", " M slug.py", "?? test_slug_length.py"})
                 tests = run(sys.executable, "-m", "unittest", cwd=repo)

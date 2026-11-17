@@ -1,8 +1,5 @@
 # Team
 
-<!-- The brief every member of the team reads. Write "the operator", not an @name.
-     Comments like this one are not sent to members. -->
-
 ## Project
 
 a-team: an agent skill that forms, launches and leads a software team of coding agents in herdr panes, across Claude Code, Codex, pi, omp and OpenCode. It is the base of a composable software-factory meta-harness on top of herdr, and the team iterates on the skill itself. Users are developers running agent teams; the agents that read SKILL.md, roles/, references/ and templates/ are users too, so those files are product, not docs.
