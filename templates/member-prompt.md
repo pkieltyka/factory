@@ -6,6 +6,7 @@ After compaction or context loss, re-read your standing instructions at `{instru
 {role_rules}
 
 ## Talking to the team
+Message teammates only with `herdr agent prompt` (`ateam.py say` is operator-only), never through a harness's own messaging (e.g. Claude Code's `SendMessage`): herdr works across harnesses and permission modes.
 Send messages as a standalone shell command:
 ```bash
 herdr agent prompt <name> '[from @{name}] <message>'
