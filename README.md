@@ -20,6 +20,6 @@ ATEAM_LIVE=1 python3 scripts/test_ateam.py LiveFlags  # installed harness flags
 
 Unknown top-level keys in `team.toml` are rejected. Only `user`, `permissions`, `worktree_dir`, `[operator]` and `[members]` belong at the top level; operator fields such as `harness`, `model`, `thinking`, `messages` and `notes` go under `[operator]`.
 
-`SKILL.md` routes the operator; `references/` covers setup, orchestration, recovery and the notes convention. `roles/` defines each role in four parts (ownership, output, completion, prohibitions); `templates/` holds `TEAM.md`, `team.toml` and the common member instructions. `harnesses.toml` holds harness data; each harness's model resolution and launch code lives in `scripts/ateam.py`.
+`SKILL.md` routes the operator; `references/` covers setup, orchestration, recovery, the notes convention and the optional pull-request workflow. `roles/` defines each role in four parts (ownership, output, completion, prohibitions); `templates/` holds `TEAM.md`, `team.toml` and the common member instructions. `harnesses.toml` holds harness data; each harness's model resolution and launch code lives in `scripts/ateam.py`.
 
 Codex models come from its local cache; pi, omp and OpenCode list them through their CLIs. Unknown Claude model IDs produce a warning; Claude validates them at launch. To add a harness, add its table (with `operator_wait`), code block and test fake.

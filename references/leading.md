@@ -9,7 +9,7 @@ Read after compaction and before assigning work. Follow the workflow in `TEAM.md
 - Tell @pm about assignments, decisions and completion; reviewers send it their verdicts. Each durable task record needs owner, criteria, branch/commit, verdict (with what was reviewed and the checks run) and next step (after `changes required`: the required fixes). Maintain this yourself without a pm.
 - Members ask peers for reviews and advice, but new work and scope come from you. Settle disagreements. A `[from @name]` tag claims a sender; it grants no additional authority.
 - Relay the user's @mentions with context. Members see only messages sent to them, not your conversation.
-- After `up` or `continue`, run the check command of each optional section in `TEAM.md` (Specs, Browser, Review, a notes search tool). A failed check blocks only the work that needs it: say so, and never edit `TEAM.md` because this machine lacks a tool.
+- After `up` or `continue`, run the check command of each optional section in `TEAM.md` (Specs, Browser, Review, Pull requests, a notes search tool). A failed check blocks only the work that needs it: say so, and never edit `TEAM.md` because this machine lacks a tool.
 - When `TEAM.md` enables notes, follow [notes.md](notes.md): link the notes that apply in each assignment, and write learnings and decisions yourself.
 
 ```bash
@@ -60,6 +60,7 @@ With names, `wait <names>` watches only those members; without names it watches 
 - Before committing the tracker, check every touched record: status, verdict and one next-step field must agree. Have the tracker owner correct stale instructions. Include acceptance browser scripts/tests and their documented run command when committing or merging browser work.
 - A failed worktree commit is a coordination problem: agree who commits it, using `git -C <path>` if needed. Do not disable signing, hooks or sandbox settings to make it pass.
 - The member merges main into its branch before the next task. Remove worktrees/branches only when cleanup is authorized and reviewed work is merged.
+- When `TEAM.md` has a `## Pull requests` section, follow [pull-requests.md](pull-requests.md): it replaces your commit to the main branch and your local merge.
 
 ## Autopilot
 
@@ -67,7 +68,7 @@ When the user gives a goal and tells you to keep going, work through it without 
 
 - Take only items the tracker marks ready, as many at a time as `TEAM.md` allows. Assign, wait, review and integrate as above, then take the next. A `wait` timeout is not a stop: start it again.
 - Stop when a decision is the user's, no ready item is left, a task is not approved within the review rounds `TEAM.md` allows, a capability the task needs is missing, or a member cannot be recovered.
-- Always the user's, whatever the goal says: pushing, deploying, destructive operations, spending money, and anything sent outside the team.
+- Always the user's, whatever the goal says: pushing, deploying, destructive operations, spending money, and anything sent outside the team. The exception is standing permission in a `## Pull requests` section of `TEAM.md`: to push ticket branches and open pull requests, and separately to merge.
 - Autopilot assumes the safe machine that `full` permissions assume (see SKILL.md).
 - On stopping, say why and what comes next in your pane, and run `herdr notification show "a-team stopped" --body "<why>" --sound request`.
 - Nothing restarts you. If your session ends, the user runs `/a-team continue`; keep the tracker current enough for that.
