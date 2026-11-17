@@ -1,6 +1,6 @@
 # a-team
 
-An agent skill for running a software team in [herdr](https://herdr.dev). The current agent becomes the operator, `@operator`: the lead agent. You, the user, are the owner who directs it; members use Claude Code, Codex, pi, omp or OpenCode v2 and message each other directly; with a Claude Code operator, their messages to the operator go to an inbox that `ateam.py wait` reads, so nothing is typed into the pane you type in. One team per herdr session, with an `a-team operator` tab and an `a-team workers` tab. Parallel developers can use separate Git worktrees.
+An agent skill for running a software team in [herdr](https://herdr.dev). The current agent becomes the operator, `@operator`: the lead agent. You, the user, are the owner who directs it; members use Claude Code, Codex, pi, omp or OpenCode v2 and message each other directly. When the configured operator harness matches its live pane, members' messages to the operator go to an inbox that `ateam.py wait` reads, so nothing is typed into the pane you type in. An unset or mismatched harness, or a damaged or unavailable inbox, uses typed messages instead. One team per herdr session, with an `a-team operator` tab and an `a-team workers` tab. Parallel developers can use separate Git worktrees.
 
 Requires Python 3.11+, herdr, and the chosen harnesses; Git is required for worktrees. Link this repo into your harness's skills directory, for example:
 
@@ -22,4 +22,4 @@ Unknown top-level keys in `team.toml` are rejected. Only `user`, `permissions`, 
 
 `SKILL.md` routes the operator; `references/` covers setup, orchestration, recovery and the notes convention. `roles/` defines each role in four parts (ownership, output, completion, prohibitions); `templates/` holds `TEAM.md`, `team.toml` and the common member instructions. `harnesses.toml` holds harness data; each harness's model resolution and launch code lives in `scripts/ateam.py`.
 
-Codex models come from its local cache; pi, omp and OpenCode list them through their CLIs. Unknown Claude model IDs produce a warning; Claude validates them at launch. To add a harness, add its table (with `operator_messages`), code block and test fake.
+Codex models come from its local cache; pi, omp and OpenCode list them through their CLIs. Unknown Claude model IDs produce a warning; Claude validates them at launch. To add a harness, add its table (with `operator_wait`), code block and test fake.

@@ -9,15 +9,14 @@
 #   never        levels a-team refuses even where the harness accepts them
 #   prompt       how a member gets its standing instructions: `file` (appended to the system prompt),
 #                `pointer` (a system line names the file; the text also goes in the first message), `message`
-#   operator_messages  how an operator on this harness receives members' messages: `inbox` (members run
-#                `ateam.py inbox send`; a finished background `wait` wakes the operator, nothing is typed)
-#                or `typed` (`herdr agent prompt` into its pane). It says nothing about a member on this harness.
+#   operator_wait  how an inbox operator waits: background (native completion wakes it) or foreground
+#                  (blocking wait, then rerun while members work). New harnesses start as foreground.
 #   dialogs      start-up questions `up` answers itself: text on the screen, then the herdr keys that accept it
 #   [x.permissions]  native flags per permission level. `full` (default) never stops for approval and adds no
 #                sandbox. `guarded` keeps the harness's own guard; only Claude Code and Codex have one.
 
 [claude]
-operator_messages = "inbox"
+operator_wait = "background"
 label = "Claude Code"
 install = "Install Claude Code (https://code.claude.com/docs) and log in once by running `claude`."
 models = ["claude-fable-5-2", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"]
@@ -34,7 +33,7 @@ full = ["--permission-mode", "bypassPermissions"]
 guarded = ["--permission-mode", "auto"]   # a classifier reviews each action; it can still stop and ask
 
 [codex]
-operator_messages = "typed"
+operator_wait = "foreground"
 label = "Codex"
 install = "Install the Codex CLI (`npm i -g @openai/codex`) and log in once by running `codex`."
 models = ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna", "gpt-6-sol"]
@@ -49,7 +48,7 @@ full = ["--dangerously-bypass-approvals-and-sandbox"]
 guarded = ["--approve-for-me", "-c", "sandbox_workspace_write.network_access=true"]
 
 [pi]
-operator_messages = "typed"
+operator_wait = "foreground"
 label = "pi"
 install = "Install pi (`npm i -g @earendil-works/pi-coding-agent`) and configure a provider (`pi auth --help`)."
 models = ["openai/gpt-6-astra", "z-ai/glm-5.3", "moonshotai/kimi-k3", "x-ai/grok-4.7", "z-ai/glm-5.3-flash", "deepseek/deepseek-v4.1-flash"]
@@ -62,7 +61,7 @@ full = []
 guarded = []
 
 [omp]
-operator_messages = "typed"
+operator_wait = "background"
 label = "omp"
 install = "Install oh-my-pi so `omp` is on PATH, and configure a provider."
 models = ["openai/gpt-6-astra", "z-ai/glm-5.3", "moonshotai/kimi-k3", "x-ai/grok-4.7", "z-ai/glm-5.3-flash", "deepseek/deepseek-v4.1-flash"]
@@ -75,7 +74,7 @@ full = ["--approval-mode", "yolo"]
 guarded = ["--approval-mode", "yolo"]
 
 [opencode]
-operator_messages = "typed"
+operator_wait = "background"
 label = "OpenCode"
 install = "Install OpenCode v2 or later (https://opencode.ai) so `opencode` is on PATH."
 models = ["openrouter/openai/gpt-6-astra", "openrouter/z-ai/glm-5.3", "openrouter/z-ai/glm-5.3-flash"]

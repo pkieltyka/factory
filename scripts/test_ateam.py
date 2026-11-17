@@ -929,7 +929,7 @@ class InboxTests(unittest.TestCase):
             closing = dict(e.prompts())["lead-dev"].split("We are picking up")[1]
             e.write_brief(formation({n: CATALOG_MEMBERS[n] for n in ("lead-dev", "frontend-dev", "reviewer", "pm")},
                                     operator={"harness": "codex"}))
-            e.update("operator", agent="codex")
+            e.update("operator", agent="pi")
             e.run("continue")
             self.assertEqual(prompt, e.run("prompt", "lead-dev").stdout)
             # The Roles row changes with configuration; the generated messaging sentence does not.
@@ -937,6 +937,7 @@ class InboxTests(unittest.TestCase):
                              e.run("brief").stdout.split("## Talking to each other")[1])
             self.assertEqual(closing, dict(e.prompts())["lead-dev"].split("We are picking up")[1])
             e.write_brief(formation({"lead-dev": CATALOG_MEMBERS["lead-dev"]}, operator={"harness": "claude"}))
+            e.update("operator", agent="codex")
             self.assertIn("team.toml says claude, herdr sees codex", e.run("continue").stdout)
             e.update("operator", agent="claude")
             self.assertIn("route to @operator changed to inbox", e.run("continue").stdout)
@@ -944,6 +945,48 @@ class InboxTests(unittest.TestCase):
             e.write_brief(formation({"lead-dev": CATALOG_MEMBERS["lead-dev"]}, operator={"harness": "unknown"}))
             self.assertIn("[operator] harness 'unknown' is not one of", e.run("check", check=False).stderr)
         self.assertNotIn("inbox", ateam.claude_settings("guarded"))
+
+    def test_operator_wait_modes_and_timeout_defaults(self):
+        def timeout(e, expected, explicit=None):
+            args = types.SimpleNamespace(cwd=str(e.repo), names=[], seen=None, timeout=explicit, interval=0)
+            out = io.StringIO()
+            with patch.dict(os.environ, e.env), patch.object(ateam, "Team") as team, \
+                    patch.object(ateam.time, "monotonic", side_effect=[0, 10000]), contextlib.redirect_stdout(out):
+                team.return_value.pane.return_value = {"pane_id": "fake"}
+                team.return_value.status.return_value = "working"
+                with self.assertRaises(SystemExit) as ex:
+                    ateam.cmd_wait(args)
+            self.assertEqual(ex.exception.code, 4)
+            self.assertIn(f"timeout after {expected}s", out.getvalue())
+
+        for harness, mode, seconds in (("claude", "background", 1800), ("opencode", "background", 1800),
+                                       ("omp", "background", 1800), ("codex", "foreground", 60), ("pi", "foreground", 60)):
+            with self.subTest(harness=harness), Env(formation({"lead-dev": CATALOG_MEMBERS["lead-dev"]},
+                                                            operator={"harness": harness})) as e:
+                e.update(None, agent=harness)  # up has not named the operator pane yet.
+                for command in ("up", "continue"):
+                    output = e.run(command).stdout
+                    self.assertIn(f"run ateam.py wait in the {mode}", output)
+                self.assertIn(f"operator messages: inbox, {mode} wait", e.run("status").stdout)
+                self.assertIn("queued message N", e.run("prompt", "lead-dev").stdout)
+                e.update("lead-dev", agent_status="done")
+                idle = e.run("wait", "--interval", "0").stdout
+                self.assertIn("nobody is working:", idle)
+                self.assertEqual("End your turn" in idle, mode == "foreground")
+                timeout(e, seconds)
+                timeout(e, 7, explicit=7)
+                self.prepare(e, "typed")
+                timeout(e, 1800)
+        with Env() as e:
+            self.prepare(e)
+            timeout(e, 1800)  # No configured operator harness, even with a saved inbox route.
+        with patch.dict(ateam.TABLE, {"future-harness": {}}), \
+                Env(formation({"lead-dev": CATALOG_MEMBERS["lead-dev"]},
+                              operator={"harness": "future-harness"})) as e:
+            self.prepare(e)
+            timeout(e, 60)  # A new harness without the key must not assume background wake.
+            self.prepare(e, "typed")
+            timeout(e, 1800)
 
     def test_worktree_uses_explicit_main_root_and_rejects_invalid_messages(self):
         with Env(formation({"lead-dev": {**CATALOG_MEMBERS["lead-dev"], "worktree": True}},
@@ -958,7 +1001,7 @@ class InboxTests(unittest.TestCase):
             for i in (1, 2):
                 result = subprocess.run(command, cwd=worktree, env=e.env, capture_output=True, text=True)
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertIn(f"queued #{i}", result.stdout)
+                self.assertIn(f"queued message {i}", result.stdout)
             before = inbox.path.read_bytes()
             for sender, text in (("nobody", "hi"), ("lead-dev", "  ")):
                 self.assertNotEqual(e.run("inbox", "send", "--from", sender, text, check=False).returncode, 0)
@@ -969,21 +1012,27 @@ class InboxTests(unittest.TestCase):
         with Env() as e:
             inbox = self.prepare(e)
             text = "line one\nUnicode: café 日本語\n@pm.\n"
-            self.assertIn("queued #1", self.send(e, text).stdout)
+            self.assertIn("queued message 1", self.send(e, text).stdout)
             note = e.root / "message.txt"
             note.write_text(text)
-            self.assertIn("queued #2", e.run("inbox", "send", "--from", "reviewer", "--file", str(note)).stdout)
+            self.assertIn("queued message 2", e.run("inbox", "send", "--from", "reviewer", "--file", str(note)).stdout)
             self.assertEqual(e.calls(), [])  # sending and reading files did not touch Herdr
             first = e.run("wait").stdout  # no members have started: inbox wins
             self.assertEqual(first, e.run("wait").stdout)
             self.assertIn("    Unicode: café 日本語", first)
+            self.assertIn("message 1 from @lead-dev at ", first)
+            self.assertIn("message 2 from @reviewer at ", first)
+            self.assertNotIn("#1", first)
+            self.assertIn("2 unread messages. After you have acted on or recorded these messages:", first)
             self.assertIn("wait --seen 2", first)
             rows = [json.loads(s) for s in inbox.path.read_text().splitlines()]
             self.assertEqual([r["text"] for r in rows], [text, text])
             self.assertRegex(rows[0]["at"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
             e.run("wait", "--seen", "2", check=False)  # acknowledges, then no members to watch
             self.assertEqual(inbox.path.read_bytes(), b"")
-            self.assertIn("queued #3", self.send(e).stdout)
+            self.assertIn("queued message 3", self.send(e).stdout)
+            self.assertIn("1 unread message.", e.run("wait").stdout)
+            self.assertIn("; 1 unread message (", e.run("status").stdout)
             e.run("wait", "--seen", "1")  # an old acknowledgement cannot move seen backwards
             before = (inbox.path.read_bytes(), inbox.state_path.read_bytes())
             self.assertEqual(e.run("wait", "--seen", "9", check=False).returncode, 2)
@@ -1064,7 +1113,7 @@ class InboxTests(unittest.TestCase):
             with patch.object(ateam.os, "write", side_effect=lambda fd, data: write(fd, data[:3])):
                 code, out, err = self.invoke(e)
             self.assertEqual((code, err), (0, ""))
-            self.assertIn("queued #1", out)
+            self.assertIn("queued message 1", out)
             self.assertEqual(inbox.directory.stat().st_mode & 0o777, 0o700)
             for path in (inbox.path, inbox.state_path, inbox.lock_path):
                 self.assertEqual(path.stat().st_mode & 0o777, 0o600)
@@ -1086,7 +1135,7 @@ class InboxTests(unittest.TestCase):
             before = inbox.path.read_bytes()
             self.assertNotIn("    one", e.run("wait").stdout)
             self.assertEqual(before, inbox.path.read_bytes())
-            self.assertIn("queued #3", self.send(e, "three").stdout)
+            self.assertIn("queued message 3", self.send(e, "three").stdout)
             self.assertEqual([r["id"] for r in map(json.loads, inbox.path.read_text().splitlines())], [2, 3])
 
     def test_damage_refuses_send_and_seen_but_lifecycle_wait_survives(self):
@@ -1145,7 +1194,7 @@ class InboxTests(unittest.TestCase):
                 path.symlink_to(target, target_is_directory=True)
                 target.chmod(0o755)
                 self.assertIn("through the inbox", e.run("up").stdout)
-                self.assertIn("queued #1", self.send(e).stdout)
+                self.assertIn("queued message 1", self.send(e).stdout)
                 self.assertTrue(path.is_symlink())
                 self.assertEqual(target.stat().st_mode & 0o777, 0o700)
 
@@ -1217,10 +1266,10 @@ class InboxTests(unittest.TestCase):
                     self.assertEqual(state, {"mode": "inbox", "seen": 0})
                     if acknowledge:
                         self.assertFalse(inbox.path.exists())
-                        self.assertNotIn("unread from the earlier team", result.stdout)
-                        self.assertIn("queued #1", self.send(e).stdout)
+                        self.assertNotIn("unread messages from the earlier team", result.stdout)
+                        self.assertIn("queued message 1", self.send(e).stdout)
                     else:
-                        self.assertIn("1 unread from the earlier team", result.stdout)
+                        self.assertIn("1 unread message from the earlier team", result.stdout)
                         self.assertIn("earlier message", e.run("wait").stdout)
 
     def test_partial_restart_and_failed_query_do_not_clear(self):
@@ -1591,7 +1640,8 @@ class ConfigTests(unittest.TestCase):
         for h, t in ateam.TABLE.items():  # every harness has the same shape, and code to go with it
             self.assertEqual(set(t["permissions"]), set(ateam.LEVELS), h)
             self.assertIn(t["prompt"], ("file", "pointer", "message"), h)
-            self.assertIn(t["operator_messages"], ("inbox", "typed"), h)
+            self.assertIn(t["operator_wait"], ("background", "foreground"), h)
+            self.assertNotIn("operator_messages", t, h)
             self.assertIn(h, ateam.CODE)
 
     def test_operator_table_and_name(self):

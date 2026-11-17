@@ -14,7 +14,7 @@ Paths below are relative to this skill. `ateam.py` means `python3 <skill>/script
 
 After compaction, re-read the active command's reference, `references/leading.md`, `TEAM.md` and the tracker. Preserve task owners, acceptance criteria, branches, verdicts and next steps there, not only in chat.
 
-Message teammates only with `ateam.py say` or `herdr agent prompt`, never through a harness's own messaging (e.g. Claude Code's `SendMessage`): herdr works across harnesses and permission modes. One exception: on the inbox route (a Claude Code operator) members reach you with `ateam.py inbox send`, which `wait` prints; nothing is typed into your pane. See `references/leading.md`.
+Message teammates only with `ateam.py say` or `herdr agent prompt`, never through a harness's own messaging (e.g. Claude Code's `SendMessage`): herdr works across harnesses and permission modes. One exception: on the inbox route members reach you with `ateam.py inbox send`, which `wait` prints; nothing is typed into your pane. See `references/leading.md`.
 
 ## Before launch
 

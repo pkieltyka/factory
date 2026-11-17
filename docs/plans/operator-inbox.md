@@ -4,6 +4,8 @@ Members reach the operator with `herdr agent prompt`, which types into the opera
 
 Agreed by @architect and @lead-dev; decided by the owner and @operator (see "Decided" at the end).
 
+**Amended by #24** (last section before "Decided"): every operator harness now uses the inbox, the per-harness key says how the operator waits, and message ids are printed as `message 12`. Where the sections below say that only Claude Code is on the inbox, name `operator_messages`, or print `#12`, the amendment replaces them.
+
 ## Decision
 
 - **Inbox for every member-to-operator message** (reports, questions, heads-ups), when the operator's harness supports it. Member-to-member and operator-to-member messages stay on `herdr agent prompt`.
@@ -287,6 +289,105 @@ One issue, one review; each step leaves the suite green.
 
 A non-typing or queued message to an agent: delivered through each harness's own channel where one exists, else held until the composer is empty. Channels seen here, none of them ACP: Codex `codex queue --thread <id> --message <text>` and the `--remote` app server; OpenCode's background server with `opencode api`; Claude Code's background-command events. ACP could be a herdr backend one day; it is not an a-team runtime.
 
+## Amendment (#24): the inbox for every operator harness
+
+A live run with each harness as the operator (#23, #24; `notes/activity/20261117-191817-operator-inbox-per-harness.md`) showed that all five can receive through the inbox, in one of two ways:
+
+| Operator | Wakes on a finished background command | How it waits |
+|---|---|---|
+| Claude Code 2.1.325 | yes | background |
+| OpenCode 2.2.4 | yes, twice from idle | background |
+| OMP 18.20.0 | its own async background; two cycles in the landing gate, on a non-default model | background |
+| Codex 0.169.0 | no | foreground, rerun after each return |
+| pi 1.5.2 | has no background commands | foreground, rerun after each return |
+
+### Data
+
+`operator_messages` would now be `inbox` in every table, so it goes. One required key per harness table replaces it:
+
+```toml
+#   operator_wait  how an inbox operator waits: background (native completion wakes it) or foreground
+#                  (blocking wait, then rerun while members work). New harnesses start as foreground.
+
+[claude]    operator_wait = "background"
+[opencode]  operator_wait = "background"
+[omp]       operator_wait = "background"
+[codex]     operator_wait = "foreground"
+[pi]        operator_wait = "foreground"
+```
+
+- **Route**: `inbox` whenever `[operator] harness` is set and equals the live kind, on any harness. `typed` stays only as the fallback it already is: harness not set, config and live kind differ, a damaged inbox or state, inbox unavailable. Nothing new is stored; the state file is unchanged.
+- **Default timeout of `wait`**: `--timeout` defaults to 60 s when the session's route is `inbox` and the operator's harness is a foreground one, and to 1800 s otherwise (a background harness, the typed fallback, no harness set), which is today's value. An explicit `--timeout` always wins. So every command a-team prints, the `--seen` hint included, is plain `ateam.py wait`.
+- **A foreground operator never waits on an idle team.** `wait` already returns when nobody is working; that return is where the foreground loop stops and the operator ends its turn, so the user is heard at once whenever the team is idle. On a foreground harness the line `wait` prints then says so: `nobody is working: <states>. End your turn; run ateam.py wait again after you assign work.` On a background harness the line is unchanged.
+- A harness table without the key counts as `foreground` (the shape test requires the key; this is the safe reading if one is ever missing). With no `[operator] harness` set, and on the typed fallback, nothing changes: no foreground loop, 1800 s.
+- The member side and the transport do not change.
+
+### What is printed
+
+`up` and `continue`, in place of the single inbox line:
+
+```text
+members reach @<operator> through the inbox (ateam.py inbox send); run ateam.py wait in the background, it wakes you with their messages
+members reach @<operator> through the inbox (ateam.py inbox send); run ateam.py wait in the foreground, and again each time it returns while a member works
+```
+
+`status`: `operator messages: inbox, background wait` or `operator messages: inbox, foreground wait` (then the unread count as before); on the typed fallback `operator messages: typed` as before.
+
+**Message ids** must not look like issue numbers. They stay plain integers in the file and for `--seen`; only the printed form changes:
+
+```text
+message 12 from @lead-dev at 17:31:06Z
+    <text>
+message 13 from @reviewer at 17:32:40Z
+    <text>
+2 unread messages. After you have acted on or recorded these messages: ateam.py wait --seen 13
+```
+
+`inbox send` prints `queued message 12`, and the member block says "`queued message N` means stored, not read". The counts say "message" for one and "messages" otherwise, in all three places. The other two: `status` ends `; <n> unread messages (ateam.py wait prints them)`, and the per-team clear prints `<n> unread messages from the earlier team; ateam.py wait prints them`.
+
+### Docs
+
+`references/leading.md`:
+
+- The Inbox sentence loses "(Claude Code)".
+- The code block comment for `ateam.py wait` becomes `# in the background, or the foreground when status says so`.
+- "After assigning work, run one background `wait` and yield until it or a message arrives." becomes "After assigning work, run one `wait` the way `status` names. With a background wait, yield until it or a message arrives."
+- "Timeout is in seconds (default 1800, exit 4)" becomes "(default 1800, or 60 with a foreground wait; exit 4)".
+- "Never wait synchronously on a member that might need you." becomes "With a background wait, never wait synchronously on a member that might need you."
+- Two bullets are added under "With the inbox", after "Keep a watcher running":
+
+```markdown
+- With a foreground wait your harness does not wake on a background command: run `ateam.py wait` in the foreground and run it again each time it returns while a member is working, after a timeout too and after you answer the user. When it says nobody is working, end your turn and do not wait: the user is then heard at once. While you wait, a message the user steers with Enter reaches you by the next wait return, within a minute; queued follow-ups may wait until your turn ends. They can also interrupt you.
+- Give the `wait` command a time limit above its timeout, as far as your harness allows, so one call blocks for the whole wait and you do not poll it. If the harness allows less, pass a smaller `--timeout` that fits. A watcher the harness kills stops watching.
+```
+
+`SKILL.md` line 17: "on the inbox route (a Claude Code operator) members reach you" becomes "on the inbox route members reach you". `README.md`: "(with `operator_messages`)" becomes "(with `operator_wait`)", and in the first paragraph the clause from "; with a Claude Code operator, their messages" to "the pane you type in." ends the sentence after "message each other directly" and becomes, with the typed fallback stated:
+
+```markdown
+When the configured operator harness matches its live pane, members' messages to the operator go to an inbox that `ateam.py wait` reads, so nothing is typed into the pane you type in. An unset or mismatched harness, or a damaged or unavailable inbox, uses typed messages instead.
+```
+
+### Tests
+
+1. Every harness table has `operator_wait` in `("background", "foreground")` and no `operator_messages`.
+2. A Codex and a pi operator (config and live kind equal) get the inbox text for members, the foreground line from `up`, `inbox, foreground wait` from `status`, and a 60 s default timeout. With no member working, their `wait` returns on the second look with the "End your turn" line; a background operator's line is unchanged.
+3. A Claude, an OpenCode and an OMP operator get the background line, `inbox, background wait` and 1800 s.
+4. An explicit `--timeout` wins in both modes; with no `[operator] harness`, and on the typed fallback of a foreground harness, the default is 1800 s.
+5. The typed text for members is byte-identical to before on every fallback (harness not set, mismatch, damage, inbox unavailable).
+6. `wait` prints `message <id> from @<name> at <time>` and "<n> unread messages. After you have acted on or recorded these messages:"; `status` and the per-team clear say "unread messages"; `inbox send` prints `queued message <id>`; the member prompt says `queued message N`; `--seen` still takes the bare integer.
+
+### Landing gates, on throwaway panes
+
+1. Codex and pi each run the foreground loop on the 60 s default: a full timeout (exit 4) and a rerun without being told, several times in a row; what one timeout-and-rerun costs in tokens, and whether the operator reruns quietly; a plain Enter message from the user during a wait (steering): when it is delivered, whether the operator answers it and then runs `wait` again; and, with no member working, that the operator ends its turn on the "nobody is working" return instead of waiting.
+2. OMP shows a second cycle, and whether its own command limit allows the 1800 s default (its probe ran a 90 s wait under a 120 s limit). If not, OMP ships with a smaller default, or as foreground once that has been tested on it.
+
+### Risks
+
+- On Codex and pi the owner is heard at once only while the team is idle. While a member works, a steering message (plain Enter) should arrive when the current `wait` returns, within 60 s; that is what gate 1 has to confirm. An end-of-turn queued message (Tab on Codex, Alt+Enter on pi; tested, text arrived verbatim) waits until the operator's turn ends, which can be many waits. The harness's own interrupt is immediate.
+- The 60 s default costs one operator round-trip a minute while a member works: 60 an hour. Gate 1 measures it; if it is too dear, the default is the one number to change.
+- A foreground operator that ends its turn has no watcher: the same accepted gap as before.
+- OMP is proven on two cycles, on a non-default model (its default provider has no key on this machine) and with an 1810 s command limit accepted; a watcher that actually runs the full 1800 s was not tested.
+
 ## Decided
 
 By the owner, through @operator (2026-11-17):
@@ -304,3 +405,10 @@ After the five-operator QA run (#23, 2026-11-17), where a member rewrote the pri
 
 - The typed recovery message opens with one of three fixed causes, not the full reason, and the member is told to run the command exactly as printed.
 - The operator treats any typed message from a member on the inbox route as off the route and looks at `status` and the member's pane for the cause, whether or not the message says so.
+
+After the inbox runs on every operator harness (#24, 2026-11-17), by the owner:
+
+- The inbox is the route on all five harnesses. `operator_wait` replaces `operator_messages`: background for Claude Code, OpenCode and OMP, foreground for Codex and pi.
+- `wait` defaults to 60 s on a foreground harness while the inbox route is in effect (the owner found five minutes too long), and 1800 s otherwise.
+- A foreground operator does not wait while no member is working: it ends its turn on the "nobody is working" return.
+- Message ids are printed as `message 12`, never `#12`; they stay integers in the file and for `--seen`.

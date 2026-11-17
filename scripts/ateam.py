@@ -377,9 +377,14 @@ def message_route(cfg):
         return "typed"
 
 
+def operator_wait(cfg, route):
+    harness = cfg.operator.get("harness")
+    return TABLE.get(harness, {}).get("operator_wait", "foreground") if route == "inbox" and harness else "background"
+
+
 def configure_messages(cfg, team, operator, restart=()):
     conf, live = cfg.operator.get("harness"), (team.pane(operator) or {}).get("agent")
-    mode = TABLE[conf]["operator_messages"] if conf and conf == live else "typed"
+    mode = "inbox" if conf and conf == live else "typed"
     reason = (f"[operator] harness is not set in {CONF}" if not conf else
               f"{CONF} says {conf}, herdr sees {live} in this pane" if conf != live else "")
     try:
@@ -388,7 +393,8 @@ def configure_messages(cfg, team, operator, restart=()):
             if not restart and not any(team.live(n) for n in cfg.members):
                 inbox.remove_seen()
                 if inbox.unread:
-                    print(f"{len(inbox.unread)} unread from the earlier team; ateam.py wait prints them")
+                    print(f"{len(inbox.unread)} unread message{'s' if len(inbox.unread) != 1 else ''}"
+                          " from the earlier team; ateam.py wait prints them")
                 else:
                     inbox.path.unlink(missing_ok=True)
                     inbox.state_path.unlink(missing_ok=True)
@@ -403,7 +409,10 @@ def configure_messages(cfg, team, operator, restart=()):
         mode, previous = "typed", "typed"
         cfg.inbox_unavailable = True  # Later rendering in this invocation must not reselect the stored route.
     if mode == "inbox":
-        print(f"members reach @{operator} through the inbox (ateam.py inbox send); wait prints their messages")
+        wait = operator_wait(cfg, mode)
+        action = ("in the background, it wakes you with their messages" if wait == "background" else
+                  "in the foreground, and again each time it returns while a member works")
+        print(f"members reach @{operator} through the inbox (ateam.py inbox send); run ateam.py wait {action}")
     else:
         print(f"members reach @{operator} by typed herdr messages" + (": " + reason if reason else ""))
     if mode != previous and any(team.live(n) and n not in restart for n in cfg.members):
@@ -444,7 +453,7 @@ def cmd_inbox_send(args):
                 inbox.sync_directory()
             finally:
                 os.close(fd)
-        print(f"queued #{row['id']}")
+        print(f"queued message {row['id']}")
     except (OSError, ValueError) as e:
         if started:
             print(f"not confirmed: {e}. The message may or may not be stored. Do not send it again by any route.",
@@ -761,7 +770,7 @@ To reach {operator}, do not use herdr. Run this as a standalone command, your me
 ```bash
 {inbox_send} '<message>'
 ```
-It queues the message without typing into {operator}'s pane. `queued #N` means stored, not read: finish with `Report queued for {operator}`, not "sent". `not stored` prints a herdr command: run it once, exactly as printed. Any other failure: do not send the message again by any route; say so in your pane and stop. In Reports below, "keep it pending" and the `agent_blocked` retry apply to herdr messages only.
+It queues the message without typing into {operator}'s pane. `queued message N` means stored, not read: finish with `Report queued for {operator}`, not "sent". `not stored` prints a herdr command: run it once, exactly as printed. Any other failure: do not send the message again by any route; say so in your pane and stop. In Reports below, "keep it pending" and the `agent_blocked` retry apply to herdr messages only.
 """
     text = text.replace("{teammates}", "teammates other than {operator}" if inbox else "teammates")
     text = text.replace("{to_operator}", to_operator)
@@ -1288,7 +1297,10 @@ def cmd_status(args):
     print_table(rows)
     try:
         with Inbox(cfg) as inbox:
-            suffix = f"; {len(inbox.unread)} unread (ateam.py wait prints them)" if inbox.unread else ""
+            suffix = (f"; {len(inbox.unread)} unread message{'s' if len(inbox.unread) != 1 else ''}"
+                      " (ateam.py wait prints them)") if inbox.unread else ""
+            if inbox.state["mode"] == "inbox":
+                suffix = f", {operator_wait(cfg, 'inbox')} wait" + suffix
             print(f"operator messages: {inbox.state['mode']}{suffix}")
     except (OSError, ValueError) as e:
         print(f"inbox unavailable: {e}" if isinstance(e, OSError) else str(e))
@@ -1303,13 +1315,16 @@ def cmd_status(args):
 
 
 def cmd_wait(args):
-    """Block until the operator is needed. Run it in the background after handing out work. It returns when a
+    """Block until the operator is needed, in the configured wait mode after handing out work. It returns when a
     member that was working stops (its report may not have been sent), when a member is blocked, gone or
     closed, when herdr cannot tell what a member is doing, or when nobody is working any more. With names,
     only those members' lifecycle changes count. Inbox messages from any member always end the wait."""
     require_herdr()
     cfg = cfg_of(args)
     watch = [n.lstrip("@") for n in args.names]
+    wait = operator_wait(cfg, message_route(cfg))
+    if args.timeout is None:
+        args.timeout = 60 if wait == "foreground" else 1800
     deadline, seen, worked, looks = time.monotonic() + args.timeout, None, set(), 0
     warned = False
     while True:
@@ -1321,9 +1336,10 @@ def cmd_wait(args):
                 unread = inbox.unread
             if unread:
                 for row in unread:
-                    print(f"#{row['id']} from @{row['from']} at {row['at']}")
+                    print(f"message {row['id']} from @{row['from']} at {row['at']}")
                     print("\n".join("    " + line for line in row["text"].splitlines()))
-                print(f"{len(unread)} unread. After you have acted on or recorded them:"
+                print(f"{len(unread)} unread message{'s' if len(unread) != 1 else ''}."
+                      " After you have acted on or recorded these messages:"
                       f" ateam.py wait --seen {unread[-1]['id']}")
                 return
         except (OSError, ValueError) as e:
@@ -1373,7 +1389,8 @@ def cmd_wait(args):
         print(f"@{n} stopped ({state[n]}). If it sent no report, read its pane:"
               f" herdr agent read {n} --source recent-unwrapped --lines 80")
     if not (closed or needs or unclear or stopped):
-        print(f"nobody is working: {', '.join('@' + n + ' ' + s for n, s in state.items())}")
+        hint = ". End your turn; run ateam.py wait again after you assign work." if wait == "foreground" else ""
+        print(f"nobody is working: {', '.join('@' + n + ' ' + s for n, s in state.items())}{hint}")
 
 
 def cmd_brief(args):
@@ -1467,7 +1484,7 @@ def main(argv=None):
 
     wt = sub.add_parser("wait", help="return when a member stops, is blocked or is gone, or nobody is working")
     wt.add_argument("names", nargs="*", help="watch only these members (default: every member)")
-    wt.add_argument("--timeout", type=float, default=1800, help="seconds before giving up (exit 4)")
+    wt.add_argument("--timeout", type=float, help="seconds before giving up (exit 4; default: foreground inbox 60, otherwise 1800)")
     wt.add_argument("--interval", type=float, default=5, help="seconds between looks")
     wt.add_argument("--seen", type=int, help="acknowledge and delete inbox messages through this id, then wait")
     common(wt)
