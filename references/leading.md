@@ -44,6 +44,17 @@ With names, `wait <names>` watches only those members; without names it watches 
 - A failed worktree commit is a coordination problem: agree who commits it, using `git -C <path>` if needed. Do not disable signing, hooks or sandbox settings to make it pass.
 - The member merges main into its branch before the next task. Remove worktrees/branches only when cleanup is authorized and reviewed work is merged.
 
+## Autopilot
+
+When the user gives a goal and tells you to keep going, work through it without waiting for prompts. First get the goal and its bounds onto the tracker: which items, until when, what is off limits.
+
+- Take only items the tracker marks ready, as many at a time as `TEAM.md` allows. Assign, wait, review and integrate as above, then take the next. A `wait` timeout is not a stop: start it again.
+- Stop when a decision is the user's, no ready item is left, a task is not approved within the review rounds `TEAM.md` allows, a capability the task needs is missing, or a member cannot be recovered.
+- Always the user's, whatever the goal says: pushing, deploying, destructive operations, spending money, and anything sent outside the team.
+- Autopilot assumes the safe machine that `full` permissions assume (see SKILL.md).
+- On stopping, say why and what comes next in your pane, and run `herdr notification show "a-team stopped" --body "<why>" --sound request`.
+- Nothing restarts you. If your session ends, the user runs `/a-team continue`; keep the tracker current enough for that.
+
 ## Keep state current
 
 When a decision changes scope, ownership, commit rules or settings, write it down at that moment; do not leave it only in chat. What the whole project follows goes in `TEAM.md` (through the repo's normal review when other people share it); your own formation and settings go in `team.toml`. Run `ateam.py check`, then `ateam.py brief --send <affected names>` to notify only affected members. Keep operator model/thinking accurate. Restart members for changed launch settings as in [cmd_continue.md](cmd_continue.md). For an unrelated task or important review, `ateam.py continue <name> --fresh --restart` starts a fresh session.

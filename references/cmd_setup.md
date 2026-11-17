@@ -8,7 +8,7 @@ A project has `TEAM.md` (the shared brief, committed) and `team.toml` (your own 
 - **Both exist:** change only what the user requested.
 
 1. Inspect the repo's stack, UI and existing tracker. Run `ateam.py harnesses`; recommend available models and report missing-harness fixes.
-2. Propose the default below. Infer known facts; ask in one round only for missing project scope, UI needs, parallel work/worktrees and where tasks are tracked. Custom formations, model mixes and trackers remain available.
+2. Propose the default below. Infer known facts; ask in one round only for missing project scope, UI needs, parallel work/worktrees, where tasks are tracked and what marks one ready to start. Custom formations, model mixes and trackers remain available.
 3. Show name, role, harness, model, thinking and project responsibility. Adjust until agreed; keep the current operator session unless the user requests a change.
 
 ## Default formation
@@ -41,8 +41,8 @@ Edit `team.toml`, your formation:
 Edit `TEAM.md`, the shared brief. Write it by role, so it holds for any person's formation:
 
 - `## Project`: what, for whom, stack. Detailed tasks go in messages.
-- `## Tasks`: where tasks and bugs are tracked and with what tool, in words a member can act on (a repo file, GitHub Issues with `gh`, Linear, another CLI). A file suits one person; several people on the repo need a shared tool. @pm owns the tracker when present; otherwise you track tasks.
-- `## Workflow`: short. Review and integration rules, and who commits: shared-checkout members leave commits to you; worktree members commit their own branches. It must not contradict the standing instructions.
+- `## Tasks`: where tasks and bugs are tracked and with what tool, in words a member can act on (a repo file, GitHub Issues with `gh`, Linear, another CLI). A file suits one person; several people on the repo need a shared tool. @pm owns the tracker when present; otherwise you track tasks. Say what marks an item ready to start and who sets it.
+- `## Workflow`: short. Review and integration rules, and who commits: shared-checkout members leave commits to you; worktree members commit their own branches. It must not contradict the standing instructions. Keep or change its defaults: one feature at a time, one writing task per shared checkout, three review rounds.
 
 When the formation should be the project's suggestion, copy `team.toml` to `team.toml.sample` and make the copy portable: remove `user` and `worktree_dir`, and any worktree branch or path that carries a person's name.
 
