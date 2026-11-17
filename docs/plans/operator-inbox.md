@@ -51,7 +51,7 @@ Selection, at `up` and `continue` only, after `ensure_operator` and `Team(cfg)`:
   - `members reach @<operator> by typed herdr messages: [operator] harness is not set in team.toml`
   - `members reach @<operator> by typed herdr messages: team.toml says <conf>, herdr sees <live> in this pane`
 - A declared `[operator] harness` that is not a table in `harnesses.toml` is rejected by `Config` (so by `check` and every command): `[operator] harness <x> is not one of <names>`.
-- The route is written to the state file (below) before any member is launched or briefed. Everything that renders text for members (`member_prompt`, `render_team_brief`, the `continue` closing) and `inbox send` read it from there; a missing state file means `typed`. `prompt` and `brief` previews outside herdr therefore show the typed text.
+- The route is written to the state file (below) before any member is launched or briefed. Everything that renders text for members (`member_prompt`, `render_team_brief`, the `continue` closing) and `inbox send` read it from there; a missing or damaged state file, or a damaged inbox, means `typed` (see Storage). `prompt` and `brief` previews outside herdr therefore show the typed text.
 - When the route differs from the stored one and a running member is not being restarted, print: `the route to @<operator> changed to <route>: run ateam.py continue --restart so running members get it`.
 
 ## Storage and security
@@ -68,7 +68,12 @@ All under the per-repo cache directory (`cfg.cache`, `~/.cache/a-team/<repo>-<ha
 - **Modes**: the cache directory `0700`, these files and their temp files `0600`, set at creation; a looser mode found is tightened. A symlink or non-regular file at one of these paths is refused. If a mode cannot be set, nothing is written.
 - **Append**, under the lock: write the whole line, checking the length written and continuing after a short write; then `fsync` the file, and the directory too when the file was just created. Only then is the message "queued".
 - **Acknowledge** (`wait --seen <id>`), under the lock: first write the state with `seen = id`, then rewrite the inbox without the lines up to `id`. Both rewrites are a temp file in the same directory, `fsync`, `os.replace`, `fsync` of the directory. A crash between the two leaves acknowledged lines in the file. Readers ignore them (`id <= seen`), and the next command that takes the lock to write (`inbox send`, `wait --seen`, the per-team clear) removes them before it does anything else, so "nothing unread" and "empty file" mean the same again. Plain `wait` only reads and never deletes. No crash can drop an unread report or move `seen` back.
-- **Damage is refused.** If the inbox has a line that is not a report as in the table, does not end in a newline or has ids that do not increase, or the state file is not as in the table, every command that needs the inbox stops, writes nothing and keeps every byte: `inbox needs repair: <path>, line <n>: <what is wrong>`. `inbox send` gives "not stored" (exit 5); `wait`, `up` and `continue` exit 2 before doing anything else; `status` prints the line with its table. A person repairs the file.
+- **Damage degrades the session to typed, and nothing writes.** The inbox is damaged when it has a line that is not a report as in the table, does not end in a newline or has ids that do not increase, or when the state file is not as in the table. While that lasts no command changes either file, and every byte is kept. Each command says so: `inbox needs repair: <path>, line <n>: <what is wrong>. This session runs on typed messages. After repairing the file, run ateam.py continue --restart.`
+  - Everything that reads the route (`member_prompt`, the brief sentence, the `continue` closing, the line `up` and `continue` print) reads `typed`. Nothing is stored, so after a repair the stored route counts again; a-team cannot tell that members were started typed in between, which is why the repair line names `continue --restart`.
+  - `up` and `continue` print the line, skip the state update and the per-team clear, and start the team.
+  - `inbox send` gives "not stored" (exit 5), so a member with inbox instructions sends typed with the `Inbox unavailable:` line.
+  - `wait` prints the line once and watches members as before, ignoring the inbox; the typed team still needs its watcher. `wait --seen` exits 2: it cannot acknowledge.
+  - `status` prints the line with its table.
 - No server, no daemon, no timer, no sweep.
 
 ## Member side: `ateam.py inbox send`
@@ -112,7 +117,7 @@ A sandbox that refuses to run the command at all gives no such output: the membe
 - **Per-team clear**, at `up` and `continue`, before anything is started or closed, when the team query succeeded and **no member of `team.toml`** (all of them, not only the named ones) is live (`team.live`) in this herdr session:
   - no unread report: under the lock, delete this session's `.jsonl` and state file (the lock file stays). The state file is then written again with the new route and `seen = 0`; ids start again at 1.
   - any unread report: keep both, update only `mode`, and print `<n> unread from the earlier team; ateam.py wait prints them`.
-- A partly live team, a restart or a failed team query deletes nothing.
+- A partly live team, a restart, a failed team query or a damaged inbox deletes nothing.
 - Two herdr sessions on one repo each touch only their own files.
 - A cold `continue` with unread reports keeps them: they are the last evidence, after the tracker and Git.
 - Known limit: the inbox of a herdr session that never comes back stays on disk, private by its modes.
@@ -166,7 +171,7 @@ With the inbox:
 - When you have acted on or recorded the messages, run `ateam.py wait --seen <last id>`: it deletes them and waits again. Until then every `wait` prints them again.
 - Keep a watcher running whenever a member may send. A message sent while none runs wakes nobody until the next `wait`; `status` shows the count.
 - A typed message that opens `Inbox unavailable:` means that member could not store its message. Handle it as usual and tell the user once per session, with the reason.
-- `inbox needs repair` stops `wait`, `up` and `continue`: tell the user; the file is theirs to repair.
+- `inbox needs repair` means this session runs on typed messages until the user repairs the file: tell them, keep your watcher running, and run `ateam.py continue --restart` after the repair.
 - If your harness changes, the route changes: run `ateam.py continue --restart`.
 ```
 
@@ -222,7 +227,7 @@ Inbox send
 
 Storage
 15. Directory `0700` and files `0600` on creation, and after starting from `0755`/`0644`.
-16. Damage: with a torn last line, and with a state file that does not parse, `inbox send` gives exit 5, `wait`, `wait --seen` and a cold `continue` exit 2 with the repair line, `status` prints it, and both files' bytes are unchanged after each.
+16. Damage: with a torn last line, and with a state file that does not parse (also one that said `inbox` before the inbox was torn): `inbox send` gives exit 5; `wait --seen` exits 2; plain `wait` prints the repair line once and still returns on a member stopping; a cold `up` and `continue` print the line, start the team, render the typed text for members and clear nothing; `status` prints the line; both files' bytes are unchanged after each.
 
 Wait and status
 17. A message pending before `wait` starts, one arriving during a named watch, and one pending when no member is started each make `wait` print it and return 0, ahead of any lifecycle return.
@@ -267,7 +272,7 @@ One issue, one review; each step leaves the suite green.
 - The inbox makes one case less reliable than today: a message sent while the operator is idle with no watcher wakes nobody until the next `wait`. Accepted for v1; `status` shows the count.
 - The route depends on `[operator] harness` being right. A wrong or missing value costs the benefit (typed), never a message.
 - The typed recovery path can still collide with the owner's typing and can stall on a last word starting with `@` or `$`; `inbox send` ends the printed text with a newline to prevent the stall.
-- A damaged inbox stops `wait`, `up` and `continue` until a person repairs it. Chosen over finer handling for simplicity; a torn write needs a crash in the middle of an append.
+- A damaged inbox turns the session typed until a person repairs it and runs `continue --restart`: the collision can return for that time, visibly, and unread reports in the damaged file are read by the person, not printed by `wait`. A torn write needs a crash in the middle of an append.
 - Messages may quote private notes. In the inbox they stay in a `0700` directory until acknowledged, then they are deleted. Copies elsewhere (transcripts, the operator's quotes) are not covered.
 
 ## Upstream ask (herdr)
@@ -281,7 +286,7 @@ By the owner, through @operator (2026-11-17):
 - A route per operator harness in `harnesses.toml`; Claude Code inbox, the rest typed until proved.
 - Names: members run `ateam.py inbox send`; the operator keeps `ateam.py wait` and `ateam.py wait --seen <id>`.
 - Delete on read: `wait --seen <id>` removes every report up to `id`, so the file holds only unread ones. No age sweep, no one-hour rule. Ids never repeat.
-- A damaged inbox or state file is refused with its path, line and fault; nothing is written and every byte is kept. No finer handling.
+- A damaged inbox or state file is reported with its path, line and fault; nothing is written and every byte is kept. The team still runs: the session falls back to typed, `wait` keeps watching members, and only `wait --seen` is refused. No finer handling.
 - Typed recovery only when a message was definitely not stored, sent by the member; "not confirmed" means no resend by any route.
 - The operator quotes each message it handles; a live feed pane is later work with #2.
 - Storage under the cache directory, `0700`/`0600`, no server.
