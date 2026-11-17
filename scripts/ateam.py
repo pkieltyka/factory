@@ -760,10 +760,11 @@ def launch(cfg, team, m, operator, timeout, resume=None):
 
 def deliver(team, texts, what):
     """Send {member: text}. herdr refuses a prompt to an agent that is waiting on an approval, so say who
-    did not get it. -> {member: reason}."""
+    did not get it. -> {member: reason}.
+    A harness may complete a last word that starts with @ or $ and swallow Enter; a final newline prevents it."""
     failed = {}
     for name, text in texts.items():
-        err = herdr("agent", "prompt", name, text, check=False).get("error")
+        err = herdr("agent", "prompt", name, text if text.endswith("\n") else text + "\n", check=False).get("error")
         if err:
             failed[name] = err
     ok = [n for n in texts if n not in failed]

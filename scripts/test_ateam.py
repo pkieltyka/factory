@@ -645,13 +645,36 @@ class UpTests(unittest.TestCase):
             e.run("say", "@pm", "add a todo: ship it")
             sent = e.prompts()
             self.assertIn(("lead-dev", "[from @operator] Priorities changed: ship the list view first.\n"), sent)
-            self.assertIn(("pm", "[from @operator] add a todo: ship it"), sent)
+            self.assertIn(("pm", "[from @operator] add a todo: ship it\n"), sent)
             self.assertIn("not running: reviewer", e.run("say", "reviewer", "hi", check=False).stderr)
             e.update("pm", agent_status="blocked")  # herdr refuses a prompt to an agent waiting on an approval
             p = e.run("say", "all", "status?", check=False)
             self.assertEqual(p.returncode, 1)
             self.assertIn("sent your message to @lead-dev", p.stdout)
             self.assertIn("NOT delivered to @pm: agent_blocked", p.stdout)
+
+    def test_say_terminates_text_and_files_without_changing_the_payload(self):
+        with Env() as e:
+            e.run("up", "lead-dev", "--no-brief")
+            note = e.root / "note.md"
+            for message, expected in (("Ask @pm.", "Ask @pm.\n"),
+                                      ("Read $herdr", "Read $herdr\n"),
+                                      ("Keep this line.\nAsk @pm.", "Keep this line.\nAsk @pm.\n"),
+                                      ("Ask @pm.\n", "Ask @pm.\n"),
+                                      ("Keep trailing space. \n\n", "Keep trailing space. \n\n")):
+                for source in ("text", "file"):
+                    with self.subTest(message=message, source=source):
+                        note.write_text(message)
+                        args = (message,) if source == "text" else ("--file", str(note))
+                        e.run("say", "lead-dev", *args)
+                        self.assertEqual(e.prompts()[-1], ("lead-dev", "[from @operator] " + expected))
+
+    def test_delivery_preserves_the_briefs_final_newline(self):
+        with Env() as e:
+            e.run("up", "--no-brief")
+            preview = e.run("brief").stdout
+            e.run("brief", "--send", "frontend-dev")  # Claude gets the brief without a standing-instructions prefix
+            self.assertEqual(dict(e.prompts())["frontend-dev"] + "\n", preview)  # CLI print adds one newline
 
     def test_herdr_required_and_brief_missing(self):
         with Env() as e:
@@ -1331,6 +1354,10 @@ class ConfigTests(unittest.TestCase):
             self.assertIn("You are read-only", prompt)
             self.assertIn("build and run", prompt)  # read-only permits builds/tests
             self.assertIn("## Reports", prompt)
+            self.assertIn("Never end a message on a word that starts with @ or $, even before a full stop: "
+                          "some harnesses complete it and the message stays unsent.", prompt)
+            self.assertIn("`agent_prompted` means sent", prompt)
+            self.assertNotIn("`agent_prompted` means submitted", prompt)
             self.assertNotIn("{instructions}", prompt)
             self.assertIn(f"read `{ateam.SKILL / 'references/notes.md'}` before you search or write them", prompt)
             self.assertTrue((ateam.SKILL / "references/notes.md").is_file())  # the pointer leads somewhere

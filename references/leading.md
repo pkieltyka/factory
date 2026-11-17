@@ -15,13 +15,15 @@ Read after compaction and before assigning work. Follow the workflow in `TEAM.md
 ```bash
 ateam.py say lead-dev "<goal, constraints, acceptance criteria>"
 ateam.py say all --file /tmp/update.md
-herdr agent prompt lead-dev '[from @operator] ...'   # standalone; never --wait
+herdr agent prompt lead-dev '[from @operator] ...'   # standalone; never --wait; never end on a word starting with @ or $
 ateam.py wait                                 # run in the background
 ```
 
 ## Receive and inspect
 
 Members send reports by herdr message; local final replies are not delivered. Check the reported tests before accepting work. Failed sends remain pending: inspect the recipient's pane, resolve the cause and resend.
+
+A sent message is not always submitted: text can stay in a member's composer, and it then goes out with the next message to that member. Before you resend, read the pane. If it shows an error or that the request already ran, do not resend. Otherwise send the whole request again, opening with a line that the held text above is superseded. Never send keys to a member's pane to clear it: Ctrl+C exits the harness.
 
 `ateam.py status` lists every member in `team.toml`, including those not started. Settings shown come from it. Read a stopped member with `herdr agent read <name> --source recent-unwrapped --lines 80`; for a blocked member use `--source visible`.
 

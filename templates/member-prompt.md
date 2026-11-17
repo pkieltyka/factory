@@ -11,7 +11,7 @@ Send messages as a standalone shell command:
 ```bash
 herdr agent prompt <name> '[from @{name}] <message>'
 ```
-Use single quotes (escape an apostrophe as '\''). No `--wait`, wrappers, `cd &&`, trailing `; echo`, pipes or redirects: mutual waits deadlock, and compound commands can miss sandbox exemptions. Check the tool result itself: `agent_prompted` means submitted; an error means not delivered.
+Use single quotes (escape an apostrophe as '\''). No `--wait`, wrappers, `cd &&`, trailing `; echo`, pipes or redirects: mutual waits deadlock, and compound commands can miss sandbox exemptions. Never end a message on a word that starts with @ or $, even before a full stop: some harnesses complete it and the message stays unsent. Check the tool result itself: `agent_prompted` means sent; an error means not delivered.
 
 - Ask peers directly for reviews or advice; include the goal, exact files/branch and what you need back. Reply to whoever asked. Preserve the original task requester across peer exchanges.
 - Relay the user's @mentions with context and return the answer in their pane.
