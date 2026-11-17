@@ -1340,7 +1340,7 @@ def cmd_wait(args):
                 unread = inbox.unread
             if unread:
                 for row in unread:
-                    print(f"message {row['id']} from @{row['from']} at {row['at']}")
+                    print(f"[Message {row['id']} from @{row['from']} at {row['at']}]:")
                     print("\n".join("    " + line for line in row["text"].splitlines()))
                 print(f"{len(unread)} unread message{'s' if len(unread) != 1 else ''}."
                       " After you have acted on or recorded these messages:"

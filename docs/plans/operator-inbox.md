@@ -336,9 +336,9 @@ members reach @<operator> through the inbox (ateam.py inbox send); run ateam.py 
 **Message ids** must not look like issue numbers. They stay plain integers in the file and for `--seen`; only the printed form changes:
 
 ```text
-message 12 from @lead-dev at 17:31:06Z
+[Message 12 from @lead-dev at 17:31:06Z]:
     <text>
-message 13 from @reviewer at 17:32:40Z
+[Message 13 from @reviewer at 17:32:40Z]:
     <text>
 2 unread messages. After you have acted on or recorded these messages: ateam.py wait --seen 13
 ```
@@ -374,7 +374,7 @@ When the configured operator harness matches its live pane, members' messages to
 3. A Claude, an OpenCode and an OMP operator get the background line, `inbox, background wait` and 1800 s.
 4. An explicit `--timeout` wins in both modes; with no `[operator] harness`, and on the typed fallback of a foreground harness, the default is 1800 s.
 5. The typed text for members is byte-identical to before on every fallback (harness not set, mismatch, damage, inbox unavailable).
-6. `wait` prints `message <id> from @<name> at <time>` and "<n> unread messages. After you have acted on or recorded these messages:"; `status` and the per-team clear say "unread messages"; `inbox send` prints `queued message <id>`; the member prompt says `queued message N`; `--seen` still takes the bare integer.
+6. `wait` prints `[Message <id> from @<name> at <time>]:` and "<n> unread messages. After you have acted on or recorded these messages:"; `status` and the per-team clear say "unread messages"; `inbox send` prints `queued message <id>`; the member prompt says `queued message N`; `--seen` still takes the bare integer.
 
 ### Landing gates, on throwaway panes
 

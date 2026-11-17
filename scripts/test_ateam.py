@@ -1069,8 +1069,8 @@ class InboxTests(unittest.TestCase):
             first = e.run("wait").stdout  # no members have started: inbox wins
             self.assertEqual(first, e.run("wait").stdout)
             self.assertIn("    Unicode: café 日本語", first)
-            self.assertIn("message 1 from @lead-dev at ", first)
-            self.assertIn("message 2 from @reviewer at ", first)
+            self.assertIn("[Message 1 from @lead-dev at ", first)
+            self.assertIn("[Message 2 from @reviewer at ", first)
             self.assertNotIn("#1", first)
             self.assertIn("2 unread messages. After you have acted on or recorded these messages:", first)
             self.assertIn("wait --seen 2", first)
