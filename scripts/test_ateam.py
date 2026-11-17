@@ -901,6 +901,7 @@ class InboxTests(unittest.TestCase):
                 prompt = e.run("prompt", name).stdout
                 self.assertIn("teammates other than @operator", prompt)
                 self.assertIn("Report queued for @operator", prompt)
+                self.assertIn("run it once, exactly as printed", prompt)
                 self.assertIn(f"--cwd {e.repo} --from {name}", prompt)
                 self.assertNotIn("{to_operator}", prompt)
             self.assertIn("with the inbox command", e.run("brief").stdout)
@@ -1009,20 +1010,31 @@ class InboxTests(unittest.TestCase):
     def test_failures_never_call_herdr_and_fallback_quotes_payload(self):
         with Env() as e:
             inbox = self.prepare(e, "typed")
-            for state in ("typed", "missing", "symlink"):
+            for state in ("typed", "missing", "damage", "symlink"):
                 if state == "missing":
                     inbox.state_path.unlink()
-                if state == "symlink":
+                if state == "damage":
                     self.prepare(e)
+                    inbox.path.write_text('{"torn":')
+                if state == "symlink":
+                    inbox.path.unlink()
                     target = e.root / "untouched"
                     target.write_text("secret")
                     inbox.path.symlink_to(target)
                 result = self.send(e, "text with ' quotes; $(false)\n$herdr", check=False)
                 self.assertEqual(result.returncode, 5, result.stderr)
-                command = result.stderr.split("Send it typed, once:\n", 1)[1]
+                reason, command = result.stderr.split(" Nothing was queued. Send it typed, once, exactly as printed:\n", 1)
                 argv = shlex.split(command)
                 self.assertEqual(argv[:4], ["herdr", "agent", "prompt", "operator"])
-                self.assertTrue(argv[4].endswith("text with ' quotes; $(false)\n$herdr\n"))
+                cause = "needs repair" if state == "damage" else "cannot write" if state == "symlink" else "no inbox route"
+                self.assertEqual(argv[4], f"[from @lead-dev] Inbox unavailable: {cause}.\ntext with ' quotes; $(false)\n$herdr\n")
+                self.assertTrue(reason.startswith("not stored: "))
+                if state in ("damage", "symlink"):
+                    self.assertIn(str(inbox.path), reason)
+                else:
+                    self.assertIn("restart it with ateam.py continue lead-dev --restart", reason)
+                if state == "damage":
+                    self.assertEqual(inbox.path.read_text(), '{"torn":')
                 if state == "symlink":
                     self.assertEqual(target.read_text(), "secret")
             self.assertEqual(e.calls(), [])
@@ -1031,7 +1043,10 @@ class InboxTests(unittest.TestCase):
             with patch.object(ateam.Inbox, "private_open", side_effect=PermissionError("denied")):
                 code, out, err = self.invoke(e)
             self.assertEqual(code, 5)
-            self.assertIn("herdr agent prompt", err)
+            self.assertIn("not stored: denied.", err)
+            command = err.split("exactly as printed:\n", 1)[1]
+            self.assertEqual(shlex.split(command)[4],
+                             "[from @lead-dev] Inbox unavailable: cannot write.\nliteral '$herdr' @pm.\n")
             with patch.object(ateam.os, "fsync", side_effect=OSError("failed fsync")):
                 code, out, err = self.invoke(e)
             self.assertEqual(code, 1)

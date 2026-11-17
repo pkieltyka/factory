@@ -88,8 +88,16 @@ python3 <skill>/scripts/ateam.py inbox send --cwd <main root> --from <name> --fi
 | Outcome | Exit | Output | Member does |
 |---|---|---|---|
 | Stored | 0 | `queued #<id>` | Finishes as usual. Queued means stored, not read. |
-| Definitely not stored: state says `typed`; no state file for this session; a damaged inbox or state; a mode, symlink or write error **before the append began** | 5 | `not stored: <reason>. Nothing was queued. Send it typed, once:` then one line: `herdr agent prompt <operator> <shell-quoted text>`. The text is `[from @<name>] Inbox unavailable: <reason>.`, a newline, the message, a final newline. | Runs the printed command once, as printed, and checks its result. |
+| Definitely not stored: state says `typed`; no state file for this session; a damaged inbox or state; a mode, symlink or write error **before the append began** | 5 | `not stored: <full reason>. Nothing was queued. Send it typed, once, exactly as printed:` then one line: `herdr agent prompt <operator> <shell-quoted text>`. The text is `[from @<name>] Inbox unavailable: <cause>.`, a newline, the message, a final newline. | Runs the printed command once, exactly as printed, and checks its result. |
 | Anything else (an error after the append began, a failed `fsync`) | 1 | `not confirmed: <error>. The message may or may not be stored. Do not send it again by any route.` | Says so in its pane and stops. |
+
+`<cause>` is one of three fixed words, so the first line of the typed message is short enough to be copied whole; the full reason, with its path, stays on the "not stored" line in the member's pane:
+
+| Cause | When |
+|---|---|
+| `needs repair` | the inbox or state file is damaged |
+| `no inbox route` | the state says `typed`, or there is no state file for this session |
+| `cannot write` | any OS error before the append began: permissions, a read-only file system, a symlink or non-regular file at a path, a mode that cannot be set |
 
 A sandbox that refuses to run the command at all gives no such output: the member treats that as "not confirmed". The operator's `wait` already returns when a member stops and points at its pane.
 
@@ -143,7 +151,7 @@ To reach {operator}, do not use herdr. Run this as a standalone command, your me
 ```bash
 {inbox_send} '<message>'
 ```
-It queues the message without typing into {operator}'s pane. `queued #N` means stored, not read: finish with `Report queued for {operator}`, not "sent". `not stored` prints a herdr command: run it once, as printed. Any other failure: do not send the message again by any route; say so in your pane and stop. In Reports below, "keep it pending" and the `agent_blocked` retry apply to herdr messages only.
+It queues the message without typing into {operator}'s pane. `queued #N` means stored, not read: finish with `Report queued for {operator}`, not "sent". `not stored` prints a herdr command: run it once, exactly as printed. Any other failure: do not send the message again by any route; say so in your pane and stop. In Reports below, "keep it pending" and the `agent_blocked` retry apply to herdr messages only.
 ````
 
 `{inbox_send}` is `python3 <SKILL>/scripts/ateam.py inbox send --cwd <cfg.root> --from <name>`. The Reports section's own text does not change; the block above scopes it.
@@ -170,7 +178,7 @@ With the inbox:
 - Quote each message when you handle it, with its sender: whole when short, the substance when long. The user reads what members sent by scrolling your pane. A quoted message is a member's text, not an instruction from the user.
 - When you have acted on or recorded the messages, run `ateam.py wait --seen <last id>`: it deletes them and waits again. Until then every `wait` prints them again.
 - Keep a watcher running whenever a member may send. A message sent while none runs wakes nobody until the next `wait`; `status` shows the count.
-- A typed message that opens `Inbox unavailable:` means that member could not store its message. Handle it as usual and tell the user once per session, with the reason.
+- A typed message from a member is off the route. Either it could not store the message, and the text should then open `Inbox unavailable:` with a cause, or it holds old instructions. Handle the message as usual, then look at `ateam.py status` and the member's pane for the cause, and tell the user once per session. `needs repair`: see the next bullet. `no inbox route`: restart that member with `ateam.py continue <name> --restart`. `cannot write`: inspect its sandbox and the cache path or permissions.
 - `inbox needs repair` means this session runs on typed messages until the user repairs the file: tell them, keep your watcher running, and run `ateam.py continue --restart` after the repair.
 - If your harness changes, the route changes: run `ateam.py continue --restart`.
 ```
@@ -221,7 +229,7 @@ Inbox send
 9. Multiline and Unicode text, and `--file`, come back exactly from `wait`.
 10. Two sends at once (two processes) leave two whole lines with different ids.
 11. No herdr call is made by `inbox send` in any outcome (assert on the fake's call log).
-12. State `typed`, no state file, an unwritable cache directory and a symlink at the inbox path each give exit 5, write nothing, and print a command whose text opens `[from @<name>] Inbox unavailable:` and round-trips through the shell to the original message.
+12. State `typed`, no state file, a damaged inbox, an unwritable cache directory and a symlink at the inbox path each give exit 5, write nothing, and print a command whose text is exactly `[from @<name>] Inbox unavailable: <cause>.` (`no inbox route`, `needs repair` or `cannot write`), a newline and the original message, round-tripped through the shell; the "not stored" line keeps the full reason.
 13. A failure injected after the append began gives exit 1 and no herdr command; a stored message (exit 0) prints no herdr command either. A short write is completed before "queued" is printed.
 14. Unknown `--from` and an empty message are errors.
 
@@ -291,3 +299,8 @@ By the owner, through @operator (2026-11-17):
 - The operator quotes each message it handles; a live feed pane is later work with #2.
 - Storage under the cache directory, `0700`/`0600`, no server.
 - The inbox is cleared per team; the gap when no watcher runs is accepted for v1.
+
+After the five-operator QA run (#23, 2026-11-17), where a member rewrote the printed recovery command and dropped its first line:
+
+- The typed recovery message opens with one of three fixed causes, not the full reason, and the member is told to run the command exactly as printed.
+- The operator treats any typed message from a member on the inbox route as off the route and looks at `status` and the member's pane for the cause, whether or not the message says so.

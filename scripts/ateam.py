@@ -451,8 +451,9 @@ def cmd_inbox_send(args):
                   file=sys.stderr)
             raise SystemExit(1)
         reason = str(e).rstrip(".")
-        print(f"not stored: {reason}. Nothing was queued. Send it typed, once:", file=sys.stderr)
-        fallback = f"{tag(args.sender)} Inbox unavailable: {reason}.\n{text}\n"
+        cause = "needs repair" if isinstance(e, InboxDamage) else "cannot write" if isinstance(e, OSError) else "no inbox route"
+        print(f"not stored: {reason}. Nothing was queued. Send it typed, once, exactly as printed:", file=sys.stderr)
+        fallback = f"{tag(args.sender)} Inbox unavailable: {cause}.\n{text}\n"
         print(shlex.join(["herdr", "agent", "prompt", cfg.operator["name"], fallback]), file=sys.stderr)
         raise SystemExit(5)
 
@@ -760,7 +761,7 @@ To reach {operator}, do not use herdr. Run this as a standalone command, your me
 ```bash
 {inbox_send} '<message>'
 ```
-It queues the message without typing into {operator}'s pane. `queued #N` means stored, not read: finish with `Report queued for {operator}`, not "sent". `not stored` prints a herdr command: run it once, as printed. Any other failure: do not send the message again by any route; say so in your pane and stop. In Reports below, "keep it pending" and the `agent_blocked` retry apply to herdr messages only.
+It queues the message without typing into {operator}'s pane. `queued #N` means stored, not read: finish with `Report queued for {operator}`, not "sent". `not stored` prints a herdr command: run it once, exactly as printed. Any other failure: do not send the message again by any route; say so in your pane and stop. In Reports below, "keep it pending" and the `agent_blocked` retry apply to herdr messages only.
 """
     text = text.replace("{teammates}", "teammates other than {operator}" if inbox else "teammates")
     text = text.replace("{to_operator}", to_operator)
