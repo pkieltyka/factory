@@ -391,7 +391,7 @@ class UpTests(unittest.TestCase):
             sent = dict(e.prompts())
             self.assertEqual(set(sent), {"lead-dev", "frontend-dev", "reviewer", "pm"})  # one message each
             self.assertTrue(sent["frontend-dev"].startswith("# Team brief (from @operator)"))  # its instructions are its system prompt
-            self.assertTrue(sent["reviewer"].startswith("[from @operator] Your standing instructions"))  # Codex gets them here too
+            self.assertTrue(sent["reviewer"].startswith("[from @operator]: Your standing instructions"))  # Codex gets them here too
             self.assertIn("You are read-only", sent["reviewer"])
             for text in sent.values():
                 for needle in ("| **@lead-dev** | Codex, gpt-6-astra, high |", "## Workflow", "No reply needed."):
@@ -462,7 +462,7 @@ class UpTests(unittest.TestCase):
             self.assertTrue(next(t for n, t in later if n == "frontend-dev").startswith("# Team brief"))
             for name in ("lead-dev", "reviewer", "pm"):  # the others hear who joined, not the whole brief again
                 text = next(t for n, t in later if n == name)
-                self.assertTrue(text.startswith("[from @operator] Joined the team: @frontend-dev (frontend-dev, Claude Code"), text)
+                self.assertTrue(text.startswith("[from @operator]: Joined the team: @frontend-dev (frontend-dev, Claude Code"), text)
             self.assertEqual(len(e.calls("tab", "create")), 1)  # the failed member's pane was reused
             self.assertEqual(len([p for p in e.fake_state()["panes"].values() if p["label"] == "frontend-dev"]), 1)
             e.run("brief", "--send", "pm")
@@ -650,8 +650,8 @@ class UpTests(unittest.TestCase):
             e.run("say", "all", "--file", str(note))
             e.run("say", "@pm", "add a todo: ship it")
             sent = e.prompts()
-            self.assertIn(("lead-dev", "[from @operator] Priorities changed: ship the list view first.\n"), sent)
-            self.assertIn(("pm", "[from @operator] add a todo: ship it\n"), sent)
+            self.assertIn(("lead-dev", "[from @operator]: Priorities changed: ship the list view first.\n"), sent)
+            self.assertIn(("pm", "[from @operator]: add a todo: ship it\n"), sent)
             self.assertIn("not running: reviewer", e.run("say", "reviewer", "hi", check=False).stderr)
             e.update("pm", agent_status="blocked")  # herdr refuses a prompt to an agent waiting on an approval
             p = e.run("say", "all", "status?", check=False)
@@ -673,7 +673,7 @@ class UpTests(unittest.TestCase):
                         note.write_text(message)
                         args = (message,) if source == "text" else ("--file", str(note))
                         e.run("say", "lead-dev", *args)
-                        self.assertEqual(e.prompts()[-1], ("lead-dev", "[from @operator] " + expected))
+                        self.assertEqual(e.prompts()[-1], ("lead-dev", "[from @operator]: " + expected))
 
     def test_delivery_preserves_the_briefs_final_newline(self):
         with Env() as e:
@@ -904,7 +904,9 @@ class InboxTests(unittest.TestCase):
                 self.assertIn("run it once, exactly as printed", prompt)
                 self.assertIn(f"--cwd {e.repo} --from {name}", prompt)
                 self.assertNotIn("{to_operator}", prompt)
-            self.assertIn("with the inbox command", e.run("brief").stdout)
+            brief = e.run("brief").stdout
+            self.assertIn("with the inbox command", brief)
+            self.assertIn("herdr agent prompt <name> '[from @you]: ...'", brief)
             e.run("continue")
             for name, text in e.prompts()[-len(members):]:
                 self.assertIn("Send it with the inbox command", text, name)
@@ -1125,7 +1127,7 @@ class InboxTests(unittest.TestCase):
                 argv = shlex.split(command)
                 self.assertEqual(argv[:4], ["herdr", "agent", "prompt", "operator"])
                 cause = "needs repair" if state == "damage" else "cannot write" if state == "symlink" else "no inbox route"
-                self.assertEqual(argv[4], f"[from @lead-dev] Inbox unavailable: {cause}.\ntext with ' quotes; $(false)\n$herdr\n")
+                self.assertEqual(argv[4], f"[from @lead-dev]: Inbox unavailable: {cause}.\ntext with ' quotes; $(false)\n$herdr\n")
                 self.assertTrue(reason.startswith("not stored: "))
                 if state in ("damage", "symlink"):
                     self.assertIn(str(inbox.path), reason)
@@ -1144,7 +1146,7 @@ class InboxTests(unittest.TestCase):
             self.assertIn("not stored: denied.", err)
             command = err.split("exactly as printed:\n", 1)[1]
             self.assertEqual(shlex.split(command)[4],
-                             "[from @lead-dev] Inbox unavailable: cannot write.\nliteral '$herdr' @pm.\n")
+                             "[from @lead-dev]: Inbox unavailable: cannot write.\nliteral '$herdr' @pm.\n")
             with patch.object(ateam.os, "fsync", side_effect=OSError("failed fsync")):
                 code, out, err = self.invoke(e)
             self.assertEqual(code, 1)
@@ -1571,7 +1573,7 @@ class ContinueTests(unittest.TestCase):
             self.assertEqual(sorted(n for n, _ in sent), ["frontend-dev", "lead-dev", "pm"])  # one message each
             for _, text in sent:
                 self.assertIn("picking up where we left off", text)
-                self.assertIn("herdr agent prompt operator", text)
+                self.assertIn("Send it: `herdr agent prompt operator '[from @you]: ...'`.", text)
                 self.assertIn("A reply in your own pane does not reach @operator", text)
                 self.assertIn("# Team brief", text)
                 self.assertNotIn("No reply needed", text)
@@ -1856,8 +1858,10 @@ class ConfigTests(unittest.TestCase):
             text = e.run("brief").stdout
             self.assertIn("| **@product** | Claude Code, claude-opus-5-5, medium |", text)
             self.assertIn("No reply needed.", text)
+            self.assertIn("herdr agent prompt <name> '[from @you]: ...'", text)
             self.assertNotIn("Works in", text)  # no worktrees on this team
             prompt = e.run("prompt", "reviewer").stdout
+            self.assertIn("herdr agent prompt <name> '[from @reviewer]: <message>'", prompt)
             self.assertIn("Start a task only when @operator or the user assigns it to you; an item the brief or "
                           "tracker marks ready is not an assignment. A teammate's request for a review or advice "
                           "needs none.", prompt)

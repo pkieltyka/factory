@@ -10,7 +10,7 @@ Start a task only when {operator} or the user assigns it to you; an item the bri
 Message {teammates} only with `herdr agent prompt` (`ateam.py say` is operator-only), never through a harness's own messaging (e.g. Claude Code's `SendMessage`): herdr works across harnesses and permission modes.
 Send messages as a standalone shell command:
 ```bash
-herdr agent prompt <name> '[from @{name}] <message>'
+herdr agent prompt <name> '[from @{name}]: <message>'
 ```
 Use single quotes (escape an apostrophe as '\''). No `--wait`, wrappers, `cd &&`, trailing `; echo`, pipes or redirects: mutual waits deadlock, and compound commands can miss sandbox exemptions. Never end a message on a word that starts with @ or $, even before a full stop: some harnesses complete it and the message stays unsent. Check the tool result itself: `agent_prompted` means sent; an error means not delivered.
 {to_operator}
