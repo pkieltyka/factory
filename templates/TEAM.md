@@ -4,7 +4,7 @@
 
 ## Tasks
 
-Tasks, owners, status and bugs are tracked in `TODO.md` at the repo root. The operator may assign an item marked `ready` without asking the user; only a person marks it, never the team.
+Tasks and bugs are tracked in `TODO.md` at the repo root, one line each: `- [ ] <title> -- <description>`. `## Ready` holds, in the order they will be done, the items the operator may assign without asking the user; only a person puts an item there or reorders it, never the team. The team adds what it finds to `## Backlog`. An assigned item moves to `## In progress` with its owner at the end of the line, `(@lead-dev)`. Integrated work moves to the top of `## Done` as `- [x]` with its commit. An item's criteria, verdict and next step go on indented lines under it.
 
 ## Workflow
 
