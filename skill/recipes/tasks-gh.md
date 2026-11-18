@@ -8,7 +8,10 @@ The person installs [gh](https://cli.github.com), signs in with `gh auth login`,
 
 ## Check
 
-`gh auth status`
+`gh repo view OWNER/REPO --json hasIssuesEnabled,viewerPermission`
+
+Pass only when `hasIssuesEnabled` is `true` and `viewerPermission` is `ADMIN`, `MAINTAIN`, `WRITE` or `TRIAGE`.
+This does not prove a fine-grained token can write issues; setup asks the owner to confirm that permission before choosing gh.
 
 ## FACTORY.md section
 
@@ -32,4 +35,4 @@ Never delete issues. Reconcile an uncertain write before retrying.
 
 ## Tested with
 
-2026-11-18: gh 2.104.0; `gh auth status`, label-filtered list (using an existing label) and issue view ran in this repository. Edit, comment, create and close flags were checked in help, not executed. The label-based ready flow has not been trialled by a team.
+2026-11-18: gh 2.104.0; the repository check returned `hasIssuesEnabled: true` and `viewerPermission: ADMIN`; authentication, label-filtered list (using an existing label) and issue view also ran in this repository. Edit, comment, create and close flags were checked in help, not executed. The label-based ready flow has not been trialled by a team.
