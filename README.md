@@ -8,48 +8,20 @@
 
 ## Quickstart
 
-Install herdr, Python 3.11+ and the harnesses you will use. From a clone of this repo, **copy or link `skill/`** into your harness's skills directory as `factory`. For Claude Code, with no existing factory installation:
+By default, members run with approval prompts off. Use a sandbox or VM, or ask setup for guarded permissions for Claude Code and Codex. [Install the skill](docs/getting-started.md#install-the-skill).
 
-```bash
-mkdir -p ~/.claude/skills
-cp -R skill ~/.claude/skills/factory
-```
-
-Or link it instead of copying: `ln -s "$PWD/skill" ~/.claude/skills/factory`.
-
-In your project, start a harness inside herdr:
+From your project inside herdr, enter these commands in Claude Code. [Other operator harnesses](docs/getting-started.md#operator-harnesses)
 
 ```text
-/factory setup      # choose the team and project tools
-/factory up         # launch the members, then give the operator a task
-/factory continue   # recover the team when you return
+/factory setup
+/factory up
+/factory continue
 ```
-
-## Commands
-
-| Command | What it does |
-|---|---|
-| `/factory` | Reads the current state and chooses the next step. |
-| `/factory setup` | Forms or changes the team and project brief. |
-| `/factory up` | Checks, launches and briefs the members. |
-| `/factory continue` | Resumes the team and reconciles unfinished work. |
-| `/factory status` | Shows each member's state and the message route. |
-| `/factory wait` | Returns when a message or member needs the operator. |
-| `/factory brief` | Previews or resends the team brief. |
-| `/factory say` | Sends an operator message to members. |
-
-The [skill references](skill/references/) hold the operating rules.
-
-## Repo setup
-
-Setup writes `FACTORY.md`, the shared project brief, and `factory.toml`, your uncommitted formation. `factory.toml.sample` is the shared suggestion. Start with `TODO.md` and the reviewer's own review; add only the [optional choices](docs/README.md) the project needs. One team runs per herdr session; parallel developers can use Git worktrees.
-
-By default, when the configured operator harness matches its live pane, members' messages go to an inbox. An explicit typed choice, an unset or mismatched harness, or an unusable inbox uses typed messages instead. See [leading the team](skill/references/leading.md).
 
 ## What else is in this repo
 
 - [skill/](skill/) — what you install: instructions, roles, templates, recipes and `scripts/factory.py`.
-- [docs/](docs/README.md) — the map and getting-started guide; [docs/plans/](docs/plans/) records development plans.
+- [docs/](docs/README.md) — the team, command map and getting-started guide.
 - [tests/](tests/) — fake harness/herdr tests, real Git checks and the Gate 1 fixture; run `python3 tests/test_factory.py`. `FACTORY_LIVE=1 python3 tests/test_factory.py LiveFlags` checks installed harness flags.
 
 To add a harness, add its table (with `operator_wait`) in `skill/harnesses.toml`, its code block and a test fake.

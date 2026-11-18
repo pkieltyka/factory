@@ -9,6 +9,7 @@ import io
 import json
 import os
 import pathlib
+import re
 import shlex
 import shutil
 import subprocess
@@ -18,6 +19,7 @@ import textwrap
 import tomllib
 import types
 import unittest
+from urllib.parse import unquote, urlsplit
 from unittest.mock import patch
 
 SCRIPT = pathlib.Path(__file__).resolve().parent.parent / "skill/scripts/factory.py"
@@ -2129,6 +2131,24 @@ class ListingTests(unittest.TestCase):
                "│ z-ai/glm-5.3       │      1M │\n│ z-ai/glm-5.3-flash │      1M │\n└─────┴─────┘\n"
                "ollama (1)\n┌─────┬─────┐\n│ model    │ context │\n├─────┼─────┤\n│ qwen3:8b │    128K │\n└─────┴─────┘\n")
         self.assertEqual(factory.listed_models(omp), ["openrouter/z-ai/glm-5.3", "openrouter/z-ai/glm-5.3-flash", "ollama/qwen3:8b"])
+
+
+class DocumentationTests(unittest.TestCase):
+    def test_relative_links_and_headings(self):
+        root = factory.SKILL.parent
+        for page in [root / "README.md", *sorted((root / "docs").glob("*.md"))]:
+            for href in re.findall(r"\]\(([^\s)]+)\)", page.read_text()):
+                link = urlsplit(href)
+                if link.scheme or link.netloc:
+                    continue
+                with self.subTest(page=page.name, href=href):
+                    target = page.parent / unquote(link.path) if link.path else page
+                    self.assertTrue(target.exists(), str(target))
+                    if link.fragment:
+                        document = target / "README.md" if target.is_dir() else target
+                        headings = re.findall(r"^#{1,6} (.+)$", document.read_text(), re.MULTILINE)
+                        anchors = [re.sub(r"[^\w -]", "", h.lower()).replace(" ", "-") for h in headings]
+                        self.assertIn(unquote(link.fragment), anchors)
 
 
 class RecipeTests(unittest.TestCase):
