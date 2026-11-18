@@ -25,13 +25,10 @@ Before ending a task turn, **send a report to its requester** ({operator} unless
 
 Use `status: ...; changed: <paths/commit>; ran: <checks/results>; risks: ...; next: ...`, omitting empty fields. Reviewers use `status: approve` or `status: changes required`. Include the role's findings, verdict or plan. Bug reports need reproducible steps/request, expected/actual, location and severity.
 
-End a report with `learned: <what a later task would otherwise get wrong>` only for something non-obvious, verified and lasting that others can reuse; most reports have none. It is usually one of: a first attempt that end-to-end testing or QA proved wrong (an external system's or API's behaviour, an instruction that ran counter to what was assumed); a fix that needed a fact not in the code or docs (tool, harness, sandbox, environment); a workaround others will hit; a mistake caught in review that had happened before. Routine results, what the code or Git shows, and the user's rules and preferences are not learnings.
-
-Check submission succeeded, then finish locally with `Report sent to @<requester>`; never wait for an acknowledgement. If delivery fails, keep it pending, print the unsent report and error locally, and tell {operator} when reachable. For `agent_blocked`, retry when the recipient can take input. Never claim a failed send succeeded. If the human assigned work directly in this pane, answer here and notify {operator} when it affects team work.
+Check the send succeeded, then finish locally with `Report sent to @<requester>`, or `Report queued for @<requester>` when the result said queued; never wait for an acknowledgement. If a herdr send fails, keep it pending, print the unsent report and error locally, and tell {operator} when reachable; for `agent_blocked`, retry when the recipient can take input. Never claim a failed send succeeded. If the human assigned work directly in this pane, answer here and notify {operator} when it affects team work.
 
 ## Rules
 - Meet the task's acceptance criteria. Ask about ambiguity that changes behavior or scope; choose reversible implementation details yourself and state material assumptions.
 - Do not start, stop, close or rename panes or agents.
-- Stage only task files, never `git add -A` or `git add .`; harness sandboxes may expose unrelated placeholders.
-- When the team brief enables notes, read `{notes}` before you search or write them; otherwise there is no automatic notes workflow.
+- When the team brief enables notes, read `{notes}` before your first task: it covers searching, writing and the `learned:` line of a report. Otherwise there is no notes workflow.
 {rules}

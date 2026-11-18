@@ -749,7 +749,11 @@ class WorktreeTests(unittest.TestCase):
             self.assertIn("`git merge main`", prompt)
             self.assertIn("agree who commits it for you", prompt)
             self.assertNotIn("Never run `git commit`", prompt)
-            self.assertIn("Never run `git commit`", e.run("prompt", "reviewer").stdout)  # the operator owns commits in the shared checkout
+            staging = "Stage only task files, never `git add -A` or `git add .`"
+            self.assertIn(staging, prompt)
+            shared = e.run("prompt", "reviewer").stdout
+            self.assertIn("Never run `git commit`", shared)
+            self.assertNotIn(staging, shared)
             brief = next(t for n, t in e.prompts() if n == "reviewer")
             self.assertIn("| branch `feature/login` in `" + str(trees / "feature-login") + "` |", brief)
             self.assertIn("`git diff main...<branch>`", brief)
@@ -878,7 +882,7 @@ class InboxTests(unittest.TestCase):
             for name in members:
                 prompt = e.run("prompt", name).stdout
                 self.assertIn("teammates other than @operator", prompt)
-                self.assertIn("Report queued for @operator", prompt)
+                self.assertIn("Report queued for @<requester>", prompt)
                 self.assertIn("run it once, exactly as printed", prompt)
                 self.assertIn(f"--cwd {e.repo} --from {name}", prompt)
                 self.assertNotIn("{to_operator}", prompt)
@@ -1618,14 +1622,15 @@ class ContinueTests(unittest.TestCase):
             self.assertEqual(len(e.prompts()), 4)
             for _, text in e.prompts():
                 self.assertIn("starting in a new session", text)
-                self.assertIn("do not start anything yet", text)
+                self.assertIn("Do not start anything yet", text)
                 self.assertIn("No reply needed", text)
                 self.assertNotIn("picking up where we left off", text)
             self.assertIn("fresh sessions, no earlier context: @lead-dev, @frontend-dev, @reviewer, @pm. "
                           "Send each its task, criteria and the evidence so far.", out)
 
     def test_no_member_panes_resumes_noted_sessions(self):
-        with Env(UI) as e:
+        marker = "This brief applies to the resumed team."
+        with Env(UI + "\n" + marker + "\n") as e:
             e.run("up", "--no-brief")
             e.set_session("lead-dev", {"agent": "codex", "kind": "id", "value": "cx-1"})
             e.set_session("pm", {"agent": "pi", "kind": "path", "value": "/s/p.jsonl"})
@@ -1640,6 +1645,10 @@ class ContinueTests(unittest.TestCase):
                 self.assertTrue({"resume", "--resume", "--session"}.isdisjoint(by[name]))
             sent = dict(e.prompts())
             self.assertEqual(len(sent), 4)
+            for message in sent.values():
+                self.assertEqual(message.count(marker), 1)
+                closing = message.rstrip().rsplit("\n\n", 1)[-1]
+                self.assertNotIn("re-read", closing.lower())
             for name in ("lead-dev", "pm"):
                 self.assertIn("picking up where we left off", sent[name])
                 self.assertNotIn("No reply needed", sent[name])
@@ -2061,14 +2070,17 @@ class ConfigTests(unittest.TestCase):
             self.assertIn("You are read-only", prompt)
             self.assertIn("build and run", prompt)  # read-only permits builds/tests
             self.assertIn("## Reports", prompt)
-            self.assertIn("learned: <what a later task would otherwise get wrong>", prompt)
+            learned = "learned: <what a later task would otherwise get wrong>"
+            self.assertNotIn(learned, prompt)
             self.assertIn("Never end a message on a word that starts with @ or $, even before a full stop: "
                           "some harnesses complete it and the message stays unsent.", prompt)
             self.assertIn("`agent_prompted` means sent", prompt)
             self.assertNotIn("`agent_prompted` means submitted", prompt)
             self.assertNotIn("{instructions}", prompt)
-            self.assertIn(f"read `{factory.SKILL / 'references/notes.md'}` before you search or write them", prompt)
-            self.assertTrue((factory.SKILL / "references/notes.md").is_file())  # the pointer leads somewhere
+            notes = factory.SKILL / "references/notes.md"
+            self.assertIn(f"read `{notes}` before your first task: it covers searching, writing and the "
+                          "`learned:` line of a report", prompt)
+            self.assertIn(learned, notes.read_text())
             self.assertIn("reviewer.md", prompt)
             self.assertNotIn("{operator}", prompt)
 
