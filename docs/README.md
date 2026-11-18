@@ -4,7 +4,7 @@ Factory is an owner-directed software factory: a team of agents in herdr, plus t
 
 | Section | Built-in default | Recommended choice and when | Recipe or reference |
 |---|---|---|---|
-| Tasks | `TODO.md` | `gh` for GitHub Issues; `todos` when a project board drives readiness | [todos](../skill/recipes/tasks-todos.md); gh: no tested recipe yet |
+| Tasks | `TODO.md` | `gh` for GitHub Issues; `todos` when a project board drives readiness | [gh](../skill/recipes/tasks-gh.md) (label flow untrialled), [todos](../skill/recipes/tasks-todos.md) |
 | Pull requests | Off | GitHub when changes must reach the integration branch through PRs | [GitHub](../skill/recipes/pull-requests-github.md) |
 | Review | Fast: the reviewer's full own review | Deep with codegenie for an additional review of committed changes | [codegenie](../skill/recipes/review-codegenie.md) |
 | Notes | Off | Enable the built-in convention with `rg` for working notes, research and decisions | [Notes convention](../skill/references/notes.md) |
