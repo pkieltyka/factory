@@ -3,8 +3,6 @@
 A project has `FACTORY.md` (the shared brief, committed) and `factory.toml` (your own formation, not committed). `factory.toml.sample` is the project's suggested formation.
 
 - **The project already has `FACTORY.md`:** someone set the team up. Run `factory.py init`; it copies `factory.toml.sample` to your `factory.toml`. Ask only what the user wants different for themselves (other models or harnesses, one model for everything, fewer members) and edit `factory.toml`. Check `user`, a top-level key above `[operator]`: it is the first part of this person's worktree branches. `init` prints it when the sample sets one. Leave `FACTORY.md` alone unless they ask.
-- **Only an old `team-brief.md` exists:** `factory.py` stops and prints how to split it by hand into `factory.toml` and `FACTORY.md`. Do that; never run `init` to get past it.
-- **`TEAM.md` or `team.toml` from a-team:** the script stops and prints the renames. Do them. Write no new file to get past it, except `FACTORY.md` from the template when `TEAM.md` is another document, as the message says.
 - **Neither file exists:** follow the steps below.
 - **Both exist:** change only what the user requested.
 
