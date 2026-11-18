@@ -25,9 +25,9 @@ spec = importlib.util.spec_from_file_location("ateam", SCRIPT)
 ateam = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ateam)
 os.environ["LOGNAME"] = "ada"  # whose team the tests run as: the first part of worktree branches
-# Fixtures are written as `+++ settings +++ prose`; Env.write_brief puts them on disk as team.toml and TEAM.md.
-TEMPLATE = ("+++\n" + (ateam.SKILL / "templates/team.toml").read_text().strip() + "\n+++\n"
-            + (ateam.SKILL / "templates/TEAM.md").read_text())
+# Fixtures are written as `+++ settings +++ prose`; Env.write_brief puts them on disk as factory.toml and FACTORY.md.
+TEMPLATE = ("+++\n" + (ateam.SKILL / "templates/factory.toml").read_text().strip() + "\n+++\n"
+            + (ateam.SKILL / "templates/FACTORY.md").read_text())
 GIT = shutil.which("git")
 
 FAKE_HERDR = textwrap.dedent(r'''
@@ -266,10 +266,10 @@ class Env:
                                env={**self.env, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"})
 
     def write_brief(self, text):
-        """A fixture's settings become team.toml and its prose TEAM.md."""
+        """A fixture's settings become factory.toml and its prose FACTORY.md."""
         head, _, body = text.removeprefix("+++\n").partition("\n+++\n")
-        (self.repo / "team.toml").write_text(head + "\n")
-        (self.repo / "TEAM.md").write_text(body)
+        (self.repo / "factory.toml").write_text(head + "\n")
+        (self.repo / "FACTORY.md").write_text(body)
 
     def write_fake(self, s):
         self.fake.write_text(json.dumps(s))
@@ -382,7 +382,7 @@ class UpTests(unittest.TestCase):
             self.assertTrue(settings["skipDangerousModePermissionPrompt"])  # nor at its first-run warning
             self.assertNotIn("--disallowedTools", fe)
             prompt = pathlib.Path(flag(fe, "--append-system-prompt-file")).read_text()
-            self.assertIn(str(e.repo / "TEAM.md"), prompt)
+            self.assertIn(str(e.repo / "FACTORY.md"), prompt)
             self.assertNotIn("{instructions}", prompt)
             self.assertEqual(flag(native(starts["pm"]), "--model"), "openrouter/deepseek/deepseek-v4.1-flash")
 
@@ -397,7 +397,7 @@ class UpTests(unittest.TestCase):
                 for needle in ("| **@lead-dev** | Codex, gpt-6-astra, high |", "## Workflow", "No reply needed."):
                     self.assertIn(needle, text)
                 self.assertNotIn("+++", text)
-            self.assertEqual(sorted(p.name for p in e.repo.iterdir()), ["TEAM.md", "sub", "team.toml"])  # nothing else
+            self.assertEqual(sorted(p.name for p in e.repo.iterdir()), ["FACTORY.md", "factory.toml", "sub"])  # nothing else
 
     def test_ten_members_stay_a_balanced_grid(self):
         with Env() as e:
@@ -610,9 +610,9 @@ class UpTests(unittest.TestCase):
                     "role": "backend-dev", "harness": "codex", "model": "gpt-6-luna",
                 } for i in range(2, number + 1)}}
                 e.write_brief(formation(members))
-                original_brief = (e.repo / "team.toml").read_bytes()
+                original_brief = (e.repo / "factory.toml").read_bytes()
                 self.assertIn(f"started @{name}", e.run("up", name).stdout)
-                self.assertEqual((e.repo / "team.toml").read_bytes(), original_brief)
+                self.assertEqual((e.repo / "factory.toml").read_bytes(), original_brief)
                 self.assertEqual(ateam.Config(e.repo).members["backend-dev"], original_settings)
                 self.assertEqual({k: e.pane_of("backend-dev")[k] for k in ("pane_id", "name", "label", "cwd")},
                                  {k: first[k] for k in ("pane_id", "name", "label", "cwd")})
@@ -622,13 +622,13 @@ class UpTests(unittest.TestCase):
 
     def test_existing_member_settings_only_come_from_the_brief(self):
         with Env(git=True) as e:
-            original = (e.repo / "team.toml").read_bytes()
+            original = (e.repo / "factory.toml").read_bytes()
             for args in (("--role", "reviewer"), ("--model", "gpt-6-luna"), ("--harness", "claude"),
                          ("--thinking", "low"), ("--worktree",), ("--team", "ui")):
                 p = e.run("up", "lead-dev", *args, check=False)
                 self.assertEqual(p.returncode, 2)
                 self.assertIn("unrecognized arguments", p.stderr)
-            self.assertEqual((e.repo / "team.toml").read_bytes(), original)
+            self.assertEqual((e.repo / "factory.toml").read_bytes(), original)
             self.assertEqual(e.starts(), {})
 
     def test_up_and_continue_fail_when_brief_delivery_fails(self):
@@ -692,7 +692,7 @@ class UpTests(unittest.TestCase):
                 self.assertNotIn("Traceback", missing.stderr)
             status = e.run("status").stdout
             self.assertEqual(status.count("not started"), len(CATALOG_MEMBERS) + 1)
-            self.assertIn("No member of team.toml has a pane in this herdr session. "
+            self.assertIn("No member of factory.toml has a pane in this herdr session. "
                           "A team that ran before: `ateam.py continue`. "
                           "A new team: `ateam.py check`, then `ateam.py up`.", status)
             for command in ("cost", "show"):
@@ -702,7 +702,7 @@ class UpTests(unittest.TestCase):
             for cmd in (["up", "pm"], ["status"], ["wait"]):
                 self.assertIn("not inside herdr", e.run(*cmd, check=False, HERDR_ENV="").stderr)
         with Env(brief=None) as e:
-            self.assertIn("Run `/a-team setup`", e.run("check", "pm", check=False).stderr)
+            self.assertIn("Run `/factory setup`", e.run("check", "pm", check=False).stderr)
 
 
 @unittest.skipUnless(GIT, "git is not installed")
@@ -940,7 +940,7 @@ class InboxTests(unittest.TestCase):
             self.assertEqual(closing, dict(e.prompts())["lead-dev"].split("We are picking up")[1])
             e.write_brief(formation({"lead-dev": CATALOG_MEMBERS["lead-dev"]}, operator={"harness": "claude"}))
             e.update("operator", agent="codex")
-            self.assertIn("team.toml says claude, herdr sees codex", e.run("continue").stdout)
+            self.assertIn("factory.toml says claude, herdr sees codex", e.run("continue").stdout)
             e.update("operator", agent="claude")
             self.assertIn("route to @operator changed to inbox", e.run("continue").stdout)
             self.assertNotIn("route to @operator changed", e.run("continue", "--restart").stdout)
@@ -956,7 +956,7 @@ class InboxTests(unittest.TestCase):
                                                                                  "messages": "typed"})) as e:
                 e.update(None, agent=harness)
                 before = e.run("prompt", "lead-dev").stdout
-                self.assertIn('by typed herdr messages: [operator] messages = "typed" in team.toml',
+                self.assertIn('by typed herdr messages: [operator] messages = "typed" in factory.toml',
                               e.run("up").stdout)
                 self.assertEqual(before, e.run("prompt", "lead-dev").stdout)
                 self.assertIn("operator messages: typed", e.run("status").stdout)
@@ -1468,7 +1468,7 @@ class ContinueTests(unittest.TestCase):
         with Env(UI) as e:
             self.assertEqual(list((e.root / "cache/a-team").glob("*/sessions.jsonl")), [])
             out = e.run("continue").stdout
-            self.assertIn("no member panes in this herdr session: continuing every member in team.toml", out)
+            self.assertIn("no member panes in this herdr session: continuing every member in factory.toml", out)
             self.assertEqual(set(e.starts()), {"lead-dev", "frontend-dev", "reviewer", "pm"})
             for call in e.starts().values():
                 self.assertTrue({"resume", "--resume", "--session"}.isdisjoint(native(call)))
@@ -1527,7 +1527,7 @@ class ContinueTests(unittest.TestCase):
         with Env(formation({})) as e:
             result = e.run("continue", check=False)
             self.assertEqual(result.returncode, 1)
-            self.assertIn("no members in team.toml; add one, then run `ateam.py up`", result.stderr)
+            self.assertIn("no members in factory.toml; add one, then run `ateam.py up`", result.stderr)
             self.assertEqual(e.starts(), {})
 
     def test_cold_continue_checks_every_member_before_launch(self):
@@ -1681,7 +1681,7 @@ class ConfigTests(unittest.TestCase):
                 self.assertIn(p["model"], ateam.TABLE[p["harness"]]["models"], name)  # the template uses recommended models
                 self.assertEqual(p["permissions"], "full")
             self.assertEqual(cfg.operator["name"], "operator")
-            self.assertIn("tracked in `TODO.md`", cfg.body)  # where tasks live is prose in TEAM.md, not a setting
+            self.assertIn("tracked in `TODO.md`", cfg.body)  # where tasks live is prose in FACTORY.md, not a setting
             todo = (ateam.SKILL / "templates/TODO.md").read_text().splitlines()
             self.assertEqual(todo[:2], ["TODO", "===="])
             headings = ["## Ready", "## In progress", "## Backlog", "## Done"]
@@ -1705,7 +1705,7 @@ class ConfigTests(unittest.TestCase):
 
     def test_operator_table_and_name(self):
         team = '[members.lead-dev]\nharness = "codex"\nmodel = "gpt-6-luna"\n'
-        stock = (ateam.SKILL / "templates/TEAM.md").read_text()  # the shared brief people really get
+        stock = (ateam.SKILL / "templates/FACTORY.md").read_text()  # the shared brief people really get
         with Env(team_brief('[operator]\nname = "boss"\nharness = "claude"\n' + team, stock)) as e:
             e.run("up")
             pane = e.fake_state()["panes"]["w1:p1"]
@@ -1716,7 +1716,7 @@ class ConfigTests(unittest.TestCase):
             self.assertIn("1. The operator assigns tasks", brief)  # the shared brief names the role ...
             self.assertNotIn("@operator", brief)                   # ... never one person's operator
             e.write_brief(team_brief(team, "## Workflow\n\n{operator} and {name} stay as written.\n"))
-            self.assertIn("{operator} and {name} stay as written.", e.run("brief").stdout)  # TEAM.md is sent as it is
+            self.assertIn("{operator} and {name} stay as written.", e.run("brief").stdout)  # FACTORY.md is sent as it is
             e.write_brief(team_brief('[operator]\nname = "boss"\nharness = "claude"\n' + team, stock))
             prompt = e.run("prompt", "lead-dev").stdout
             self.assertIn("led by its operator, @boss", prompt)  # roles and the member prompt follow the name
@@ -1737,7 +1737,7 @@ class ConfigTests(unittest.TestCase):
                 for command in ("check", "brief"):
                     result = e.run(command, check=False)
                     self.assertEqual(result.returncode, 1, command)
-                    self.assertIn(f"{e.repo / 'team.toml'}: unknown top-level key(s): ['{key}']", result.stderr)
+                    self.assertIn(f"{e.repo / 'factory.toml'}: unknown top-level key(s): ['{key}']", result.stderr)
                     self.assertIn("operator fields belong under [operator]", result.stderr)
 
     def test_member_requires_explicit_harness(self):
@@ -1750,7 +1750,7 @@ class ConfigTests(unittest.TestCase):
         team = '[members.lead-dev]\nharness = "codex"\nmodel = "gpt-6-luna"\nworktree = true\n'
         with Env(team_brief(team, "# Team\n\n<!-- for the editor -->\n## Tasks\n\nGitHub Issues on o/r, with `gh issue`.\n"), git=True) as e:
             sent = e.run("brief").stdout
-            self.assertIn("GitHub Issues on o/r", sent)       # TEAM.md is the prose of the brief ...
+            self.assertIn("GitHub Issues on o/r", sent)       # FACTORY.md is the prose of the brief ...
             self.assertNotIn("\n# Team\n", sent)              # ... without its own title
             self.assertNotIn("for the editor", sent)           # ... and without its comments
             self.assertIn("branch `ada/lead-dev`", sent)       # worktree branches start with the user's name
@@ -1760,27 +1760,27 @@ class ConfigTests(unittest.TestCase):
             e.write_brief(team_brief(team))  # a VM or CI user name that someone else's machine may share: a note, not a failure
             generic = e.run("check", LOGNAME="root")
             self.assertIn("note: worktree branches will start with 'root'", generic.stderr)
-            self.assertIn("Set `user` in team.toml", generic.stderr)
+            self.assertIn("Set `user` in factory.toml", generic.stderr)
             self.assertNotIn("note:", e.run("check").stderr)               # an ordinary system user name
             e.write_brief(team_brief('user = "root"\n' + team))
-            self.assertNotIn("note:", e.run("check", LOGNAME="root").stderr)  # chosen in team.toml
+            self.assertNotIn("note:", e.run("check", LOGNAME="root").stderr)  # chosen in factory.toml
             e.write_brief(team_brief(team.replace("worktree = true\n", "")))
             self.assertNotIn("note:", e.run("check", LOGNAME="root").stderr)  # no branch depends on it
             e.write_brief(team_brief('user = "a b"\n' + team))
             self.assertIn("set `user`", e.run("check", check=False).stderr)
-            (e.repo / "team.toml").unlink()                    # a teammate's clone: the brief is there, the formation is not
+            (e.repo / "factory.toml").unlink()                    # a teammate's clone: the brief is there, the formation is not
             p = e.run("check", check=False)
             self.assertEqual(p.returncode, 1)
-            self.assertIn("no team.toml in", p.stderr)
+            self.assertIn("no factory.toml in", p.stderr)
             self.assertIn("ateam.py init", p.stderr)
 
     def test_an_old_single_file_brief_is_never_replaced_by_defaults(self):
         old = '+++\npermissions = "guarded"\n[lead]\nname = "boss"\n[members.reviewer]\nharness = "codex"\n+++\n## Project\n\nOurs.\n'
-        for present in ((), ("TEAM.md",), ("team.toml",)):  # only the old file, and two half-done migrations
+        for present in ((), ("FACTORY.md",), ("factory.toml",)):  # only the old file, and two half-done migrations
             with self.subTest(present=present), Env(brief=None) as e:
                 (e.repo / "team-brief.md").write_text(old)
                 for name in present:
-                    (e.repo / name).write_text("# Team\n" if name == "TEAM.md" else '[members.pm]\nharness = "pi"\n')
+                    (e.repo / name).write_text("# Team\n" if name == "FACTORY.md" else '[members.pm]\nharness = "pi"\n')
                 before = sorted(p.name for p in e.repo.iterdir())
                 for command in (["check"], ["init"], ["up"]):
                     for cwd in (e.repo, e.repo / "sub"):  # also found from a subdirectory
@@ -1788,6 +1788,8 @@ class ConfigTests(unittest.TestCase):
                         self.assertEqual(p.returncode, 1, command)
                         self.assertIn("team-brief.md is the single-file brief of earlier versions; nothing was written", p.stderr)
                         self.assertIn("rename [lead] or [orchestrator] to [operator] and remove `tracker`", p.stderr)
+                        self.assertIn("to factory.toml", p.stderr)
+                        self.assertIn("to FACTORY.md", p.stderr)
                 self.assertEqual(sorted(p.name for p in e.repo.iterdir()), before)  # nothing was written
                 self.assertEqual((e.repo / "team-brief.md").read_text(), old)
                 self.assertEqual(e.starts(), {})
@@ -1804,7 +1806,7 @@ class ConfigTests(unittest.TestCase):
             (team_brief('[members.pm]\nharness = "claude"\n[teams]\ndefault = ["pm", "ghost"]'), "[teams] is no longer used"),
             (team_brief('[tabs]\nteam = "crew"'), "unknown top-level key(s): ['tabs']"),
             (formation({"backend-dev-" + "2" * 25: {"role": "backend-dev", "harness": "codex"}}), "member"),
-            (team_brief("members = [unclosed"), "team.toml:"),
+            (team_brief("members = [unclosed"), "factory.toml:"),
             (team_brief('[members.dev]\nrole = "backend-dev"\nharness = "codex"'), "role"),
         ]
         for brief, error in cases:
@@ -1825,42 +1827,42 @@ class ConfigTests(unittest.TestCase):
             subprocess.run([GIT, "init", "-q", str(e.repo)], check=True, capture_output=True)
             out = e.run("init", cwd=e.repo / "sub").stdout     # in a repository: at its root
             self.assertEqual(sorted(p.name for p in e.repo.iterdir() if p.name != ".git"),
-                             [".gitignore", "TEAM.md", "sub", "team.toml", "team.toml.sample"])
-            self.assertEqual((e.repo / "team.toml").read_text(), (ateam.SKILL / "templates/team.toml").read_text())
-            self.assertEqual((e.repo / ".gitignore").read_text(), "team.toml\n")
+                             [".gitignore", "FACTORY.md", "factory.toml", "factory.toml.sample", "sub"])
+            self.assertEqual((e.repo / "factory.toml").read_text(), (ateam.SKILL / "templates/factory.toml").read_text())
+            self.assertEqual((e.repo / ".gitignore").read_text(), "factory.toml\n")
             self.assertEqual(out.count("wrote"), 3)
             e.run("check", "lead-dev")                         # what init writes is a team that checks
             self.assertIn("`## Ready` holds, in the order they will be done, the items the operator may assign "
                           "without asking the user; only a person puts an item there or reorders it, never the team.",
                           e.run("brief").stdout)
-            # a teammate: the shared files are there, edited; only their own team.toml is missing
-            (e.repo / "team.toml.sample").write_text('[members.pm]\nharness = "pi"\nmodel = "z-ai/glm-5.3"\n')
-            (e.repo / "TEAM.md").write_text("# Team\n\nOurs.\n")
-            (e.repo / "team.toml").unlink()
+            # a teammate: the shared files are there, edited; only their own factory.toml is missing
+            (e.repo / "factory.toml.sample").write_text('[members.pm]\nharness = "pi"\nmodel = "z-ai/glm-5.3"\n')
+            (e.repo / "FACTORY.md").write_text("# Team\n\nOurs.\n")
+            (e.repo / "factory.toml").unlink()
             out = e.run("init").stdout
             self.assertEqual((out.count("kept"), out.count("wrote")), (2, 1))
             self.assertEqual(list(ateam.Config(e.repo).members), ["pm"])        # copied from the project's sample
-            self.assertEqual((e.repo / "TEAM.md").read_text(), "# Team\n\nOurs.\n")
-            self.assertEqual((e.repo / ".gitignore").read_text(), "team.toml\n")  # listed once
+            self.assertEqual((e.repo / "FACTORY.md").read_text(), "# Team\n\nOurs.\n")
+            self.assertEqual((e.repo / ".gitignore").read_text(), "factory.toml\n")  # listed once
             self.assertEqual(e.run("init").stdout.count("wrote"), 0)             # nothing is ever replaced
             self.assertNotIn("sets user", out)
             # the project's sample names a user: whose branches these are is said, not guessed
-            (e.repo / "team.toml.sample").write_text('user = "peter"\n[members.pm]\nharness = "pi"\nmodel = "z-ai/glm-5.3"\n')
-            (e.repo / "team.toml").unlink()
+            (e.repo / "factory.toml.sample").write_text('user = "peter"\n[members.pm]\nharness = "pi"\nmodel = "z-ai/glm-5.3"\n')
+            (e.repo / "factory.toml").unlink()
             out = e.run("init", LOGNAME="jane").stdout
-            self.assertIn("team.toml.sample sets user = 'peter'", out)
-            self.assertIn("change `user` in team.toml", out)
+            self.assertIn("factory.toml.sample sets user = 'peter'", out)
+            self.assertIn("change `user` in factory.toml", out)
             # a later negation undoes the ignore line: what git really does decides
-            (e.repo / ".gitignore").write_text("team.toml\n!team.toml\n")
-            self.assertIn("added team.toml", e.run("init").stdout)
-            self.assertEqual((e.repo / ".gitignore").read_text(), "team.toml\n!team.toml\nteam.toml\n")
-            self.assertNotIn("added team.toml", e.run("init").stdout)
+            (e.repo / ".gitignore").write_text("factory.toml\n!factory.toml\n")
+            self.assertIn("added factory.toml", e.run("init").stdout)
+            self.assertEqual((e.repo / ".gitignore").read_text(), "factory.toml\n!factory.toml\nfactory.toml\n")
+            self.assertNotIn("added factory.toml", e.run("init").stdout)
             self.assertNotIn("already tracks", e.run("init").stdout)
-            subprocess.run([GIT, "-C", str(e.repo), "add", "-f", "team.toml"], check=True, capture_output=True)
-            self.assertIn("git already tracks team.toml", e.run("init").stdout)  # ignoring it does not untrack it
+            subprocess.run([GIT, "-C", str(e.repo), "add", "-f", "factory.toml"], check=True, capture_output=True)
+            self.assertIn("git already tracks factory.toml", e.run("init").stdout)  # ignoring it does not untrack it
         with Env(brief=None) as e:
             e.run("init", cwd=e.repo / "sub")                  # no repository: where you are
-            self.assertTrue((e.repo / "sub/team.toml").is_file())
+            self.assertTrue((e.repo / "sub/factory.toml").is_file())
 
     def test_brief_preview_and_member_prompt(self):
         with Env() as e:
@@ -1934,6 +1936,209 @@ class ListingTests(unittest.TestCase):
         self.assertEqual(ateam.listed_models(omp), ["openrouter/z-ai/glm-5.3", "openrouter/z-ai/glm-5.3-flash", "ollama/qwen3:8b"])
 
 
+class PublicNameMigrationTests(unittest.TestCase):
+    @staticmethod
+    def files(root):
+        return {str(p.relative_to(root)): ("symlink", os.readlink(p)) if p.is_symlink() else p.read_bytes()
+                for p in root.rglob("*") if p.is_file() or p.is_symlink()}
+
+    def test_dangling_new_names_are_preserved_without_writes_or_rename_advice(self):
+        brief = formation({"lead-dev": CATALOG_MEMBERS["lead-dev"]}, operator={"harness": "claude"})
+        for old, new in (("TEAM.md", "FACTORY.md"), ("team.toml", "factory.toml"),
+                         ("team.toml.sample", "factory.toml.sample")):
+            for migrating in (False, True):
+                with self.subTest(new=new, migrating=migrating), Env(brief) as e:
+                    destination = e.repo / new
+                    if migrating:
+                        (e.repo / old).write_bytes(destination.read_bytes() if destination.exists()
+                                                  else (e.repo / "factory.toml").read_bytes())
+                    destination.unlink(missing_ok=True)
+                    target = e.root / "missing target"
+                    destination.symlink_to(target)
+                    before = self.files(e.repo)
+                    commands = ("init",) if new == "factory.toml.sample" else ("init", "check", "up", "continue")
+                    for command in commands:
+                        result = e.run(command, check=False)
+                        self.assertEqual(result.returncode, 1)
+                        self.assertIn(f"{destination} is a symbolic link to a missing file", result.stderr)
+                        self.assertIn("Repair or remove the link.", result.stderr)
+                        self.assertNotIn("mv ", result.stderr)
+                        self.assertNotIn("cp ", result.stderr)
+                        self.assertEqual(self.files(e.repo), before)
+                        self.assertFalse(target.exists())
+                    if new == "factory.toml.sample":
+                        for command in (("check",), ("up", "--no-brief"), ("continue",)):
+                            result = e.run(*command)
+                            if migrating:
+                                self.assertIn(f"note: {destination} is a symbolic link to a missing file", result.stderr)
+                            self.assertNotIn("mv ", result.stderr)
+                            self.assertNotIn("cp ", result.stderr)
+                        self.assertIn("queued message 1", e.run("inbox", "send", "--from", "lead-dev", "report").stdout)
+                        self.assertEqual(self.files(e.repo), before)
+                        self.assertFalse(target.exists())
+
+    def test_new_links_to_old_settings_keep_the_target_and_allow_reports(self):
+        brief = formation({"lead-dev": CATALOG_MEMBERS["lead-dev"]}, operator={"harness": "claude"})
+        for old, new in (("team.toml", "factory.toml"), ("team.toml.sample", "factory.toml.sample")):
+            with self.subTest(new=new), Env(brief) as e:
+                source, target = e.repo / old, e.repo / new
+                source.write_bytes((e.repo / "factory.toml").read_bytes())
+                target.unlink(missing_ok=True)
+                target.symlink_to(old)
+                before = self.files(e.repo)
+                for command in (("check",), ("up", "--no-brief")):
+                    result = e.run(*command)
+                    self.assertIn(f"note: {target} is a link to {source}", result.stderr)
+                    self.assertIn("Keep it, or replace the link with the file itself.", result.stderr)
+                    self.assertNotIn("Compare them, then remove", result.stderr)
+                    self.assertNotIn("Rename it", result.stderr)
+                self.assertIn("queued message 1", e.run("inbox", "send", "--from", "lead-dev", "report").stdout)
+                self.assertEqual(self.files(e.repo), before)
+                self.assertTrue(target.samefile(source))
+
+    def test_old_files_stop_without_writes_and_commands_work_from_a_subdirectory(self):
+        with Env() as e:
+            root = e.root / "old project"
+            e.repo.rename(root)
+            e.repo = root
+            (root / "FACTORY.md").rename(root / "TEAM.md")
+            (root / "factory.toml").rename(root / "team.toml")
+            (root / "team.toml.sample").write_bytes((root / "team.toml").read_bytes())
+            (root / ".gitignore").write_text("team.toml\n")
+            before = self.files(root)
+            expected = [shlex.join(["mv", str(root / old), str(root / new)]) for old, new in (
+                ("TEAM.md", "FACTORY.md"), ("team.toml", "factory.toml"),
+                ("team.toml.sample", "factory.toml.sample"))]
+            for command in ("check", "init", "up", "continue"):
+                for cwd in (root, root / "sub"):
+                    with self.subTest(command=command, cwd=cwd):
+                        result = e.run(command, check=False, cwd=cwd)
+                        self.assertEqual(result.returncode, 1)
+                        self.assertIn(f"{root} holds files under their earlier names", result.stderr)
+                        self.assertEqual([line.strip() for line in result.stderr.splitlines()
+                                          if line.startswith("  mv ")], expected)
+                        self.assertEqual(self.files(root), before)
+            for command in expected:
+                subprocess.run(command, shell=True, cwd=root / "sub", check=True, capture_output=True,
+                               env={**e.env, "PATH": os.environ.get("PATH", os.defpath)})
+            e.run("check", cwd=root / "sub")
+            e.run("init", cwd=root / "sub")
+            self.assertIn("factory.toml\n", (root / ".gitignore").read_text())
+            for old in ("TEAM.md", "team.toml", "team.toml.sample"):
+                self.assertFalse((root / old).exists())
+
+    def test_only_the_old_personal_file_is_pending(self):
+        with Env() as e:
+            (e.repo / "factory.toml.sample").write_bytes((e.repo / "factory.toml").read_bytes())
+            (e.repo / "factory.toml").rename(e.repo / "team.toml")
+            before = self.files(e.repo)
+            result = e.run("check", check=False)
+            self.assertEqual(result.returncode, 1)
+            self.assertEqual([shlex.split(line.strip()) for line in result.stderr.splitlines()
+                              if line.startswith("  mv ")],
+                             [["mv", str(e.repo / "team.toml"), str(e.repo / "factory.toml")]])
+            self.assertNotIn("run instead: cp", result.stderr)
+            self.assertEqual(self.files(e.repo), before)
+
+    def test_unused_old_files_do_not_block_checks_launches_or_inbox_send(self):
+        brief = formation({"lead-dev": CATALOG_MEMBERS["lead-dev"]}, operator={"harness": "claude"})
+        for old, new, alongside in (("team.toml", "factory.toml", True),
+                                     ("team.toml.sample", "factory.toml.sample", True),
+                                     ("team.toml.sample", "factory.toml.sample", False)):
+            with self.subTest(old=old, alongside=alongside), Env(brief) as e:
+                (e.repo / old).write_text("old settings: not TOML\n")
+                if alongside and not (e.repo / new).exists():
+                    (e.repo / new).write_bytes((e.repo / "factory.toml").read_bytes())
+                for command in (("check",), ("up", "--no-brief"), ("continue",)):
+                    result = e.run(*command)
+                    self.assertIn(f"note: {e.repo / old} is not read", result.stderr)
+                    if alongside:
+                        self.assertIn("Compare them, then remove", result.stderr)
+                    else:
+                        self.assertIn(shlex.join(["mv", str(e.repo / old), str(e.repo / new)]), result.stderr)
+                self.assertIn("queued message 1", e.run("inbox", "send", "--from", "lead-dev", "report").stdout)
+                before = self.files(e.repo)
+                result = e.run("init", check=False)
+                if alongside:
+                    self.assertEqual(result.returncode, 0)
+                    self.assertEqual((e.repo / old).read_text(), "old settings: not TOML\n")
+                else:
+                    self.assertEqual(result.returncode, 1)
+                    self.assertEqual(self.files(e.repo), before)
+                    self.assertFalse((e.repo / new).exists())
+
+    def test_unrelated_team_document_can_be_kept_without_runtime_warnings(self):
+        with Env(brief=None) as e:
+            old = e.repo / "TEAM.md"
+            old.write_text("A different document.\n")
+            result = e.run("init", check=False)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("If TEAM.md is another document", result.stderr)
+            command = result.stderr.split("run instead: ", 1)[1].strip()
+            subprocess.run(command, shell=True, cwd=e.repo / "sub", check=True, capture_output=True,
+                           env={**e.env, "PATH": os.environ.get("PATH", os.defpath)})
+            for command in (("init",), ("check",)):
+                result = e.run(*command)
+                self.assertNotIn("TEAM.md", result.stdout + result.stderr)
+            self.assertEqual(old.read_text(), "A different document.\n")
+
+    @unittest.skipUnless(GIT, "git is not installed")
+    def test_init_finds_old_brief_and_sample_at_git_root(self):
+        with Env(brief=None) as e:
+            (e.root / "bin/git").symlink_to(GIT)
+            subprocess.run([GIT, "init", "-q", str(e.repo)], check=True, capture_output=True)
+            for name in ("TEAM.md", "team.toml.sample"):
+                (e.repo / name).write_text("keep me\n")
+            before = self.files(e.repo)
+            result = e.run("init", cwd=e.repo / "sub", check=False)
+            self.assertEqual(result.returncode, 1)
+            self.assertEqual([shlex.split(line.strip())[1] for line in result.stderr.splitlines()
+                              if line.startswith("  mv ")],
+                             [str(e.repo / "TEAM.md"), str(e.repo / "team.toml.sample")])
+            self.assertEqual(self.files(e.repo), before)
+
+    @unittest.skipUnless(GIT, "git is not installed")
+    def test_parent_formation_is_a_marker_but_samples_and_old_brief_are_not(self):
+        for marker in ("factory.toml", "team.toml.sample", "factory.toml.sample", "TEAM.md"):
+            with self.subTest(marker=marker), Env(brief=None) as e:
+                (e.root / "bin/git").symlink_to(GIT)
+                (e.repo / marker).write_text("# parent file\n")
+                nested = e.repo / "sub"
+                subprocess.run([GIT, "init", "-q", str(nested)], check=True, capture_output=True)
+                e.run("init", cwd=nested)
+                chosen = e.repo if marker == "factory.toml" else nested
+                other = nested if chosen == e.repo else e.repo
+                self.assertTrue((chosen / "FACTORY.md").is_file())
+                self.assertFalse((other / "FACTORY.md").exists())
+                self.assertEqual((e.repo / marker).read_text(), "# parent file\n")
+
+    def test_old_brief_without_git_does_not_capture_a_subdirectory(self):
+        with Env(brief=None) as e:
+            (e.repo / "TEAM.md").write_text("keep me\n")
+            result = e.run("check", cwd=e.repo / "sub", check=False)
+            self.assertIn("no FACTORY.md or factory.toml", result.stderr)
+            self.assertNotIn("Rename them", result.stderr)
+            e.run("init", cwd=e.repo / "sub")
+            self.assertTrue((e.repo / "sub/FACTORY.md").is_file())
+            self.assertFalse((e.repo / "FACTORY.md").exists())
+
+    def test_published_text_uses_the_new_names_except_migration_guidance(self):
+        paths = [ateam.SKILL / "SKILL.md", ateam.SKILL / "harnesses.toml", ateam.SKILL.parent / "README.md"]
+        for directory in ("references", "roles", "templates"):
+            paths.extend(p for p in (ateam.SKILL / directory).iterdir() if p.is_file())
+        for path in paths:
+            for line in path.read_text().splitlines():
+                if (path.name == "README.md" and line.startswith("Coming from a-team:")
+                        or path.name == "cmd_setup.md" and line.startswith("- **`TEAM.md` or `team.toml`")):
+                    continue
+                with self.subTest(path=path, line=line):
+                    self.assertNotIn("TEAM.md", line)
+                    self.assertNotIn("team.toml", line)
+                    self.assertNotIn("/a-team", line.replace("~/.cache/a-team", ""))
+        self.assertIn("name: factory\n", (ateam.SKILL / "SKILL.md").read_text())
+        self.assertTrue((ateam.SKILL / "templates/FACTORY.md").read_text().startswith("# Factory\n"))
+
+
 class InstalledCopyTests(unittest.TestCase):
     def test_skill_runs_without_the_rest_of_the_checkout(self):
         head = (ateam.SKILL / "SKILL.md").read_text().split("---\n", 2)[1]
@@ -1993,7 +2198,7 @@ class GateFixtureTests(unittest.TestCase):
                 self.assertFalse(cache.exists())
                 caches.append(cache)
                 self.assertEqual(run(GIT, "rev-list", "--count", "HEAD", cwd=repo).stdout.strip(), "3")
-                self.assertIn("slug: a one-function", (repo / "TEAM.md").read_text())
+                self.assertIn("slug: a one-function", (repo / "FACTORY.md").read_text())
                 todo = (repo / "TODO.md").read_text()
                 self.assertEqual(todo.splitlines()[:2], ["TODO", "===="])
                 self.assertEqual([line for line in todo.splitlines() if line.startswith("## ")],
