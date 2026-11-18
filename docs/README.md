@@ -19,3 +19,30 @@ With pull requests enabled, a task flows like this:
 4. The reviewer checks the change; the developer fixes findings.
 5. The operator pushes the approved change; CI and head review establish readiness.
 6. An authorized person or operator squash-merges it; the tracker closes after confirmation.
+
+## The team
+
+| Member | Responsibility |
+|---|---|
+| Operator | Your current agent assigns work, decides scope and integrates reviewed changes. |
+| @lead-dev | Implements changes across layers and tests how they work together. |
+| @reviewer | Checks the exact change against its criteria and reports findings. |
+| @pm | Keeps the tracker current with ownership, decisions and next steps. |
+| @frontend-dev | Joins for a UI project to implement and test the interface. |
+
+Add @architect, @backend-dev, @designer, @product, @qa-backend or @qa-frontend as the work requires. [Role descriptions](../skill/roles/) · [Default formation](../skill/templates/factory.toml)
+
+## Commands
+
+Use these in the Claude Code operator conversation. For another harness, use its spelling of the skill command. [Operator harnesses](getting-started.md#operator-harnesses)
+
+| Command | What it does |
+|---|---|
+| `/factory` | Reads the current state and chooses the next step. |
+| `/factory setup` | Forms or changes the team and project brief. |
+| `/factory up` | Checks, launches and briefs the members. |
+| `/factory continue` | Resumes the team and reconciles unfinished work. |
+| `/factory status` | Shows each member's state and the message route. |
+| `/factory wait` | Returns when a message or member needs the operator. |
+| `/factory brief` | Previews or resends the team brief. |
+| `/factory say` | Sends an operator message to members. |
