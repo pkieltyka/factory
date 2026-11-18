@@ -482,9 +482,14 @@ def cmd_inbox_send(args):
                   file=sys.stderr)
             raise SystemExit(1)
         reason = str(e).rstrip(".")
-        cause = "needs repair" if isinstance(e, InboxDamage) else "cannot write" if isinstance(e, OSError) else "no inbox route"
+        if isinstance(e, InboxDamage):
+            advice = "needs repair; after the repair: factory.py continue --restart"
+        elif isinstance(e, OSError):
+            advice = "cannot write; check this member's sandbox and the cache path"
+        else:
+            advice = f"no inbox route; factory.py continue {args.sender} --restart"
         print(f"not stored: {reason}. Nothing was queued. Send it typed, once, exactly as printed:", file=sys.stderr)
-        fallback = f"{tag(args.sender)} Inbox unavailable: {cause}.\n{text}\n"
+        fallback = f"{tag(args.sender)} Inbox unavailable: {advice}.\n{text}\n"
         print(shlex.join(["herdr", "agent", "prompt", cfg.operator["name"], fallback]), file=sys.stderr)
         raise SystemExit(5)
 
