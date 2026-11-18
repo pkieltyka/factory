@@ -1168,7 +1168,10 @@ class InboxTests(unittest.TestCase):
     def test_failures_never_call_herdr_and_fallback_quotes_payload(self):
         with Env() as e:
             inbox = self.prepare(e, "typed")
-            for state in ("typed", "missing", "damage", "symlink"):
+            for state, advice in (("typed", "no inbox route; factory.py continue lead-dev --restart"),
+                                  ("missing", "no inbox route; factory.py continue lead-dev --restart"),
+                                  ("damage", "needs repair; after the repair: factory.py continue --restart"),
+                                  ("symlink", "cannot write; check this member's sandbox and the cache path")):
                 if state == "missing":
                     inbox.state_path.unlink()
                 if state == "damage":
@@ -1184,8 +1187,8 @@ class InboxTests(unittest.TestCase):
                 reason, command = result.stderr.split(" Nothing was queued. Send it typed, once, exactly as printed:\n", 1)
                 argv = shlex.split(command)
                 self.assertEqual(argv[:4], ["herdr", "agent", "prompt", "operator"])
-                cause = "needs repair" if state == "damage" else "cannot write" if state == "symlink" else "no inbox route"
-                self.assertEqual(argv[4], f"[from @lead-dev]: Inbox unavailable: {cause}.\ntext with ' quotes; $(false)\n$herdr\n")
+                self.assertEqual(argv[4], f"[from @lead-dev]: Inbox unavailable: {advice}.\n"
+                                 "text with ' quotes; $(false)\n$herdr\n")
                 self.assertTrue(reason.startswith("not stored: "))
                 if state in ("damage", "symlink"):
                     self.assertIn(str(inbox.path), reason)
@@ -1204,7 +1207,8 @@ class InboxTests(unittest.TestCase):
             self.assertIn("not stored: denied.", err)
             command = err.split("exactly as printed:\n", 1)[1]
             self.assertEqual(shlex.split(command)[4],
-                             "[from @lead-dev]: Inbox unavailable: cannot write.\nliteral '$herdr' @pm.\n")
+                             "[from @lead-dev]: Inbox unavailable: cannot write; check this member's sandbox "
+                             "and the cache path.\nliteral '$herdr' @pm.\n")
             with patch.object(factory.os, "fsync", side_effect=OSError("failed fsync")):
                 code, out, err = self.invoke(e)
             self.assertEqual(code, 1)
