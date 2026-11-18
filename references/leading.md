@@ -55,7 +55,7 @@ With names, `wait <names>` watches only those members; without names it watches 
 
 ## Review and integrate
 
-- Obtain peer review against the task and exact diff/commit; resolve findings before your final review. QA verifies applicable criteria and retests fixes; @product can check acceptance.
+- Obtain peer review against the task and exact diff/commit; resolve findings before your final review. QA verifies applicable criteria and retests fixes; @product can check acceptance. Name the lane, fast or deep, in a review request only when it differs from what `TEAM.md` says.
 - Shared checkout: members leave changes uncommitted; you review and commit. Worktree: the developer commits its branch; you review and merge. Check both `git diff <main>...<branch>` and `git -C <path> status`.
 - Before committing the tracker, check every touched record: status, verdict and one next-step field must agree. Have the tracker owner correct stale instructions. Include acceptance browser scripts/tests and their documented run command when committing or merging browser work.
 - A failed worktree commit is a coordination problem: agree who commits it, using `git -C <path>` if needed. Do not disable signing, hooks or sandbox settings to make it pass.

@@ -1861,6 +1861,7 @@ class ConfigTests(unittest.TestCase):
             self.assertIn("herdr agent prompt <name> '[from @you]: ...'", text)
             self.assertNotIn("Works in", text)  # no worktrees on this team
             prompt = e.run("prompt", "reviewer").stdout
+            self.assertIn("run it only when the brief's Review section or the requester calls for the deep lane", prompt)
             self.assertIn("herdr agent prompt <name> '[from @reviewer]: <message>'", prompt)
             self.assertIn("Start a task only when @operator or the user assigns it to you; an item the brief or "
                           "tracker marks ready is not an assignment. A teammate's request for a review or advice "
