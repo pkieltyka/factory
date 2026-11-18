@@ -2,7 +2,7 @@
 
 ## Project
 
-a-team: an agent skill that forms, launches and leads a software team of coding agents in herdr panes, across Claude Code, Codex, pi, omp and OpenCode. It is the base of a composable software-factory meta-harness on top of herdr, and the team iterates on the skill itself. Users are developers running agent teams; the agents that read SKILL.md, roles/, references/ and templates/ are users too, so those files are product, not docs.
+factory: an agent skill (`/factory`) that forms, launches and leads a software team of coding agents in herdr panes, across Claude Code, Codex, pi, omp and OpenCode. It is the base of a composable software-factory meta-harness on top of herdr, and the team iterates on the skill itself. Users are developers running agent teams; the agents that read SKILL.md, roles/, references/ and templates/ are users too, so those files are product, not docs.
 
 Stack: Python 3.11+ standard library (`skill/scripts/factory.py`, one file), herdr's CLI and socket, Git worktrees, `skill/harnesses.toml` for harness and model facts. Tests: `python3 tests/test_factory.py` (fake harnesses and herdr, real Git); live flag checks with `FACTORY_LIVE=1 python3 tests/test_factory.py LiveFlags`.
 
@@ -10,7 +10,7 @@ Principles: keep it small and simple. Prefer deleting words and code to adding t
 
 ## Tasks
 
-Tasks and bugs are GitHub Issues on `pkieltyka/herdr-a-team`, managed with the `todos` CLI. Run `todos skill` once to read how it works, and always pass `--json`. Never run `todos rm`; close instead. An issue in the board's Todo column is ready: the operator may assign it without asking the owner; only the owner moves issues to Todo, never the team. Backlog is not ready.
+Tasks and bugs are GitHub Issues on `pkieltyka/factory`, managed with the `todos` CLI. Run `todos skill` once to read how it works, and always pass `--json`. Never run `todos rm`; close instead. An issue in the board's Todo column is ready: the operator may assign it without asking the owner; only the owner moves issues to Todo, never the team. Backlog is not ready.
 
 ## Workflow
 
@@ -28,7 +28,7 @@ Work reaches `master` only through a pull request on GitHub. Ticket branches are
 - The operator may squash-merge a pull request once it is ready: the reviewer approved its head commit and every check passed. It does not wait for the owner.
 - CI: the `Tests` workflow runs on every push and pull request.
 - The issue links its pull request and closes only after the merge is confirmed.
-- Commands (`gh`; learn with `gh pr --help`; check with `gh auth status`). Open: `gh pr create --base master --head <branch>`. Wait: `timeout 900 gh pr checks <branch> --watch --interval 60`. State: `gh pr view <branch> --json state,headRefOid,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup`. Comments and reviews: `gh pr view <branch> --comments`. Review threads (unresolved ones have `isResolved` false; read each linked discussion): `gh api graphql --paginate --slurp -F owner=pkieltyka -F repo=herdr-a-team -F number=<pr> -f query='query($owner:String!,$repo:String!,$number:Int!,$endCursor:String){repository(owner:$owner,name:$repo){pullRequest(number:$number){headRefOid reviewThreads(first:100,after:$endCursor){nodes{id isResolved isOutdated path line comments(first:1){nodes{url}}} pageInfo{hasNextPage endCursor}}}}}'`. Merge: `gh pr merge <branch> --squash --match-head-commit <sha>`.
+- Commands (`gh`; learn with `gh pr --help`; check with `gh auth status`). Open: `gh pr create --base master --head <branch>`. Wait: `timeout 900 gh pr checks <branch> --watch --interval 60`. State: `gh pr view <branch> --json state,headRefOid,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup`. Comments and reviews: `gh pr view <branch> --comments`. Review threads (unresolved ones have `isResolved` false; read each linked discussion): `gh api graphql --paginate --slurp -F owner=pkieltyka -F repo=factory -F number=<pr> -f query='query($owner:String!,$repo:String!,$number:Int!,$endCursor:String){repository(owner:$owner,name:$repo){pullRequest(number:$number){headRefOid reviewThreads(first:100,after:$endCursor){nodes{id isResolved isOutdated path line comments(first:1){nodes{url}}} pageInfo{hasNextPage endCursor}}}}}'`. Merge: `gh pr merge <branch> --squash --match-head-commit <sha>`.
 
 ## Review
 
@@ -36,4 +36,4 @@ Reviews start in the fast lane. Deep lane: @reviewer runs `codegenie` (github.co
 
 ## Notes
 
-Enabled in `notes/`: `activity/` (the team's working notes), `research/` (findings the owner asked for), `discussions/` (records of meetings and their decisions). Follow the a-team notes convention; search with rg. `notes/private/` holds each person's own notes, ignored by Git. That person's team may read and search it, under the private-folder rule of the notes convention.
+Enabled in `notes/`: `activity/` (the team's working notes), `research/` (findings the owner asked for), `discussions/` (records of meetings and their decisions). Follow the factory notes convention; search with rg. `notes/private/` holds each person's own notes, ignored by Git. That person's team may read and search it, under the private-folder rule of the notes convention.
