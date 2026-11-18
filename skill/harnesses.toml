@@ -6,7 +6,7 @@
 #                Claude Code has no listing command, so for claude these are the ids `check` knows.
 #   aliases      claude only: short names Claude Code takes in place of a model id ("opus")
 #   thinking     levels the harness accepts (codex: read per model from its cache; opencode: per-model variants)
-#   never        levels a-team refuses even where the harness accepts them
+#   never        levels factory refuses even where the harness accepts them
 #   prompt       how a member gets its standing instructions: `file` (appended to the system prompt),
 #                `pointer` (a system line names the file; the text also goes in the first message), `message`
 #   operator_wait  how an inbox operator waits: background (native completion wakes it) or foreground

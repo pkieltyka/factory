@@ -34,7 +34,7 @@ EOF
 python3 "$SKILL/scripts/ateam.py" init --cwd "$GATE" > /dev/null
 python3 - <<'EOF'
 import pathlib, re
-p = pathlib.Path("TEAM.md")
+p = pathlib.Path("FACTORY.md")
 project = "slug: a one-function Python library that turns text into URL slugs. Standard library only. Tests: `python3 -m unittest`."
 text, n = re.subn(r"(## Project\n\n).*?(?=## )", lambda m: m.group(1) + project + "\n\n", p.read_text(), count=1, flags=re.S)
 assert n == 1

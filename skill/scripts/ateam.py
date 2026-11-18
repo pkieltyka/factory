@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""a-team: a software team of coding agents in herdr, one team per herdr session. You are the operator (CTO);
+"""factory: a software team of coding agents in herdr, one team per herdr session. You are the operator (CTO);
 each member runs in its own pane of the team tab, on its own harness, model and thinking level.
 
-A project has two files at its root. TEAM.md is the brief every member reads: the project and how the team
-works; it is committed and shared. team.toml is one person's formation: the operator, the members and their
-harnesses and models; it is not committed (team.toml.sample is, as the project's suggestion). herdr holds the
+A project has two files at its root. FACTORY.md is the brief every member reads: the project and how the team
+works; it is committed and shared. factory.toml is one person's formation: the operator, the members and their
+harnesses and models; it is not committed (factory.toml.sample is, as the project's suggestion). herdr holds the
 rest: a member's pane is labeled with its @name and its agent carries that name. Harnesses are described in
 harnesses.toml. `ateam.py --help` lists the commands.
 """
@@ -35,11 +35,12 @@ HARNESSES = tuple(TABLE)
 LEVELS = ("full", "guarded")
 PROBE_TIMEOUT = 60
 SETTLE = float(os.environ.get("ATEAM_SETTLE", 8))  # seconds a member may take to get past a start-up notice
-BRIEF = "TEAM.md"              # the brief: shared and committed
-CONF = "team.toml"             # one person's formation: not committed
-SAMPLE = "team.toml.sample"    # the project's suggested formation: committed, copied to team.toml by `init`
+BRIEF = "FACTORY.md"              # the brief: shared and committed
+CONF = "factory.toml"             # one person's formation: not committed
+SAMPLE = "factory.toml.sample"    # the project's suggested formation: committed, copied to factory.toml by `init`
+OLD = {"TEAM.md": BRIEF, "team.toml": CONF, "team.toml.sample": SAMPLE}
 LEGACY = "team-brief.md"       # the single file of earlier versions: found only to say how to split it
-OPERATOR = "operator"  # the operator's @name, unless `[operator] name` in team.toml says otherwise
+OPERATOR = "operator"  # the operator's @name, unless `[operator] name` in factory.toml says otherwise
 TABS = {"operator": "a-team operator", "team": "a-team workers"}  # herdr tab labels
 
 
@@ -57,9 +58,34 @@ def find_root(cwd):
     """The directory holding the team's files, searching up from cwd; else cwd itself."""
     cwd = pathlib.Path(cwd).resolve()
     for d in (cwd, *cwd.parents):
-        if any((d / name).is_file() for name in (CONF, BRIEF, LEGACY)):
+        if any((d / name).is_file() for name in (CONF, BRIEF, LEGACY, "team.toml")):
             return d
     return cwd
+
+
+def dangling_link_error(path):
+    if path.is_symlink() and not path.exists():
+        return f"{path} is a symbolic link to a missing file; nothing was written. Repair or remove the link."
+
+
+def refuse_old_names(root):
+    """Stop before defaults can replace files still awaiting their public-name migration."""
+    for name in (BRIEF, CONF, SAMPLE):
+        if error := dangling_link_error(root / name):
+            raise SystemExit(error)
+    pending = [(old, new) for old, new in OLD.items()
+               if (root / old).is_file() and not (root / new).exists()]
+    if not pending:
+        return
+    message = (f"{root} holds files under their earlier names (a-team is now factory); nothing was written."
+               " Rename them:\n" + "\n".join(
+                   "  " + shlex.join(["mv", str(root / old), str(root / new)]) for old, new in pending)
+               + f"\nThen run `ateam.py init`: it adds {CONF} to .gitignore."
+               " Remove the team.toml line there and commit the renames.")
+    if any(old == "TEAM.md" for old, _ in pending):
+        message += ("\nIf TEAM.md is another document, leave it and run instead: "
+                    + shlex.join(["cp", str(SKILL / "templates" / BRIEF), str(root / BRIEF)]))
+    raise SystemExit(message)
 
 
 def refuse_legacy(root):
@@ -97,8 +123,9 @@ class Config:
         self.roles = {p.stem: parse_role(p) for p in sorted((SKILL / "roles").glob("*.md"))}
         missing = [f.name for f in (self.brief_file, self.conf_file) if not f.is_file()]
         if missing and require:
+            refuse_old_names(self.root)
             refuse_legacy(self.root)
-            raise SystemExit(f"no {' or '.join(missing)} in {self.root} or above. Run `/a-team setup`, or"
+            raise SystemExit(f"no {' or '.join(missing)} in {self.root} or above. Run `/factory setup`, or"
                              f" `ateam.py init`, which writes what is missing and copies the project's {SAMPLE} to"
                              f" {CONF} if there is one.")
         try:
@@ -151,7 +178,7 @@ class Config:
 
     @property
     def worktree_dir(self):
-        """Where members' git worktrees live: next to the repo unless team.toml sets `worktree_dir`."""
+        """Where members' git worktrees live: next to the repo unless factory.toml sets `worktree_dir`."""
         return (self.root / (self.team.get("worktree_dir") or f"../{self.root.name}.worktrees")).resolve()
 
     @property
@@ -165,7 +192,7 @@ class Config:
 
 
 def plan(cfg, name):
-    """A member's settings from team.toml, before availability checks."""
+    """A member's settings from factory.toml, before availability checks."""
     m = cfg.members[name]
     role = m.get("role", name)
     meta, _ = cfg.roles[role]
@@ -535,7 +562,7 @@ class Checker:
                           f"Move it away, or set `worktree_dir` in {CONF}.")
         # Defaults used to be a-team/<name>. A member on `worktree = true` whose new default branch does not exist
         # yet, while its old checkout is still there, may be leaving unmerged work behind. A branch that
-        # team.toml names is a decision and is left alone.
+        # factory.toml names is a decision and is left alone.
         old, implicit = f"a-team/{p['name']}", self.cfg.members[p["name"]].get("worktree") is True
         if implicit and branch != old and old in trees.values() and git("rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"):
             raise Problem(f"this member has an earlier worktree on branch {old}, which may hold unmerged work",
@@ -573,6 +600,19 @@ def check_all(cfg, plans):
     """-> (ready members, [(member, Problem)])."""
     if (cfg.root / LEGACY).is_file():
         print(f"note: {cfg.root / LEGACY} is no longer read; {BRIEF} and {CONF} replace it. Delete it.", file=sys.stderr)
+    for old in ("team.toml", "team.toml.sample"):
+        source, target = cfg.root / old, cfg.root / OLD[old]
+        if source.is_file():
+            if error := dangling_link_error(target):
+                print(f"note: {error}", file=sys.stderr)
+            elif target.is_symlink() and target.samefile(source):
+                print(f"note: {target} is a link to {source}; that file still holds the settings."
+                      " Keep it, or replace the link with the file itself.", file=sys.stderr)
+            elif target.exists():
+                print(f"note: {source} is not read; {target} is. Compare them, then remove {source}.", file=sys.stderr)
+            else:
+                command = shlex.join(["mv", str(source), str(target)])
+                print(f"note: {source} is not read. Rename it: {command}", file=sys.stderr)
     generic = {"root", "ubuntu", "runner", "user", "admin", "ec2-user", "vscode", "codespace", "node"}
     if "user" not in cfg.team and cfg.user in generic and any(p["branch"] == f"{cfg.user}/{p['name']}" for p in plans):
         print(f"note: worktree branches will start with {cfg.user!r}, this machine's user name, which other people's"
@@ -689,7 +729,7 @@ def argv_codex(m, prompt_file, resume):
                f" {prompt_file}. Read that file before your first task, and again whenever your context was"
                " compacted or you are unsure of the rules.")
     # -C: a resumed session goes back to the directory it was started in, whatever the pane's is. Naming the
-    # member's directory keeps it where team.toml says, also after its worktree changed.
+    # member's directory keeps it where factory.toml says, also after its worktree changed.
     argv = ["-m", m["model"], "-C", m["dir"], "-c", f"model_reasoning_effort={json.dumps(m['thinking'])}",
             "-c", f"developer_instructions={json.dumps(pointer)}"]
     if m["permissions"] == "guarded" and m.get("inbox_dir"):
@@ -739,7 +779,7 @@ CODE = {
 
 def launch_argv(m, prompt_file, resume=None):
     """-> (native argv after `--`, pane env): the harness's own arguments, then the member's permission level
-    and any extra `args` from team.toml."""
+    and any extra `args` from factory.toml."""
     argv, env = CODE[m["harness"]].argv(m, prompt_file, resume)
     return argv + TABLE[m["harness"]]["permissions"][m["permissions"]] + m["args"], env
 
@@ -789,7 +829,7 @@ It queues the message without typing into {operator}'s pane. `queued message N` 
 
 
 def render_team_brief(cfg, members, operator, closing=None):
-    """The team brief as sent: a roster built from team.toml now, then TEAM.md, then the names."""
+    """The team brief as sent: a roster built from factory.toml now, then FACTORY.md, then the names."""
     L = cfg.operator
     trees = any(m["branch"] for m in members)
     out = [f"# Team brief (from @{operator})", "",
@@ -806,7 +846,7 @@ def render_team_brief(cfg, members, operator, closing=None):
         where = f" branch `{m['branch']}` in `{m['dir']}` |" if m["branch"] else " the main checkout |"
         out.append(f"| **@{m['name']}** | {TABLE[m['harness']]['label']}, {m['model']}, {m['thinking']}"
                    f" | {m.get('notes') or meta['description']} |" + (where if trees else ""))
-    if cfg.body:  # TEAM.md without its own title and its notes to whoever edits it
+    if cfg.body:  # FACTORY.md without its own title and its notes to whoever edits it
         out += ["", re.sub(r"\A# .*\n+", "", re.sub(r"<!--.*?-->\n?", "", cfg.body, flags=re.S)).strip()]
     if trees:
         out += ["", "## Worktrees", "",
@@ -890,7 +930,7 @@ class Team:
         return bool(p and p.get("agent"))
 
     def members(self):
-        """Member plans for the members that are running, in team.toml order."""
+        """Member plans for the members that are running, in factory.toml order."""
         return [plan(self.cfg, n) for n in self.cfg.members if self.live(n)]
 
     def status(self, name):
@@ -1095,7 +1135,7 @@ def cfg_of(args, require=True):
 
 
 def selected(cfg, names):
-    """Plans for the named members, or for every member in team.toml."""
+    """Plans for the named members, or for every member in factory.toml."""
     names = [n.lstrip("@") for n in names] or list(cfg.members)
     strangers = [n for n in names if n not in cfg.members]
     if strangers:
@@ -1113,8 +1153,8 @@ def print_plan(plans, extra_col=None):
 
 
 def cmd_init(args):
-    """Write what the project lacks: TEAM.md and team.toml.sample (shared), and this person's own team.toml, copied
-    from the project's sample. team.toml goes in .gitignore. Nothing that exists is replaced."""
+    """Write what the project lacks: FACTORY.md and factory.toml.sample (shared), and this person's own factory.toml, copied
+    from the project's sample. factory.toml goes in .gitignore. Nothing that exists is replaced."""
     root = find_root(pathlib.Path(args.cwd or os.getcwd()))
 
     def git(*a):  # -> exit status, or None without git
@@ -1123,8 +1163,9 @@ def cmd_init(args):
         except OSError:
             return None
     top = git("rev-parse", "--show-toplevel")
-    if top and top.stdout.strip() and not any((root / n).exists() for n in (CONF, BRIEF, LEGACY)):
+    if top and top.stdout.strip() and not any((root / n).exists() for n in (CONF, BRIEF, LEGACY, "team.toml")):
         root = pathlib.Path(top.stdout.strip())  # the repo root, not a subdirectory
+    refuse_old_names(root)
     refuse_legacy(root)
     for name, source in ((BRIEF, SKILL / "templates" / BRIEF), (SAMPLE, SKILL / "templates" / CONF), (CONF, root / SAMPLE)):
         if (root / name).exists():
@@ -1139,7 +1180,7 @@ def cmd_init(args):
     ignore = root / ".gitignore"
     lines = ignore.read_text().splitlines() if ignore.exists() else []
     rules = git("check-ignore", "-q", "--no-index", CONF)  # what the rules really do: 0 ignored, 1 not, else no repository
-    if not (rules.returncode == 0 if rules and rules.returncode in (0, 1) else CONF in lines):  # a later `!team.toml` undoes a line
+    if not (rules.returncode == 0 if rules and rules.returncode in (0, 1) else CONF in lines):  # a later `!factory.toml` undoes a line
         ignore.write_text("\n".join(lines + [CONF]) + "\n")
         print(f"added {CONF} to {ignore}: it is yours; {SAMPLE} is what the project shares")
     tracked = git("ls-files", "--error-unmatch", CONF)
@@ -1246,7 +1287,7 @@ def cmd_continue(args):
     if unknown:
         raise SystemExit(f"not in {CONF}: {', '.join(unknown)}")
     restart = [n for n in names if args.restart and team.live(n)]
-    ready = checked(cfg, [plan(cfg, n) for n in names if n in restart or not team.live(n)])  # with team.toml's settings as they are now
+    ready = checked(cfg, [plan(cfg, n) for n in names if n in restart or not team.live(n)])  # with factory.toml's settings as they are now
     configure_messages(cfg, team, operator, restart=names if args.restart else ())
     failed, fresh = {}, []
     past = past_sessions(cfg)
@@ -1452,16 +1493,16 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def common(sp):
-        sp.add_argument("--cwd", help="where to look for TEAM.md and team.toml (default: here, then parent directories)")
+        sp.add_argument("--cwd", help="where to look for FACTORY.md and factory.toml (default: here, then parent directories)")
 
     def launching(sp):
         sp.add_argument("--timeout", type=int, default=60000, help="ms to wait for each agent to be ready")
         common(sp)
 
     def selection(sp):
-        sp.add_argument("names", nargs="*", help="member names (default: every member in team.toml)")
+        sp.add_argument("names", nargs="*", help="member names (default: every member in factory.toml)")
 
-    it = sub.add_parser("init", help="write the TEAM.md, team.toml.sample and team.toml a project lacks")
+    it = sub.add_parser("init", help="write the FACTORY.md, factory.toml.sample and factory.toml a project lacks")
     common(it)
 
     common(sub.add_parser("harnesses", help="installed harnesses and which recommended models they can use"))
@@ -1471,7 +1512,7 @@ def main(argv=None):
     common(ck)
 
     up = sub.add_parser("up", help="check, launch each member in a pane of the team tab, send the team brief",
-                        epilog="Native harness flags go in the member's `args` in team.toml.")
+                        epilog="Native harness flags go in the member's `args` in factory.toml.")
     selection(up)
     up.add_argument("--no-brief", action="store_true", help="do not send the team brief afterwards")
     launching(up)
@@ -1480,7 +1521,7 @@ def main(argv=None):
     co.add_argument("names", nargs="*", help="only these members")
     co.add_argument("--fresh", action="store_true", help="start new sessions instead of resuming")
     co.add_argument("--restart", action="store_true",
-                    help="also restart members that are running, so they get team.toml's settings (after a herdr restart)")
+                    help="also restart members that are running, so they get factory.toml's settings (after a herdr restart)")
     launching(co)
 
     st = sub.add_parser("status", help="members and whether they are running")

@@ -1,15 +1,15 @@
 # Your formation: the operator and the members, each on its own harness and model. The operator is the lead
 # agent; you, the user, are the owner who directs it. This file is yours and is not committed;
-# team.toml.sample is the project's suggestion. All roles are in the skill's roles/.
+# factory.toml.sample is the project's suggestion. All roles are in the skill's roles/.
 # A member needs harness + model; thinking defaults to its role's. Optional per member: role (for numbered
 # names), notes (what it owns here), permissions, args (native flags), worktree (true: its own checkout on
 # branch <user>/<name>; a branch name: that branch). The first member of a role has the role's name; more of
 # that role are -2, -3, ... A name never changes.
 
 # user = "peter"          # the first part of your worktree branches (peter/lead-dev); default: your system user
-#                         # name. A top-level key: it goes here, above [operator]. Leave it out of team.toml.sample.
+#                         # name. A top-level key: it goes here, above [operator]. Leave it out of factory.toml.sample.
 # permissions = "guarded" # default "full": members never stop for approval, which assumes a safe machine.
-#                         # guarded keeps Claude Code and Codex behind their own guard. See SKILL.md.
+#                         # guarded keeps Claude Code and Codex behind their own guard. See the factory skill's SKILL.md.
 # worktree_dir = "../<repo>.worktrees"
 
 [operator]
