@@ -40,7 +40,7 @@ text, n = re.subn(r"(## Project\n\n).*?(?=## )", lambda m: m.group(1) + project 
 assert n == 1
 p.write_text(text)
 EOF
-printf '# Tasks\n\nNothing recorded yet.\n' > TODO.md
+cp "$SKILL/templates/TODO.md" TODO.md
 g add -A
 g commit -q -m "Start slug"
 
@@ -75,35 +75,41 @@ T1=$(git rev-parse --short HEAD)
 
 # The tracker as the team left it. T4 is the planted contradiction: no such commit, no such code.
 cat > TODO.md <<EOF
-# Tasks
+TODO
+====
 
-## T1 Slugify joins words: done
-- owner: @lead-dev
-- criteria: \`slugify("Hello, World")\` returns \`hello-world\`; tests pass.
-- commit: $T1
-- verdict: approve by @reviewer on $T1; ran \`python3 -m unittest\`, 2 passed
-- next: none
+## Ready
 
-## T2 max_length: doing
-- owner: @lead-dev
-- criteria: \`slugify(text, max_length=n)\` returns at most n characters and never ends with \`-\`; without max_length nothing changes; tests cover it.
-- work: uncommitted in the main checkout: \`slug.py\`, \`test_slug_length.py\`
-- verdict: changes required by @reviewer on those paths; ran \`python3 -m unittest\`, 3 passed
-- next: @lead-dev makes the required fixes, then @reviewer re-reviews:
-  1. \`slug.py:8\`: \`slugify("hello world", max_length=6)\` returns \`hello-\`; strip the trailing \`-\` after cutting.
-  2. Add a test where max_length cuts right after a word.
+- [ ] T3 Command line -- python3 -m slug prints the slug
+  - owner: none yet
+  - criteria: \`python3 -m slug "Hello World"\` prints \`hello-world\`.
+  - next: start after T2 is done; it changes the same function.
 
-## T3 Command line: todo
-- owner: none yet
-- criteria: \`python3 -m slug "Hello World"\` prints \`hello-world\`.
-- next: start after T2 is done; it changes the same function.
+## In progress
 
-## T4 Strip accents: done
-- owner: @lead-dev
-- criteria: \`slugify("Crème")\` returns \`creme\`.
-- commit: 0f3a9c1
-- verdict: approve by @reviewer on 0f3a9c1; ran \`python3 -m unittest\`
-- next: none
+- [ ] T2 max_length -- limit the slug length (@lead-dev)
+  - criteria: \`slugify(text, max_length=n)\` returns at most n characters and never ends with \`-\`; without max_length nothing changes; tests cover it.
+  - work: uncommitted in the main checkout: \`slug.py\`, \`test_slug_length.py\`
+  - verdict: changes required by @reviewer on those paths; ran \`python3 -m unittest\`, 3 passed
+  - next: @lead-dev makes the required fixes, then @reviewer re-reviews:
+    1. \`slug.py:8\`: \`slugify("hello world", max_length=6)\` returns \`hello-\`; strip the trailing \`-\` after cutting.
+    2. Add a test where max_length cuts right after a word.
+
+## Backlog
+
+## Done
+
+- [x] T1 Slugify joins words -- join words with hyphens ($T1)
+  - owner: @lead-dev
+  - criteria: \`slugify("Hello, World")\` returns \`hello-world\`; tests pass.
+  - verdict: approve by @reviewer on $T1; ran \`python3 -m unittest\`, 2 passed
+  - next: none
+
+- [x] T4 Strip accents -- remove accents from the slug (0f3a9c1)
+  - owner: @lead-dev
+  - criteria: \`slugify("Crème")\` returns \`creme\`.
+  - verdict: approve by @reviewer on 0f3a9c1; ran \`python3 -m unittest\`
+  - next: none
 EOF
 g add TODO.md
 g commit -q -m "Tracker"

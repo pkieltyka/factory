@@ -1682,6 +1682,14 @@ class ConfigTests(unittest.TestCase):
                 self.assertEqual(p["permissions"], "full")
             self.assertEqual(cfg.operator["name"], "operator")
             self.assertIn("tracked in `TODO.md`", cfg.body)  # where tasks live is prose in TEAM.md, not a setting
+            todo = (ateam.SKILL / "templates/TODO.md").read_text().splitlines()
+            self.assertEqual(todo[:2], ["TODO", "===="])
+            headings = ["## Ready", "## In progress", "## Backlog", "## Done"]
+            self.assertEqual([line for line in todo if line.startswith("## ")], headings)
+            tasks = cfg.body.split("## Tasks\n", 1)[1].split("\n## Workflow", 1)[0]
+            for heading in headings:
+                self.assertIn(heading, tasks)
+            self.assertIn("An item's criteria, verdict and next step go on indented lines under it.", tasks)
             self.assertNotIn("tracker", cfg.team)
             self.assertEqual(list(cfg.members), ["lead-dev", "reviewer", "pm"])
             self.assertEqual(cfg.members["lead-dev"]["model"], "gpt-6-astra")
@@ -1822,7 +1830,8 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual((e.repo / ".gitignore").read_text(), "team.toml\n")
             self.assertEqual(out.count("wrote"), 3)
             e.run("check", "lead-dev")                         # what init writes is a team that checks
-            self.assertIn("The operator may assign an item marked `ready` without asking the user",
+            self.assertIn("`## Ready` holds, in the order they will be done, the items the operator may assign "
+                          "without asking the user; only a person puts an item there or reorders it, never the team.",
                           e.run("brief").stdout)
             # a teammate: the shared files are there, edited; only their own team.toml is missing
             (e.repo / "team.toml.sample").write_text('[members.pm]\nharness = "pi"\nmodel = "z-ai/glm-5.3"\n')
@@ -1954,6 +1963,21 @@ class GateFixtureTests(unittest.TestCase):
                 caches.append(cache)
                 self.assertEqual(run(GIT, "rev-list", "--count", "HEAD", cwd=repo).stdout.strip(), "3")
                 self.assertIn("slug: a one-function", (repo / "TEAM.md").read_text())
+                todo = (repo / "TODO.md").read_text()
+                self.assertEqual(todo.splitlines()[:2], ["TODO", "===="])
+                self.assertEqual([line for line in todo.splitlines() if line.startswith("## ")],
+                                 ["## Ready", "## In progress", "## Backlog", "## Done"])
+                t1 = run(GIT, "rev-parse", "--short", "HEAD~1", cwd=repo).stdout.strip()
+                self.assertEqual([line for line in todo.splitlines() if line.startswith("- [")], [
+                    "- [ ] T3 Command line -- python3 -m slug prints the slug",
+                    "- [ ] T2 max_length -- limit the slug length (@lead-dev)",
+                    f"- [x] T1 Slugify joins words -- join words with hyphens ({t1})",
+                    "- [x] T4 Strip accents -- remove accents from the slug (0f3a9c1)",
+                ])
+                self.assertIn("  - verdict: changes required by @reviewer", todo)
+                self.assertIn("    2. Add a test where max_length cuts right after a word.", todo)
+                self.assertNotEqual(subprocess.run([GIT, "cat-file", "-e", "0f3a9c1"], cwd=repo,
+                                                   env=env, capture_output=True).returncode, 0)
                 self.assertEqual(set(run(GIT, "status", "--short", cwd=repo).stdout.splitlines()),
                                  {" M README.md", " M slug.py", "?? test_slug_length.py"})
                 tests = run(sys.executable, "-m", "unittest", cwd=repo)
