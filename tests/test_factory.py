@@ -2124,7 +2124,8 @@ class PublicNameMigrationTests(unittest.TestCase):
 
     def test_published_text_uses_the_new_names_except_migration_guidance(self):
         paths = [factory.SKILL / "SKILL.md", factory.SKILL / "harnesses.toml", factory.SKILL.parent / "README.md"]
-        for directory in ("references", "roles", "templates"):
+        paths.extend(factory.SKILL.parent / "docs" / name for name in ("README.md", "getting-started.md"))
+        for directory in ("references", "roles", "templates", "recipes"):
             paths.extend(p for p in (factory.SKILL / directory).iterdir() if p.is_file())
         for path in paths:
             self.assertNotIn("ateam.py", path.read_text(), str(path))
@@ -2139,6 +2140,37 @@ class PublicNameMigrationTests(unittest.TestCase):
                     self.assertNotIn("/a-team", line.replace("~/.cache/a-team", ""))
         self.assertIn("name: factory\n", (factory.SKILL / "SKILL.md").read_text())
         self.assertTrue((factory.SKILL / "templates/FACTORY.md").read_text().startswith("# Factory\n"))
+
+
+class RecipeTests(unittest.TestCase):
+    def test_recipes_are_pasteable_sections_linked_from_the_map(self):
+        setup = (factory.SKILL / "references/cmd_setup.md").read_text()
+        overview = (factory.SKILL.parent / "docs/README.md").read_text()
+        recipes = sorted((factory.SKILL / "recipes").glob("*.md"))
+        self.assertTrue(recipes)
+        for path in recipes:
+            with self.subTest(recipe=path.name):
+                headings, blocks, block = [], [], None
+                for line in path.read_text().splitlines():
+                    if line.startswith("```"):
+                        if block is None:
+                            self.assertEqual(headings[-1], "## FACTORY.md section")
+                            block = []
+                        else:
+                            blocks.append(block)
+                            block = None
+                    elif block is not None:
+                        block.append(line)
+                    elif line.startswith("#"):
+                        headings.append(line)
+                self.assertIsNone(block, "unclosed fence")
+                self.assertEqual(len(blocks), 1)
+                self.assertTrue(blocks[0][0].startswith("## "))
+                section = blocks[0][0]
+                self.assertIn(f"`{section}`", setup)
+                self.assertTrue(headings[0].startswith(f"# {section[3:]}: "))
+                self.assertEqual(headings[1:], ["## Needs", "## Check", "## FACTORY.md section", "## Tested with"])
+                self.assertIn(f"(../skill/recipes/{path.name})", overview)
 
 
 class CacheNameTests(unittest.TestCase):

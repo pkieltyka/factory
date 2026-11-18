@@ -9,7 +9,7 @@ A project has `FACTORY.md` (the shared brief, committed) and `factory.toml` (you
 - **Both exist:** change only what the user requested.
 
 1. Inspect the repo's stack, UI and existing tracker. Run `factory.py harnesses`; recommend available models and report missing-harness fixes.
-2. Propose the default below. Infer known facts; ask in one round only for missing project scope, UI needs, parallel work/worktrees, where tasks are tracked, what marks one ready to start, whether to keep notes and a private notes folder, any spec, browser or review tool the project uses, and whether work reaches the main branch through pull requests. Custom formations, model mixes and trackers remain available.
+2. Propose the default below. Infer known facts; ask in one round only for missing project scope, UI needs, parallel work/worktrees, where tasks are tracked, what marks one ready to start, whether to keep notes and a private notes folder, any spec, browser or review tool the project uses, and whether work reaches the main branch through pull requests. Custom formations, model mixes and trackers remain available. The skill's `recipes/` hold tested choices for the optional sections: propose one when its check passes on this machine, name the alternative, and keep a tracker or tool the project already uses.
 3. Show name, role, harness, model, thinking and project responsibility. Adjust until agreed; keep the current operator session unless the user requests a change.
 
 ## Default formation
@@ -39,7 +39,7 @@ Edit `factory.toml`, your formation:
 - Use `worktree = true` for developers who work in parallel: each gets branch `<user>/<member>` (for example `peter/lead-dev`), so two people's branches do not collide when their `user` differs. `user` is a top-level key above `[operator]` and defaults to the system user name; set it when that name is generic (`root`, `ubuntu`).
 - Match the operator's model/thinking to the current session, not the template defaults.
 
-Edit `FACTORY.md`, the shared brief, as plain Markdown without comments. Write it by role ("the operator", never an @name), so it holds for any person's formation:
+Edit `FACTORY.md`, the shared brief, as plain Markdown without comments. Paste the chosen recipe's section and fill the names in capitals; names in angle brackets stay for members. Write it by role ("the operator", never an @name), so it holds for any person's formation:
 
 - `## Project`: what, for whom, stack. Detailed tasks go in messages.
 - `## Tasks`: where tasks and bugs are tracked and with what tool, in words a member can act on (a repo file, GitHub Issues with `gh`, Linear, another CLI). A file suits one person; several people on the repo need a shared tool, with the person's name next to the member's in an item's owner (`peter/@lead-dev`). @pm owns the tracker when present; otherwise you track tasks. Say what marks an item ready to start and who sets it. With `TODO.md` as the tracker and none in the repo, copy the skill's `templates/TODO.md` to the repo root.
