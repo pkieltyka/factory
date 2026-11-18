@@ -39,6 +39,6 @@ notes = "Reviews each diff, runs python3 tests/test_factory.py, and checks that 
 
 [members.pm]
 harness = "pi"
-model = "deepseek/deepseek-v4.1-flash"
+model = "deepseek/deepseek-v4.1-flash-1017"
 thinking = "high"
 notes = "Owns the GitHub Issues tracker on pkieltyka/factory through the todos CLI."
