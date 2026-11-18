@@ -23,19 +23,19 @@ notes = "Decides scope and architecture, assigns tasks, reviews and commits to m
 harness = "claude"
 model = "claude-fable-5-2"
 thinking = "high"
-notes = "Standing design adviser for the skill: keeps ateam.py, the roles, references and templates simple and coherent. Any member may consult it. Writes plans only, never code."
+notes = "Standing design adviser for the skill: keeps factory.py, the roles, references and templates simple and coherent. Any member may consult it. Writes plans only, never code."
 
 [members.lead-dev]
 harness = "codex"
 model = "gpt-6-astra"
 thinking = "high"
-notes = "Implements changes to skill/scripts/ateam.py, skill/roles/, skill/references/, skill/templates/ and skill/SKILL.md, with tests in tests/test_ateam.py."
+notes = "Implements changes to skill/scripts/factory.py, skill/roles/, skill/references/, skill/templates/ and skill/SKILL.md, with tests in tests/test_factory.py."
 
 [members.reviewer]
 harness = "codex"
 model = "gpt-6-luna"
 thinking = "high"
-notes = "Reviews each diff, runs python3 tests/test_ateam.py, and checks that skill/SKILL.md, README.md and skill/references/ still match the behaviour."
+notes = "Reviews each diff, runs python3 tests/test_factory.py, and checks that skill/SKILL.md, README.md and skill/references/ still match the behaviour."
 
 [members.pm]
 harness = "pi"

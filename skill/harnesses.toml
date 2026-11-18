@@ -1,8 +1,8 @@
-# One table per harness: what ateam.py knows about it that is plain data. What cannot be data (listing its
-# models, building its launch command) is that harness's block in scripts/ateam.py.
+# One table per harness: what factory.py knows about it that is plain data. What cannot be data (listing its
+# models, building its launch command) is that harness's block in scripts/factory.py.
 #
 #   label, install   the name in rosters; what to tell the user when the binary is missing
-#   models       recommended models, strongest first; `ateam.py harnesses` says which this machine can use.
+#   models       recommended models, strongest first; `factory.py harnesses` says which this machine can use.
 #                Claude Code has no listing command, so for claude these are the ids `check` knows.
 #   aliases      claude only: short names Claude Code takes in place of a model id ("opus")
 #   thinking     levels the harness accepts (codex: read per model from its cache; opencode: per-model variants)

@@ -7,7 +7,7 @@ Start a task only when {operator} or the user assigns it to you; an item the bri
 {role_rules}
 
 ## Talking to the team
-Message {teammates} only with `herdr agent prompt` (`ateam.py say` is operator-only), never through a harness's own messaging (e.g. Claude Code's `SendMessage`): herdr works across harnesses and permission modes.
+Message {teammates} only with `herdr agent prompt` (`factory.py say` is operator-only), never through a harness's own messaging (e.g. Claude Code's `SendMessage`): herdr works across harnesses and permission modes.
 Send messages as a standalone shell command:
 ```bash
 herdr agent prompt <name> '[from @{name}]: <message>'

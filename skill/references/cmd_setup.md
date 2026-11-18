@@ -2,13 +2,13 @@
 
 A project has `FACTORY.md` (the shared brief, committed) and `factory.toml` (your own formation, not committed). `factory.toml.sample` is the project's suggested formation.
 
-- **The project already has `FACTORY.md`:** someone set the team up. Run `ateam.py init`; it copies `factory.toml.sample` to your `factory.toml`. Ask only what the user wants different for themselves (other models or harnesses, one model for everything, fewer members) and edit `factory.toml`. Check `user`, a top-level key above `[operator]`: it is the first part of this person's worktree branches. `init` prints it when the sample sets one. Leave `FACTORY.md` alone unless they ask.
-- **Only an old `team-brief.md` exists:** `ateam.py` stops and prints how to split it by hand into `factory.toml` and `FACTORY.md`. Do that; never run `init` to get past it.
+- **The project already has `FACTORY.md`:** someone set the team up. Run `factory.py init`; it copies `factory.toml.sample` to your `factory.toml`. Ask only what the user wants different for themselves (other models or harnesses, one model for everything, fewer members) and edit `factory.toml`. Check `user`, a top-level key above `[operator]`: it is the first part of this person's worktree branches. `init` prints it when the sample sets one. Leave `FACTORY.md` alone unless they ask.
+- **Only an old `team-brief.md` exists:** `factory.py` stops and prints how to split it by hand into `factory.toml` and `FACTORY.md`. Do that; never run `init` to get past it.
 - **`TEAM.md` or `team.toml` from a-team:** the script stops and prints the renames. Do them. Write no new file to get past it, except `FACTORY.md` from the template when `TEAM.md` is another document, as the message says.
 - **Neither file exists:** follow the steps below.
 - **Both exist:** change only what the user requested.
 
-1. Inspect the repo's stack, UI and existing tracker. Run `ateam.py harnesses`; recommend available models and report missing-harness fixes.
+1. Inspect the repo's stack, UI and existing tracker. Run `factory.py harnesses`; recommend available models and report missing-harness fixes.
 2. Propose the default below. Infer known facts; ask in one round only for missing project scope, UI needs, parallel work/worktrees, where tasks are tracked, what marks one ready to start, whether to keep notes and a private notes folder, any spec, browser or review tool the project uses, and whether work reaches the main branch through pull requests. Custom formations, model mixes and trackers remain available.
 3. Show name, role, harness, model, thinking and project responsibility. Adjust until agreed; keep the current operator session unless the user requests a change.
 
@@ -31,7 +31,7 @@ A project has `FACTORY.md` (the shared brief, committed) and `factory.toml` (you
 
 ## Write and validate
 
-Run `ateam.py init`. It writes what is missing (`FACTORY.md`, `factory.toml.sample`, your `factory.toml`), replaces nothing, and adds `factory.toml` to `.gitignore`.
+Run `factory.py init`. It writes what is missing (`FACTORY.md`, `factory.toml.sample`, your `factory.toml`), replaces nothing, and adds `factory.toml` to `.gitignore`.
 
 Edit `factory.toml`, your formation:
 
@@ -50,4 +50,4 @@ Edit `FACTORY.md`, the shared brief, as plain Markdown without comments. Write i
 
 When the formation should be the project's suggestion, copy `factory.toml` to `factory.toml.sample` and make the copy portable: remove `user` and `worktree_dir`, and any worktree branch or path that carries a person's name.
 
-Run `ateam.py check`. Resolve each failure without substituting unapproved models or harnesses; unknown Claude IDs only warn. Preview with `ateam.py brief`, show the result, and commit `FACTORY.md` and `factory.toml.sample` when authorized; never `factory.toml`. Next: `/factory up`.
+Run `factory.py check`. Resolve each failure without substituting unapproved models or harnesses; unknown Claude IDs only warn. Preview with `factory.py brief`, show the result, and commit `FACTORY.md` and `factory.toml.sample` when authorized; never `factory.toml`. Next: `/factory up`.
