@@ -778,7 +778,8 @@ def member_prompt(m, operator, cfg):
                  f" tell @{operator} or the teammate concerned and agree who commits it for you."]
     else:
         where = f"You work in `{cfg.root}`, the checkout you share with every teammate who has no worktree of their own."
-        rules = [f"- Never run `git commit`, `git merge` or `git push`; @{operator} commits."]
+        rules = ["- Do not stage files. Never run `git commit`, `git merge` or `git push`."
+                 f" @{operator} stages only task files and commits."]
     if m["readonly"]:
         rules.append("- You are read-only: do not edit the project's files. You may read anything, build and run"
                      f" tests. Write only scratch files outside the repo, or a document @{operator} asks you for.")

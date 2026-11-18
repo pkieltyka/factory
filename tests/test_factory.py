@@ -751,8 +751,10 @@ class WorktreeTests(unittest.TestCase):
             self.assertNotIn("Never run `git commit`", prompt)
             staging = "Stage only task files, never `git add -A` or `git add .`"
             self.assertIn(staging, prompt)
+            self.assertNotIn("Do not stage files", prompt)
             shared = e.run("prompt", "reviewer").stdout
-            self.assertIn("Never run `git commit`", shared)
+            self.assertIn("Do not stage files. Never run `git commit`, `git merge` or `git push`. "
+                          "@operator stages only task files and commits.", shared)
             self.assertNotIn(staging, shared)
             brief = next(t for n, t in e.prompts() if n == "reviewer")
             self.assertIn("| branch `feature/login` in `" + str(trees / "feature-login") + "` |", brief)
