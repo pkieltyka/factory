@@ -53,9 +53,3 @@ By default, when the configured operator harness matches its live pane, members'
 - [tests/](tests/) — fake harness/herdr tests, real Git checks and the Gate 1 fixture; run `python3 tests/test_factory.py`. `FACTORY_LIVE=1 python3 tests/test_factory.py LiveFlags` checks installed harness flags.
 
 To add a harness, add its table (with `operator_wait`) in `skill/harnesses.toml`, its code block and a test fake.
-
-## Coming from a-team
-
-Coming from a-team: install the skill as `factory`. The first command in a project with the earlier names prints the renames from `TEAM.md`, `team.toml` and `team.toml.sample` to `FACTORY.md`, `factory.toml` and `factory.toml.sample`. Follow them, then run `factory.py init` to update `.gitignore`.
-
-A project that ran under a-team keeps its cache under `a-team`; new projects use `factory-skill`. Moving a project's cache is optional and done by a person, with no team running on that project and only if its destination does not exist. Under the cache base (`$XDG_CACHE_HOME`, or `~/.cache` when unset or empty), create `factory-skill` with `mkdir -p -m 700`, then `mv` the project's directory from `a-team` into it.

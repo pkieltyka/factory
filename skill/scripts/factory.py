@@ -38,8 +38,6 @@ SETTLE = float(os.environ.get("FACTORY_SETTLE", 8))  # seconds a member may take
 BRIEF = "FACTORY.md"              # the brief: shared and committed
 CONF = "factory.toml"             # one person's formation: not committed
 SAMPLE = "factory.toml.sample"    # the project's suggested formation: committed, copied to factory.toml by `init`
-OLD = {"TEAM.md": BRIEF, "team.toml": CONF, "team.toml.sample": SAMPLE}
-LEGACY = "team-brief.md"       # the single file of earlier versions: found only to say how to split it
 OPERATOR = "operator"  # the operator's @name, unless `[operator] name` in factory.toml says otherwise
 TABS = {"operator": "factory operator", "team": "factory team"}  # herdr tab labels
 
@@ -58,46 +56,18 @@ def find_root(cwd):
     """The directory holding the team's files, searching up from cwd; else cwd itself."""
     cwd = pathlib.Path(cwd).resolve()
     for d in (cwd, *cwd.parents):
-        if any((d / name).is_file() for name in (CONF, BRIEF, LEGACY, "team.toml")):
+        if any((d / name).is_file() for name in (CONF, BRIEF)):
             return d
     return cwd
 
 
-def dangling_link_error(path):
-    if path.is_symlink() and not path.exists():
-        return f"{path} is a symbolic link to a missing file; nothing was written. Repair or remove the link."
-
-
-def refuse_old_names(root):
-    """Stop before defaults can replace files still awaiting their public-name migration."""
+def refuse_dangling_links(root):
+    """Stop before a write could follow a link to a missing file."""
     for name in (BRIEF, CONF, SAMPLE):
-        if error := dangling_link_error(root / name):
-            raise SystemExit(error)
-    pending = [(old, new) for old, new in OLD.items()
-               if (root / old).is_file() and not (root / new).exists()]
-    if not pending:
-        return
-    message = (f"{root} holds files under their earlier names (a-team is now factory); nothing was written."
-               " Rename them:\n" + "\n".join(
-                   "  " + shlex.join(["mv", str(root / old), str(root / new)]) for old, new in pending)
-               + f"\nThen run `factory.py init`: it adds {CONF} to .gitignore."
-               " Remove the team.toml line there and commit the renames.")
-    if any(old == "TEAM.md" for old, _ in pending):
-        message += ("\nIf TEAM.md is another document, leave it and run instead: "
-                    + shlex.join(["cp", str(SKILL / "templates" / BRIEF), str(root / BRIEF)]))
-    raise SystemExit(message)
-
-
-def refuse_legacy(root):
-    """With an old team-brief.md and not both new files, stop before anything is read or written: defaults
-    would quietly replace the team it describes."""
-    if (root / LEGACY).is_file() and not ((root / BRIEF).is_file() and (root / CONF).is_file()):
-        raise SystemExit(f"{root / LEGACY} is the single-file brief of earlier versions; nothing was written."
-                         f" Split it by hand:\n"
-                         f"  1. Move the settings between its +++ lines to {CONF}.\n"
-                         f"  2. In {CONF}, rename [lead] or [orchestrator] to [operator] and remove `tracker`.\n"
-                         f"  3. Move the prose to {BRIEF}, and say there where tasks are tracked.\n"
-                         f"  4. Delete {LEGACY}, add {CONF} to .gitignore, and run `factory.py check`.")
+        path = root / name
+        if path.is_symlink() and not path.exists():
+            raise SystemExit(f"{path} is a symbolic link to a missing file; nothing was written."
+                             " Repair or remove the link.")
 
 
 def parse_role(path):
@@ -123,8 +93,7 @@ class Config:
         self.roles = {p.stem: parse_role(p) for p in sorted((SKILL / "roles").glob("*.md"))}
         missing = [f.name for f in (self.brief_file, self.conf_file) if not f.is_file()]
         if missing and require:
-            refuse_old_names(self.root)
-            refuse_legacy(self.root)
+            refuse_dangling_links(self.root)
             raise SystemExit(f"no {' or '.join(missing)} in {self.root} or above. Run `/factory setup`, or"
                              f" `factory.py init`, which writes what is missing and copies the project's {SAMPLE} to"
                              f" {CONF} if there is one.")
@@ -133,9 +102,6 @@ class Config:
         except tomllib.TOMLDecodeError as e:
             raise SystemExit(f"{self.conf_file}: {e}")
         self.body = self.brief_file.read_text().strip() if self.brief_file.is_file() else ""
-        for old in ("lead", "orchestrator"):
-            if old in self.team:
-                raise SystemExit(f"{self.conf_file}: rename [{old}] to [operator]")
         self.operator = {"name": OPERATOR, **self.team.get("operator", {})}
         harness = self.operator.get("harness")
         if harness is not None and (not isinstance(harness, str) or harness not in TABLE):
@@ -152,9 +118,6 @@ class Config:
             self.user = ""
         if not re.fullmatch(r"[A-Za-z0-9._-]+", self.user):
             raise SystemExit(f"{self.conf_file}: set `user` to your name for branches, e.g. user = \"peter\"")
-        if "teams" in self.team:  # from before: starting "every member" would start a whole catalog
-            raise SystemExit(f"{self.conf_file}: [teams] is no longer used. The members in {CONF} are the team:"
-                             " remove [teams] and the members you do not want.")
         unknown = self.team.keys() - {"user", "permissions", "worktree_dir", "operator", "members"}
         if unknown:
             raise SystemExit(f"{self.conf_file}: unknown top-level key(s): {sorted(unknown)};"
@@ -175,8 +138,7 @@ class Config:
         The path is short on purpose: it is typed into a shell line that macOS limits to 1024 bytes."""
         base = pathlib.Path(os.environ.get("XDG_CACHE_HOME") or pathlib.Path.home() / ".cache")
         key = f"{self.root.name[:24]}-{hashlib.sha1(str(self.root).encode()).hexdigest()[:8]}"
-        old = base / "a-team" / key  # a project that ran under a-team keeps its sessions and unread messages here
-        return old if old.is_dir() else base / "factory-skill" / key
+        return base / "factory-skill" / key
 
     @property
     def worktree_dir(self):
@@ -589,13 +551,6 @@ class Checker:
         if path not in trees and pathlib.Path(path).exists():
             raise Problem(f"the worktree path {path} exists but is not a checkout of this repository",
                           f"Move it away, or set `worktree_dir` in {CONF}.")
-        # Defaults used to be a-team/<name>. A member on `worktree = true` whose new default branch does not exist
-        # yet, while its old checkout is still there, may be leaving unmerged work behind. A branch that
-        # factory.toml names is a decision and is left alone.
-        old, implicit = f"a-team/{p['name']}", self.cfg.members[p["name"]].get("worktree") is True
-        if implicit and branch != old and old in trees.values() and git("rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"):
-            raise Problem(f"this member has an earlier worktree on branch {old}, which may hold unmerged work",
-                          f'Set `worktree = "{old}"` for it in {CONF} to keep using it, or merge and remove it first.')
         held = [t for t, b in trees.items() if b == branch and t != path]
         if held:
             raise Problem(f"the worktree branch {branch} is already checked out in {held[0]}",
@@ -627,25 +582,6 @@ class Checker:
 
 def check_all(cfg, plans):
     """-> (ready members, [(member, Problem)])."""
-    cache = cfg.cache
-    newer = cache.parent.parent / "factory-skill" / cache.name
-    if cache.parent.name == "a-team" and newer.is_dir():
-        print(f"note: {newer} is not used while {cache} exists.", file=sys.stderr)
-    if (cfg.root / LEGACY).is_file():
-        print(f"note: {cfg.root / LEGACY} is no longer read; {BRIEF} and {CONF} replace it. Delete it.", file=sys.stderr)
-    for old in ("team.toml", "team.toml.sample"):
-        source, target = cfg.root / old, cfg.root / OLD[old]
-        if source.is_file():
-            if error := dangling_link_error(target):
-                print(f"note: {error}", file=sys.stderr)
-            elif target.is_symlink() and target.samefile(source):
-                print(f"note: {target} is a link to {source}; that file still holds the settings."
-                      " Keep it, or replace the link with the file itself.", file=sys.stderr)
-            elif target.exists():
-                print(f"note: {source} is not read; {target} is. Compare them, then remove {source}.", file=sys.stderr)
-            else:
-                command = shlex.join(["mv", str(source), str(target)])
-                print(f"note: {source} is not read. Rename it: {command}", file=sys.stderr)
     generic = {"root", "ubuntu", "runner", "user", "admin", "ec2-user", "vscode", "codespace", "node"}
     if "user" not in cfg.team and cfg.user in generic and any(p["branch"] == f"{cfg.user}/{p['name']}" for p in plans):
         print(f"note: worktree branches will start with {cfg.user!r}, this machine's user name, which other people's"
@@ -1196,10 +1132,9 @@ def cmd_init(args):
         except OSError:
             return None
     top = git("rev-parse", "--show-toplevel")
-    if top and top.stdout.strip() and not any((root / n).exists() for n in (CONF, BRIEF, LEGACY, "team.toml")):
+    if top and top.stdout.strip() and not any((root / n).exists() for n in (CONF, BRIEF)):
         root = pathlib.Path(top.stdout.strip())  # the repo root, not a subdirectory
-    refuse_old_names(root)
-    refuse_legacy(root)
+    refuse_dangling_links(root)
     for name, source in ((BRIEF, SKILL / "templates" / BRIEF), (SAMPLE, SKILL / "templates" / CONF), (CONF, root / SAMPLE)):
         if (root / name).exists():
             print(f"kept  {root / name}")

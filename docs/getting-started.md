@@ -13,7 +13,7 @@ mkdir -p ~/.claude/skills
 cp -R skill ~/.claude/skills/factory
 ```
 
-Or use `ln -s "$PWD/skill" ~/.claude/skills/factory` instead of the copy. Use your harness's own skills directory for another harness. [The root README](../README.md) has the command map and migration guidance.
+Or use `ln -s "$PWD/skill" ~/.claude/skills/factory` instead of the copy. Use your harness's own skills directory for another harness. [The root README](../README.md) has the command map.
 
 ## Form and launch the team
 
