@@ -184,13 +184,15 @@ FAKE_OPENCODE = textwrap.dedent(r'''
 MODELS = """\
 openrouter z-ai/glm-5.3
 openrouter z-ai/glm-5.3-flash
-openrouter deepseek/deepseek-v4.1-flash
+openrouter deepseek/deepseek-v4.1-flash-1017
 openrouter openai/gpt-6-astra
 pax-vllm nvidia/Qwen3.8-Flash-Next-NVFP4
 """
 
 LEVELS = ["low", "medium", "high", "xhigh", "max"]
 CODEX_CACHE = {"models": [
+    {"slug": "gpt-6.2-astra", "visibility": "list", "supported_reasoning_levels": [{"effort": e} for e in LEVELS + ["ultra"]]},
+    {"slug": "gpt-6.2-sol", "visibility": "list", "supported_reasoning_levels": [{"effort": e} for e in LEVELS + ["ultra"]]},
     {"slug": "gpt-6-luna", "visibility": "list", "supported_reasoning_levels": [{"effort": e} for e in LEVELS]},
     {"slug": "gpt-6-astra", "visibility": "list", "supported_reasoning_levels": [{"effort": e} for e in LEVELS + ["ultra"]]},
     {"slug": "gpt-6.1-sol", "visibility": "list", "supported_reasoning_levels": [{"effort": e} for e in LEVELS + ["ultra"]]},
@@ -218,7 +220,7 @@ CATALOG_MEMBERS = {
     "frontend-dev": {"harness": "claude", "model": "claude-opus-5-5", "thinking": "medium"},
     "designer": {"harness": "claude", "model": "claude-sonnet-5-5", "thinking": "high"},
     "reviewer": {"harness": "codex", "model": "gpt-6-luna", "thinking": "high"},
-    "pm": {"harness": "pi", "model": "deepseek/deepseek-v4.1-flash", "thinking": "low"},
+    "pm": {"harness": "pi", "model": "deepseek/deepseek-v4.1-flash-1017", "thinking": "low"},
     "qa-frontend": {"harness": "claude", "model": "claude-sonnet-5-5", "thinking": "medium"},
     "qa-backend": {"harness": "pi", "model": "z-ai/glm-5.3-flash", "thinking": "medium"},
 }
@@ -384,7 +386,7 @@ class UpTests(unittest.TestCase):
             prompt = pathlib.Path(flag(fe, "--append-system-prompt-file")).read_text()
             self.assertIn(str(e.repo / "FACTORY.md"), prompt)
             self.assertNotIn("{instructions}", prompt)
-            self.assertEqual(flag(native(starts["pm"]), "--model"), "openrouter/deepseek/deepseek-v4.1-flash")
+            self.assertEqual(flag(native(starts["pm"]), "--model"), "openrouter/deepseek/deepseek-v4.1-flash-1017")
 
             status = e.run("status").stdout  # names come from herdr's agent list, not its pane list
             self.assertNotIn("unnamed", status)
@@ -490,6 +492,8 @@ class UpTests(unittest.TestCase):
         cases = [
             ("claude", "claude-opus-5-5", "max", "not allowed"),
             ("codex", "gpt-6-astra", "ultra", "not allowed"),
+            ("codex", "gpt-6.2-astra", "xhigh", None),
+            ("codex", "gpt-6.2-sol", "xhigh", None),
             ("codex", "gpt-6-luna", "xhigh", None),
             ("pi", "z-ai/glm-5.3", "max", None),
             ("pi", "z-ai/glm-5.3", "turbo", "has no thinking level"),
@@ -1777,7 +1781,7 @@ class ContinueTests(unittest.TestCase):
             e.set_session("pm", {"agent": "pi", "kind": "path", "value": "/s/p.jsonl"})
             e.kill("pm")
             e.close("reviewer")
-            e.write_brief(CATALOG.replace('model = "deepseek/deepseek-v4.1-flash"', 'model = "gpt-6-sol"')
+            e.write_brief(CATALOG.replace('model = "deepseek/deepseek-v4.1-flash-1017"', 'model = "gpt-6-sol"')
                           .replace('[members.pm]\nharness = "pi"', '[members.pm]\nharness = "codex"'))
             out = e.run("continue", "pm", "reviewer").stdout
             self.assertIn("@reviewer has no pane any more; it gets a new one", out)
@@ -2403,6 +2407,7 @@ class InstalledCopyTests(unittest.TestCase):
                 return result.stdout
 
             harnesses = run("harnesses")
+            self.assertRegex(harnesses, r"codex\s+available: gpt-6\.2-astra, gpt-6\.2-sol,")
             for harness in factory.HARNESSES:
                 self.assertRegex(harnesses, rf"{harness}\s+available:")
             run("init")

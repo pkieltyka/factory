@@ -19,7 +19,7 @@ A project has `FACTORY.md` (the shared brief, committed) and `factory.toml` (you
 | @operator | Current operator; Claude Code Opus or Fable recommended |
 | @lead-dev | Codex gpt-6-astra |
 | @reviewer | Codex gpt-6-luna |
-| @pm | pi deepseek/deepseek-v4.1-flash |
+| @pm | pi deepseek/deepseek-v4.1-flash-1017 |
 | @frontend-dev, only for a UI | Claude Code claude-opus-5-5 |
 
 - Add catalog roles only for concrete work; an architect is optional for larger systems.
