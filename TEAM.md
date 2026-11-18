@@ -4,7 +4,7 @@
 
 a-team: an agent skill that forms, launches and leads a software team of coding agents in herdr panes, across Claude Code, Codex, pi, omp and OpenCode. It is the base of a composable software-factory meta-harness on top of herdr, and the team iterates on the skill itself. Users are developers running agent teams; the agents that read SKILL.md, roles/, references/ and templates/ are users too, so those files are product, not docs.
 
-Stack: Python 3.11+ standard library (`scripts/ateam.py`, one file), herdr's CLI and socket, Git worktrees, `harnesses.toml` for harness and model facts. Tests: `python3 scripts/test_ateam.py` (fake harnesses and herdr, real Git); live flag checks with `ATEAM_LIVE=1 python3 scripts/test_ateam.py LiveFlags`.
+Stack: Python 3.11+ standard library (`skill/scripts/ateam.py`, one file), herdr's CLI and socket, Git worktrees, `skill/harnesses.toml` for harness and model facts. Tests: `python3 tests/test_ateam.py` (fake harnesses and herdr, real Git); live flag checks with `ATEAM_LIVE=1 python3 tests/test_ateam.py LiveFlags`.
 
 Principles: keep it small and simple. Prefer deleting words and code to adding them; every line an agent reads costs context. A change to behaviour updates the docs that describe it in the same change.
 
