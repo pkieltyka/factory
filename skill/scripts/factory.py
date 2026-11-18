@@ -899,8 +899,8 @@ def render_team_brief(cfg, members, operator, closing=None):
 
 
 def message_for(cfg, m, members, operator, closing=None):
-    """What a member is sent: its standing instructions when its harness cannot hold them as a system prompt
-    (or when asked), then the team brief."""
+    """What a member is sent: its standing instructions when its harness cannot hold them as a system prompt,
+    then the team brief."""
     brief = render_team_brief(cfg, members, operator, closing)
     if TABLE[m["harness"]]["prompt"] == "file":
         return brief
@@ -1561,7 +1561,8 @@ def main(argv=None):
     st = sub.add_parser("status", help="members and whether they are running")
     common(st)
 
-    wt = sub.add_parser("wait", help="return when a member stops, is blocked or is gone, or nobody is working")
+    wt = sub.add_parser("wait", help="return for unread inbox messages or a blocked, gone or closed member; "
+                                     "outside a quiet watch also when a member stops or nobody is working")
     wt.add_argument("names", nargs="*", help="watch only these members (default: every member)")
     wt.add_argument("--timeout", type=float, help="seconds before giving up (exit 4; default: foreground inbox 60, otherwise 1800)")
     wt.add_argument("--interval", type=float, default=5, help="seconds between looks")

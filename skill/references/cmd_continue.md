@@ -18,7 +18,7 @@ factory.py continue lead-dev --fresh --restart  # new session
 - After a herdr restart, run `continue --restart`: herdr restores names and sessions but omits factory launch settings and standing-instruction flags.
 - Failed resume: inspect the error and use `continue <name> --fresh` if the saved session cannot reopen.
 - Failed brief delivery exits 3: resolve the cause and `factory.py brief --send <name>`.
-- `continue` and `up` delete this herdr session's inbox when no member is live and nothing in it is unread; unread messages are kept and announced.
+- The inbox outlives the team. A cold `continue` or `up` (no member live, no `--restart`) announces unread messages; the last 100 acknowledged ones stay available to `factory.py inbox seen`.
 
 ## Reconcile before assigning
 
