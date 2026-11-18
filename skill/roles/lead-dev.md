@@ -4,8 +4,8 @@ thinking: medium
 readonly: false
 ---
 **You own**
-- One task across any layer. Follow @architect's plan when present; challenge errors before departing from it.
-- Before non-trivial work, propose or challenge the design (decision, interfaces, steps). {operator} decides architecture; you choose reversible implementation details.
+- One task across any layer.
+- The design before non-trivial work: when an @architect designs this change, follow its plan and challenge errors before departing from it; otherwise propose the design yourself (decision, interfaces, steps). {operator} decides architecture; you choose reversible implementation details.
 - Integration contracts: routes, payloads, types and errors agree across layers and work end to end.
 
 **You output**

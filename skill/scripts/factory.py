@@ -771,13 +771,15 @@ def member_prompt(m, operator, cfg):
         where = (f"You work in your own git worktree, `{m['dir']}`, on branch `{m['branch']}`. The main checkout is"
                  f" `{cfg.root}`, on branch `{cfg.main_branch}`. Stay in your worktree and on your branch.")
         rules = [f"- Commit your work on `{m['branch']}` as you go, in small commits with clear messages. That is the"
-                 f" only branch you commit to. Never push, and never merge into or check out another branch:"
+                 " only branch you commit to. Stage only task files, never `git add -A` or `git add .`;"
+                 " harness sandboxes may expose unrelated placeholders. Never push, and never merge into or check out another branch:"
                  f" @{operator} reviews your branch and merges it. Before a new task, bring your branch up to date"
                  f" with `git merge {cfg.main_branch}`. If a commit fails (for example your sandbox blocks git),"
                  f" tell @{operator} or the teammate concerned and agree who commits it for you."]
     else:
         where = f"You work in `{cfg.root}`, the checkout you share with every teammate who has no worktree of their own."
-        rules = [f"- Never run `git commit`, `git merge` or `git push`; @{operator} commits."]
+        rules = ["- Do not stage files. Never run `git commit`, `git merge` or `git push`."
+                 f" @{operator} stages only task files and commits."]
     if m["readonly"]:
         rules.append("- You are read-only: do not edit the project's files. You may read anything, build and run"
                      f" tests. Write only scratch files outside the repo, or a document @{operator} asks you for.")
@@ -788,7 +790,7 @@ To reach {operator}, do not use herdr. Run this as a standalone command, your me
 ```bash
 {inbox_send} '<message>'
 ```
-It queues the message without typing into {operator}'s pane. `queued message N` means stored, not read: finish with `Report queued for {operator}`, not "sent". `not stored` prints a herdr command: run it once, exactly as printed. Any other failure: do not send the message again by any route; say so in your pane and stop. In Reports below, "keep it pending" and the `agent_blocked` retry apply to herdr messages only.
+It queues the message without typing into {operator}'s pane. `queued message N` means stored, not read. `not stored` prints a herdr command: run it once, exactly as printed. Any other failure: do not send the message again by any route; say so in your pane and stop.
 """
     text = text.replace("{teammates}", "teammates other than {operator}" if inbox else "teammates")
     text = text.replace("{to_operator}", to_operator)
@@ -1280,14 +1282,14 @@ def cmd_continue(args):
     if not ready:
         print("every member is running")
     team = Team(cfg)
-    pickup_text = (f"We are picking up where we left off. Re-read `{BRIEF}`, check the tracker it names"
-                   f", then tell @{operator} in one line what you were doing and what you will do next. Send it:"
+    pickup_text = ("We are picking up where we left off. Check the tracker the brief above names, then tell"
+                   f" @{operator} in one line what you were doing and what you will do next. Send it:"
                    f" `herdr agent prompt {operator} '[from @you]: ...'`. A reply in your own pane does not reach @{operator}.")
     if message_route(cfg) == "inbox":
         pickup_text = pickup_text.replace(f"Send it: `herdr agent prompt {operator} '[from @you]: ...'`.",
                                           "Send it with the inbox command in your standing instructions.")
-    fresh_text = (f"You are starting in a new session and know nothing of the work so far. Re-read `{BRIEF}`"
-                  f" and do not start anything yet: @{operator} will send your task, its criteria and the evidence"
+    fresh_text = ("You are starting in a new session and know nothing of the work so far. Do not start anything"
+                  f" yet: @{operator} will send your task, its criteria and the evidence"
                   " so far. No reply needed.")
     closing = {name: fresh_text if name in fresh else pickup_text for name in cfg.members}
     # With names, only those members are re-briefed. With none, every running member is re-briefed.

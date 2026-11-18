@@ -9,10 +9,14 @@ A note is one file, `<folder>/<UTC YYYYMMDD-HHMMSS>-<slug>.md`. If the name exis
 These add a `kind` field:
 
 - `observation`: something noticed during a task, provisional. A writing member adds it with its task's change.
-- `learning`: something reusable, non-obvious, verified and durable. Only the operator writes it, usually from a report that ends `learned: <what a later task would otherwise get wrong>`.
+- `learning`: something reusable, non-obvious, verified and durable. Only the operator writes it, usually from a report's `learned:` line (below).
 - `decision`: a decision already made by whoever had the authority, that outlives its task. Only the operator writes it, and the task record links to it.
 
 Read-only members and @pm put note text in their report instead of writing the file.
+
+### The learned: line of a report
+
+End a report with `learned: <what a later task would otherwise get wrong>` only for something non-obvious, verified and lasting that others can reuse; most reports have none. It is usually one of: a first attempt that end-to-end testing or QA proved wrong (an external system's or API's behaviour, an instruction that ran counter to what was assumed); a fix that needed a fact not in the code or docs (tool, harness, sandbox, environment); a workaround others will hit; a mistake caught in review that had happened before. Routine results, what the code or Git shows, and the user's rules and preferences are not learnings.
 
 ## Other folders: requested notes
 
