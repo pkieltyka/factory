@@ -1480,8 +1480,10 @@ class WaitTests(unittest.TestCase):
                         self.fail("watch did not return after message or inbox error")
                 args = types.SimpleNamespace(cwd=str(e.repo), names=[], seen=None, timeout=5, interval=0)
                 out, err = io.StringIO(), io.StringIO()
+                # Patch factory's binding: changing time.sleep also intercepts subprocess timeout polling.
                 with patch.dict(os.environ, e.env), patch.object(factory, "HERDR", e.env["HERDR_BIN"]), \
-                        patch.object(factory.time, "sleep", side_effect=after_poll), \
+                        patch.object(factory, "time", types.SimpleNamespace(monotonic=factory.time.monotonic,
+                                                                          sleep=after_poll)), \
                         contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
                     if event == "message":
                         factory.cmd_wait(args)
