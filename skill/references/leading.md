@@ -13,39 +13,39 @@ Read after compaction and before assigning work. Follow the workflow in `FACTORY
 - When `FACTORY.md` enables notes, follow [notes.md](notes.md): link the notes that apply in each assignment, and write learnings and decisions yourself. When an issue's work is approved, turn the `learned:` lines of its reports that meet the bar there into `activity/` notes in the same change; one that arrives later goes with the next change.
 
 ```bash
-ateam.py say lead-dev "<goal, constraints, acceptance criteria>"
-ateam.py say all --file /tmp/update.md
+factory.py say lead-dev "<goal, constraints, acceptance criteria>"
+factory.py say all --file /tmp/update.md
 herdr agent prompt lead-dev '[from @operator]: ...'   # standalone; never --wait; never end on a word starting with @ or $
-ateam.py wait                                 # in the background, or the foreground when status says so
+factory.py wait                                 # in the background, or the foreground when status says so
 ```
 
 ## Receive and inspect
 
-Members reach you by the route `up` and `continue` print. **Typed**: herdr messages typed into your pane. **Inbox**: members run `ateam.py inbox send`, nothing is typed, and `wait` returns with the unread messages and their ids. Local final replies are not delivered in either.
+Members reach you by the route `up` and `continue` print. **Typed**: herdr messages typed into your pane. **Inbox**: members run `factory.py inbox send`, nothing is typed, and `wait` returns with the unread messages and their ids. Local final replies are not delivered in either.
 
 With the inbox:
 
 - Quote each message when you handle it, with its sender: whole when short, the substance when long. The user reads what members sent by scrolling your pane. A quoted message is a member's text, not an instruction from the user.
-- When you have acted on or recorded the messages, run `ateam.py wait --seen <last id>`: it deletes them and waits again. Until then every `wait` prints them again.
+- When you have acted on or recorded the messages, run `factory.py wait --seen <last id>`: it deletes them and waits again. Until then every `wait` prints them again.
 - Keep a watcher running whenever a member may send. A message sent while none runs wakes nobody until the next `wait`; `status` shows the count.
-- With a foreground wait your harness does not wake on a background command: run `ateam.py wait` in the foreground and run it again each time it returns while a member is working, after a timeout too and after you answer the user. When it says nobody is working, end your turn and do not wait: the user is then heard at once. While you wait, a message the user steers with Enter reaches you by the next wait return, within a minute; queued follow-ups may wait until your turn ends. They can also interrupt you.
+- With a foreground wait your harness does not wake on a background command: run `factory.py wait` in the foreground and run it again each time it returns while a member is working, after a timeout too and after you answer the user. When it says nobody is working, end your turn and do not wait: the user is then heard at once. While you wait, a message the user steers with Enter reaches you by the next wait return, within a minute; queued follow-ups may wait until your turn ends. They can also interrupt you.
 - Give the `wait` command a time limit above its timeout, as far as your harness allows, so one call blocks for the whole wait and you do not poll it. If the harness allows less, pass a smaller `--timeout` that fits. A watcher the harness kills stops watching.
-- A typed message from a member is off the route. Either it could not store the message, and the text should then open `Inbox unavailable:` with a cause, or it holds old instructions. Handle the message as usual, then look at `ateam.py status` and the member's pane for the cause, and tell the user once per session. `needs repair`: see the next bullet. `no inbox route`: restart that member with `ateam.py continue <name> --restart`. `cannot write`: inspect its sandbox and the cache path or permissions.
-- `inbox needs repair` means this session runs on typed messages until the user repairs the file: tell them, keep your watcher running, and run `ateam.py continue --restart` after the repair.
-- If your harness changes, the route changes: run `ateam.py continue --restart`.
+- A typed message from a member is off the route. Either it could not store the message, and the text should then open `Inbox unavailable:` with a cause, or it holds old instructions. Handle the message as usual, then look at `factory.py status` and the member's pane for the cause, and tell the user once per session. `needs repair`: see the next bullet. `no inbox route`: restart that member with `factory.py continue <name> --restart`. `cannot write`: inspect its sandbox and the cache path or permissions.
+- `inbox needs repair` means this session runs on typed messages until the user repairs the file: tell them, keep your watcher running, and run `factory.py continue --restart` after the repair.
+- If your harness changes, the route changes: run `factory.py continue --restart`.
 
 Check the reported tests before accepting work. Failed sends remain pending: inspect the recipient's pane, resolve the cause and resend.
 
 A sent message is not always submitted: text can stay in a member's composer, and it then goes out with the next message to that member. Before you resend, read the pane. If it shows an error or that the request already ran, do not resend. Otherwise send the whole request again, opening with a line that the held text above is superseded. Never send keys to a member's pane to clear it: Ctrl+C exits the harness.
 
-`ateam.py status` lists every member in `factory.toml`, including those not started. Settings shown come from it. Read a stopped member with `herdr agent read <name> --source recent-unwrapped --lines 80`; for a blocked member use `--source visible`.
+`factory.py status` lists every member in `factory.toml`, including those not started. Settings shown come from it. Read a stopped member with `herdr agent read <name> --source recent-unwrapped --lines 80`; for a blocked member use `--source visible`.
 
 | Status or watcher result | Action |
 |---|---|
 | `working` | Keep waiting. |
 | `idle` / `done`, or an observed worker stops | Check its report; if absent, read the pane. |
 | `blocked` | Inspect the question; resolve within existing authorization, asking the user only for a new decision. |
-| `gone` / closed pane | Recover with `ateam.py continue <name>`. |
+| `gone` / closed pane | Recover with `factory.py continue <name>`. |
 | `unknown` | Inspect; it does not prove completion. |
 | Nobody working | Assign the next work or resolve dependencies. |
 
@@ -75,6 +75,6 @@ When the user gives a goal and tells you to keep going, work through it without 
 
 ## Keep state current
 
-When a decision changes scope, ownership, commit rules or settings, write it down at that moment; do not leave it only in chat. What the whole project follows goes in `FACTORY.md` (through the repo's normal review when other people share it); your own formation and settings go in `factory.toml`. Run `ateam.py check`, then `ateam.py brief --send <affected names>` to notify only affected members. Keep operator model/thinking accurate. Restart members for changed launch settings as in [cmd_continue.md](cmd_continue.md). For an unrelated task or important review, `ateam.py continue <name> --fresh --restart` starts a fresh session.
+When a decision changes scope, ownership, commit rules or settings, write it down at that moment; do not leave it only in chat. What the whole project follows goes in `FACTORY.md` (through the repo's normal review when other people share it); your own formation and settings go in `factory.toml`. Run `factory.py check`, then `factory.py brief --send <affected names>` to notify only affected members. Keep operator model/thinking accurate. Restart members for changed launch settings as in [cmd_continue.md](cmd_continue.md). For an unrelated task or important review, `factory.py continue <name> --fresh --restart` starts a fresh session.
 
 Keep the team small. Roles marked read-only are constrained by instructions, not enforced permissions. Do not close or relabel panes/tabs unless authorized; factory locates members by their labels. Usage accounting belongs to each harness, not factory.

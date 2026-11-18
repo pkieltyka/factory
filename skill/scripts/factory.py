@@ -6,7 +6,7 @@ A project has two files at its root. FACTORY.md is the brief every member reads:
 works; it is committed and shared. factory.toml is one person's formation: the operator, the members and their
 harnesses and models; it is not committed (factory.toml.sample is, as the project's suggestion). herdr holds the
 rest: a member's pane is labeled with its @name and its agent carries that name. Harnesses are described in
-harnesses.toml. `ateam.py --help` lists the commands.
+harnesses.toml. `factory.py --help` lists the commands.
 """
 import argparse
 import collections
@@ -34,14 +34,14 @@ TABLE = tomllib.loads((SKILL / "harnesses.toml").read_text())  # harness -> its 
 HARNESSES = tuple(TABLE)
 LEVELS = ("full", "guarded")
 PROBE_TIMEOUT = 60
-SETTLE = float(os.environ.get("ATEAM_SETTLE", 8))  # seconds a member may take to get past a start-up notice
+SETTLE = float(os.environ.get("FACTORY_SETTLE", 8))  # seconds a member may take to get past a start-up notice
 BRIEF = "FACTORY.md"              # the brief: shared and committed
 CONF = "factory.toml"             # one person's formation: not committed
 SAMPLE = "factory.toml.sample"    # the project's suggested formation: committed, copied to factory.toml by `init`
 OLD = {"TEAM.md": BRIEF, "team.toml": CONF, "team.toml.sample": SAMPLE}
 LEGACY = "team-brief.md"       # the single file of earlier versions: found only to say how to split it
 OPERATOR = "operator"  # the operator's @name, unless `[operator] name` in factory.toml says otherwise
-TABS = {"operator": "a-team operator", "team": "a-team workers"}  # herdr tab labels
+TABS = {"operator": "factory operator", "team": "factory team"}  # herdr tab labels
 
 
 class Problem(Exception):
@@ -80,7 +80,7 @@ def refuse_old_names(root):
     message = (f"{root} holds files under their earlier names (a-team is now factory); nothing was written."
                " Rename them:\n" + "\n".join(
                    "  " + shlex.join(["mv", str(root / old), str(root / new)]) for old, new in pending)
-               + f"\nThen run `ateam.py init`: it adds {CONF} to .gitignore."
+               + f"\nThen run `factory.py init`: it adds {CONF} to .gitignore."
                " Remove the team.toml line there and commit the renames.")
     if any(old == "TEAM.md" for old, _ in pending):
         message += ("\nIf TEAM.md is another document, leave it and run instead: "
@@ -97,7 +97,7 @@ def refuse_legacy(root):
                          f"  1. Move the settings between its +++ lines to {CONF}.\n"
                          f"  2. In {CONF}, rename [lead] or [orchestrator] to [operator] and remove `tracker`.\n"
                          f"  3. Move the prose to {BRIEF}, and say there where tasks are tracked.\n"
-                         f"  4. Delete {LEGACY}, add {CONF} to .gitignore, and run `ateam.py check`.")
+                         f"  4. Delete {LEGACY}, add {CONF} to .gitignore, and run `factory.py check`.")
 
 
 def parse_role(path):
@@ -126,7 +126,7 @@ class Config:
             refuse_old_names(self.root)
             refuse_legacy(self.root)
             raise SystemExit(f"no {' or '.join(missing)} in {self.root} or above. Run `/factory setup`, or"
-                             f" `ateam.py init`, which writes what is missing and copies the project's {SAMPLE} to"
+                             f" `factory.py init`, which writes what is missing and copies the project's {SAMPLE} to"
                              f" {CONF} if there is one.")
         try:
             self.team = tomllib.loads(self.conf_file.read_text()) if self.conf_file.is_file() else {}
@@ -173,8 +173,10 @@ class Config:
     def cache(self):
         """Per-repo scratch outside the repo: members' prompt files and the sessions `continue` resumes from.
         The path is short on purpose: it is typed into a shell line that macOS limits to 1024 bytes."""
-        base = pathlib.Path(os.environ.get("XDG_CACHE_HOME") or pathlib.Path.home() / ".cache") / "a-team"
-        return base / f"{self.root.name[:24]}-{hashlib.sha1(str(self.root).encode()).hexdigest()[:8]}"
+        base = pathlib.Path(os.environ.get("XDG_CACHE_HOME") or pathlib.Path.home() / ".cache")
+        key = f"{self.root.name[:24]}-{hashlib.sha1(str(self.root).encode()).hexdigest()[:8]}"
+        old = base / "a-team" / key  # a project that ran under a-team keeps its sessions and unread messages here
+        return old if old.is_dir() else base / "factory-skill" / key
 
     @property
     def worktree_dir(self):
@@ -216,13 +218,13 @@ def run_probe(argv, env=None):
                            env={**os.environ, **(env or {})})
     except (OSError, subprocess.TimeoutExpired) as e:
         raise Problem(f"`{' '.join(argv[:3])}` failed: {e}",
-                      "Run ateam.py outside any sandbox, or check that the harness starts on its own.")
+                      "Run factory.py outside any sandbox, or check that the harness starts on its own.")
     if p.returncode != 0:
         err = [l.strip() for l in (p.stderr.strip() or p.stdout.strip()).splitlines() if l.strip()]
         named = [l for l in err if re.match(r"(error|\w*Error)\b", l, re.I)]  # skip stack frames
         tail = (named or err or [f"exit {p.returncode}"])[0][:300]
         raise Problem(f"`{' '.join(argv[:3])}` failed: {tail}",
-                      "If a sandbox blocks it (read-only file system), run ateam.py outside the sandbox.")
+                      "If a sandbox blocks it (read-only file system), run factory.py outside the sandbox.")
     return p.stdout
 
 
@@ -267,7 +269,7 @@ def resolve_listed(model, listed, harness):
                " ~/.omp/agent/models.yml.",
         "opencode": "Connect a provider that serves it in OpenCode (`/connect` in the TUI, or providers in opencode.json).",
     }.get(harness, "")
-    raise Problem(f"{harness} has no model {base} configured", fix + " `ateam.py harnesses` lists what it can use.")
+    raise Problem(f"{harness} has no model {base} configured", fix + " `factory.py harnesses` lists what it can use.")
 
 
 
@@ -275,7 +277,7 @@ def resolve_listed(model, listed, harness):
 class InboxDamage(ValueError):
     def __init__(self, path, line, reason):
         super().__init__(f"inbox needs repair: {path}, line {line}: {reason}. This session runs on typed messages."
-                         " After repairing the file, run ateam.py continue --restart.")
+                         " After repairing the file, run factory.py continue --restart.")
 
 
 class Inbox:
@@ -425,7 +427,7 @@ def configure_messages(cfg, team, operator, restart=()):
                 inbox.remove_seen()
                 if inbox.unread:
                     print(f"{len(inbox.unread)} unread message{'s' if len(inbox.unread) != 1 else ''}"
-                          " from the earlier team; ateam.py wait prints them")
+                          " from the earlier team; factory.py wait prints them")
                 else:
                     inbox.path.unlink(missing_ok=True)
                     inbox.state_path.unlink(missing_ok=True)
@@ -436,18 +438,18 @@ def configure_messages(cfg, team, operator, restart=()):
     except (InboxDamage, OSError) as e:
         print(str(e) if isinstance(e, InboxDamage) else
               f"inbox unavailable: {str(e).rstrip('.')}. This session runs on typed messages."
-              " After fixing it, run ateam.py continue --restart.")
+              " After fixing it, run factory.py continue --restart.")
         mode, previous = "typed", "typed"
         cfg.inbox_unavailable = True  # Later rendering in this invocation must not reselect the stored route.
     if mode == "inbox":
         wait = operator_wait(cfg, mode)
         action = ("in the background, it wakes you with their messages" if wait == "background" else
                   "in the foreground, and again each time it returns while a member works")
-        print(f"members reach @{operator} through the inbox (ateam.py inbox send); run ateam.py wait {action}")
+        print(f"members reach @{operator} through the inbox (factory.py inbox send); run factory.py wait {action}")
     else:
         print(f"members reach @{operator} by typed herdr messages" + (": " + reason if reason else ""))
     if mode != previous and any(team.live(n) and n not in restart for n in cfg.members):
-        print(f"the route to @{operator} changed to {mode}: run ateam.py continue --restart so running members get it")
+        print(f"the route to @{operator} changed to {mode}: run factory.py continue --restart so running members get it")
 
 
 def cmd_inbox_send(args):
@@ -467,7 +469,7 @@ def cmd_inbox_send(args):
         with Inbox(cfg) as inbox:
             if inbox.state["mode"] != "inbox":
                 raise ValueError("the operator takes typed messages in this session; this member has inbox instructions,"
-                                 f" restart it with ateam.py continue {args.sender} --restart")
+                                 f" restart it with factory.py continue {args.sender} --restart")
             inbox.remove_seen()
             row = {"id": inbox.highest + 1, "at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                    "from": args.sender, "text": text}
@@ -580,7 +582,7 @@ class Checker:
         if not shutil.which(harness):
             raise Problem(f"{harness} is not installed (not on PATH)", TABLE[harness]["install"])
         if not model:
-            raise Problem("no model set", f"Set `model` for this member in {CONF}; `ateam.py harnesses` lists"
+            raise Problem("no model set", f"Set `model` for this member in {CONF}; `factory.py harnesses` lists"
                                           " what this machine can use.")
         never = TABLE[harness].get("never", [])
         if thinking in never:
@@ -598,6 +600,10 @@ class Checker:
 
 def check_all(cfg, plans):
     """-> (ready members, [(member, Problem)])."""
+    cache = cfg.cache
+    newer = cache.parent.parent / "factory-skill" / cache.name
+    if cache.parent.name == "a-team" and newer.is_dir():
+        print(f"note: {newer} is not used while {cache} exists.", file=sys.stderr)
     if (cfg.root / LEGACY).is_file():
         print(f"note: {cfg.root / LEGACY} is no longer read; {BRIEF} and {CONF} replace it. Delete it.", file=sys.stderr)
     for old in ("team.toml", "team.toml.sample"):
@@ -675,7 +681,7 @@ def claude_settings(level, inbox=False):
     skips the warning Claude Code shows the first time it starts in bypassPermissions mode."""
     sandbox = {"excludedCommands": ["herdr agent prompt *", "herdr agent list"]}
     if inbox:
-        sandbox["excludedCommands"].append(shlex.join(["python3", str(SKILL / "scripts/ateam.py"), "inbox", "send"]) + " *")
+        sandbox["excludedCommands"].append(shlex.join(["python3", str(SKILL / "scripts/factory.py"), "inbox", "send"]) + " *")
     if level == "full":
         sock = os.environ.get("HERDR_SOCKET_PATH")
         sandbox["network"] = {"allowUnixSockets": [sock]} if sys.platform == "darwin" and sock else {"allowAllUnixSockets": True}
@@ -818,7 +824,7 @@ It queues the message without typing into {operator}'s pane. `queued message N` 
 """
     text = text.replace("{teammates}", "teammates other than {operator}" if inbox else "teammates")
     text = text.replace("{to_operator}", to_operator)
-    text = text.replace("{inbox_send}", shlex.join(["python3", str(SKILL / "scripts/ateam.py"), "inbox", "send",
+    text = text.replace("{inbox_send}", shlex.join(["python3", str(SKILL / "scripts/factory.py"), "inbox", "send",
                                                    "--cwd", str(cfg.root), "--from", m["name"]]))
     for key, value in {"role_rules": cfg.roles[m["role"]][1], "name": m["name"], "role": m["role"], "operator": f"@{operator}",
                        "brief": str(cfg.brief_file), "where": where, "rules": "\n".join(rules),
@@ -953,7 +959,7 @@ def ensure_operator(cfg, tab=False):
     if "error" in got and "not_found" not in got["error"]:  # herdr itself failed: say that, not "no agent"
         raise SystemExit(f"herdr agent get {pane}: {got['error']}")
     if not info:
-        raise SystemExit(f"herdr sees no agent in this pane ({pane}). Run ateam.py from the operator's pane.")
+        raise SystemExit(f"herdr sees no agent in this pane ({pane}). Run factory.py from the operator's pane.")
     name = cfg.operator["name"]
     if info.get("name") != name:
         clash = [a for a in herdr("agent", "list").get("agents", []) if a.get("name") == name]
@@ -1094,12 +1100,12 @@ def report_failed(failed, team, undelivered=()):
         if team.live(name):
             print(f"@{name} started but is waiting on a dialog: {err}. Read its pane (herdr agent read {name}"
                   f" --source visible), tell the user what it asks, and once it is answered run:"
-                  f" ateam.py brief --send {name}")
+                  f" factory.py brief --send {name}")
         else:
-            print(f"@{name} did not come up: {err}. Read the pane, fix the cause, then run: ateam.py up {name}")
+            print(f"@{name} did not come up: {err}. Read the pane, fix the cause, then run: factory.py up {name}")
     if undelivered:
         print(f"The team brief did not reach {', '.join('@' + n for n in undelivered)}. Once they can take a message,"
-              f" run: ateam.py brief --send {' '.join(undelivered)}")
+              f" run: factory.py brief --send {' '.join(undelivered)}")
     if failed or undelivered:
         sys.exit(3)
 
@@ -1186,7 +1192,7 @@ def cmd_init(args):
     tracked = git("ls-files", "--error-unmatch", CONF)
     if tracked and tracked.returncode == 0:
         print(f"note: git already tracks {CONF}, and .gitignore does not change that. `git rm --cached {CONF}` stops it.")
-    print(f"Edit {BRIEF} (project, workflow, where tasks are tracked) and {CONF} (your members), then run `ateam.py check`.")
+    print(f"Edit {BRIEF} (project, workflow, where tasks are tracked) and {CONF} (your members), then run `factory.py check`.")
 
 
 def cmd_harnesses(args):
@@ -1253,7 +1259,7 @@ def cmd_up(args):
             started.append(m)
     team, undelivered = Team(cfg), {}
     if started and args.no_brief:
-        print("next: ateam.py brief --send")
+        print("next: factory.py brief --send")
     elif started:
         new = {m["name"] for m in started}
         undelivered = send_brief(cfg, team, operator, names=new)
@@ -1274,7 +1280,7 @@ def cmd_continue(args):
     if not names:
         names = list(cfg.members)
         if not names:
-            raise SystemExit(f"no members in {CONF}; add one, then run `ateam.py up`")
+            raise SystemExit(f"no members in {CONF}; add one, then run `factory.py up`")
         print(f"no member panes in this herdr session: continuing every member in {CONF}")
         if os.environ.get("HERDR_TAB_ID"):
             herdr("tab", "rename", os.environ["HERDR_TAB_ID"], TABS["operator"], check=False)
@@ -1282,7 +1288,7 @@ def cmd_continue(args):
         missing = [n for n in cfg.members if n not in names]
         if missing:
             print(f"no pane, not continued: {', '.join('@' + n for n in missing)}."
-                  f" To bring them back: ateam.py continue {' '.join(missing)}")
+                  f" To bring them back: factory.py continue {' '.join(missing)}")
     unknown = [n for n in names if n not in cfg.members]
     if unknown:
         raise SystemExit(f"not in {CONF}: {', '.join(unknown)}")
@@ -1300,7 +1306,7 @@ def cmd_continue(args):
             print(f"@{m['name']} has no pane any more; it gets a new one")
         err = launch(cfg, team, m, operator, args.timeout, resume=resume)
         if err:
-            failed[m["name"]] = err + (f". If its session cannot be resumed, run: ateam.py continue {m['name']} --fresh"
+            failed[m["name"]] = err + (f". If its session cannot be resumed, run: factory.py continue {m['name']} --fresh"
                                        if resume else "")
         elif not resume:
             fresh.append(m["name"])
@@ -1343,20 +1349,20 @@ def cmd_status(args):
     try:
         with Inbox(cfg) as inbox:
             suffix = (f"; {len(inbox.unread)} unread message{'s' if len(inbox.unread) != 1 else ''}"
-                      " (ateam.py wait prints them)") if inbox.unread else ""
+                      " (factory.py wait prints them)") if inbox.unread else ""
             if inbox.state["mode"] == "inbox":
                 suffix = f", {operator_wait(cfg, 'inbox')} wait" + suffix
             print(f"operator messages: {inbox.state['mode']}{suffix}")
     except (OSError, ValueError) as e:
         print(f"inbox unavailable: {e}" if isinstance(e, OSError) else str(e))
     for state, hint in (("blocked", "blocked: waiting on an approval or a question. Read the pane and ask the user."),
-                        ("gone", "gone: `ateam.py continue` brings them back in their panes and sessions.")):
+                        ("gone", "gone: `factory.py continue` brings them back in their panes and sessions.")):
         hit = [r[0] for r in rows[2:] if state in r[5]]
         if hit:
             print(f"\n{', '.join(hit)} {hint}")
     if not any(team.pane(n) for n in cfg.members):
-        print(f"\nNo member of {CONF} has a pane in this herdr session. A team that ran before: `ateam.py continue`."
-              " A new team: `ateam.py check`, then `ateam.py up`.")
+        print(f"\nNo member of {CONF} has a pane in this herdr session. A team that ran before: `factory.py continue`."
+              " A new team: `factory.py check`, then `factory.py up`.")
 
 
 def cmd_wait(args):
@@ -1385,7 +1391,7 @@ def cmd_wait(args):
                     print("\n".join("    " + line for line in row["text"].splitlines()))
                 print(f"{len(unread)} unread message{'s' if len(unread) != 1 else ''}."
                       " After you have acted on or recorded these messages:"
-                      f" ateam.py wait --seen {unread[-1]['id']}")
+                      f" factory.py wait --seen {unread[-1]['id']}")
                 return
         except (OSError, ValueError) as e:
             if args.seen is not None:
@@ -1418,10 +1424,10 @@ def cmd_wait(args):
         worked.update(working)
         time.sleep(args.interval)
     for n in closed:
-        print(f"@{n}'s pane was closed, so it is no longer running. `ateam.py continue {n}` gives it a new pane.")
+        print(f"@{n}'s pane was closed, so it is no longer running. `factory.py continue {n}` gives it a new pane.")
     for n in needs:
         if state[n] == "gone":
-            print(f"@{n} is gone: its agent exited. `ateam.py continue {n}` brings it back.")
+            print(f"@{n} is gone: its agent exited. `factory.py continue {n}` brings it back.")
             continue
         print(f"@{n} is {state[n]}: it needs an answer. Its pane ends:")
         # herdr cannot scroll a blocked agent's history, so read what is on its screen
@@ -1434,7 +1440,7 @@ def cmd_wait(args):
         print(f"@{n} stopped ({state[n]}). If it sent no report, read its pane:"
               f" herdr agent read {n} --source recent-unwrapped --lines 80")
     if not (closed or needs or unclear or stopped):
-        hint = ". End your turn; run ateam.py wait again after you assign work." if wait == "foreground" else ""
+        hint = ". End your turn; run factory.py wait again after you assign work." if wait == "foreground" else ""
         print(f"nobody is working: {', '.join('@' + n + ' ' + s for n, s in state.items())}{hint}")
 
 

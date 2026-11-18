@@ -1,8 +1,8 @@
-"""Tests for ateam.py with a fake `herdr` and fake harness binaries; nothing real is launched.
+"""Tests for factory.py with a fake `herdr` and fake harness binaries; nothing real is launched.
 
 Two test classes touch real tools and skip when they cannot: HerdrContract reads the installed herdr's API
-schema, and LiveFlags (ATEAM_LIVE=1, outside any sandbox) greps each installed harness's --help for the
-flags ateam.py passes."""
+schema, and LiveFlags (FACTORY_LIVE=1, outside any sandbox) greps each installed harness's --help for the
+flags factory.py passes."""
 import importlib.util
 import contextlib
 import io
@@ -20,14 +20,14 @@ import types
 import unittest
 from unittest.mock import patch
 
-SCRIPT = pathlib.Path(__file__).resolve().parent.parent / "skill/scripts/ateam.py"
-spec = importlib.util.spec_from_file_location("ateam", SCRIPT)
-ateam = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(ateam)
+SCRIPT = pathlib.Path(__file__).resolve().parent.parent / "skill/scripts/factory.py"
+spec = importlib.util.spec_from_file_location("factory", SCRIPT)
+factory = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(factory)
 os.environ["LOGNAME"] = "ada"  # whose team the tests run as: the first part of worktree branches
 # Fixtures are written as `+++ settings +++ prose`; Env.write_brief puts them on disk as factory.toml and FACTORY.md.
-TEMPLATE = ("+++\n" + (ateam.SKILL / "templates/factory.toml").read_text().strip() + "\n+++\n"
-            + (ateam.SKILL / "templates/FACTORY.md").read_text())
+TEMPLATE = ("+++\n" + (factory.SKILL / "templates/factory.toml").read_text().strip() + "\n+++\n"
+            + (factory.SKILL / "templates/FACTORY.md").read_text())
 GIT = shutil.which("git")
 
 FAKE_HERDR = textwrap.dedent(r'''
@@ -256,7 +256,7 @@ class Env:
         self.env = {**os.environ, "HERDR_BIN": str(bin_ / "herdr"), "FAKE_HERDR": str(self.fake),
                     "HERDR_ENV": "1", "HERDR_PANE_ID": "w1:p1", "HERDR_TAB_ID": "w1:t1", "HERDR_WORKSPACE_ID": "w1",
                     "PATH": str(bin_), "HOME": str(self.home), "XDG_CACHE_HOME": str(self.root / "cache"),
-                    "FAKE_MODELS": models, "ATEAM_SETTLE": "0.2"}
+                    "FAKE_MODELS": models, "FACTORY_SETTLE": "0.2"}
         self.env.pop("CODEX_HOME", None)
         if git:  # a real repo with one commit, for worktrees
             (bin_ / "git").symlink_to(GIT)
@@ -344,11 +344,11 @@ def kind(call):
 class UpTests(unittest.TestCase):
     def test_ui_team_launches_in_the_team_tab_and_is_briefed(self):
         with Env(UI) as e:
-            self.assertEqual(ateam.Config(e.repo).operator["name"], "operator")  # the default name
+            self.assertEqual(factory.Config(e.repo).operator["name"], "operator")  # the default name
             e.run("up", cwd=e.repo / "sub")  # the team's files are found from a subdirectory too
             fs = e.fake_state()
             self.assertEqual((fs["panes"]["w1:p1"]["name"], fs["panes"]["w1:p1"]["label"]), ("operator", "operator"))
-            self.assertEqual(fs["tabs"], {"w1:t1": "a-team operator", "w1:t2": "a-team workers"})  # the operator's tab, and one for the team
+            self.assertEqual(fs["tabs"], {"w1:t1": "factory operator", "w1:t2": "factory team"})  # the operator's tab, and one for the team
             tab = e.calls("tab", "create")
             self.assertEqual(len(tab), 1)
             self.assertEqual((flag(tab[0], "--cwd"), flag(tab[0], "--workspace")), (str(e.repo), "w1"))
@@ -362,7 +362,7 @@ class UpTests(unittest.TestCase):
             starts = e.starts()
             self.assertEqual({n: kind(c) for n, c in starts.items()},
                              {"lead-dev": "codex", "frontend-dev": "claude", "reviewer": "codex", "pm": "pi"})
-            cache = e.root / "cache/a-team"
+            cache = e.root / "cache/factory-skill"
             for name in ("lead-dev", "reviewer"):  # Codex: never stops to ask, never hard read-only
                 argv = native(starts[name])
                 self.assertEqual(flag(argv, "-m"), {"lead-dev": "gpt-6-astra", "reviewer": "gpt-6-luna"}[name])
@@ -414,13 +414,13 @@ class UpTests(unittest.TestCase):
         # herdr types `<harness> <argv>` into the pane's shell, and macOS limits that line to 1024 bytes.
         deep = "/Users/someone/Development/some-organization/a-rather-long-repository-name-for-a-project"
         with Env() as e:
-            cfg = ateam.Config(e.repo)
+            cfg = factory.Config(e.repo)
             cfg.root = pathlib.Path(deep)
             resume = {"agent": "codex", "kind": "id", "value": "01a1cbc6-e708-7623-986f-cc2e07efa28f"}
             for name in cfg.members:
-                m = {**ateam.plan(cfg, name), "permissions": "full", "branch": "ada/" + name}
+                m = {**factory.plan(cfg, name), "permissions": "full", "branch": "ada/" + name}
                 m["model"] = "openrouter/" + m["model"] if m["harness"] == "pi" else m["model"]
-                argv, _ = ateam.launch_argv(m, pathlib.Path("/Users/someone/.cache/a-team") / cfg.cache.name / f"{name}.md", resume)
+                argv, _ = factory.launch_argv(m, pathlib.Path("/Users/someone/.cache/factory-skill") / cfg.cache.name / f"{name}.md", resume)
                 self.assertLess(len(shlex.join([m["harness"], *argv]).encode("utf-8")), 900, name)
 
     def test_failed_check_launches_nothing_and_explains_the_fix(self):
@@ -447,9 +447,9 @@ class UpTests(unittest.TestCase):
             self.assertIn("started @lead-dev", p.stdout)  # a question the harness table knows is answered
             self.assertEqual([c[3:] for c in e.calls("pane", "send-keys")], [["enter"]])
             self.assertIn("@frontend-dev did not come up: timeout: agent did not appear", p.stdout)  # herdr's reason is shown
-            self.assertIn("ateam.py up frontend-dev", p.stdout)
+            self.assertIn("factory.py up frontend-dev", p.stdout)
             self.assertIn("@pm started but is waiting on a dialog: agent_not_ready", p.stdout)
-            self.assertIn("ateam.py brief --send pm", p.stdout)
+            self.assertIn("factory.py brief --send pm", p.stdout)
             self.assertEqual(sorted(e.starts()), ["frontend-dev", "lead-dev", "pm", "reviewer"])  # it went on past both
             self.assertEqual({n for n, _ in e.prompts()}, {"lead-dev", "reviewer"})  # only those that came up were briefed
 
@@ -590,18 +590,18 @@ class UpTests(unittest.TestCase):
     def test_claude_socket_settings_follow_platform_and_permission_level(self):
         for platform in ("linux", "darwin"):
             for socket_path in ("", "/tmp/test-herdr.sock"):
-                with self.subTest(platform=platform, socket=socket_path), patch.object(ateam.sys, "platform", platform), \
+                with self.subTest(platform=platform, socket=socket_path), patch.object(factory.sys, "platform", platform), \
                         patch.dict(os.environ, {"HERDR_SOCKET_PATH": socket_path}):
-                    full = json.loads(ateam.claude_settings("full"))["sandbox"]
+                    full = json.loads(factory.claude_settings("full"))["sandbox"]
                     expected = {"allowUnixSockets": [socket_path]} if platform == "darwin" and socket_path else {"allowAllUnixSockets": True}
                     self.assertEqual(full["network"], expected)
-                    self.assertNotIn("network", json.loads(ateam.claude_settings("guarded"))["sandbox"])
+                    self.assertNotIn("network", json.loads(factory.claude_settings("guarded"))["sandbox"])
 
     def test_new_members_never_rename_existing_members(self):
         with Env() as e:
             e.run("up", "backend-dev", "pm", "--no-brief")
             first = e.pane_of("backend-dev")
-            original_settings = ateam.Config(e.repo).members["backend-dev"]
+            original_settings = factory.Config(e.repo).members["backend-dev"]
             original_prompt = pathlib.Path(flag(native(e.starts()["backend-dev"]), "--append-system-prompt"))
             original_text = original_prompt.read_text()
             for number in (2, 3):
@@ -613,12 +613,12 @@ class UpTests(unittest.TestCase):
                 original_brief = (e.repo / "factory.toml").read_bytes()
                 self.assertIn(f"started @{name}", e.run("up", name).stdout)
                 self.assertEqual((e.repo / "factory.toml").read_bytes(), original_brief)
-                self.assertEqual(ateam.Config(e.repo).members["backend-dev"], original_settings)
+                self.assertEqual(factory.Config(e.repo).members["backend-dev"], original_settings)
                 self.assertEqual({k: e.pane_of("backend-dev")[k] for k in ("pane_id", "name", "label", "cwd")},
                                  {k: first[k] for k in ("pane_id", "name", "label", "cwd")})
                 self.assertEqual(original_prompt.read_text(), original_text)
             self.assertEqual(e.calls("agent", "rename"), [["agent", "rename", "w1:p1", "operator"]])
-            self.assertNotIn("backend-dev-1", ateam.Config(e.repo).members)
+            self.assertNotIn("backend-dev-1", factory.Config(e.repo).members)
 
     def test_existing_member_settings_only_come_from_the_brief(self):
         with Env(git=True) as e:
@@ -635,11 +635,11 @@ class UpTests(unittest.TestCase):
         with Env() as e:
             p = e.run("up", "lead-dev", check=False, FAKE_PROMPT_FAIL="lead-dev")
             self.assertEqual(p.returncode, 3)
-            self.assertIn("ateam.py brief --send lead-dev", p.stdout)
+            self.assertIn("factory.py brief --send lead-dev", p.stdout)
             e.kill("lead-dev")
             p = e.run("continue", "lead-dev", check=False, FAKE_PROMPT_FAIL="lead-dev")
             self.assertEqual(p.returncode, 3)
-            self.assertIn("ateam.py brief --send lead-dev", p.stdout)
+            self.assertIn("factory.py brief --send lead-dev", p.stdout)
             self.assertEqual(e.run("brief", "--send", "lead-dev").returncode, 0)
 
     def test_say_reports_who_did_not_get_the_message(self):
@@ -693,8 +693,8 @@ class UpTests(unittest.TestCase):
             status = e.run("status").stdout
             self.assertEqual(status.count("not started"), len(CATALOG_MEMBERS) + 1)
             self.assertIn("No member of factory.toml has a pane in this herdr session. "
-                          "A team that ran before: `ateam.py continue`. "
-                          "A new team: `ateam.py check`, then `ateam.py up`.", status)
+                          "A team that ran before: `factory.py continue`. "
+                          "A new team: `factory.py check`, then `factory.py up`.", status)
             for command in ("cost", "show"):
                 self.assertEqual(e.run(command, check=False).returncode, 2)
             for option in ("--dry-run", "--trust-models", "--effort"):
@@ -759,7 +759,7 @@ class WorktreeTests(unittest.TestCase):
         }}), git=True) as e:
             e.run("up", "reviewer-2", "--no-brief")  # the existing reviewer keeps its name
             self.assertTrue((e.root / "repo.worktrees/ada-reviewer-2").is_dir())
-            self.assertIs(ateam.Config(e.repo).members["reviewer-2"]["worktree"], True)
+            self.assertIs(factory.Config(e.repo).members["reviewer-2"]["worktree"], True)
         with Env(team_brief(self.BRIEF)) as e:  # not a git repository
             p = e.run("up", "backend-dev", check=False)
             self.assertEqual(p.returncode, 2)
@@ -871,7 +871,7 @@ class WorktreeTests(unittest.TestCase):
 
 class InboxTests(unittest.TestCase):
     def prepare(self, e, mode="inbox"):
-        with patch.dict(os.environ, e.env), ateam.Inbox(ateam.Config(e.repo)) as inbox:
+        with patch.dict(os.environ, e.env), factory.Inbox(factory.Config(e.repo)) as inbox:
             inbox.state["mode"] = mode
             inbox.save_state()
             return inbox
@@ -884,7 +884,7 @@ class InboxTests(unittest.TestCase):
         out, err = io.StringIO(), io.StringIO()
         with patch.dict(os.environ, e.env), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             try:
-                ateam.cmd_inbox_send(args)
+                factory.cmd_inbox_send(args)
                 code = 0
             except SystemExit as ex:
                 code = ex.code
@@ -919,7 +919,7 @@ class InboxTests(unittest.TestCase):
             self.assertIn(f"Bash({prefix})", settings["permissions"]["allow"])
             codex = starts["lead-dev"]
             with patch.dict(os.environ, e.env):
-                cache = str(ateam.Config(e.repo).cache)
+                cache = str(factory.Config(e.repo).cache)
             self.assertEqual(codex[codex.index("--add-dir") + 1], cache)
             self.assertIn("Message teammates only", e.run("prompt", "lead-dev", HERDR_ENV="").stdout)
 
@@ -946,7 +946,7 @@ class InboxTests(unittest.TestCase):
             self.assertNotIn("route to @operator changed", e.run("continue", "--restart").stdout)
             e.write_brief(formation({"lead-dev": CATALOG_MEMBERS["lead-dev"]}, operator={"harness": "unknown"}))
             self.assertIn("[operator] harness 'unknown' is not one of", e.run("check", check=False).stderr)
-        self.assertNotIn("inbox", ateam.claude_settings("guarded"))
+        self.assertNotIn("inbox", factory.claude_settings("guarded"))
 
     def test_operator_messages_opt_out(self):
         members = {"lead-dev": {**CATALOG_MEMBERS["lead-dev"], "permissions": "guarded"},
@@ -964,7 +964,7 @@ class InboxTests(unittest.TestCase):
                 self.assertNotIn("--add-dir", starts["lead-dev"])
                 self.assertNotIn("inbox send", " ".join(starts["architect"]))
                 with patch.dict(os.environ, e.env):
-                    with ateam.Inbox(ateam.Config(e.repo)) as inbox:
+                    with factory.Inbox(factory.Config(e.repo)) as inbox:
                         self.assertEqual(inbox.state["mode"], "typed")
                 for name in members:
                     e.update(name, agent_status="done")
@@ -978,7 +978,7 @@ class InboxTests(unittest.TestCase):
                 self.assertEqual(explicit, e.run("prompt", "lead-dev").stdout)
                 self.send(e, "pending before opt-out")
                 with patch.dict(os.environ, e.env):
-                    path = ateam.Inbox(ateam.Config(e.repo)).path
+                    path = factory.Inbox(factory.Config(e.repo)).path
                 pending = path.read_bytes()
                 e.write_brief(formation(members, operator={"harness": harness, "messages": "typed"}))
                 self.assertIn("route to @operator changed to typed", e.run("continue").stdout)
@@ -997,12 +997,12 @@ class InboxTests(unittest.TestCase):
         def timeout(e, expected, explicit=None):
             args = types.SimpleNamespace(cwd=str(e.repo), names=[], seen=None, timeout=explicit, interval=0)
             out = io.StringIO()
-            with patch.dict(os.environ, e.env), patch.object(ateam, "Team") as team, \
-                    patch.object(ateam.time, "monotonic", side_effect=[0, 10000]), contextlib.redirect_stdout(out):
+            with patch.dict(os.environ, e.env), patch.object(factory, "Team") as team, \
+                    patch.object(factory.time, "monotonic", side_effect=[0, 10000]), contextlib.redirect_stdout(out):
                 team.return_value.pane.return_value = {"pane_id": "fake"}
                 team.return_value.status.return_value = "working"
                 with self.assertRaises(SystemExit) as ex:
-                    ateam.cmd_wait(args)
+                    factory.cmd_wait(args)
             self.assertEqual(ex.exception.code, 4)
             self.assertIn(f"timeout after {expected}s", out.getvalue())
 
@@ -1013,7 +1013,7 @@ class InboxTests(unittest.TestCase):
                 e.update(None, agent=harness)  # up has not named the operator pane yet.
                 for command in ("up", "continue"):
                     output = e.run(command).stdout
-                    self.assertIn(f"run ateam.py wait in the {mode}", output)
+                    self.assertIn(f"run factory.py wait in the {mode}", output)
                 self.assertIn(f"operator messages: inbox, {mode} wait", e.run("status").stdout)
                 self.assertIn("queued message N", e.run("prompt", "lead-dev").stdout)
                 e.update("lead-dev", agent_status="done")
@@ -1031,7 +1031,7 @@ class InboxTests(unittest.TestCase):
         with Env() as e:
             self.prepare(e)
             timeout(e, 1800)  # No configured operator harness, even with a saved inbox route.
-        with patch.dict(ateam.TABLE, {"future-harness": {}}), \
+        with patch.dict(factory.TABLE, {"future-harness": {}}), \
                 Env(formation({"lead-dev": CATALOG_MEMBERS["lead-dev"]},
                               operator={"harness": "future-harness"})) as e:
             self.prepare(e)
@@ -1044,9 +1044,9 @@ class InboxTests(unittest.TestCase):
                            operator={"harness": "claude"}), git=True) as e:
             e.run("up")
             with patch.dict(os.environ, e.env):
-                cfg = ateam.Config(e.repo)
-                worktree = ateam.plan(cfg, "lead-dev")["dir"]
-                inbox = ateam.Inbox(cfg)
+                cfg = factory.Config(e.repo)
+                worktree = factory.plan(cfg, "lead-dev")["dir"]
+                inbox = factory.Inbox(cfg)
             command = [sys.executable, str(SCRIPT), "inbox", "send", "--cwd", str(e.repo), "--from", "lead-dev", "hi"]
             calls = e.calls()
             for i in (1, 2):
@@ -1132,7 +1132,7 @@ class InboxTests(unittest.TestCase):
                 if state in ("damage", "symlink"):
                     self.assertIn(str(inbox.path), reason)
                 else:
-                    self.assertIn("restart it with ateam.py continue lead-dev --restart", reason)
+                    self.assertIn("restart it with factory.py continue lead-dev --restart", reason)
                 if state == "damage":
                     self.assertEqual(inbox.path.read_text(), '{"torn":')
                 if state == "symlink":
@@ -1140,14 +1140,14 @@ class InboxTests(unittest.TestCase):
             self.assertEqual(e.calls(), [])
         with Env() as e:
             self.prepare(e)
-            with patch.object(ateam.Inbox, "private_open", side_effect=PermissionError("denied")):
+            with patch.object(factory.Inbox, "private_open", side_effect=PermissionError("denied")):
                 code, out, err = self.invoke(e)
             self.assertEqual(code, 5)
             self.assertIn("not stored: denied.", err)
             command = err.split("exactly as printed:\n", 1)[1]
             self.assertEqual(shlex.split(command)[4],
                              "[from @lead-dev]: Inbox unavailable: cannot write.\nliteral '$herdr' @pm.\n")
-            with patch.object(ateam.os, "fsync", side_effect=OSError("failed fsync")):
+            with patch.object(factory.os, "fsync", side_effect=OSError("failed fsync")):
                 code, out, err = self.invoke(e)
             self.assertEqual(code, 1)
             self.assertIn("not confirmed", err)
@@ -1161,7 +1161,7 @@ class InboxTests(unittest.TestCase):
             inbox.state_path.chmod(0o644)
             inbox.lock_path.chmod(0o644)
             write = os.write
-            with patch.object(ateam.os, "write", side_effect=lambda fd, data: write(fd, data[:3])):
+            with patch.object(factory.os, "write", side_effect=lambda fd, data: write(fd, data[:3])):
                 code, out, err = self.invoke(e)
             self.assertEqual((code, err), (0, ""))
             self.assertIn("queued message 1", out)
@@ -1175,7 +1175,7 @@ class InboxTests(unittest.TestCase):
             inbox = self.prepare(e)
             self.send(e, "one")
             self.send(e, "two")
-            with patch.dict(os.environ, e.env), ateam.Inbox(ateam.Config(e.repo)) as current:
+            with patch.dict(os.environ, e.env), factory.Inbox(factory.Config(e.repo)) as current:
                 replace = current.replace
                 def interrupt(path, data):
                     if path == current.path:
@@ -1234,8 +1234,8 @@ class InboxTests(unittest.TestCase):
             self.assertEqual(waiting.count("inbox unavailable:"), 1)
             self.assertTrue(inbox.state_path.is_symlink())
             self.assertEqual(target.read_bytes(), before)
-            with patch.dict(os.environ, e.env), patch.object(ateam.Inbox, "__enter__", side_effect=PermissionError("denied")):
-                self.assertEqual(ateam.message_route(ateam.Config(e.repo)), "typed")
+            with patch.dict(os.environ, e.env), patch.object(factory.Inbox, "__enter__", side_effect=PermissionError("denied")):
+                self.assertEqual(factory.message_route(factory.Config(e.repo)), "typed")
         for parent in (False, True):
             with self.subTest(parent=parent), Env(brief) as e:
                 inbox = self.prepare(e)
@@ -1261,17 +1261,17 @@ class InboxTests(unittest.TestCase):
                     raise PermissionError("state unlink denied")
                 return unlink(path, *a, **kw)
             out = io.StringIO()
-            with patch.dict(os.environ, e.env), patch.object(ateam, "HERDR", e.env["HERDR_BIN"]), \
+            with patch.dict(os.environ, e.env), patch.object(factory, "HERDR", e.env["HERDR_BIN"]), \
                     patch.object(pathlib.Path, "unlink", denied), contextlib.redirect_stdout(out):
-                cfg = ateam.Config(e.repo)
-                with patch.object(ateam, "cfg_of", return_value=cfg):
-                    ateam.cmd_up(args)
-                self.assertEqual(ateam.message_route(cfg), "typed")
-                prompt = ateam.member_prompt(ateam.plan(cfg, "lead-dev"), "operator", cfg)
+                cfg = factory.Config(e.repo)
+                with patch.object(factory, "cfg_of", return_value=cfg):
+                    factory.cmd_up(args)
+                self.assertEqual(factory.message_route(cfg), "typed")
+                prompt = factory.member_prompt(factory.plan(cfg, "lead-dev"), "operator", cfg)
                 self.assertIn("Message teammates only", prompt)
                 self.assertNotIn("To reach @operator, do not use herdr", prompt)
             self.assertIn("inbox unavailable: state unlink denied. This session runs on typed messages."
-                          " After fixing it, run ateam.py continue --restart.", out.getvalue())
+                          " After fixing it, run factory.py continue --restart.", out.getvalue())
             self.assertIn("by typed herdr messages", out.getvalue())
             self.assertIn("started @lead-dev", out.getvalue())
             self.assertIn("Message anyone with", dict(e.prompts())["lead-dev"])
@@ -1304,7 +1304,7 @@ class InboxTests(unittest.TestCase):
                     if acknowledge:
                         e.run("wait", "--seen", "1", check=False)
                     with patch.dict(os.environ, {**e.env, "HERDR_SESSION": "another/session"}):
-                        with ateam.Inbox(ateam.Config(e.repo)) as other:
+                        with factory.Inbox(factory.Config(e.repo)) as other:
                             other.state["mode"] = "typed"
                             other.save_state()
                         other.path.write_bytes(b"untouched")
@@ -1345,10 +1345,10 @@ class InboxTests(unittest.TestCase):
             self.assertEqual(json.loads(inbox.state_path.read_text())["seen"], 1)
             before = (inbox.path.read_bytes(), inbox.state_path.read_bytes())
             args = types.SimpleNamespace(cwd=str(e.repo), names=[], restart=False, fresh=False, timeout=1000)
-            with patch.dict(os.environ, e.env), patch.object(ateam, "ensure_operator", return_value="operator"), \
-                    patch.object(ateam, "Team", side_effect=SystemExit("query failed")):
+            with patch.dict(os.environ, e.env), patch.object(factory, "ensure_operator", return_value="operator"), \
+                    patch.object(factory, "Team", side_effect=SystemExit("query failed")):
                 with self.assertRaisesRegex(SystemExit, "query failed"):
-                    ateam.cmd_continue(args)
+                    factory.cmd_continue(args)
             self.assertEqual(before, (inbox.path.read_bytes(), inbox.state_path.read_bytes()))
 
     def test_named_watch_wakes_on_any_sender_and_sessions_are_isolated(self):
@@ -1385,7 +1385,7 @@ class WaitTests(unittest.TestCase):
             self.assertIn("Allow this command? (y/n)  [w1:p3]", out)
             e.update("reviewer", agent_status="working")
             e.kill("pm")
-            self.assertIn("@pm is gone: its agent exited. `ateam.py continue pm`", e.run("wait").stdout)
+            self.assertIn("@pm is gone: its agent exited. `factory.py continue pm`", e.run("wait").stdout)
 
             e.run("continue", "pm")
             e.update("pm", agent_status="working")
@@ -1466,7 +1466,7 @@ class WaitTests(unittest.TestCase):
 class ContinueTests(unittest.TestCase):
     def test_no_member_panes_and_no_cache_starts_the_whole_team_fresh(self):
         with Env(UI) as e:
-            self.assertEqual(list((e.root / "cache/a-team").glob("*/sessions.jsonl")), [])
+            self.assertEqual(list((e.root / "cache/factory-skill").glob("*/sessions.jsonl")), [])
             out = e.run("continue").stdout
             self.assertIn("no member panes in this herdr session: continuing every member in factory.toml", out)
             self.assertEqual(set(e.starts()), {"lead-dev", "frontend-dev", "reviewer", "pm"})
@@ -1474,8 +1474,8 @@ class ContinueTests(unittest.TestCase):
                 self.assertTrue({"resume", "--resume", "--session"}.isdisjoint(native(call)))
             tabs = e.calls("tab", "create")
             self.assertEqual(len(tabs), 1)
-            self.assertEqual(flag(tabs[0], "--label"), "a-team workers")
-            self.assertIn(["tab", "rename", "w1:t1", "a-team operator"], e.calls("tab", "rename"))
+            self.assertEqual(flag(tabs[0], "--label"), "factory team")
+            self.assertIn(["tab", "rename", "w1:t1", "factory operator"], e.calls("tab", "rename"))
             self.assertEqual(len(e.prompts()), 4)
             for _, text in e.prompts():
                 self.assertIn("starting in a new session", text)
@@ -1515,7 +1515,7 @@ class ContinueTests(unittest.TestCase):
             e.close("reviewer")
             out = e.run("continue").stdout
             self.assertEqual([c[2] for c in e.calls("agent", "start")[4:]], ["lead-dev"])
-            self.assertIn("no pane, not continued: @reviewer. To bring them back: ateam.py continue reviewer", out)
+            self.assertIn("no pane, not continued: @reviewer. To bring them back: factory.py continue reviewer", out)
             self.assertNotIn("no member panes", out)
             self.assertEqual(len(e.calls("tab", "rename")), 1)  # only up labels the operator's tab
             sent = dict(e.prompts())
@@ -1527,7 +1527,7 @@ class ContinueTests(unittest.TestCase):
         with Env(formation({})) as e:
             result = e.run("continue", check=False)
             self.assertEqual(result.returncode, 1)
-            self.assertIn("no members in factory.toml; add one, then run `ateam.py up`", result.stderr)
+            self.assertIn("no members in factory.toml; add one, then run `factory.py up`", result.stderr)
             self.assertEqual(e.starts(), {})
 
     def test_cold_continue_checks_every_member_before_launch(self):
@@ -1653,7 +1653,7 @@ class ContinueTests(unittest.TestCase):
             e.kill("pm", "reviewer")
             p = e.run("continue", check=False, FAKE_START_FAIL="dead:pm")
             self.assertEqual(p.returncode, 3)
-            self.assertIn("ateam.py continue pm --fresh", p.stdout)
+            self.assertIn("factory.py continue pm --fresh", p.stdout)
             self.assertIn("started @reviewer", p.stdout)  # the others still came back
 
     def test_duplicate_session_observations_keep_latest_resume(self):
@@ -1662,7 +1662,7 @@ class ContinueTests(unittest.TestCase):
             for value in ("first", "second"):
                 e.set_session("lead-dev", {"agent": "codex", "kind": "id", "value": value})
                 e.run("status")
-            history = next((e.root / "cache/a-team").glob("*/sessions.jsonl"))
+            history = next((e.root / "cache/factory-skill").glob("*/sessions.jsonl"))
             lines = history.read_text().splitlines()
             with history.open("a") as f:
                 f.write(lines[-1] + "\n")
@@ -1674,15 +1674,15 @@ class ContinueTests(unittest.TestCase):
 class ConfigTests(unittest.TestCase):
     def test_template_is_consistent(self):
         with Env(TEMPLATE) as e:
-            cfg = ateam.Config(e.repo)
+            cfg = factory.Config(e.repo)
             for name in cfg.members:
-                p = ateam.plan(cfg, name)
-                self.assertIn(p["harness"], ateam.HARNESSES, name)
-                self.assertIn(p["model"], ateam.TABLE[p["harness"]]["models"], name)  # the template uses recommended models
+                p = factory.plan(cfg, name)
+                self.assertIn(p["harness"], factory.HARNESSES, name)
+                self.assertIn(p["model"], factory.TABLE[p["harness"]]["models"], name)  # the template uses recommended models
                 self.assertEqual(p["permissions"], "full")
             self.assertEqual(cfg.operator["name"], "operator")
             self.assertIn("tracked in `TODO.md`", cfg.body)  # where tasks live is prose in FACTORY.md, not a setting
-            todo = (ateam.SKILL / "templates/TODO.md").read_text().splitlines()
+            todo = (factory.SKILL / "templates/TODO.md").read_text().splitlines()
             self.assertEqual(todo[:2], ["TODO", "===="])
             headings = ["## Ready", "## In progress", "## Backlog", "## Done"]
             self.assertEqual([line for line in todo if line.startswith("## ")], headings)
@@ -1695,17 +1695,17 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(cfg.members["lead-dev"]["model"], "gpt-6-astra")
             self.assertEqual(cfg.members["reviewer"]["model"], "gpt-6-luna")
             self.assertIn("## Project", cfg.body)
-        self.assertFalse(any("/" in m for m in ateam.TABLE["codex"]["models"]), "Codex takes bare model names")
-        for h, t in ateam.TABLE.items():  # every harness has the same shape, and code to go with it
-            self.assertEqual(set(t["permissions"]), set(ateam.LEVELS), h)
+        self.assertFalse(any("/" in m for m in factory.TABLE["codex"]["models"]), "Codex takes bare model names")
+        for h, t in factory.TABLE.items():  # every harness has the same shape, and code to go with it
+            self.assertEqual(set(t["permissions"]), set(factory.LEVELS), h)
             self.assertIn(t["prompt"], ("file", "pointer", "message"), h)
             self.assertIn(t["operator_wait"], ("background", "foreground"), h)
             self.assertNotIn("operator_messages", t, h)
-            self.assertIn(h, ateam.CODE)
+            self.assertIn(h, factory.CODE)
 
     def test_operator_table_and_name(self):
         team = '[members.lead-dev]\nharness = "codex"\nmodel = "gpt-6-luna"\n'
-        stock = (ateam.SKILL / "templates/FACTORY.md").read_text()  # the shared brief people really get
+        stock = (factory.SKILL / "templates/FACTORY.md").read_text()  # the shared brief people really get
         with Env(team_brief('[operator]\nname = "boss"\nharness = "claude"\n' + team, stock)) as e:
             e.run("up")
             pane = e.fake_state()["panes"]["w1:p1"]
@@ -1756,7 +1756,7 @@ class ConfigTests(unittest.TestCase):
             self.assertIn("branch `ada/lead-dev`", sent)       # worktree branches start with the user's name
             self.assertIn("The team brief says where tasks are tracked", e.run("prompt", "lead-dev").stdout)
             e.write_brief(team_brief('user = "peter"\n' + team))
-            self.assertEqual(ateam.plan(ateam.Config(e.repo), "lead-dev")["branch"], "peter/lead-dev")
+            self.assertEqual(factory.plan(factory.Config(e.repo), "lead-dev")["branch"], "peter/lead-dev")
             e.write_brief(team_brief(team))  # a VM or CI user name that someone else's machine may share: a note, not a failure
             generic = e.run("check", LOGNAME="root")
             self.assertIn("note: worktree branches will start with 'root'", generic.stderr)
@@ -1772,7 +1772,7 @@ class ConfigTests(unittest.TestCase):
             p = e.run("check", check=False)
             self.assertEqual(p.returncode, 1)
             self.assertIn("no factory.toml in", p.stderr)
-            self.assertIn("ateam.py init", p.stderr)
+            self.assertIn("factory.py init", p.stderr)
 
     def test_an_old_single_file_brief_is_never_replaced_by_defaults(self):
         old = '+++\npermissions = "guarded"\n[lead]\nname = "boss"\n[members.reviewer]\nharness = "codex"\n+++\n## Project\n\nOurs.\n'
@@ -1828,7 +1828,7 @@ class ConfigTests(unittest.TestCase):
             out = e.run("init", cwd=e.repo / "sub").stdout     # in a repository: at its root
             self.assertEqual(sorted(p.name for p in e.repo.iterdir() if p.name != ".git"),
                              [".gitignore", "FACTORY.md", "factory.toml", "factory.toml.sample", "sub"])
-            self.assertEqual((e.repo / "factory.toml").read_text(), (ateam.SKILL / "templates/factory.toml").read_text())
+            self.assertEqual((e.repo / "factory.toml").read_text(), (factory.SKILL / "templates/factory.toml").read_text())
             self.assertEqual((e.repo / ".gitignore").read_text(), "factory.toml\n")
             self.assertEqual(out.count("wrote"), 3)
             e.run("check", "lead-dev")                         # what init writes is a team that checks
@@ -1841,7 +1841,7 @@ class ConfigTests(unittest.TestCase):
             (e.repo / "factory.toml").unlink()
             out = e.run("init").stdout
             self.assertEqual((out.count("kept"), out.count("wrote")), (2, 1))
-            self.assertEqual(list(ateam.Config(e.repo).members), ["pm"])        # copied from the project's sample
+            self.assertEqual(list(factory.Config(e.repo).members), ["pm"])        # copied from the project's sample
             self.assertEqual((e.repo / "FACTORY.md").read_text(), "# Team\n\nOurs.\n")
             self.assertEqual((e.repo / ".gitignore").read_text(), "factory.toml\n")  # listed once
             self.assertEqual(e.run("init").stdout.count("wrote"), 0)             # nothing is ever replaced
@@ -1886,8 +1886,8 @@ class ConfigTests(unittest.TestCase):
             self.assertIn("`agent_prompted` means sent", prompt)
             self.assertNotIn("`agent_prompted` means submitted", prompt)
             self.assertNotIn("{instructions}", prompt)
-            self.assertIn(f"read `{ateam.SKILL / 'references/notes.md'}` before you search or write them", prompt)
-            self.assertTrue((ateam.SKILL / "references/notes.md").is_file())  # the pointer leads somewhere
+            self.assertIn(f"read `{factory.SKILL / 'references/notes.md'}` before you search or write them", prompt)
+            self.assertTrue((factory.SKILL / "references/notes.md").is_file())  # the pointer leads somewhere
             self.assertIn("reviewer.md", prompt)
             self.assertNotIn("{operator}", prompt)
 
@@ -1905,35 +1905,35 @@ class ConfigTests(unittest.TestCase):
                 self.assertIn(f"| **@operator** | {expected} |", e.run("brief").stdout)
 
     def test_every_role_has_the_same_four_parts(self):
-        for path in sorted((ateam.SKILL / "roles").glob("*.md")):
-            _, body = ateam.parse_role(path)
+        for path in sorted((factory.SKILL / "roles").glob("*.md")):
+            _, body = factory.parse_role(path)
             heads = [line for line in body.splitlines() if line.startswith("**")]
             self.assertEqual(heads, ["**You own**", "**You output**", "**Done when**", "**Never**"], path.name)
             self.assertNotIn("LSP", body, path.name)  # nothing harness-specific in a role
 
     def test_session_id_from_ref(self):
-        self.assertEqual(ateam.session_id({"kind": "id", "value": "abc"}), "abc")
+        self.assertEqual(factory.session_id({"kind": "id", "value": "abc"}), "abc")
         path = "/x/rollout-2026-11-11T13-02-52-01a1cbc6-e708-7623-986f-cc2e07efa28f.jsonl"
-        self.assertEqual(ateam.session_id({"kind": "path", "value": path}), "01a1cbc6-e708-7623-986f-cc2e07efa28f")
+        self.assertEqual(factory.session_id({"kind": "path", "value": path}), "01a1cbc6-e708-7623-986f-cc2e07efa28f")
 
     def test_bad_role_frontmatter_names_file(self):
         with tempfile.TemporaryDirectory() as d:
             p = pathlib.Path(d) / "x.md"
             p.write_text("---\nthinking: low\noops\n---\nbody\n")
             with self.assertRaisesRegex(ValueError, "x.md:3"):
-                ateam.parse_role(p)
+                factory.parse_role(p)
 
 
 class ListingTests(unittest.TestCase):
     def test_listed_models_formats(self):
         pi = "provider  model  context\nopenrouter  z-ai/glm-5.3  1M\npax-vllm  nvidia/Q  262K\n"
-        self.assertEqual(ateam.listed_models(pi), ["openrouter/z-ai/glm-5.3", "pax-vllm/nvidia/Q"])
-        self.assertEqual(ateam.listed_models("openrouter/z-ai/glm-5.3\nollama/qwen3:8b\n"),
+        self.assertEqual(factory.listed_models(pi), ["openrouter/z-ai/glm-5.3", "pax-vllm/nvidia/Q"])
+        self.assertEqual(factory.listed_models("openrouter/z-ai/glm-5.3\nollama/qwen3:8b\n"),
                          ["openrouter/z-ai/glm-5.3", "ollama/qwen3:8b"])
         omp = ("openrouter (2)\n┌──────┬─────┐\n│ model              │ context │\n├─────┼─────┤\n"
                "│ z-ai/glm-5.3       │      1M │\n│ z-ai/glm-5.3-flash │      1M │\n└─────┴─────┘\n"
                "ollama (1)\n┌─────┬─────┐\n│ model    │ context │\n├─────┼─────┤\n│ qwen3:8b │    128K │\n└─────┴─────┘\n")
-        self.assertEqual(ateam.listed_models(omp), ["openrouter/z-ai/glm-5.3", "openrouter/z-ai/glm-5.3-flash", "ollama/qwen3:8b"])
+        self.assertEqual(factory.listed_models(omp), ["openrouter/z-ai/glm-5.3", "openrouter/z-ai/glm-5.3-flash", "ollama/qwen3:8b"])
 
 
 class PublicNameMigrationTests(unittest.TestCase):
@@ -2123,10 +2123,12 @@ class PublicNameMigrationTests(unittest.TestCase):
             self.assertFalse((e.repo / "FACTORY.md").exists())
 
     def test_published_text_uses_the_new_names_except_migration_guidance(self):
-        paths = [ateam.SKILL / "SKILL.md", ateam.SKILL / "harnesses.toml", ateam.SKILL.parent / "README.md"]
+        paths = [factory.SKILL / "SKILL.md", factory.SKILL / "harnesses.toml", factory.SKILL.parent / "README.md"]
         for directory in ("references", "roles", "templates"):
-            paths.extend(p for p in (ateam.SKILL / directory).iterdir() if p.is_file())
+            paths.extend(p for p in (factory.SKILL / directory).iterdir() if p.is_file())
         for path in paths:
+            self.assertNotIn("ateam.py", path.read_text(), str(path))
+            self.assertNotIn("ATEAM_", path.read_text(), str(path))
             for line in path.read_text().splitlines():
                 if (path.name == "README.md" and line.startswith("Coming from a-team:")
                         or path.name == "cmd_setup.md" and line.startswith("- **`TEAM.md` or `team.toml`")):
@@ -2135,34 +2137,90 @@ class PublicNameMigrationTests(unittest.TestCase):
                     self.assertNotIn("TEAM.md", line)
                     self.assertNotIn("team.toml", line)
                     self.assertNotIn("/a-team", line.replace("~/.cache/a-team", ""))
-        self.assertIn("name: factory\n", (ateam.SKILL / "SKILL.md").read_text())
-        self.assertTrue((ateam.SKILL / "templates/FACTORY.md").read_text().startswith("# Factory\n"))
+        self.assertIn("name: factory\n", (factory.SKILL / "SKILL.md").read_text())
+        self.assertTrue((factory.SKILL / "templates/FACTORY.md").read_text().startswith("# Factory\n"))
+
+
+class CacheNameTests(unittest.TestCase):
+    def test_new_projects_use_factory_cache_with_xdg_or_home(self):
+        with Env() as e:
+            for xdg in (str(e.root / "cache"), ""):
+                with self.subTest(xdg=xdg), patch.dict(os.environ, {**e.env, "XDG_CACHE_HOME": xdg}):
+                    cache = factory.Config(e.repo).cache
+                    base = pathlib.Path(xdg) if xdg else e.home / ".cache"
+                    self.assertEqual(cache.parent, base / "factory-skill")
+                    self.assertFalse(cache.exists())
+
+    def test_earlier_cache_keeps_sessions_messages_and_launch_paths(self):
+        members = {"lead-dev": {**CATALOG_MEMBERS["lead-dev"], "permissions": "guarded"}}
+        for both in (False, True):
+            with self.subTest(both=both), Env(formation(members, operator={"harness": "claude"})) as e, \
+                    patch.dict(os.environ, e.env):
+                cfg = factory.Config(e.repo)
+                newer = cfg.cache
+                old = newer.parent.parent / "a-team" / newer.name
+                old.mkdir(parents=True)
+                if both:
+                    newer.mkdir(parents=True)
+                    (newer / "sentinel").write_text("leave this cache alone")
+                self.assertEqual(cfg.cache, old)
+                history = old / "sessions.jsonl"
+                session = {"member": "lead-dev", "agent": "codex", "kind": "id", "value": "saved-before-rename"}
+                history.write_text(json.dumps(session) + "\n")
+                with factory.Inbox(cfg) as inbox:
+                    inbox.state["mode"] = "inbox"
+                    inbox.save_state()
+                    inbox.path.write_text(json.dumps({"id": 4, "from": "lead-dev", "at": "2026-11-17T12:00:00Z",
+                                                      "text": "unread before the rename"}) + "\n")
+                original = history.read_bytes(), inbox.path.read_bytes(), inbox.state_path.read_bytes()
+                checked = e.run("check")
+                note = f"note: {newer} is not used while {old} exists."
+                self.assertEqual(note in checked.stderr, both)
+                result = e.run("continue")
+                self.assertIn("1 unread message from the earlier team", result.stdout)
+                argv = native(e.starts()["lead-dev"])
+                self.assertEqual(argv[:2], ["resume", "saved-before-rename"])
+                self.assertEqual(flag(argv, "--add-dir"), str(old))
+                prompt = (old / "lead-dev.md").read_text()
+                self.assertIn(str(old / "lead-dev.md"), prompt)
+                command = shlex.join(["python3", str(SCRIPT), "inbox", "send", "--cwd", str(e.repo), "--from", "lead-dev"])
+                self.assertIn(command, prompt)
+                self.assertIn("unread before the rename", e.run("wait").stdout)
+                self.assertEqual((history.read_bytes(), inbox.path.read_bytes(), inbox.state_path.read_bytes()), original)
+                sent = e.run("inbox", "send", "--from", "lead-dev", "after the rename")
+                self.assertIn("queued message 5", sent.stdout)
+                self.assertIn("after the rename", inbox.path.read_text())
+                if both:
+                    self.assertEqual([p.name for p in newer.iterdir()], ["sentinel"])
+                    self.assertEqual((newer / "sentinel").read_text(), "leave this cache alone")
+                else:
+                    self.assertFalse(newer.exists())
 
 
 class InstalledCopyTests(unittest.TestCase):
     def test_skill_runs_without_the_rest_of_the_checkout(self):
-        head = (ateam.SKILL / "SKILL.md").read_text().split("---\n", 2)[1]
+        head = (factory.SKILL / "SKILL.md").read_text().split("---\n", 2)[1]
         name = next(line.split(":", 1)[1].strip() for line in head.splitlines() if line.startswith("name:"))
         with Env(brief=None) as e:
             installed = e.root / "installed skills" / name
-            shutil.copytree(ateam.SKILL, installed, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+            shutil.copytree(factory.SKILL, installed, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
             script = installed / "scripts" / SCRIPT.name
 
             def run(*args):
                 result = subprocess.run([sys.executable, str(script), *args, "--cwd", str(e.repo)],
                                         cwd=e.repo, env=e.env, capture_output=True, text=True)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertNotIn(str(ateam.SKILL), result.stdout + result.stderr)
+                self.assertNotIn(str(factory.SKILL), result.stdout + result.stderr)
                 return result.stdout
 
             harnesses = run("harnesses")
-            for harness in ateam.HARNESSES:
+            for harness in factory.HARNESSES:
                 self.assertRegex(harnesses, rf"{harness}\s+available:")
             run("init")
-            self.assertEqual((e.repo / ateam.BRIEF).read_text(),
-                             (installed / "templates" / ateam.BRIEF).read_text())
-            self.assertEqual((e.repo / ateam.CONF).read_text(),
-                             (installed / "templates" / ateam.CONF).read_text())
+            self.assertEqual((e.repo / factory.BRIEF).read_text(),
+                             (installed / "templates" / factory.BRIEF).read_text())
+            self.assertEqual((e.repo / factory.CONF).read_text(),
+                             (installed / "templates" / factory.CONF).read_text())
             self.assertIn("ok", run("check"))
             prompt = run("prompt", "reviewer")
             self.assertIn("You are @reviewer, the reviewer", prompt)
@@ -2177,7 +2235,7 @@ class GateFixtureTests(unittest.TestCase):
             parent = pathlib.Path(directory)
             env = {**os.environ, "XDG_CACHE_HOME": str(parent / "cache"), "GIT_CONFIG_GLOBAL": os.devnull,
                    "GIT_CONFIG_NOSYSTEM": "1", "PYTHONDONTWRITEBYTECODE": "1"}
-            unrelated = parent / "cache/a-team/ateam-gate1-unrelated/sessions.jsonl"
+            unrelated = parent / "cache/factory-skill/factory-gate1-unrelated/sessions.jsonl"
             unrelated.parent.mkdir(parents=True)
             unrelated.write_text("unrelated session")
             fixtures, caches = [], []
@@ -2186,14 +2244,14 @@ class GateFixtureTests(unittest.TestCase):
                 return subprocess.run(args, cwd=cwd, env=env, check=True, capture_output=True, text=True)
 
             for _ in range(2):
-                before = set(parent.glob("ateam-gate1.*"))
-                run("bash", str(pathlib.Path(__file__).with_name("gate1-setup.sh")), str(ateam.SKILL), str(parent))
-                created = set(parent.glob("ateam-gate1.*")) - before
+                before = set(parent.glob("factory-gate1.*"))
+                run("bash", str(pathlib.Path(__file__).with_name("gate1-setup.sh")), str(factory.SKILL), str(parent))
+                created = set(parent.glob("factory-gate1.*")) - before
                 self.assertEqual(len(created), 1)
                 repo = created.pop()
                 fixtures.append(repo)
                 with patch.dict(os.environ, env):
-                    cache = ateam.Config(repo).cache
+                    cache = factory.Config(repo).cache
                 self.assertNotIn(cache, caches)
                 self.assertFalse(cache.exists())
                 caches.append(cache)
@@ -2231,7 +2289,7 @@ class GateFixtureTests(unittest.TestCase):
 
 
 class HerdrContract(unittest.TestCase):
-    """The fields ateam.py reads must exist where it reads them. The fake above follows the same split."""
+    """The fields factory.py reads must exist where it reads them. The fake above follows the same split."""
 
     def test_pane_and_agent_records(self):
         if not shutil.which("herdr"):
@@ -2263,7 +2321,7 @@ class HerdrContract(unittest.TestCase):
             self.assertIn(field, defs[params]["properties"])
 
 
-@unittest.skipUnless(os.environ.get("ATEAM_LIVE"), "set ATEAM_LIVE=1 (outside any sandbox) to check real harness flags")
+@unittest.skipUnless(os.environ.get("FACTORY_LIVE"), "set FACTORY_LIVE=1 (outside any sandbox) to check real harness flags")
 class LiveFlags(unittest.TestCase):
     """Harness flags drift between releases. Each installed harness's --help must still name what we pass."""
     FLAGS = {

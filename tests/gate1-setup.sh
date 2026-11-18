@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Gate 1 fixture: a small repo left mid-task, with no team running and no session cache.
-# Usage: gate1-setup.sh <a-team skill dir> [parent dir]     (each run builds a new directory)
+# Usage: gate1-setup.sh <factory skill dir> [parent dir]     (each run builds a new directory)
 set -euo pipefail
 SKILL=$(cd "$1" && pwd)
-GATE=$(mktemp -d "${2:-${TMPDIR:-/tmp}}/ateam-gate1.XXXXXX")
+GATE=$(mktemp -d "${2:-${TMPDIR:-/tmp}}/factory-gate1.XXXXXX")
 cd "$GATE"
 git init -q -b main
 g() { git -c user.name=gate1 -c user.email=gate1@example.invalid -c commit.gpgsign=false "$@"; }
@@ -31,7 +31,7 @@ class SlugTests(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main()
 EOF
-python3 "$SKILL/scripts/ateam.py" init --cwd "$GATE" > /dev/null
+python3 "$SKILL/scripts/factory.py" init --cwd "$GATE" > /dev/null
 python3 - <<'EOF'
 import pathlib, re
 p = pathlib.Path("FACTORY.md")
