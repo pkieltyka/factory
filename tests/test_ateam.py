@@ -20,7 +20,7 @@ import types
 import unittest
 from unittest.mock import patch
 
-SCRIPT = pathlib.Path(__file__).with_name("ateam.py")
+SCRIPT = pathlib.Path(__file__).resolve().parent.parent / "skill/scripts/ateam.py"
 spec = importlib.util.spec_from_file_location("ateam", SCRIPT)
 ateam = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ateam)
@@ -1934,6 +1934,37 @@ class ListingTests(unittest.TestCase):
         self.assertEqual(ateam.listed_models(omp), ["openrouter/z-ai/glm-5.3", "openrouter/z-ai/glm-5.3-flash", "ollama/qwen3:8b"])
 
 
+class InstalledCopyTests(unittest.TestCase):
+    def test_skill_runs_without_the_rest_of_the_checkout(self):
+        head = (ateam.SKILL / "SKILL.md").read_text().split("---\n", 2)[1]
+        name = next(line.split(":", 1)[1].strip() for line in head.splitlines() if line.startswith("name:"))
+        with Env(brief=None) as e:
+            installed = e.root / "installed skills" / name
+            shutil.copytree(ateam.SKILL, installed, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+            script = installed / "scripts" / SCRIPT.name
+
+            def run(*args):
+                result = subprocess.run([sys.executable, str(script), *args, "--cwd", str(e.repo)],
+                                        cwd=e.repo, env=e.env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertNotIn(str(ateam.SKILL), result.stdout + result.stderr)
+                return result.stdout
+
+            harnesses = run("harnesses")
+            for harness in ateam.HARNESSES:
+                self.assertRegex(harnesses, rf"{harness}\s+available:")
+            run("init")
+            self.assertEqual((e.repo / ateam.BRIEF).read_text(),
+                             (installed / "templates" / ateam.BRIEF).read_text())
+            self.assertEqual((e.repo / ateam.CONF).read_text(),
+                             (installed / "templates" / ateam.CONF).read_text())
+            self.assertIn("ok", run("check"))
+            prompt = run("prompt", "reviewer")
+            self.assertIn("You are @reviewer, the reviewer", prompt)
+            self.assertIn("You are read-only", prompt)
+            self.assertIn(str(installed / "references/notes.md"), prompt)
+
+
 @unittest.skipUnless(GIT, "git is not installed")
 class GateFixtureTests(unittest.TestCase):
     def test_each_build_is_fresh_and_preserves_existing_fixtures_and_caches(self):
@@ -1951,7 +1982,7 @@ class GateFixtureTests(unittest.TestCase):
 
             for _ in range(2):
                 before = set(parent.glob("ateam-gate1.*"))
-                run("bash", str(ateam.SKILL / "scripts/gate1-setup.sh"), str(ateam.SKILL), str(parent))
+                run("bash", str(pathlib.Path(__file__).with_name("gate1-setup.sh")), str(ateam.SKILL), str(parent))
                 created = set(parent.glob("ateam-gate1.*")) - before
                 self.assertEqual(len(created), 1)
                 repo = created.pop()
