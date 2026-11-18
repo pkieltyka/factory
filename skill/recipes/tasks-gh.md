@@ -24,7 +24,7 @@ Only a person adds READY_LABEL; the team never adds it. It means the operator ma
 
 @pm owns tracker writes, or the operator when there is no @pm. Members report discoveries to that owner. Record owner, criteria, branch or commit, verdict and next step on the issue.
 
-- List ready: `gh issue list --label 'READY_LABEL' --limit 100 --json number,title,labels`; list active with the same command and 'ACTIVE_LABEL'.
+- List ready: `gh issue list --label 'READY_LABEL' --limit 100 --json number,title,labels`; list active with the same command and 'ACTIVE_LABEL' (if 100 come back, rerun with a higher `--limit`).
 - Read: `gh issue view <issue> --json title,body,comments`.
 - Record: `gh issue comment <issue> --body-file <file>`; create a backlog item: `gh issue create --title '<title>' --body-file <file>` (no ready label).
 - Assign: `gh issue edit <issue> --remove-label 'READY_LABEL' --add-label 'ACTIVE_LABEL'`.
