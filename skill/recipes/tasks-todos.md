@@ -4,7 +4,7 @@ Choose todos for GitHub Issues managed through a project board, where a column m
 
 ## Needs
 
-The person installs todos (ask the owner where to get it) and [gh](https://cli.github.com), signs in with `gh auth login`, and grants access to the repository and board. The board must already exist. Nothing installs or upgrades itself.
+The person installs [todos](https://github.com/pkieltyka/todos) and [gh](https://cli.github.com), signs in with `gh auth login`, and grants access to the repository and board. The board must already exist. Nothing installs or upgrades itself.
 
 ## Check
 
