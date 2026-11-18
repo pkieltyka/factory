@@ -937,7 +937,7 @@ class InboxTests(unittest.TestCase):
     def test_operator_messages_opt_out(self):
         members = {"lead-dev": {**CATALOG_MEMBERS["lead-dev"], "permissions": "guarded"},
                    "architect": CATALOG_MEMBERS["architect"]}
-        for harness in ("claude", "codex"):
+        for harness, mode in (("claude", "background"), ("codex", "foreground")):
             with self.subTest(harness=harness), Env(formation(members, operator={"harness": harness,
                                                                                  "messages": "typed"})) as e:
                 e.update(None, agent=harness)
@@ -963,13 +963,17 @@ class InboxTests(unittest.TestCase):
                 self.assertIn("through the inbox", e.run("continue").stdout)
                 self.assertEqual(explicit, e.run("prompt", "lead-dev").stdout)
                 self.send(e, "pending before opt-out")
+                self.assertIn(f"acknowledge by starting your next watcher in the {mode}: factory.py wait --seen 1",
+                              e.run("wait").stdout)
                 with patch.dict(os.environ, e.env):
                     path = factory.Inbox(factory.Config(e.repo)).path
                 pending = path.read_bytes()
                 e.write_brief(formation(members, operator={"harness": harness, "messages": "typed"}))
                 self.assertIn("route to @operator changed to typed", e.run("continue").stdout)
                 self.assertEqual(pending, path.read_bytes())
-                self.assertIn("pending before opt-out", e.run("wait").stdout)
+                output = e.run("wait").stdout
+                self.assertIn("pending before opt-out", output)
+                self.assertIn("After you have acted on or recorded these messages: factory.py wait --seen 1", output)
                 e.run("wait", "--seen", "1", "--interval", "0", check=False)
                 self.assertEqual(path.read_bytes(), b"")
 
@@ -1061,7 +1065,7 @@ class InboxTests(unittest.TestCase):
             self.assertIn("[Message 1 from @lead-dev at ", first)
             self.assertIn("[Message 2 from @reviewer at ", first)
             self.assertNotIn("#1", first)
-            self.assertIn("2 unread messages. After you have acted on or recorded these messages:", first)
+            self.assertIn("2 unread messages. After you have acted on or recorded these messages,", first)
             self.assertIn("wait --seen 2", first)
             rows = [json.loads(s) for s in inbox.path.read_text().splitlines()]
             self.assertEqual([r["text"] for r in rows], [text, text])

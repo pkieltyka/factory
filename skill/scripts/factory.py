@@ -1357,8 +1357,9 @@ def cmd_wait(args):
                 unread = inbox.unread
             if unread:
                 print_messages(unread)
+                next_watch = f", acknowledge by starting your next watcher in the {wait}" if route == "inbox" else ""
                 print(f"{len(unread)} unread message{'s' if len(unread) != 1 else ''}."
-                      " After you have acted on or recorded these messages:"
+                      f" After you have acted on or recorded these messages{next_watch}:"
                       f" factory.py wait --seen {unread[-1]['id']}")
                 return
         except (OSError, ValueError) as e:
