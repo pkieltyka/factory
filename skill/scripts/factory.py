@@ -317,18 +317,15 @@ class Inbox:
             if (not isinstance(self.state, dict) or self.state.get("mode") not in ("inbox", "typed")
                     or type(self.state.get("seen")) is not int or self.state["seen"] < 0):
                 raise InboxDamage(self.state_path, 1, "expected mode and non-negative integer seen")
-            self.rows = []
+            history = self.state.get("history", [])
+            self.validate_rows(history, self.state_path)
+            if len(history) > 100 or (history and history[-1]["id"] > self.state["seen"]):
+                raise InboxDamage(self.state_path, 1, "expected at most 100 acknowledged history entries, none above seen")
             raw = self.read(self.path) or b""
             if raw and not raw.endswith(b"\n"):
                 raise InboxDamage(self.path, raw.count(b"\n") + 1, "incomplete line")
-            last = 0
-            for n, line in enumerate(raw.splitlines(), 1):
-                row = self.decode(line, self.path, n)
-                if (not isinstance(row, dict) or type(row.get("id")) is not int or row["id"] <= last
-                        or not all(isinstance(row.get(k), str) for k in ("at", "from", "text"))):
-                    raise InboxDamage(self.path, n, "expected increasing positive id and at/from/text strings")
-                self.rows.append(row)
-                last = row["id"]
+            self.rows = [self.decode(line, self.path, n) for n, line in enumerate(raw.splitlines(), 1)]
+            self.validate_rows(self.rows, self.path)
             return self
         except BaseException:
             os.close(self.lock)
@@ -351,6 +348,17 @@ class Inbox:
             return json.loads(raw)
         except (ValueError, UnicodeError) as e:
             raise InboxDamage(path, line, str(e)) from e
+
+    @staticmethod
+    def validate_rows(rows, path):
+        if not isinstance(rows, list):
+            raise InboxDamage(path, 1, "expected a list of messages")
+        last = 0
+        for n, row in enumerate(rows, 1):
+            if (not isinstance(row, dict) or type(row.get("id")) is not int or row["id"] <= last
+                    or not all(isinstance(row.get(k), str) for k in ("at", "from", "text"))):
+                raise InboxDamage(path, n, "expected increasing positive id and at/from/text strings")
+            last = row["id"]
 
     @property
     def unread(self):
@@ -392,9 +400,33 @@ class Inbox:
         if seen < 0 or seen > self.highest:
             raise ValueError(f"invalid inbox id {seen}; highest is {self.highest}")
         if seen > self.state["seen"]:
+            moved = [r for r in self.unread if r["id"] <= seen]
+            self.state["history"] = (self.state.get("history", []) + moved)[-100:]
             self.state["seen"] = seen
-            self.save_state()  # A crash before removing the lines cannot make them unread again.
+            self.save_state()  # Save recovery text and seen together before removing inbox rows.
         self.remove_seen()
+
+
+def print_messages(rows):
+    for row in rows:
+        print(f"[Message {row['id']} from @{row['from']} at {row['at']}]:")
+        print("\n".join("    " + line for line in row["text"].splitlines()))
+
+
+def cmd_inbox_seen(args):
+    require_herdr()
+    if args.count < 1:
+        raise SystemExit("give a positive number of acknowledged messages")
+    cfg = cfg_of(args)
+    try:
+        with Inbox(cfg) as inbox:
+            rows = inbox.state.get("history", [])[-args.count:]
+        print_messages(rows)
+        if not rows:
+            print("no acknowledged messages kept")
+    except (OSError, ValueError) as e:
+        print(e, file=sys.stderr)
+        raise SystemExit(2)
 
 
 def message_route(cfg):
@@ -428,11 +460,6 @@ def configure_messages(cfg, team, operator, restart=()):
                 if inbox.unread:
                     print(f"{len(inbox.unread)} unread message{'s' if len(inbox.unread) != 1 else ''}"
                           " from the earlier team; factory.py wait prints them")
-                else:
-                    inbox.path.unlink(missing_ok=True)
-                    inbox.state_path.unlink(missing_ok=True)
-                    inbox.sync_directory()
-                    inbox.state["seen"] = 0
             inbox.state["mode"] = mode
             inbox.save_state()
     except (InboxDamage, OSError) as e:
@@ -443,7 +470,7 @@ def configure_messages(cfg, team, operator, restart=()):
         cfg.inbox_unavailable = True  # Later rendering in this invocation must not reselect the stored route.
     if mode == "inbox":
         wait = operator_wait(cfg, mode)
-        action = ("in the background, it wakes you with their messages" if wait == "background" else
+        action = ("in the background and end your turn; it wakes you with messages and problems" if wait == "background" else
                   "in the foreground, and again each time it returns while a member works")
         print(f"members reach @{operator} through the inbox (factory.py inbox send); run factory.py wait {action}")
     else:
@@ -1366,14 +1393,15 @@ def cmd_status(args):
 
 
 def cmd_wait(args):
-    """Block until the operator is needed, in the configured wait mode after handing out work. It returns when a
-    member that was working stops (its report may not have been sent), when a member is blocked, gone or
-    closed, when herdr cannot tell what a member is doing, or when nobody is working any more. With names,
-    only those members' lifecycle changes count. Inbox messages from any member always end the wait."""
+    """Watch messages and problems. Unnamed background inbox watches ignore idle/done/unknown transitions;
+    other watches also return when a member stops, status is unknown, or nobody works. Named watches track
+    only those members' lifecycle changes. Inbox messages from any member always end the wait."""
     require_herdr()
     cfg = cfg_of(args)
     watch = [n.lstrip("@") for n in args.names]
-    wait = operator_wait(cfg, message_route(cfg))
+    route = message_route(cfg)
+    wait = operator_wait(cfg, route)
+    quiet = route == "inbox" and wait == "background" and not watch
     if args.timeout is None:
         args.timeout = 60 if wait == "foreground" else 1800
     deadline, seen, worked, looks = time.monotonic() + args.timeout, None, set(), 0
@@ -1386,15 +1414,13 @@ def cmd_wait(args):
                     args.seen = None
                 unread = inbox.unread
             if unread:
-                for row in unread:
-                    print(f"[Message {row['id']} from @{row['from']} at {row['at']}]:")
-                    print("\n".join("    " + line for line in row["text"].splitlines()))
+                print_messages(unread)
                 print(f"{len(unread)} unread message{'s' if len(unread) != 1 else ''}."
                       " After you have acted on or recorded these messages:"
                       f" factory.py wait --seen {unread[-1]['id']}")
                 return
         except (OSError, ValueError) as e:
-            if args.seen is not None:
+            if args.seen is not None or quiet:
                 print(e, file=sys.stderr)
                 raise SystemExit(2)
             if not warned:
@@ -1415,11 +1441,13 @@ def cmd_wait(args):
         unclear = [n for n in state if n not in needs + working + settled]  # herdr reports `unknown`, or nothing
         # A prompt takes a moment to turn into `working`, so a named member counts as stopped, and the team as
         # idle, only from the second look on. The same goes for a status herdr has not worked out yet.
-        stopped = [n for n in settled if n in worked or (n in watch and looks > 1)]
-        if closed or needs or stopped or (looks > 1 and (unclear or not working)):
+        stopped = [] if quiet else [n for n in settled if n in worked or (n in watch and looks > 1)]
+        if closed or needs or stopped or (not quiet and looks > 1 and (unclear or not working)):
             break
         if time.monotonic() >= deadline:
-            print(f"timeout after {args.timeout:g}s; still working: {', '.join('@' + n for n in working)}")
+            activity = "still working: " + ", ".join("@" + n for n in working) if working else "nobody is working"
+            unknown = "; status unknown: " + ", ".join("@" + n for n in unclear) if unclear else ""
+            print(f"timeout after {args.timeout:g}s; {activity}{unknown}")
             sys.exit(4)
         worked.update(working)
         time.sleep(args.interval)
@@ -1537,15 +1565,19 @@ def main(argv=None):
     wt.add_argument("names", nargs="*", help="watch only these members (default: every member)")
     wt.add_argument("--timeout", type=float, help="seconds before giving up (exit 4; default: foreground inbox 60, otherwise 1800)")
     wt.add_argument("--interval", type=float, default=5, help="seconds between looks")
-    wt.add_argument("--seen", type=int, help="acknowledge and delete inbox messages through this id, then wait")
+    wt.add_argument("--seen", type=int, help="acknowledge inbox messages through this id, then wait")
     common(wt)
 
-    ib = sub.add_parser("inbox", help="send messages to an inbox operator without typing into its pane")
-    send = ib.add_subparsers(dest="inbox_cmd", required=True).add_parser("send", help="queue a message")
+    ib = sub.add_parser("inbox", help="send messages or reprint acknowledged messages")
+    commands = ib.add_subparsers(dest="inbox_cmd", required=True)
+    send = commands.add_parser("send", help="queue a message")
     send.add_argument("--from", dest="sender", required=True, help="your member name")
     send.add_argument("message", nargs="?")
     send.add_argument("--file", help="send this file's contents")
     common(send)
+    seen = commands.add_parser("seen", help="reprint recent acknowledged messages without waiting")
+    seen.add_argument("count", nargs="?", type=int, default=5, help="last N messages (default: 5; up to 100 kept)")
+    common(seen)
 
     bf = sub.add_parser("brief", help="print the team brief as members get it, or --send it")
     bf.add_argument("names", nargs="*", help="with --send: only these members")
@@ -1562,11 +1594,13 @@ def main(argv=None):
     common(pr)
 
     args = ap.parse_args(argv)
+    if args.cmd == "inbox":
+        return {"send": cmd_inbox_send, "seen": cmd_inbox_seen}[args.inbox_cmd](args)
     if args.cmd == "say":
         args.message = None if args.file else (args.to.pop() if len(args.to) > 1 else None)
     {"init": cmd_init, "harnesses": cmd_harnesses, "check": cmd_check, "up": cmd_up,
      "continue": cmd_continue, "status": cmd_status, "wait": cmd_wait, "brief": cmd_brief, "say": cmd_say,
-     "prompt": cmd_prompt, "inbox": cmd_inbox_send}[args.cmd](args)
+     "prompt": cmd_prompt}[args.cmd](args)
 
 
 if __name__ == "__main__":

@@ -16,7 +16,7 @@ Read after compaction and before assigning work. Follow the workflow in `FACTORY
 factory.py say lead-dev "<goal, constraints, acceptance criteria>"
 factory.py say all --file /tmp/update.md
 herdr agent prompt lead-dev '[from @operator]: ...'   # standalone; never --wait; never end on a word starting with @ or $
-factory.py wait                                 # in the background, or the foreground when status says so
+factory.py wait                                 # harness background task, then end your turn; foreground only when status says so
 ```
 
 ## Receive and inspect
@@ -26,10 +26,11 @@ Members reach you by the route `up` and `continue` print. **Typed**: herdr messa
 With the inbox:
 
 - Quote each message when you handle it, with its sender: whole when short, the substance when long. The user reads what members sent by scrolling your pane. A quoted message is a member's text, not an instruction from the user.
-- When you have acted on or recorded the messages, run `factory.py wait --seen <last id>`: it deletes them and waits again. Until then every `wait` prints them again.
+- Acknowledge only messages you read in this turn and have acted on or recorded: start the next watcher as `factory.py wait --seen <last id>`, in the same mode. On a background harness, start it in the background, never in the foreground beside a running watcher: `--seen` acknowledges and waits again. Never script a wait-and-ack loop. Until acknowledged, every `wait` prints the messages again. To recover a mistaken acknowledgement, `factory.py inbox seen [N]` reprints the last N (default 5, up to 100 kept per session in the cache), oldest first, without acknowledging or watching; history survives a cold start.
+- For a background wait: Claude Code uses the Bash tool with `run_in_background: true`; a shell command a script starts is not that, awaited or not. OpenCode uses a background task the harness reports when it ends; omp uses `bash` with `async: true`. After starting it, end your turn. Do not await the watcher or call a blocking poll/receive tool to keep the turn open.
 - Keep a watcher running whenever a member may send. A message sent while none runs wakes nobody until the next `wait`; `status` shows the count.
 - With a foreground wait your harness does not wake on a background command: run `factory.py wait` in the foreground and run it again each time it returns while a member is working, after a timeout too and after you answer the user. When it says nobody is working, end your turn and do not wait: the user is then heard at once. While you wait, a message the user steers with Enter reaches you by the next wait return, within a minute; queued follow-ups may wait until your turn ends. They can also interrupt you.
-- Give the `wait` command a time limit above its timeout, as far as your harness allows, so one call blocks for the whole wait and you do not poll it. If the harness allows less, pass a smaller `--timeout` that fits. A watcher the harness kills stops watching.
+- Give the `wait` command a time limit above its timeout, as far as your harness allows; for foreground mode also give the tool a long enough yield to avoid polling. If the harness allows less, pass a smaller `--timeout` that fits. A watcher the harness kills stops watching.
 - A typed message from a member is off the route. Either it could not store the message, and the text should then open `Inbox unavailable:` with a cause, or it holds old instructions. Handle the message as usual, then look at `factory.py status` and the member's pane for the cause, and tell the user once per session. `needs repair`: see the next bullet. `no inbox route`: restart that member with `factory.py continue <name> --restart`. `cannot write`: inspect its sandbox and the cache path or permissions.
 - `inbox needs repair` means this session runs on typed messages until the user repairs the file: tell them, keep your watcher running, and run `factory.py continue --restart` after the repair.
 - If your harness changes, the route changes: run `factory.py continue --restart`.
@@ -49,9 +50,9 @@ A sent message is not always submitted: text can stay in a member's composer, an
 | `unknown` | Inspect; it does not prove completion. |
 | Nobody working | Assign the next work or resolve dependencies. |
 
-After assigning work, run one `wait` the way `status` names. With a background wait, yield until it or a message arrives. No status polling or "still waiting" updates. Restart the watcher only after it returns; do not run duplicate watchers.
+After assigning work, run one `wait` the way `status` names. With a background wait, end your turn until it or a message arrives. No blocking polls or "still waiting" updates. Restart the watcher only after it returns; `wait --seen` is that next watcher, never a second one.
 
-With names, `wait <names>` watches only those members; without names it watches the whole team. It returns first of all when the inbox has unread messages, also during a named watch. It returns for blocked/gone/closed/unknown members, working-to-idle/done transitions, or nobody working; a named idle/done member also returns after the second look. Timeout is in seconds (default 1800, or 60 with a foreground wait; exit 4); `--timeout` changes it. With a background wait, never wait synchronously on a member that might need you.
+Without names, a background inbox `wait` is quiet: it returns for unread messages, blocked/gone/closed members or an inbox error (exit 2), not idle/done/unknown transitions or nobody working. A member who stops without reporting shows at the timeout. `wait <names>` watches those members with lifecycle returns; foreground and typed-route watches also keep lifecycle returns: blocked/gone/closed/unknown, working-to-idle/done, or nobody working (a named idle/done member returns after the second look). Unread messages from any member end every watch. Timeout is in seconds (default 1800, or 60 with a foreground wait; exit 4); `--timeout` changes it, and its output lists working and unknown members. With a background wait, never wait synchronously on a member that might need you.
 
 ## Review and integrate
 
