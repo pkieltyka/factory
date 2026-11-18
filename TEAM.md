@@ -32,7 +32,7 @@ Work reaches `master` only through a pull request on GitHub. Ticket branches are
 
 ## Review
 
-@reviewer runs `codegenie` (github.com/0xPolygon/codegenie) on committed changes: at the pull-request readiness step, on the pull request's head against its base: `codegenie review --no-progress --base <base sha> --head <head sha>`. Learn it with `codegenie --help`; check it works with `codegenie --help`. Limits: a run can take up to 30 minutes; never pass `--post-github-comments` or anything else that publishes. Its report is input: the reviewer verifies each finding and names what it reviewed.
+Reviews start in the fast lane. Deep lane: @reviewer runs `codegenie` (github.com/0xPolygon/codegenie) on committed changes: at the pull-request readiness step, on the pull request's head against its base: `codegenie review --no-progress --base <base sha> --head <head sha>`. Learn it with `codegenie --help`; check it works with `codegenie --help`. Limits: a run can take up to 30 minutes; never pass `--post-github-comments` or anything else that publishes. Its report is input: the reviewer verifies each finding and names what it reviewed.
 
 ## Notes
 
