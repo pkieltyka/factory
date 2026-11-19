@@ -17,6 +17,8 @@ cd factory
 
 ### Operator harnesses
 
+Claude Code and Codex make good operators, and medium to high thinking works well. Feel free to try any harness and model. The session where you run setup stays the operator when you run `up`.
+
 | Operator harness | Install the skill at | Enter in its conversation |
 |---|---|---|
 | Claude Code | `~/.claude/skills/factory` | `/factory setup` |

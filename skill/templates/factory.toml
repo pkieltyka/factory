@@ -15,9 +15,7 @@
 [operator]
 # messages = "typed"   # members type into your pane with herdr instead of using the inbox
 name = "operator"   # the operator agent's @name, pane label and herdr agent name; fixed while the team runs
-harness = "claude"
-model = "claude-fable-5-2"
-thinking = "medium"
+# Setup records this session’s harness, model and thinking in your local factory.toml.
 notes = "Owns architecture, assigns tasks and integrates reviewed work."
 
 [members.lead-dev]
