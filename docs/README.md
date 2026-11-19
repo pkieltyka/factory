@@ -40,8 +40,7 @@ Use these in the Claude Code operator conversation. For another harness, use its
 |---|---|
 | `/factory` | Reads the current state and chooses the next step. |
 | `/factory setup` | Forms or changes the team and project brief. |
-| `/factory up` | Checks, launches and briefs the members. |
-| `/factory continue` | Resumes the team and reconciles unfinished work. |
+| `/factory up` | Starts or resumes members and briefs those launched. Use `--restart` to reapply settings to running members. |
 | `/factory status` | Shows each member's state and the message route. |
 | `/factory wait` | Returns when a message or member needs the operator. |
 | `/factory brief` | Previews or resends the team brief. |

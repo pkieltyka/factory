@@ -134,7 +134,7 @@ class Config:
 
     @property
     def cache(self):
-        """Per-repo scratch outside the repo: members' prompt files and the sessions `continue` resumes from.
+        """Per-repo scratch outside the repo: members' prompt files and the sessions `up` resumes from.
         The path is short on purpose: it is typed into a shell line that macOS limits to 1024 bytes."""
         base = pathlib.Path(os.environ.get("XDG_CACHE_HOME") or pathlib.Path.home() / ".cache")
         key = f"{self.root.name[:24]}-{hashlib.sha1(str(self.root).encode()).hexdigest()[:8]}"
@@ -239,7 +239,7 @@ def resolve_listed(model, listed, harness):
 class InboxDamage(ValueError):
     def __init__(self, path, line, reason):
         super().__init__(f"inbox needs repair: {path}, line {line}: {reason}. This session runs on typed messages."
-                         " After repairing the file, run factory.py continue --restart.")
+                         " After repairing the file, run factory.py up --restart.")
 
 
 class Inbox:
@@ -427,7 +427,7 @@ def configure_messages(cfg, team, operator, restart=()):
     except (InboxDamage, OSError) as e:
         print(str(e) if isinstance(e, InboxDamage) else
               f"inbox unavailable: {str(e).rstrip('.')}. This session runs on typed messages."
-              " After fixing it, run factory.py continue --restart.")
+              " After fixing it, run factory.py up --restart.")
         mode, previous = "typed", "typed"
         cfg.inbox_unavailable = True  # Later rendering in this invocation must not reselect the stored route.
     if mode == "inbox":
@@ -438,7 +438,7 @@ def configure_messages(cfg, team, operator, restart=()):
     else:
         print(f"members reach @{operator} by typed herdr messages" + (": " + reason if reason else ""))
     if mode != previous and any(team.live(n) and n not in restart for n in cfg.members):
-        print(f"the route to @{operator} changed to {mode}: run factory.py continue --restart so running members get it")
+        print(f"the route to @{operator} changed to {mode}: run factory.py up --restart so running members get it")
 
 
 def cmd_inbox_send(args):
@@ -458,7 +458,7 @@ def cmd_inbox_send(args):
         with Inbox(cfg) as inbox:
             if inbox.state["mode"] != "inbox":
                 raise ValueError("the operator takes typed messages in this session; this member has inbox instructions,"
-                                 f" restart it with factory.py continue {args.sender} --restart")
+                                 f" restart it with factory.py up {args.sender} --restart")
             inbox.remove_seen()
             row = {"id": inbox.highest + 1, "at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                    "from": args.sender, "text": text}
@@ -483,11 +483,11 @@ def cmd_inbox_send(args):
             raise SystemExit(1)
         reason = str(e).rstrip(".")
         if isinstance(e, InboxDamage):
-            advice = "needs repair; after the repair: factory.py continue --restart"
+            advice = "needs repair; after the repair: factory.py up --restart"
         elif isinstance(e, OSError):
             advice = "cannot write; check this member's sandbox and the cache path"
         else:
-            advice = f"no inbox route; factory.py continue {args.sender} --restart"
+            advice = f"no inbox route; factory.py up {args.sender} --restart"
         print(f"not stored: {reason}. Nothing was queued. Send it typed, once, exactly as printed:", file=sys.stderr)
         fallback = f"{tag(args.sender)} Inbox unavailable: {advice}.\n{text}\n"
         print(shlex.join(["herdr", "agent", "prompt", cfg.operator["name"], fallback]), file=sys.stderr)
@@ -889,7 +889,7 @@ class Team:
     def __init__(self, cfg):
         self.cfg = cfg
         # `pane list` has labels and sessions but no agent names; `agent list` has the names.
-        self.names = {a.get("name") for a in herdr("agent", "list").get("agents", [])}
+        self.agent_panes = {a["name"]: a.get("pane_id") for a in herdr("agent", "list").get("agents", []) if a.get("name")}
         self.panes = {}
         for p in herdr("pane", "list").get("panes", []):
             label = p.get("label")
@@ -1080,9 +1080,9 @@ def report_failed(failed, team, undelivered=()):
         sys.exit(3)
 
 
-# ================================================================ sessions seen (for continue)
+# ================================================================ sessions seen (for up)
 # herdr drops a pane's session reference when its agent exits. So every command that looks at the team notes
-# each agent's current session in one small file in the cache, and `continue` resumes a member's last one.
+# each agent's current session in one small file in the cache, and `up` resumes a member's last one.
 # The file is only ever appended to. Without it, a member that exited starts fresh.
 
 def past_sessions(cfg):
@@ -1117,7 +1117,7 @@ def selected(cfg, names):
     if strangers:
         raise SystemExit(f"{', '.join(strangers)}: not a member in {CONF} (members: {', '.join(cfg.members)})."
                          f" To add a member, add its table to {CONF}.")
-    return [plan(cfg, n) for n in names]
+    return [plan(cfg, n) for n in dict.fromkeys(names)]
 
 
 def print_plan(plans, extra_col=None):
@@ -1206,82 +1206,24 @@ def cmd_check(args):
 def cmd_up(args):
     cfg = cfg_of(args)
     plans = selected(cfg, args.names)
-    ready = checked(cfg, plans)  # every member must pass first
+    if not plans:
+        raise SystemExit(f"no members in {CONF}; add one, then run `factory.py up`")
     require_herdr()
     operator = ensure_operator(cfg, tab=True)
     team = Team(cfg)
-    running = [m["name"] for m in ready if team.live(m["name"])]
-    if running:  # so `up` can be run again after a partial launch
-        print(f"already running: {', '.join(running)}")
-    todo = [m for m in ready if m["name"] not in running]
-    taken = [m["name"] for m in todo if m["name"] in team.names]
-    if taken:
-        raise SystemExit(f"an agent outside this team is already named {', '.join(taken)}. One team runs per herdr"
-                         " session: rename that agent, or use another session.")
-    configure_messages(cfg, team, operator)
-    started, failed = [], {}
-    for m in todo:
-        err = launch(cfg, team, m, operator, args.timeout)
-        if err:
-            failed[m["name"]] = err
-        else:
-            started.append(m)
-    team, undelivered = Team(cfg), {}
-    if started and args.no_brief:
-        print("next: factory.py brief --send")
-    elif started:
-        new = {m["name"] for m in started}
-        undelivered = send_brief(cfg, team, operator, names=new)
-        others = [m["name"] for m in team.members() if m["name"] not in new and m["name"] not in failed]
-        if others:  # the rest of the team hears who joined, without the whole brief again
-            joined = "; ".join(f"@{m['name']} ({m['role']}, {TABLE[m['harness']]['label']} {m['model']})" for m in started)
-            deliver(team, {n: f"{tag(operator)} Joined the team: {joined}. No reply needed." for n in others}, "the news")
-    report_failed(failed, team, undelivered)
-
-
-def cmd_continue(args):
-    """Bring members back after their agents exited, resuming their sessions; with --restart, running ones too."""
-    require_herdr()
-    cfg = cfg_of(args)
-    operator = ensure_operator(cfg)
-    team = Team(cfg)
-    names = [n.lstrip("@") for n in args.names] or [n for n in cfg.members if team.pane(n)]
-    if not names:
-        names = list(cfg.members)
-        if not names:
-            raise SystemExit(f"no members in {CONF}; add one, then run `factory.py up`")
-        print(f"no member panes in this herdr session: continuing every member in {CONF}")
-        if os.environ.get("HERDR_TAB_ID"):
-            herdr("tab", "rename", os.environ["HERDR_TAB_ID"], TABS["operator"], check=False)
-    elif not args.names:
-        missing = [n for n in cfg.members if n not in names]
-        if missing:
-            print(f"no pane, not continued: {', '.join('@' + n for n in missing)}."
-                  f" To bring them back: factory.py continue {' '.join(missing)}")
-    unknown = [n for n in names if n not in cfg.members]
-    if unknown:
-        raise SystemExit(f"not in {CONF}: {', '.join(unknown)}")
-    restart = [n for n in names if args.restart and team.live(n)]
-    ready = checked(cfg, [plan(cfg, n) for n in names if n in restart or not team.live(n)])  # with factory.toml's settings as they are now
-    configure_messages(cfg, team, operator, restart=names if args.restart else ())
-    failed, fresh = {}, []
-    past = past_sessions(cfg)
+    running = [m["name"] for m in plans if not args.restart and team.live(m["name"])]
+    ready = checked(cfg, [m for m in plans if m["name"] not in running])
     for m in ready:
-        ref = (team.pane(m["name"]) or {}).get("agent_session") or past.get(m["name"])
-        resume = ref if ref and ref.get("agent") == m["harness"] and not args.fresh else None
-        if m["name"] in restart:  # closing its pane ends the agent; it starts again, from its session, in a new one
-            herdr("pane", "close", team.panes.pop(m["name"])["pane_id"])
-        elif not team.pane(m["name"]):
-            print(f"@{m['name']} has no pane any more; it gets a new one")
-        err = launch(cfg, team, m, operator, args.timeout, resume=resume)
-        if err:
-            failed[m["name"]] = err + (f". If its session cannot be resumed, run: factory.py continue {m['name']} --fresh"
-                                       if resume else "")
-        elif not resume:
-            fresh.append(m["name"])
+        name = m["name"]
+        if name in team.agent_panes and (not team.live(name) or team.agent_panes[name] != team.pane(name)["pane_id"]):
+            print(f"an agent outside this team is already named {name}. One team runs per herdr session:"
+                  " rename that agent, or use another session.", file=sys.stderr)
+            sys.exit(2)
+    if running:
+        print(f"already running: {', '.join(running)}")
+    configure_messages(cfg, team, operator, restart=[m["name"] for m in plans] if args.restart else ())
     if not ready:
-        print("every member is running")
-    team = Team(cfg)
+        return
     pickup_text = ("We are picking up where we left off. Check the tracker the brief above names, then tell"
                    f" @{operator} in one line what you were doing and what you will do next. Send it:"
                    f" `herdr agent prompt {operator} '[from @you]: ...'`. A reply in your own pane does not reach @{operator}.")
@@ -1291,13 +1233,38 @@ def cmd_continue(args):
     fresh_text = ("You are starting in a new session and know nothing of the work so far. Do not start anything"
                   f" yet: @{operator} will send your task, its criteria and the evidence"
                   " so far. No reply needed.")
-    closing = {name: fresh_text if name in fresh else pickup_text for name in cfg.members}
-    # With names, only those members are re-briefed. With none, every running member is re-briefed.
-    undelivered = send_brief(cfg, team, operator, names=set(names) - set(failed) if args.names else None,
-                            closing=closing)
-    if fresh:
-        print(f"fresh sessions, no earlier context: {', '.join('@' + n for n in fresh)}."
-              " Send each its task, criteria and the evidence so far.")
+    past = past_sessions(cfg)
+    closing, joined, failed = {}, [], {}
+    for m in ready:
+        name = m["name"]
+        pane = team.pane(name)
+        ref = (pane or {}).get("agent_session") or past.get(name)
+        resume = ref if ref and ref.get("agent") == m["harness"] and not args.fresh else None
+        was_live = team.live(name)
+        if was_live:  # preflight has passed for every restart
+            herdr("pane", "close", team.panes.pop(name)["pane_id"])
+        err = launch(cfg, team, m, operator, args.timeout, resume=resume)
+        if err:
+            failed[name] = err + (f". If its session cannot be resumed, run: factory.py up {name} --fresh" if resume else "")
+            continue
+        if resume:
+            closing[name] = pickup_text
+        elif pane or ref:
+            closing[name] = fresh_text
+        else:
+            closing[name] = None  # first launch: the plain brief
+        if not was_live and not ref:  # also announce a successful retry of a first launch
+            joined.append(m)
+    team, undelivered = Team(cfg), {}
+    if closing and args.no_brief:
+        print("next: factory.py brief --send")
+    elif closing:
+        undelivered = send_brief(cfg, team, operator, names=closing, closing=closing)
+        if joined:
+            news = "; ".join(f"@{m['name']} ({m['role']}, {TABLE[m['harness']]['label']} {m['model']})" for m in joined)
+            others = [m["name"] for m in team.members() if m["name"] not in closing and m["name"] not in failed]
+            if others:
+                deliver(team, {n: f"{tag(operator)} Joined the team: {news}. No reply needed." for n in others}, "the news")
     report_failed(failed, team, undelivered)
 
 
@@ -1325,13 +1292,12 @@ def cmd_status(args):
     except (OSError, ValueError) as e:
         print(f"inbox unavailable: {e}" if isinstance(e, OSError) else str(e))
     for state, hint in (("blocked", "blocked: waiting on an approval or a question. Read the pane and ask the user."),
-                        ("gone", "gone: `factory.py continue` brings them back in their panes and sessions.")):
+                        ("gone", "gone: run `factory.py up {names}` to bring them back.")):
         hit = [r[0] for r in rows[2:] if state in r[5]]
         if hit:
-            print(f"\n{', '.join(hit)} {hint}")
+            print(f"\n{', '.join(hit)} " + hint.format(names=" ".join(n.lstrip("@") for n in hit)))
     if not any(team.pane(n) for n in cfg.members):
-        print(f"\nNo member of {CONF} has a pane in this herdr session. A team that ran before: `factory.py continue`."
-              " A new team: `factory.py check`, then `factory.py up`.")
+        print(f"\nNo member of {CONF} has a pane in this herdr session. Run `factory.py up` to start or resume its members.")
 
 
 def cmd_wait(args):
@@ -1395,10 +1361,10 @@ def cmd_wait(args):
         worked.update(working)
         time.sleep(args.interval)
     for n in closed:
-        print(f"@{n}'s pane was closed, so it is no longer running. `factory.py continue {n}` gives it a new pane.")
+        print(f"@{n}'s pane was closed, so it is no longer running. `factory.py up {n}` gives it a new pane.")
     for n in needs:
         if state[n] == "gone":
-            print(f"@{n} is gone: its agent exited. `factory.py continue {n}` brings it back.")
+            print(f"@{n} is gone: its agent exited. `factory.py up {n}` brings it back.")
             continue
         print(f"@{n} is {state[n]}: it needs an answer. Its pane ends:")
         # herdr cannot scroll a blocked agent's history, so read what is on its screen
@@ -1466,6 +1432,10 @@ def print_table(rows):
 
 
 def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] == "continue":
+        print("use factory.py up [names] [--fresh] [--restart]", file=sys.stderr)
+        sys.exit(2)
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
@@ -1488,18 +1458,13 @@ def main(argv=None):
     selection(ck)
     common(ck)
 
-    up = sub.add_parser("up", help="check, launch each member in a pane of the team tab, send the team brief",
+    up = sub.add_parser("up", help="check and start or resume members, then send their briefs",
                         epilog="Native harness flags go in the member's `args` in factory.toml.")
     selection(up)
     up.add_argument("--no-brief", action="store_true", help="do not send the team brief afterwards")
+    up.add_argument("--fresh", action="store_true", help="start new sessions instead of resuming")
+    up.add_argument("--restart", action="store_true", help="also relaunch running members with current settings")
     launching(up)
-
-    co = sub.add_parser("continue", help="bring members back in their panes and sessions, and re-brief them")
-    co.add_argument("names", nargs="*", help="only these members")
-    co.add_argument("--fresh", action="store_true", help="start new sessions instead of resuming")
-    co.add_argument("--restart", action="store_true",
-                    help="also restart members that are running, so they get factory.toml's settings (after a herdr restart)")
-    launching(co)
 
     st = sub.add_parser("status", help="members and whether they are running")
     common(st)
@@ -1543,7 +1508,7 @@ def main(argv=None):
     if args.cmd == "say":
         args.message = None if args.file else (args.to.pop() if len(args.to) > 1 else None)
     {"init": cmd_init, "harnesses": cmd_harnesses, "check": cmd_check, "up": cmd_up,
-     "continue": cmd_continue, "status": cmd_status, "wait": cmd_wait, "brief": cmd_brief, "say": cmd_say,
+     "status": cmd_status, "wait": cmd_wait, "brief": cmd_brief, "say": cmd_say,
      "prompt": cmd_prompt}[args.cmd](args)
 
 

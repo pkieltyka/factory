@@ -15,7 +15,6 @@ From your project inside herdr, enter these commands in Claude Code. [Other oper
 ```text
 /factory setup
 /factory up
-/factory continue
 ```
 
 ## What else is in this repo
