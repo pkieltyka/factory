@@ -789,8 +789,7 @@ class WorktreeTests(unittest.TestCase):
             p = e.run("up", "backend-dev", check=False)
             self.assertEqual(p.returncode, 2)
             self.assertIn("a worktree needs a git repository with a commit", p.stdout)
-            self.assertEqual(e.calls("agent", "start"), [])
-            self.assertEqual(e.calls("pane", "close"), [])
+            self.assertTrue(all(c[:2] in (["agent", "list"], ["pane", "list"]) for c in e.calls()), e.calls())
 
     def test_distinct_branches_cannot_share_a_worktree_path(self):
         brief = formation({
