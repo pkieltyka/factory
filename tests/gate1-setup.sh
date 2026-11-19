@@ -80,36 +80,40 @@ TODO
 
 ## Ready
 
-- [ ] T3 Command line -- python3 -m slug prints the slug
-  - owner: none yet
-  - criteria: \`python3 -m slug "Hello World"\` prints \`hello-world\`.
-  - next: start after T2 is done; it changes the same function.
+- [ ] T3 Command line
+    * python3 -m slug prints the slug
+    * owner: none yet
+    * criteria: \`python3 -m slug "Hello World"\` prints \`hello-world\`.
+    * next: start after T2 is done; it changes the same function.
 
 ## In progress
 
-- [ ] T2 max_length -- limit the slug length (@lead-dev)
-  - criteria: \`slugify(text, max_length=n)\` returns at most n characters and never ends with \`-\`; without max_length nothing changes; tests cover it.
-  - work: uncommitted in the main checkout: \`slug.py\`, \`test_slug_length.py\`
-  - verdict: changes required by @reviewer on those paths; ran \`python3 -m unittest\`, 3 passed
-  - next: @lead-dev makes the required fixes, then @reviewer re-reviews:
-    1. \`slug.py:8\`: \`slugify("hello world", max_length=6)\` returns \`hello-\`; strip the trailing \`-\` after cutting.
-    2. Add a test where max_length cuts right after a word.
+- [ ] T2 max_length (@lead-dev)
+    * limit the slug length
+    * criteria: \`slugify(text, max_length=n)\` returns at most n characters and never ends with \`-\`; without max_length nothing changes; tests cover it.
+    * work: uncommitted in the main checkout: \`slug.py\`, \`test_slug_length.py\`
+    * verdict: changes required by @reviewer on those paths; ran \`python3 -m unittest\`, 3 passed
+    * next: @lead-dev makes the required fixes, then @reviewer re-reviews:
+        1. \`slug.py:8\`: \`slugify("hello world", max_length=6)\` returns \`hello-\`; strip the trailing \`-\` after cutting.
+        2. Add a test where max_length cuts right after a word.
 
 ## Backlog
 
 ## Done
 
-- [x] T1 Slugify joins words -- join words with hyphens ($T1)
-  - owner: @lead-dev
-  - criteria: \`slugify("Hello, World")\` returns \`hello-world\`; tests pass.
-  - verdict: approve by @reviewer on $T1; ran \`python3 -m unittest\`, 2 passed
-  - next: none
+- [x] T1 Slugify joins words ($T1)
+    * join words with hyphens
+    * owner: @lead-dev
+    * criteria: \`slugify("Hello, World")\` returns \`hello-world\`; tests pass.
+    * verdict: approve by @reviewer on $T1; ran \`python3 -m unittest\`, 2 passed
+    * next: none
 
-- [x] T4 Strip accents -- remove accents from the slug (0f3a9c1)
-  - owner: @lead-dev
-  - criteria: \`slugify("Crème")\` returns \`creme\`.
-  - verdict: approve by @reviewer on 0f3a9c1; ran \`python3 -m unittest\`
-  - next: none
+- [x] T4 Strip accents (0f3a9c1)
+    * remove accents from the slug
+    * owner: @lead-dev
+    * criteria: \`slugify("Crème")\` returns \`creme\`.
+    * verdict: approve by @reviewer on 0f3a9c1; ran \`python3 -m unittest\`
+    * next: none
 EOF
 g add TODO.md
 g commit -q -m "Tracker"

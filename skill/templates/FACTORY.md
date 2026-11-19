@@ -4,7 +4,17 @@
 
 ## Tasks
 
-Tasks and bugs are tracked in `TODO.md` at the repo root, one line each: `- [ ] <title> -- <description>`. `## Ready` holds, in the order they will be done, the items the operator may assign without asking the user; only a person puts an item there or reorders it, never the team. Members report discoveries to @pm, or the operator when there is no @pm, who records them in `## Backlog`. An assigned item moves to `## In progress` with its owner at the end of the line, `(@lead-dev)`. Integrated work moves to the top of `## Done` as `- [x]` with its commit. An item's criteria, verdict and next step go on indented lines under it.
+Tasks and bugs are tracked in `TODO.md` at the repo root. An item is its title on a checkbox line, then `*` bullets indented four spaces: one or more description lines first, then labelled record lines (`owner`, `criteria`, `work`, `verdict`, `next`), with any nested list (such as required fixes) indented eight spaces:
+
+```markdown
+- [ ] Title
+    * description
+    * criteria: ...
+    * next: ...
+        1. ...
+```
+
+`## Ready` holds, in the order they will be done, the items the operator may assign without asking the user; only a person puts an item there or reorders it, never the team. Members report discoveries to @pm, or the operator when there is no @pm, who records them in `## Backlog`. An assigned item moves to `## In progress` with its owner at the end of the checkbox line, `(@lead-dev)`. Integrated work moves to the top of `## Done` as `- [x]` with its commit.
 
 ## Workflow
 
