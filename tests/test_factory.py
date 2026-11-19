@@ -227,6 +227,17 @@ def formation(members, **tables):
                                 for name, fields in sections.items()))
 
 
+def assert_todo_items(case, text):
+    """Every checkbox line is followed by at least one 4-space '* ' description line."""
+    lines = text.splitlines()
+    items = [i for i, line in enumerate(lines) if line.startswith(("- [ ] ", "- [x] "))]
+    case.assertTrue(items, "expected at least one TODO checkbox item")
+    for i in items:
+        case.assertLess(i + 1, len(lines), lines[i])
+        case.assertRegex(lines[i + 1], r"^    \* \S", (lines[i], lines[i + 1]))
+        case.assertNotRegex(lines[i + 1], r"^    \* (?:owner|criteria|work|verdict|next):(?:\s|$)", lines[i + 1])
+
+
 CATALOG_MEMBERS = {
     "architect": {"harness": "claude", "model": "claude-fable-5-2", "thinking": "high"},
     "product": {"harness": "claude", "model": "claude-opus-5-5", "thinking": "medium"},
@@ -2045,7 +2056,11 @@ class ConfigTests(unittest.TestCase):
             tasks = cfg.body.split("## Tasks\n", 1)[1].split("\n## Workflow", 1)[0]
             for heading in headings:
                 self.assertIn(heading, tasks)
-            self.assertIn("An item's criteria, verdict and next step go on indented lines under it.", tasks)
+            self.assertNotIn(" -- ", tasks)
+            example = re.search(r"```[^\n]*\n(.*?)\n```", tasks, re.S)
+            self.assertIsNotNone(example)
+            assert_todo_items(self, example.group(1))
+            self.assertRegex(example.group(1), r"(?m)^        (?:\* |\d+\. )")
             self.assertNotIn("tracker", cfg.team)
             self.assertEqual(list(cfg.members), ["lead-dev", "reviewer", "pm"])
             self.assertEqual(cfg.members["lead-dev"]["model"], "gpt-6-astra")
@@ -2395,14 +2410,16 @@ class GateFixtureTests(unittest.TestCase):
                 self.assertEqual([line for line in todo.splitlines() if line.startswith("## ")],
                                  ["## Ready", "## In progress", "## Backlog", "## Done"])
                 t1 = run(GIT, "rev-parse", "--short", "HEAD~1", cwd=repo).stdout.strip()
+                self.assertNotIn(" -- ", todo)
                 self.assertEqual([line for line in todo.splitlines() if line.startswith("- [")], [
-                    "- [ ] T3 Command line -- python3 -m slug prints the slug",
-                    "- [ ] T2 max_length -- limit the slug length (@lead-dev)",
-                    f"- [x] T1 Slugify joins words -- join words with hyphens ({t1})",
-                    "- [x] T4 Strip accents -- remove accents from the slug (0f3a9c1)",
+                    "- [ ] T3 Command line",
+                    "- [ ] T2 max_length (@lead-dev)",
+                    f"- [x] T1 Slugify joins words ({t1})",
+                    "- [x] T4 Strip accents (0f3a9c1)",
                 ])
-                self.assertIn("  - verdict: changes required by @reviewer", todo)
-                self.assertIn("    2. Add a test where max_length cuts right after a word.", todo)
+                assert_todo_items(self, todo)
+                self.assertIn("    * verdict: changes required by @reviewer", todo)
+                self.assertIn("        2. Add a test where max_length cuts right after a word.", todo)
                 self.assertNotEqual(subprocess.run([GIT, "cat-file", "-e", "0f3a9c1"], cwd=repo,
                                                    env=env, capture_output=True).returncode, 0)
                 self.assertEqual(set(run(GIT, "status", "--short", cwd=repo).stdout.splitlines()),
