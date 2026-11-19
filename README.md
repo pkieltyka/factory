@@ -2,7 +2,7 @@
 
 ### An owner-directed software factory on herdr
 
-`/factory` is an agent skill that forms a team, assigns work, gets it reviewed and brings it back after a restart. You direct the operator; members work in their own panes using Claude Code, Codex, pi, omp or OpenCode. Keep the built-in workflow or add tools through short project sections.
+`/factory` is an agent skill that forms a team, assigns work, gets it reviewed and brings it back after a restart. You direct the operator; members work in their own panes using Claude Code, Codex, pi, omp, OpenCode or Antigravity CLI (agy). Keep the built-in workflow or add tools through short project sections.
 
 [Get started](docs/getting-started.md) · [The factory on one page](docs/README.md)
 

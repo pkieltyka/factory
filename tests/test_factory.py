@@ -124,8 +124,10 @@ FAKE_HERDR = textwrap.dedent(r'''
             fail("timeout", "agent did not appear")
         panes[pane].update(agent=kind, name=name, agent_status="idle" if how in (None, "banner") else "blocked")
         if how == "dialog":  # a first-run question the harness table knows
-            panes[pane]["dialog"] = {"codex": ["> 1. Trust and continue  2. Back", ["enter"]]}.get(
-                kind, ["> No, exit\n  Yes, I trust this folder", ["down", "enter"]])
+            panes[pane]["dialog"] = {
+                "codex": ["> 1. Trust and continue  2. Back", ["enter"]],
+                "agy": ["Do you trust the contents of this project?\n> Yes, I trust this folder", ["enter"]],
+            }.get(kind, ["> No, exit\n  Yes, I trust this folder", ["down", "enter"]])
             if kind == "codex":  # herdr 0.9.5 calls Codex ready while its trust question is up
                 panes[pane]["agent_status"] = how = "idle"
         if how in ("blocked", "banner", "dialog"):  # a banner clears by itself: the agent is idle a moment later
@@ -183,6 +185,17 @@ FAKE_OPENCODE = textwrap.dedent(r'''
                 p, m = l.split(); print(f"{p}/{m}")
 ''').lstrip()
 
+FAKE_AGY = textwrap.dedent(r'''
+    #!/usr/bin/env python3
+    import sys
+    if sys.argv[1:] != ["models"]:
+        sys.exit(2)
+    print("Fetching available models...")
+    print("gemini-4-neon-high\tGemini 4 Neon (High)")
+    print("gemini-4-neon-low\tGemini 4 Neon (Low)")
+    print("gemini-pro-orchestrator-neon\tOrchestrator (Neon)")
+''').lstrip()
+
 MODELS = """\
 openrouter z-ai/glm-5.3
 openrouter z-ai/glm-5.3-flash
@@ -234,7 +247,7 @@ class Env:
     """A temp repo with a ten-role fixture brief by default, a fake herdr, fake harnesses,
     a Codex model cache, and the operator (a claude agent) in pane w1:p1 of tab w1:t1."""
 
-    def __init__(self, brief=CATALOG, harnesses=("claude", "codex", "pi", "omp", "opencode"), models=MODELS, git=False):
+    def __init__(self, brief=CATALOG, harnesses=factory.HARNESSES, models=MODELS, git=False):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = pathlib.Path(self.tmp.name).resolve()
         self.home = self.root / "home"
@@ -247,7 +260,7 @@ class Env:
         bin_ = self.root / "bin"
         bin_.mkdir()
         (bin_ / "python3").symlink_to(sys.executable)
-        scripts = {"herdr": FAKE_HERDR, "pi": FAKE_PI, "omp": FAKE_OMP, "opencode": FAKE_OPENCODE,
+        scripts = {"herdr": FAKE_HERDR, "pi": FAKE_PI, "omp": FAKE_OMP, "opencode": FAKE_OPENCODE, "agy": FAKE_AGY,
                    "claude": "#!/bin/sh\n", "codex": "#!/bin/sh\n"}
         for name, body in scripts.items():
             if name == "herdr" or name in harnesses:
@@ -557,6 +570,57 @@ class UpTests(unittest.TestCase):
             name, text = e.prompts()[0]
             self.assertIn("You are @reviewer", text)  # OpenCode gets its instructions as a message
             self.assertIn("# Team brief", text)
+
+    def test_agy_default_launch_trust_message_and_resume(self):
+        with Env(formation({"pm": {"harness": "agy"}}, operator={"harness": "claude"})) as e:
+            e.run("up", FAKE_START_FAIL="dialog:pm")
+            args = ["--model", "gemini-4-neon-high", "--mode", "accept-edits",
+                    "--settings", '{"toolPermission":"always-proceed"}']
+            self.assertEqual(kind(e.starts()["pm"]), "agy")
+            self.assertEqual(native(e.starts()["pm"]), args)
+            self.assertEqual([c[3:] for c in e.calls("pane", "send-keys")], [["enter"]])
+            brief = dict(e.prompts())["pm"]
+            self.assertIn("You are @pm", brief)
+            self.assertIn("Antigravity CLI, gemini-4-neon, high", brief)
+            self.assertIn("inbox send", brief)
+            self.assertEqual(e.run("inbox", "send", "--from", "pm", "report").stdout.strip(), "queued message 1")
+            e.set_session("pm", {"agent": "agy", "kind": "id", "value": "conversation-94"})
+            e.kill("pm")
+            e.run("up", "pm")
+            self.assertEqual(native(e.starts()["pm"]), args[:2] + ["--conversation", "conversation-94"] + args[2:])
+
+    def test_agy_model_variants_and_guarded_permissions(self):
+        cases = {"pm": ("gemini-4-neon", "low", "gemini-4-neon-low"),
+                 "reviewer": ("gemini-4-neon-low", None, "gemini-4-neon-low"),
+                 "designer": ("gemini-pro-orchestrator-neon", None, "gemini-pro-orchestrator-neon")}
+        members = {name: {"harness": "agy", "model": model, "permissions": "guarded",
+                          **({"thinking": level} if level else {})} for name, (model, level, _) in cases.items()}
+        with Env(formation(members)) as e:
+            e.run("up")
+            for name, (_, _, wanted) in cases.items():
+                self.assertEqual(native(e.starts()[name]), ["--model", wanted, "--mode", "accept-edits",
+                                 "--settings", '{"toolPermission":"always-proceed"}'])
+            brief = dict(e.prompts())["pm"]
+            self.assertIn("gemini-4-neon-low, low", brief)
+            self.assertIn("gemini-pro-orchestrator-neon, default", brief)
+            self.assertIn("agy offers: gemini-4-neon-high, gemini-4-neon-low, gemini-pro-orchestrator-neon",
+                          e.run("harnesses").stdout)
+
+    def test_agy_preflight_rejects_missing_models_and_conflicting_levels(self):
+        with Env(formation({
+            "pm": {"harness": "agy", "model": "gemini-4-neon-low", "thinking": "high"},
+            "reviewer": {"harness": "agy", "model": "gemini-4-neon", "thinking": "max"},
+            "designer": {"harness": "agy", "model": "Gemini 4 Neon (High)"},
+        })) as e:
+            result = e.run("up", check=False)
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(e.starts(), {})
+            self.assertIn("gemini-4-neon-low has no thinking level 'high'", result.stdout)
+            self.assertIn("Use one of: low.", result.stdout)
+            self.assertIn("gemini-4-neon has no thinking level 'max'", result.stdout)
+            self.assertIn("agy does not offer Gemini 4 Neon (High)", result.stdout)
+        with Env(formation({"pm": {"harness": "agy"}}), harnesses=("claude",)) as e:
+            self.assertIn("agy is not installed", e.run("check", check=False).stdout)
 
     def test_permissions_and_extra_args_come_from_the_brief(self):
         with Env(team_brief('''
@@ -2360,6 +2424,11 @@ class GateFixtureTests(unittest.TestCase):
 class HerdrContract(unittest.TestCase):
     """The fields factory.py reads must exist where it reads them. The fake above follows the same split."""
 
+    @unittest.skipUnless(shutil.which("herdr"), "herdr is not installed")
+    def test_agy_member_kind(self):
+        help_text = subprocess.run(["herdr", "agent"], capture_output=True, text=True)
+        self.assertRegex(help_text.stderr + help_text.stdout, r"kinds: [^\n]*\bagy\b")
+
     def test_pane_and_agent_records(self):
         if not shutil.which("herdr"):
             self.skipTest("herdr is not installed")
@@ -2401,7 +2470,12 @@ class LiveFlags(unittest.TestCase):
         "pi": (["--help"], ["--model", "--thinking", "--append-system-prompt", "--name", "--session", "--list-models"]),
         "omp": (["--help"], ["--model", "--thinking", "--append-system-prompt", "--resume", "--approval-mode"]),
         "opencode": (["--help"], ["--standalone", "--session", "--auto", "models"]),
+        "agy": (["--help"], ["--model", "--mode", "accept-edits", "--settings", "--conversation", "models"]),
     }
+
+    @unittest.skipUnless(shutil.which("agy"), "agy is not installed")
+    def test_agy_model_listing(self):
+        self.assertTrue(factory.agy_models(), "agy models returned no tab-separated model IDs")
 
     def test_flags_exist(self):
         for harness, (argv, flags) in self.FLAGS.items():

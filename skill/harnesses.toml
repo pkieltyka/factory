@@ -5,6 +5,7 @@
 #   models       recommended models, strongest first; `factory.py harnesses` says which this machine can use.
 #                Claude Code has no listing command, so for claude these are the ids `check` knows.
 #   aliases      claude only: short names Claude Code takes in place of a model id ("opus")
+#   default_model, default_thinking   agy member defaults, independent of the role
 #   thinking     levels the harness accepts (codex: read per model from its cache; opencode: per-model variants)
 #   never        levels factory refuses even where the harness accepts them
 #   prompt       how a member gets its standing instructions: `file` (appended to the system prompt),
@@ -84,3 +85,19 @@ prompt = "message"
 [opencode.permissions]   # --auto approves whatever the user's own rules do not deny
 full = ["--auto"]
 guarded = ["--auto"]
+
+[agy]
+operator_wait = "foreground"
+label = "Antigravity CLI"
+default_model = "gemini-4-neon"
+default_thinking = "high"
+install = "Install Antigravity CLI and sign in by running `agy`."
+models = ["gemini-4-neon", "gemini-4-argon", "gemini-4-hydrogen", "gemini-3.8-flash"]
+thinking = ["low", "medium", "high", "xhigh", "max"]
+never = []
+prompt = "message"
+dialogs = [["Do you trust the contents of this project?", ["enter"]]]
+
+[agy.permissions]   # guarded equals full because agy's sandbox and auto mode do not work on NixOS
+full = ["--mode", "accept-edits", "--settings", '{"toolPermission":"always-proceed"}']
+guarded = ["--mode", "accept-edits", "--settings", '{"toolPermission":"always-proceed"}']

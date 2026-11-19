@@ -1,8 +1,8 @@
 ---
 name: factory
 description: >
-  Form, launch and lead a software team in herdr across Claude Code, Codex, pi, omp
-  and OpenCode. Commands: setup, up, status, wait, brief, say, or bare
+  Form, launch and lead a software team in herdr across Claude Code, Codex, pi, omp,
+  OpenCode and Antigravity CLI (agy). Commands: setup, up, status, wait, brief, say, or bare
   /factory. Use for team formation, delegation, peer review and session recovery.
 ---
 
@@ -19,7 +19,7 @@ Message teammates only with `factory.py say` or `herdr agent prompt`, never thro
 ## Before launch
 
 - Require `HERDR_ENV=1`; otherwise stop and tell the user to run inside herdr.
-- Install herdr integration once per chosen harness: `herdr integration install <harness>`; session recovery depends on it.
+- Install herdr integration once per chosen harness: `herdr integration install <harness>` (use `antigravity-cli` for `agy`). Session recovery depends on it.
 - The operator needs herdr's socket, harness config directories, `~/.cache/factory-skill`, and any worktree parent. If your own sandbox blocks one of factory's own commands (`factory.py`, `herdr`, a `git worktree` operation), you may retry that one command outside the sandbox when your harness allows it, and you say so in your report to the user. Never edit the user's sandbox settings; every other command keeps the normal rules, and a block you cannot get past is reported, not worked around. Run shell commands standalone so command exemptions match: no `cd &&`, pipe, redirect or trailing `echo`.
 - Members default to `full` permissions, which assume a safe machine (a sandbox or VM); `guarded` is the alternative. What each means per harness: [references/cmd_setup.md](references/cmd_setup.md#permissions). Unknown startup questions and higher-level policy can still block a member.
 

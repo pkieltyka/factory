@@ -15,7 +15,7 @@ The default is [templates/factory.toml](../templates/factory.toml): @lead-dev, @
 - Add catalog roles only for concrete work; an architect is optional for larger systems.
 - Tip for custom teams: a reviewer from a different model family can catch different mistakes. The template's reviewer stays the default.
 - Frontend, designer and frontend QA need a real browser tool. Verify availability or ask before assigning browser work.
-- Use the role's thinking default unless the task warrants another supported level. The highest Claude/Codex levels are refused by `harnesses.toml`.
+- Use the role's thinking default unless the task warrants another supported level. An `agy` member defaults to `gemini-4-neon` at `high`. Choose another family and `thinking`, or an exact ID from `agy models` such as `gemini-4-neon-low`. The highest Claude/Codex levels are refused by `harnesses.toml`.
 - Separate developers' worktrees when parallel changes could collide. Otherwise they share the main checkout.
 - Default permissions are full: explain the safe-machine assumption (Permissions, below). Use guarded if the user requests it.
 
@@ -25,7 +25,7 @@ Run `factory.py init`. It writes what is missing (`FACTORY.md`, `factory.toml.sa
 
 Edit `factory.toml`, your formation:
 
-- Keep the chosen members, each with explicit harness, model and project-specific `notes`. `up` starts every member in it; there are no named rosters.
+- Keep the chosen members, each with a harness and project-specific `notes`. Set the model explicitly unless using the agy default. `up` starts every member in it; there are no named rosters.
 - Use `worktree = true` for developers who work in parallel: each gets branch `<user>/<member>` (for example `peter/lead-dev`), so two people's branches do not collide when their `user` differs. `user` is a top-level key above `[operator]` and defaults to the system user name; set it when that name is generic (`root`, `ubuntu`).
 - Match the operator's model/thinking to the current session, not the template defaults.
 
@@ -45,4 +45,5 @@ Run `factory.py check`. Resolve each failure without substituting unapproved mod
 ## Permissions
 
 - Members default to `full`, intended for a safe sandbox/VM. Claude uses bypass-permissions while retaining inherited sandbox settings; Codex disables approvals and its sandbox; pi/omp/OpenCode allow unattended commands. `guarded` uses Claude auto mode or Codex's workspace sandbox with automatic review; it changes nothing for the others.
+- Both agy levels use `--mode accept-edits` and the session-only `always-proceed` preset. In agy 1.5.12 a command matching an explicit Ask rule ran without approval, and a command matching Deny was blocked. Both levels run without a sandbox.
 - Full Claude members permit Unix sockets inside an inherited sandbox: all sockets on Linux, `HERDR_SOCKET_PATH` on macOS (all sockets if absent). The macOS form is not live-tested. Guarded only exempts standalone messaging commands, the inbox command included. Unknown startup questions and higher-level policy can still block.
