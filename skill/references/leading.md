@@ -62,7 +62,8 @@ A sent message is not always submitted: text can stay in a member's composer, an
 When the user gives a goal and tells you to keep going, work through it without waiting for prompts. First get the goal and its bounds onto the tracker: which items, until when, what is off limits.
 
 - Take only items the tracker marks ready, as many at a time as `FACTORY.md` allows. Assign, wait, review and integrate as above, then take the next. A `wait` timeout is not a stop: start it again.
-- Stop when a decision is the user's, no ready item is left, a task is not approved within the review rounds `FACTORY.md` allows, a capability the task needs is missing, or a member cannot be recovered.
+- Stop at the first item whose criteria you cannot meet as written, including when an input, capability or permission is missing. Keep its criteria unchanged and record the observed blocker on the tracker. Take no later item, even an independent one, until the user decides how to proceed. Do not try to run a task command outside your sandbox.
+- Also stop when a decision is the user's, no ready item is left, a task is not approved within the review rounds `FACTORY.md` allows, or a member cannot be recovered.
 - Always the user's, whatever the goal says: pushing, deploying, destructive operations, spending money, and anything sent outside the team. The exception is standing permission in a `## Pull requests` section of `FACTORY.md`: to push ticket branches and open pull requests, and separately to merge.
 - Autopilot assumes the safe machine that `full` permissions assume (see SKILL.md).
 - On stopping, say why and what comes next in your pane, and run `herdr notification show "factory stopped" --body "<why>" --sound request`.
