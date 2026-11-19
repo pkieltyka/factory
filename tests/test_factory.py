@@ -227,6 +227,17 @@ def formation(members, **tables):
                                 for name, fields in sections.items()))
 
 
+def assert_todo_items(case, text):
+    """Every checkbox line is followed by at least one 4-space '* ' description line."""
+    lines = text.splitlines()
+    items = [i for i, line in enumerate(lines) if line.startswith(("- [ ] ", "- [x] "))]
+    case.assertTrue(items, "expected at least one TODO checkbox item")
+    for i in items:
+        case.assertLess(i + 1, len(lines), lines[i])
+        case.assertRegex(lines[i + 1], r"^    \* \S", (lines[i], lines[i + 1]))
+        case.assertNotRegex(lines[i + 1], r"^    \* (?:owner|criteria|work|verdict|next):(?:\s|$)", lines[i + 1])
+
+
 CATALOG_MEMBERS = {
     "architect": {"harness": "claude", "model": "claude-fable-5-2", "thinking": "high"},
     "product": {"harness": "claude", "model": "claude-opus-5-5", "thinking": "medium"},
@@ -2046,10 +2057,10 @@ class ConfigTests(unittest.TestCase):
             for heading in headings:
                 self.assertIn(heading, tasks)
             self.assertNotIn(" -- ", tasks)
-            self.assertIn("`*` bullets indented four spaces", tasks)
-            self.assertIn("(`owner`, `criteria`, `work`, `verdict`, `next`)", tasks)
-            self.assertIn("indented eight spaces", tasks)
-            self.assertIn("- [ ] Title\n    * description\n    * criteria: ...\n    * next: ...\n        1. ...", tasks)
+            example = re.search(r"```[^\n]*\n(.*?)\n```", tasks, re.S)
+            self.assertIsNotNone(example)
+            assert_todo_items(self, example.group(1))
+            self.assertRegex(example.group(1), r"(?m)^        (?:\* |\d+\. )")
             self.assertNotIn("tracker", cfg.team)
             self.assertEqual(list(cfg.members), ["lead-dev", "reviewer", "pm"])
             self.assertEqual(cfg.members["lead-dev"]["model"], "gpt-6-astra")
@@ -2406,7 +2417,7 @@ class GateFixtureTests(unittest.TestCase):
                     f"- [x] T1 Slugify joins words ({t1})",
                     "- [x] T4 Strip accents (0f3a9c1)",
                 ])
-                self.assertIn("    * limit the slug length\n", todo)
+                assert_todo_items(self, todo)
                 self.assertIn("    * verdict: changes required by @reviewer", todo)
                 self.assertIn("        2. Add a test where max_length cuts right after a word.", todo)
                 self.assertNotEqual(subprocess.run([GIT, "cat-file", "-e", "0f3a9c1"], cwd=repo,

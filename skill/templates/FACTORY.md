@@ -4,7 +4,7 @@
 
 ## Tasks
 
-Tasks and bugs are tracked in `TODO.md` at the repo root. An item is its title on a checkbox line, then `*` bullets indented four spaces: one or more description lines first, then labelled record lines (`owner`, `criteria`, `work`, `verdict`, `next`), with any nested list (such as required fixes) indented eight spaces:
+Tasks and bugs are tracked in `TODO.md` at the repo root: title on a checkbox line, then four-space `*` description bullets. Add labelled record fields (`owner`, `criteria`, `work`, `verdict`, `next`) as they become known; indent nested lists eight spaces:
 
 ```markdown
 - [ ] Title
