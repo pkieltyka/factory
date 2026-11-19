@@ -886,12 +886,15 @@ class Team:
     """The running team as herdr sees it: one team per herdr session. A member's pane carries the member's
     @name as its label, and herdr knows the pane, the agent in it (if any) and its harness session."""
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, exclude_pane=None):
         self.cfg = cfg
         # `pane list` has labels and sessions but no agent names; `agent list` has the names.
-        self.agent_panes = {a["name"]: a.get("pane_id") for a in herdr("agent", "list").get("agents", []) if a.get("name")}
+        self.agent_panes = {a["name"]: a.get("pane_id") for a in herdr("agent", "list").get("agents", [])
+                            if a.get("name") and (not exclude_pane or a.get("pane_id") != exclude_pane)}
         self.panes = {}
         for p in herdr("pane", "list").get("panes", []):
+            if p["pane_id"] == exclude_pane:
+                continue
             label = p.get("label")
             if label and (label not in self.panes or p.get("agent")):  # a label can repeat: the live pane wins
                 self.panes[label] = p
@@ -1209,8 +1212,8 @@ def cmd_up(args):
     if not plans:
         raise SystemExit(f"no members in {CONF}; add one, then run `factory.py up`")
     require_herdr()
-    operator = ensure_operator(cfg, tab=True)
-    team = Team(cfg)
+    # The operator pane may still carry a member name or label from an earlier team.
+    team = Team(cfg, exclude_pane=os.environ.get("HERDR_PANE_ID"))
     running = [m["name"] for m in plans if not args.restart and team.live(m["name"])]
     ready = checked(cfg, [m for m in plans if m["name"] not in running])
     for m in ready:
@@ -1221,7 +1224,8 @@ def cmd_up(args):
             sys.exit(2)
     if running:
         print(f"already running: {', '.join(running)}")
-    configure_messages(cfg, team, operator, restart=[m["name"] for m in plans] if args.restart else ())
+    operator = ensure_operator(cfg, tab=True)
+    configure_messages(cfg, Team(cfg), operator, restart=[m["name"] for m in plans] if args.restart else ())
     if not ready:
         return
     pickup_text = ("We are picking up where we left off. Check the tracker the brief above names, then tell"

@@ -441,8 +441,7 @@ class UpTests(unittest.TestCase):
             self.assertIn("Cannot launch: 1 member(s)", p.stdout)
             self.assertIn("pi has no model z-ai/glm-9 configured", p.stdout)
             self.assertIn("OpenRouter key", p.stdout)
-            self.assertEqual(e.calls("agent", "start"), [])
-            self.assertEqual(e.calls("pane", "close"), [])
+            self.assertTrue(all(c[:2] in (["agent", "list"], ["pane", "list"]) for c in e.calls()), e.calls())
 
     def test_up_can_be_run_again_after_a_partial_launch(self):
         with Env(UI) as e:
@@ -1678,11 +1677,25 @@ class UpRecoveryTests(unittest.TestCase):
             state = e.fake_state()
             state["panes"][e.pane_of("pm")["pane_id"]]["name"] = "reviewer"
             e.write_fake(state)
+            before = len(e.calls())
             p = e.run("up", "lead-dev", "reviewer", "--restart", check=False)
             self.assertEqual(p.returncode, 2)
             self.assertIn("outside this team", p.stderr)
-            self.assertEqual(len(e.calls("agent", "start")), 2)
+            calls = e.calls()[before:]
+            self.assertTrue(all(c[:2] in (["agent", "list"], ["pane", "list"]) for c in calls), calls)
+
+    def test_operator_pane_with_an_old_member_label_is_not_a_restart_target(self):
+        with Env(formation({"lead-dev": CATALOG_MEMBERS["lead-dev"]}, operator={"harness": "claude"})) as e:
+            state = e.fake_state()
+            pane = state["panes"]["w1:p1"]
+            pane.update(label="lead-dev", name="lead-dev",
+                        agent_session={"agent": "claude", "kind": "id", "value": "operator-session"})
+            e.write_fake(state)
+            self.assertIn("through the inbox", e.run("up", "--restart").stdout)
             self.assertEqual(e.calls("pane", "close"), [])
+            self.assertEqual(e.pane_of("operator")["pane_id"], "w1:p1")
+            self.assertNotEqual(e.pane_of("lead-dev")["pane_id"], "w1:p1")
+            self.assertIn("That is the whole team brief.", dict(e.prompts())["lead-dev"])
 
     def test_continue_stub_never_launches(self):
         with Env(UI) as e:

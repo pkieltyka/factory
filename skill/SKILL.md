@@ -42,7 +42,7 @@ factory.py up                       # every member in factory.toml
 factory.py up reviewer pm           # selected members
 ```
 
-`up` checks every member it will start or restart before closing or starting any pane. If checks fail, report the problem/fix and resolve it; do not substitute models, harnesses or effort levels without the user's authorization. Unknown Claude models warn instead of failing preflight; Claude rejects invalid IDs at launch.
+`up` checks every member it will start or restart and checks for name conflicts before changing anything in herdr. Reading the team can record observed sessions in the local cache. If checks fail, report the problem/fix and resolve it; do not substitute models, harnesses or effort levels without the user's authorization. Unknown Claude models warn instead of failing preflight; Claude rejects invalid IDs at launch.
 
 On success, the script labels the operator tab `factory operator`, creates a balanced `factory team` tab, prepares worktrees, starts members and sends their briefs. Re-running `up` leaves live members alone and resumes matching sessions for stopped members. Use `--fresh` for new sessions and `--restart` to relaunch running members too.
 
