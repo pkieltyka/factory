@@ -228,7 +228,7 @@ def formation(members, **tables):
 
 
 def assert_todo_items(case, text):
-    """Check item spacing within each section and the first bullet of any item with details."""
+    """Check item spacing within each section and indentation of detail bullets and nested lists."""
     lines = text.splitlines()
     checkbox = ("- [ ] ", "- [x] ")
     case.assertTrue(any(line.startswith(checkbox) for line in lines), "expected a TODO checkbox item")
@@ -245,6 +245,8 @@ def assert_todo_items(case, text):
             case.assertTrue(lines[i - 1].strip(), f"blank line inside item before {line}")
             if lines[i - 1].startswith(checkbox):
                 case.assertRegex(line, r"^    \* \S")
+            elif re.match(r"\s*(?:[-+*]|\d+[.)])(?:\s|$)", line):
+                case.assertRegex(line, r"^(?:    \*|        (?:[-+*]|\d+[.)])) \S")
 
 
 CATALOG_MEMBERS = {
@@ -2052,7 +2054,8 @@ class ConfigTests(unittest.TestCase):
         first = "- [x] First\n    * verdict: approved"
         second = "- [ ] Second"
         assert_todo_items(self, first + "\n\n" + second)
-        for bad in (first + "\n" + second, first + "\n\n\n" + second, second + "\n\n    * detail"):
+        for bad in (first + "\n" + second, first + "\n\n\n" + second, second + "\n\n    * detail",
+                    first + "\n  * misindented detail", first + "\n    - wrong marker"):
             with self.subTest(text=bad), self.assertRaises(AssertionError):
                 assert_todo_items(self, bad)
 
