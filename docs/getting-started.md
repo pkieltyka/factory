@@ -60,7 +60,9 @@ Pushing, deploying, destructive actions, spending and sending anything outside t
 
 After members report, quit each member's harness in its pane to stop the members. To stop the whole dedicated session, run `herdr session stop first-factory` from another terminal. This ends every process in that session, including the operator. To leave work running instead, detach with **Ctrl+B**, then **q**. [How herdr sessions persist](https://herdr.dev/tui/docs/persistence-remote/)
 
-From the project, return with `herdr --session first-factory`. Use the existing operator or start its harness again if it exited. Enter `/factory continue` when returning to a running herdr session. It reuses live members, resumes recorded sessions of the same harness, and starts fresh when there is no matching session. After a full herdr server stop and restart, enter `/factory continue --restart` to reapply launch settings.
+From the project, return with `herdr --session first-factory`. If the operator pane opens at a shell, start your harness there. If you left the session running, enter `/factory continue`. It reuses live members, resumes recorded sessions of the same harness, and starts members fresh when there is no matching session.
+
+After `herdr session stop first-factory` or a full server restart, herdr restores the panes and can reopen the operator's previous conversation. Use that conversation, or quit the restored harness and start it again in the same pane for a fresh one. Enter `/factory continue --restart` to reapply member launch settings.
 
 ## Where the rules live
 
