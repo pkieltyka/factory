@@ -593,6 +593,21 @@ class UpTests(unittest.TestCase):
         '''))
             self.assertIn("must be one of full, guarded", e.run("check", "pm", check=False).stderr)
 
+    def test_claude_members_disable_prompt_suggestions_on_start_and_resume(self):
+        members = {"frontend-dev": {**CATALOG_MEMBERS["frontend-dev"], "permissions": "full"},
+                   "designer": {**CATALOG_MEMBERS["designer"], "permissions": "guarded"}}
+        with Env(formation(members)) as e:
+            e.run("up", "--no-brief")
+            for name in members:
+                e.set_session(name, {"agent": "claude", "kind": "id", "value": f"saved-{name}"})
+            e.run("continue", "--restart")
+            for name in members:
+                fresh, resumed = [native(call) for call in e.calls("agent", "start", name)]
+                self.assertNotIn("--resume", fresh)
+                self.assertEqual(flag(resumed, "--resume"), f"saved-{name}")
+                for argv in (fresh, resumed):
+                    self.assertIs(json.loads(flag(argv, "--settings"))["promptSuggestionEnabled"], False)
+
     def test_claude_socket_settings_follow_platform_and_permission_level(self):
         for platform in ("linux", "darwin"):
             for socket_path in ("", "/tmp/test-herdr.sock"):
