@@ -40,4 +40,4 @@ An `activity` decision or verified learning binds until a newer spec or decision
 
 ## Upkeep, by the operator
 
-Supersede a stale note instead of rewriting it. When a lesson recurs, re-verify the existing note or strengthen it with the new evidence instead of writing a second one. At a milestone, promote observations to learnings, turn them into tasks, or remove them. Files directly in the notes location are older material: leave them where they are.
+Supersede a stale note instead of rewriting it. When a lesson recurs, re-verify the existing note, then cite it if still valid or supersede it if stale. At a milestone, promote observations to learnings, turn them into tasks, or remove them. Files directly in the notes location are older material: leave them where they are.
