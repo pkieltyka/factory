@@ -2,7 +2,7 @@
 name: factory
 description: >
   Form, launch and lead a software team in herdr across Claude Code, Codex, pi, omp
-  and OpenCode. Commands: setup, up, continue, status, wait, brief, say, or bare
+  and OpenCode. Commands: setup, up, status, wait, brief, say, or bare
   /factory. Use for team formation, delegation, peer review and session recovery.
 ---
 
@@ -28,13 +28,12 @@ Message teammates only with `factory.py say` or `herdr agent prompt`, never thro
 | Request | Action |
 |---|---|
 | `setup` | Read [references/cmd_setup.md](references/cmd_setup.md); form or change the team. |
-| `up` | Follow Launch below, then [references/leading.md](references/leading.md). |
-| `continue` / `cont` | Read [references/cmd_continue.md](references/cmd_continue.md); `--restart` reapplies settings to running members. |
+| `up` | Start or resume the team as under Launch. When returning to unfinished work, [reconcile before assigning](references/cmd_continue.md#reconcile-before-assigning). |
 | `status` / `wait` | Run the command; interpret results using [references/leading.md](references/leading.md). |
 | `brief` | `factory.py brief --send [names]` resends the brief; without `--send`, preview it. |
 | `say` | `factory.py say <names|all> "message"`, or `--file <path>`. Check delivery failures. |
 
-Bare `/factory`: no `FACTORY.md` or `factory.toml` → setup; otherwise run `status`. No members → continue when the tracker or Git shows unfinished work, otherwise up; gone → continue; blocked → inspect and resolve within existing authorization; running → continue the user's work or ask for the next task if none is known.
+Bare `/factory`: if either project file is missing, run setup. Otherwise run `status`. If no member is running, run `up`. If some are gone, run `up <names>` for those members. While others run, start never-started members only if the user asks. Inspect blocked members and resolve within existing authorization. When the tracker or Git shows unfinished work, reconcile as above, even if everyone is running. Carry on with the user's work or ask for the next task if none is known.
 
 ## Launch
 
@@ -43,12 +42,12 @@ factory.py up                       # every member in factory.toml
 factory.py up reviewer pm           # selected members
 ```
 
-`up` checks every selected member before starting any. If checks fail, report the problem/fix and resolve it; do not substitute models, harnesses or effort levels without the user's authorization. Unknown Claude models warn instead of failing preflight; Claude rejects invalid IDs at launch.
+`up` checks every member it will start or restart and checks for name conflicts before changing anything in herdr. Reading the team can record observed sessions in the local cache. If checks fail, report the problem/fix and resolve it; do not substitute models, harnesses or effort levels without the user's authorization. Unknown Claude models warn instead of failing preflight; Claude rejects invalid IDs at launch.
 
-On success, the script labels the operator tab `factory operator`, creates a balanced `factory team` tab, prepares worktrees, starts members and sends their briefs. Re-running `up` skips live members.
+On success, the script labels the operator tab `factory operator`, creates a balanced `factory team` tab, prepares worktrees, starts members and sends their briefs. Re-running `up` leaves live members alone and resumes matching sessions for stopped members. Use `--fresh` for new sessions and `--restart` to relaunch running members too.
 
 - Failed start: read the reported pane, fix the cause, then `factory.py up <name>`.
 - Undelivered brief: resolve the error and `factory.py brief --send <name>` before assigning work. Failed starts or briefing exit 3; preflight failures exit 2.
 - Known startup dialogs are answered automatically. For any other dialog, read `herdr agent read <name> --source visible`; resolve it within existing authorization or ask for the missing decision, then resend the brief.
 
-Check `status`, then assign self-contained tasks as in `leading.md`. Add members only in `factory.toml`: use the role's next name (`reviewer`, then `reviewer-2`, `reviewer-3`), explicit harness/model, and `role` for numbered names. Run `check`, then `up <name>`. Change running members in `factory.toml` and restart with `continue <name> --restart`. Names are never reassigned or renumbered; the operator's name stays fixed while the team runs, and tab labels are fixed.
+Check `status`, then assign self-contained tasks as in [leading.md](references/leading.md). Add members only in `factory.toml`: use the role's next name (`reviewer`, then `reviewer-2`, `reviewer-3`), explicit harness/model, and `role` for numbered names. Run `check`, then `up` or `up <name>`. Change running members in `factory.toml` and restart with `up <name> --restart`. Names are never reassigned or renumbered; the operator's name stays fixed while the team runs, and tab labels are fixed.

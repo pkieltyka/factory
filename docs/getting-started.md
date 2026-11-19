@@ -34,7 +34,7 @@ mkdir -p ~/.claude/skills
 cp -R skill ~/.claude/skills/factory
 ```
 
-To link instead, create the parent directory and use `ln -s "$PWD/skill" ~/.claude/skills/factory` in place of the copy command. To update either installation, run `git pull` in the factory clone. A link follows the update. For a copy, refresh the contents with `cp -R skill/. ~/.claude/skills/factory/`. To give running members the updated instructions, finish their current work and have the operator run `/factory continue --restart`.
+To link instead, create the parent directory and use `ln -s "$PWD/skill" ~/.claude/skills/factory` in place of the copy command. To update either installation, run `git pull` in the factory clone. A link follows the update. For a copy, refresh the contents with `cp -R skill/. ~/.claude/skills/factory/`. To give running members the updated instructions, finish their current work and have the operator run `/factory up --restart`.
 
 ## Form the team
 
@@ -46,7 +46,7 @@ Setup writes the shared brief in `FACTORY.md` and the suggested formation in `fa
 
 ## Launch
 
-Enter `/factory up`. After checking the formation, the operator renames its tab **factory operator** and opens **factory team** with one pane per member, labelled with the member's name. Enter `/factory status` to see who is running. You can speak in any pane.
+Enter `/factory up`. After checking the formation, the operator renames its tab **factory operator** and opens **factory team** with one pane per member, labelled with the member's name. Enter `/factory status` to see who is running. You can speak in any pane. To add a configured member or finish a partial launch, run `/factory up` again, or `/factory up <name>` for one member.
 
 ## Give it one task
 
@@ -62,10 +62,10 @@ Pushing, deploying, destructive actions, spending and sending anything outside t
 
 After members report, quit each member's harness in its pane to stop the members. To stop the whole dedicated session, run `herdr session stop first-factory` from another terminal. This ends every process in that session, including the operator. To leave work running instead, detach with **Ctrl+B**, then **q**. [How herdr sessions persist](https://herdr.dev/tui/docs/persistence-remote/)
 
-From the project, return with `herdr --session first-factory`. If the operator pane opens at a shell, start your harness there. If you left the session running, enter `/factory continue`. It reuses live members, resumes recorded sessions of the same harness, and starts members fresh when there is no matching session.
+From the project, return with `herdr --session first-factory`. If the operator pane opens at a shell, start your harness there. If you left the session running, enter `/factory up`. It leaves live members alone and brings back the rest, including closed panes, resuming recorded sessions of the same harness when available. Use `/factory up --fresh` to start stopped members in new sessions. To keep a member out, name the others or remove it from `factory.toml`.
 
-After `herdr session stop first-factory` or a full server restart, herdr restores the panes and can reopen the operator's previous conversation. Use that conversation, or quit the restored harness and start it again in the same pane for a fresh one. Enter `/factory continue --restart` to reapply member launch settings.
+After `herdr session stop first-factory` or a full server restart, herdr restores the panes and can reopen the operator's previous conversation. Use that conversation, or quit the restored harness and start it again in the same pane for a fresh one. Enter `/factory up --restart` to reapply member launch settings.
 
 ## Where the rules live
 
-The skill references address the operator agent. “You” in those pages means the operator. [Setup](../skill/references/cmd_setup.md) · [Leading the team](../skill/references/leading.md) · [Pull requests](../skill/references/pull-requests.md) · [Continue](../skill/references/cmd_continue.md)
+The skill references address the operator agent. “You” in those pages means the operator. [Setup](../skill/references/cmd_setup.md) · [Leading the team](../skill/references/leading.md) · [Pull requests](../skill/references/pull-requests.md) · [Returning to the team](../skill/references/cmd_continue.md)

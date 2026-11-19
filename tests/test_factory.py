@@ -441,7 +441,7 @@ class UpTests(unittest.TestCase):
             self.assertIn("Cannot launch: 1 member(s)", p.stdout)
             self.assertIn("pi has no model z-ai/glm-9 configured", p.stdout)
             self.assertIn("OpenRouter key", p.stdout)
-            self.assertEqual(e.fake_state()["calls"], [])
+            self.assertTrue(all(c[:2] in (["agent", "list"], ["pane", "list"]) for c in e.calls()), e.calls())
 
     def test_up_can_be_run_again_after_a_partial_launch(self):
         with Env(UI) as e:
@@ -459,14 +459,13 @@ class UpTests(unittest.TestCase):
 
             e.update("pm", agent_status="idle")  # the user answered pm's dialog
             before = len(e.prompts())
-            out = e.run("up").stdout
-            self.assertIn("already running: lead-dev, reviewer, pm", out)
+            out = e.run("up", "frontend-dev").stdout
             self.assertIn("started @frontend-dev", out)
-            later = e.prompts()[before:]
-            self.assertTrue(next(t for n, t in later if n == "frontend-dev").startswith("# Team brief"))
-            for name in ("lead-dev", "reviewer", "pm"):  # the others hear who joined, not the whole brief again
-                text = next(t for n, t in later if n == name)
-                self.assertTrue(text.startswith("[from @operator]: Joined the team: @frontend-dev (frontend-dev, Claude Code"), text)
+            later = dict(e.prompts()[before:])
+            self.assertIn("starting in a new session", later.pop("frontend-dev"))
+            self.assertEqual(set(later), {"lead-dev", "reviewer", "pm"})
+            for text in later.values():
+                self.assertTrue(text.startswith("[from @operator]: Joined the team: @frontend-dev (frontend-dev, Claude Code"))
             self.assertEqual(len(e.calls("tab", "create")), 1)  # the failed member's pane was reused
             self.assertEqual(len([p for p in e.fake_state()["panes"].values() if p["label"] == "frontend-dev"]), 1)
             e.run("brief", "--send", "pm")
@@ -600,7 +599,7 @@ class UpTests(unittest.TestCase):
             e.run("up", "--no-brief")
             for name in members:
                 e.set_session(name, {"agent": "claude", "kind": "id", "value": f"saved-{name}"})
-            e.run("continue", "--restart")
+            e.run("up", "--restart")
             for name in members:
                 fresh, resumed = [native(call) for call in e.calls("agent", "start", name)]
                 self.assertNotIn("--resume", fresh)
@@ -652,13 +651,13 @@ class UpTests(unittest.TestCase):
             self.assertEqual((e.repo / "factory.toml").read_bytes(), original)
             self.assertEqual(e.starts(), {})
 
-    def test_up_and_continue_fail_when_brief_delivery_fails(self):
+    def test_up_reports_brief_delivery_failure_on_start_and_recovery(self):
         with Env() as e:
             p = e.run("up", "lead-dev", check=False, FAKE_PROMPT_FAIL="lead-dev")
             self.assertEqual(p.returncode, 3)
             self.assertIn("factory.py brief --send lead-dev", p.stdout)
             e.kill("lead-dev")
-            p = e.run("continue", "lead-dev", check=False, FAKE_PROMPT_FAIL="lead-dev")
+            p = e.run("up", "lead-dev", check=False, FAKE_PROMPT_FAIL="lead-dev")
             self.assertEqual(p.returncode, 3)
             self.assertIn("factory.py brief --send lead-dev", p.stdout)
             self.assertEqual(e.run("brief", "--send", "lead-dev").returncode, 0)
@@ -714,8 +713,7 @@ class UpTests(unittest.TestCase):
             status = e.run("status").stdout
             self.assertEqual(status.count("not started"), len(CATALOG_MEMBERS) + 1)
             self.assertIn("No member of factory.toml has a pane in this herdr session. "
-                          "A team that ran before: `factory.py continue`. "
-                          "A new team: `factory.py check`, then `factory.py up`.", status)
+                          "Run `factory.py up` to start or resume its members.", status)
             for command in ("cost", "show"):
                 self.assertEqual(e.run(command, check=False).returncode, 2)
             for option in ("--dry-run", "--trust-models", "--effort"):
@@ -778,7 +776,7 @@ class WorktreeTests(unittest.TestCase):
             self.assertIn("`git diff main...<branch>`", brief)
             self.assertIn("| the main checkout |", brief)
             e.kill("backend-dev")
-            self.assertNotIn("created worktree", e.run("continue", "backend-dev").stdout)  # the checkout is kept
+            self.assertNotIn("created worktree", e.run("up", "backend-dev").stdout)  # the checkout is kept
 
     def test_numbered_worktree_and_no_repository(self):
         with Env(formation({**CATALOG_MEMBERS, "reviewer-2": {
@@ -791,7 +789,7 @@ class WorktreeTests(unittest.TestCase):
             p = e.run("up", "backend-dev", check=False)
             self.assertEqual(p.returncode, 2)
             self.assertIn("a worktree needs a git repository with a commit", p.stdout)
-            self.assertEqual(e.fake_state()["calls"], [])
+            self.assertTrue(all(c[:2] in (["agent", "list"], ["pane", "list"]) for c in e.calls()), e.calls())
 
     def test_distinct_branches_cannot_share_a_worktree_path(self):
         brief = formation({
@@ -838,19 +836,19 @@ class WorktreeTests(unittest.TestCase):
             e.run("up", "--no-brief")
             pane = e.pane_of("lead-dev")["pane_id"]
             e.write_brief(team_brief('user = ".ada"\n' + team.format("true")))
-            p = e.run("continue", "lead-dev", "--restart", check=False)
+            p = e.run("up", "lead-dev", "--restart", check=False)
             self.assertEqual(p.returncode, 2)
             self.assertEqual(e.calls("pane", "close"), [])
             self.assertEqual(e.pane_of("lead-dev")["pane_id"], pane)
 
-    def test_continue_moves_member_to_newly_configured_worktree(self):
+    def test_up_moves_member_to_newly_configured_worktree(self):
         with Env(git=True) as e:
             e.run("up", "lead-dev", "--no-brief")
             old_id = e.pane_of("lead-dev")["pane_id"]
             e.set_session("lead-dev", {"agent": "codex", "kind": "id", "value": "saved-codex"})
             e.kill("lead-dev")
             e.write_brief(CATALOG.replace('[members.lead-dev]', '[members.lead-dev]\nworktree = true'))
-            e.run("continue", "lead-dev")
+            e.run("up", "lead-dev")
             current = e.pane_of("lead-dev")
             self.assertNotEqual(current["pane_id"], old_id)
             self.assertEqual(current["cwd"], str(e.root / "repo.worktrees/ada-lead-dev"))
@@ -859,13 +857,13 @@ class WorktreeTests(unittest.TestCase):
             # Codex restores its saved tool cwd unless explicitly overridden, even in a new pane.
             self.assertEqual(flag(native(e.starts()["lead-dev"]), "-C"), current["cwd"])
 
-    def test_continue_uses_foreground_directory_when_shell_moved(self):
+    def test_up_uses_foreground_directory_when_shell_moved(self):
         with Env(git=True) as e:
             e.run("up", "lead-dev", "--no-brief")
             old_id = e.pane_of("lead-dev")["pane_id"]
             e.kill("lead-dev")
             e.update("lead-dev", foreground_cwd=str(e.repo / "sub"))
-            e.run("continue", "lead-dev")
+            e.run("up", "lead-dev")
             self.assertNotEqual(e.pane_of("lead-dev")["pane_id"], old_id)
             self.assertEqual(e.pane_of("lead-dev")["cwd"], str(e.repo))
 
@@ -908,7 +906,9 @@ class InboxTests(unittest.TestCase):
             brief = e.run("brief").stdout
             self.assertIn("with the inbox command", brief)
             self.assertIn("herdr agent prompt <name> '[from @you]: ...'", brief)
-            e.run("continue")
+            for name, settings in members.items():
+                e.set_session(name, {"agent": settings["harness"], "kind": "id", "value": f"saved-{name}"})
+            e.run("up", "--restart")
             for name, text in e.prompts()[-len(members):]:
                 self.assertIn("Send it with the inbox command", text, name)
                 self.assertNotIn("Send it: `herdr agent prompt operator", text)
@@ -928,12 +928,13 @@ class InboxTests(unittest.TestCase):
         with Env(UI) as e:
             prompt, brief = e.run("prompt", "lead-dev").stdout, e.run("brief").stdout
             self.assertIn("harness is not set", e.run("up").stdout)
-            e.run("continue")
+            e.set_session("lead-dev", {"agent": "codex", "kind": "id", "value": "saved"})
+            e.run("up", "lead-dev", "--restart")
             closing = dict(e.prompts())["lead-dev"].split("We are picking up")[1]
             e.write_brief(formation({n: CATALOG_MEMBERS[n] for n in ("lead-dev", "frontend-dev", "reviewer", "pm")},
                                     operator={"harness": "codex"}))
             e.update("operator", agent="pi")
-            e.run("continue")
+            e.run("up", "lead-dev", "--restart")
             self.assertEqual(prompt, e.run("prompt", "lead-dev").stdout)
             # The Roles row changes with configuration; the generated messaging sentence does not.
             self.assertEqual(brief.split("## Talking to each other")[1],
@@ -941,10 +942,10 @@ class InboxTests(unittest.TestCase):
             self.assertEqual(closing, dict(e.prompts())["lead-dev"].split("We are picking up")[1])
             e.write_brief(formation({"lead-dev": CATALOG_MEMBERS["lead-dev"]}, operator={"harness": "claude"}))
             e.update("operator", agent="codex")
-            self.assertIn("factory.toml says claude, herdr sees codex", e.run("continue").stdout)
+            self.assertIn("factory.toml says claude, herdr sees codex", e.run("up").stdout)
             e.update("operator", agent="claude")
-            self.assertIn("route to @operator changed to inbox", e.run("continue").stdout)
-            self.assertNotIn("route to @operator changed", e.run("continue", "--restart").stdout)
+            self.assertIn("route to @operator changed to inbox", e.run("up").stdout)
+            self.assertNotIn("route to @operator changed", e.run("up", "--restart").stdout)
             e.write_brief(formation({"lead-dev": CATALOG_MEMBERS["lead-dev"]}, operator={"harness": "unknown"}))
             self.assertIn("[operator] harness 'unknown' is not one of", e.run("check", check=False).stderr)
         self.assertNotIn("inbox", factory.claude_settings("guarded"))
@@ -972,10 +973,10 @@ class InboxTests(unittest.TestCase):
                 self.assertNotIn("End your turn", e.run("wait", "--interval", "0").stdout)
 
                 e.write_brief(formation(members, operator={"harness": harness, "messages": "inbox"}))
-                self.assertIn("route to @operator changed to inbox", e.run("continue").stdout)
+                self.assertIn("route to @operator changed to inbox", e.run("up").stdout)
                 explicit = e.run("prompt", "lead-dev").stdout
                 e.write_brief(formation(members, operator={"harness": harness}))
-                self.assertIn("through the inbox", e.run("continue").stdout)
+                self.assertIn("through the inbox", e.run("up").stdout)
                 self.assertEqual(explicit, e.run("prompt", "lead-dev").stdout)
                 self.send(e, "pending before opt-out")
                 self.assertIn(f"acknowledge by starting your next watcher in the {mode}: factory.py wait --seen 1",
@@ -984,7 +985,7 @@ class InboxTests(unittest.TestCase):
                     path = factory.Inbox(factory.Config(e.repo)).path
                 pending = path.read_bytes()
                 e.write_brief(formation(members, operator={"harness": harness, "messages": "typed"}))
-                self.assertIn("route to @operator changed to typed", e.run("continue").stdout)
+                self.assertIn("route to @operator changed to typed", e.run("up").stdout)
                 self.assertEqual(pending, path.read_bytes())
                 output = e.run("wait").stdout
                 self.assertIn("pending before opt-out", output)
@@ -1016,9 +1017,8 @@ class InboxTests(unittest.TestCase):
             with self.subTest(harness=harness), Env(formation({"lead-dev": CATALOG_MEMBERS["lead-dev"]},
                                                             operator={"harness": harness})) as e:
                 e.update(None, agent=harness)  # up has not named the operator pane yet.
-                for command in ("up", "continue"):
-                    output = e.run(command).stdout
-                    self.assertIn(f"run factory.py wait in the {mode}", output)
+                output = e.run("up").stdout
+                self.assertIn(f"run factory.py wait in the {mode}", output)
                 self.assertIn(f"operator messages: inbox, {mode} wait", e.run("status").stdout)
                 self.assertIn("queued message N", e.run("prompt", "lead-dev").stdout)
                 e.update("lead-dev", agent_status="done")
@@ -1032,7 +1032,7 @@ class InboxTests(unittest.TestCase):
                 timeout(e, 1800)
                 e.write_brief(formation({"lead-dev": CATALOG_MEMBERS["lead-dev"]},
                                         operator={"harness": harness, "messages": "typed"}))
-                e.run("continue")
+                e.run("up")
                 timeout(e, 1800)
         with Env() as e:
             self.prepare(e)
@@ -1195,9 +1195,9 @@ class InboxTests(unittest.TestCase):
     def test_failures_never_call_herdr_and_fallback_quotes_payload(self):
         with Env() as e:
             inbox = self.prepare(e, "typed")
-            for state, advice in (("typed", "no inbox route; factory.py continue lead-dev --restart"),
-                                  ("missing", "no inbox route; factory.py continue lead-dev --restart"),
-                                  ("damage", "needs repair; after the repair: factory.py continue --restart"),
+            for state, advice in (("typed", "no inbox route; factory.py up lead-dev --restart"),
+                                  ("missing", "no inbox route; factory.py up lead-dev --restart"),
+                                  ("damage", "needs repair; after the repair: factory.py up --restart"),
                                   ("symlink", "cannot write; check this member's sandbox and the cache path")):
                 if state == "missing":
                     inbox.state_path.unlink()
@@ -1220,7 +1220,7 @@ class InboxTests(unittest.TestCase):
                 if state in ("damage", "symlink"):
                     self.assertIn(str(inbox.path), reason)
                 else:
-                    self.assertIn("restart it with factory.py continue lead-dev --restart", reason)
+                    self.assertIn("restart it with factory.py up lead-dev --restart", reason)
                 if state == "damage":
                     self.assertEqual(inbox.path.read_text(), '{"torn":')
                 if state == "symlink":
@@ -1300,15 +1300,14 @@ class InboxTests(unittest.TestCase):
                 self.assertIn("nobody is working", result.stdout)
                 self.assertIn("inbox needs repair", e.run("status").stdout)
                 self.assertEqual(before, (inbox.path.read_bytes(), inbox.state_path.read_bytes()))
-                for cmd in ("up", "continue"):
-                    fake = e.fake_state()
-                    fake["panes"] = {"w1:p1": fake["panes"]["w1:p1"]}
-                    e.write_fake(fake)
-                    result = e.run(cmd)
-                    self.assertIn("inbox needs repair", result.stdout)
-                    self.assertIn("started @lead-dev", result.stdout)
-                    self.assertIn("Message teammates only", e.run("prompt", "lead-dev").stdout)
-                    self.assertEqual(before, (inbox.path.read_bytes(), inbox.state_path.read_bytes()))
+                fake = e.fake_state()
+                fake["panes"] = {"w1:p1": fake["panes"]["w1:p1"]}
+                e.write_fake(fake)
+                result = e.run("up")
+                self.assertIn("inbox needs repair", result.stdout)
+                self.assertIn("started @lead-dev", result.stdout)
+                self.assertIn("Message teammates only", e.run("prompt", "lead-dev").stdout)
+                self.assertEqual(before, (inbox.path.read_bytes(), inbox.state_path.read_bytes()))
 
     def test_unavailable_inbox_degrades_but_cache_directories_may_be_symlinks(self):
         brief = formation({"lead-dev": CATALOG_MEMBERS["lead-dev"]}, operator={"harness": "claude"})
@@ -1319,7 +1318,6 @@ class InboxTests(unittest.TestCase):
             inbox.state_path.symlink_to(target)
             before = target.read_bytes()
             self.assertIn("inbox unavailable:", e.run("up").stdout)
-            self.assertIn("inbox unavailable:", e.run("continue").stdout)
             self.assertIn("Message teammates only", e.run("prompt", "lead-dev").stdout)
             self.assertIn("Message anyone with", e.run("brief").stdout)
             self.assertIn("inbox unavailable:", e.run("status").stdout)
@@ -1347,7 +1345,7 @@ class InboxTests(unittest.TestCase):
         with Env(brief) as e:
             inbox = self.prepare(e)
             before = inbox.state_path.read_bytes()
-            args = types.SimpleNamespace(cwd=str(e.repo), names=[], timeout=1000, no_brief=False)
+            args = types.SimpleNamespace(cwd=str(e.repo), names=[], timeout=1000, no_brief=False, restart=False, fresh=False)
             replace = os.replace
             def denied(source, target):
                 if target == inbox.state_path:
@@ -1364,7 +1362,7 @@ class InboxTests(unittest.TestCase):
                 self.assertIn("Message teammates only", prompt)
                 self.assertNotIn("To reach @operator, do not use herdr", prompt)
             self.assertIn("inbox unavailable: state replace denied. This session runs on typed messages."
-                          " After fixing it, run factory.py continue --restart.", out.getvalue())
+                          " After fixing it, run factory.py up --restart.", out.getvalue())
             self.assertIn("by typed herdr messages", out.getvalue())
             self.assertIn("started @lead-dev", out.getvalue())
             self.assertIn("Message anyone with", dict(e.prompts())["lead-dev"])
@@ -1389,34 +1387,33 @@ class InboxTests(unittest.TestCase):
 
     def test_cold_retention_clears_only_acknowledged_in_current_session(self):
         brief = formation({"lead-dev": CATALOG_MEMBERS["lead-dev"]}, operator={"harness": "claude"})
-        for cmd in ("up", "continue"):
-            for acknowledge in (False, True):
-                with self.subTest(cmd=cmd, acknowledge=acknowledge), Env(brief) as e:
-                    inbox = self.prepare(e)
-                    self.send(e, "earlier message")
-                    if acknowledge:
-                        e.run("wait", "--seen", "1", check=False)
-                    with patch.dict(os.environ, {**e.env, "HERDR_SESSION": "another/session"}):
-                        with factory.Inbox(factory.Config(e.repo)) as other:
-                            other.state["mode"] = "typed"
-                            other.save_state()
-                        other.path.write_bytes(b"untouched")
-                    before_other = (other.path.read_bytes(), other.state_path.read_bytes())
-                    inode = inbox.lock_path.stat().st_ino
-                    result = e.run(cmd)
-                    self.assertEqual(inbox.lock_path.stat().st_ino, inode)
-                    self.assertEqual(before_other, (other.path.read_bytes(), other.state_path.read_bytes()))
-                    state = json.loads(inbox.state_path.read_text())
-                    self.assertEqual(state["mode"], "inbox")
-                    self.assertEqual(state["seen"], 1 if acknowledge else 0)
-                    if acknowledge:
-                        self.assertEqual(inbox.path.read_bytes(), b"")
-                        self.assertNotIn("unread messages from the earlier team", result.stdout)
-                        self.assertIn("earlier message", e.run("inbox", "seen").stdout)
-                        self.assertIn("queued message 2", self.send(e).stdout)
-                    else:
-                        self.assertIn("1 unread message from the earlier team", result.stdout)
-                        self.assertIn("earlier message", e.run("wait").stdout)
+        for acknowledge in (False, True):
+            with self.subTest(acknowledge=acknowledge), Env(brief) as e:
+                inbox = self.prepare(e)
+                self.send(e, "earlier message")
+                if acknowledge:
+                    e.run("wait", "--seen", "1", check=False)
+                with patch.dict(os.environ, {**e.env, "HERDR_SESSION": "another/session"}):
+                    with factory.Inbox(factory.Config(e.repo)) as other:
+                        other.state["mode"] = "typed"
+                        other.save_state()
+                    other.path.write_bytes(b"untouched")
+                before_other = (other.path.read_bytes(), other.state_path.read_bytes())
+                inode = inbox.lock_path.stat().st_ino
+                result = e.run("up")
+                self.assertEqual(inbox.lock_path.stat().st_ino, inode)
+                self.assertEqual(before_other, (other.path.read_bytes(), other.state_path.read_bytes()))
+                state = json.loads(inbox.state_path.read_text())
+                self.assertEqual(state["mode"], "inbox")
+                self.assertEqual(state["seen"], 1 if acknowledge else 0)
+                if acknowledge:
+                    self.assertEqual(inbox.path.read_bytes(), b"")
+                    self.assertNotIn("unread messages from the earlier team", result.stdout)
+                    self.assertIn("earlier message", e.run("inbox", "seen").stdout)
+                    self.assertIn("queued message 2", self.send(e).stdout)
+                else:
+                    self.assertIn("1 unread message from the earlier team", result.stdout)
+                    self.assertIn("earlier message", e.run("wait").stdout)
 
     def test_partial_restart_and_failed_query_do_not_clear(self):
         brief = formation({"lead-dev": CATALOG_MEMBERS["lead-dev"], "reviewer": CATALOG_MEMBERS["reviewer"]},
@@ -1427,7 +1424,7 @@ class InboxTests(unittest.TestCase):
             self.send(e)
             e.run("wait", "--seen", "1", "--interval", "0.01", "--timeout", "0", check=False)
             inode = inbox.lock_path.stat().st_ino
-            for command in (("up", "reviewer"), ("continue", "reviewer"), ("continue", "--restart")):
+            for command in (("up", "reviewer"), ("up", "--restart")):
                 e.run(*command)
                 self.assertTrue(inbox.path.exists())
                 self.assertEqual(json.loads(inbox.state_path.read_text())["seen"], 1)
@@ -1436,14 +1433,14 @@ class InboxTests(unittest.TestCase):
             fake = e.fake_state()
             fake["panes"] = {"w1:p1": fake["panes"]["w1:p1"]}
             e.write_fake(fake)
-            e.run("continue", "--restart")
+            e.run("up", "--restart")
             self.assertEqual(json.loads(inbox.state_path.read_text())["seen"], 1)
             before = (inbox.path.read_bytes(), inbox.state_path.read_bytes())
-            args = types.SimpleNamespace(cwd=str(e.repo), names=[], restart=False, fresh=False, timeout=1000)
+            args = types.SimpleNamespace(cwd=str(e.repo), names=[], restart=False, fresh=False, timeout=1000, no_brief=False)
             with patch.dict(os.environ, e.env), patch.object(factory, "ensure_operator", return_value="operator"), \
                     patch.object(factory, "Team", side_effect=SystemExit("query failed")):
                 with self.assertRaisesRegex(SystemExit, "query failed"):
-                    factory.cmd_continue(args)
+                    factory.cmd_up(args)
             self.assertEqual(before, (inbox.path.read_bytes(), inbox.state_path.read_bytes()))
 
     def test_named_watch_wakes_on_any_sender_and_sessions_are_isolated(self):
@@ -1551,9 +1548,9 @@ class WaitTests(unittest.TestCase):
             self.assertIn("Allow this command? (y/n)  [w1:p3]", out)
             e.update("reviewer", agent_status="working")
             e.kill("pm")
-            self.assertIn("@pm is gone: its agent exited. `factory.py continue pm`", e.run("wait").stdout)
+            self.assertIn("@pm is gone: its agent exited. `factory.py up pm`", e.run("wait").stdout)
 
-            e.run("continue", "pm")
+            e.run("up", "pm")
             e.update("pm", agent_status="working")
             e.update("lead-dev", agent_status="idle")  # a watched member stopped while others still work
             self.assertIn("@lead-dev stopped (idle)", e.run("wait", "lead-dev", "--interval", "0.05").stdout)
@@ -1629,27 +1626,83 @@ class WaitTests(unittest.TestCase):
                 self.assertNotIn("nobody is working", result.stdout)
 
 
-class ContinueTests(unittest.TestCase):
-    def test_no_member_panes_and_no_cache_starts_the_whole_team_fresh(self):
+class UpRecoveryTests(unittest.TestCase):
+    def test_launch_matrix(self):
+        for flags in ((), ("--fresh",), ("--restart",), ("--restart", "--fresh")):
+            with self.subTest(flags=flags), Env(UI) as e:
+                # One live member, two closed panes (matching and incompatible sessions), one newcomer.
+                e.run("up", "lead-dev", "frontend-dev", "pm", "--no-brief")
+                for name, agent in (("lead-dev", "codex"), ("frontend-dev", "claude"), ("pm", "codex")):
+                    e.set_session(name, {"agent": agent, "kind": "id", "value": f"saved-{name}"})
+                e.run("status")
+                e.close("frontend-dev", "pm")
+                before = e.pane_of("lead-dev")["pane_id"]
+                out = e.run("up", *flags).stdout
+                restarted = "--restart" in flags
+                fresh = "--fresh" in flags
+                targets = ["frontend-dev", "reviewer", "pm"]
+                if restarted:
+                    targets.insert(0, "lead-dev")
+                self.assertEqual([c[2] for c in e.calls("agent", "start")[3:]], targets)
+                self.assertEqual(e.calls("pane", "close"), [["pane", "close", before]] if restarted else [])
+                prompts = dict(e.prompts())
+                self.assertEqual(len(e.prompts()), 4)
+                for name in targets:
+                    resumed = name in ("lead-dev", "frontend-dev") and not fresh
+                    self.assertEqual(f"saved-{name}" in native(e.starts()[name]), resumed)
+                    self.assertIn(f"{'resumed' if resumed else 'started'} @{name} (", out)
+                    closing = prompts[name].rstrip().rsplit("\n\n", 1)[-1]
+                    if resumed:
+                        self.assertIn("picking up where we left off", closing)
+                    elif name == "reviewer":
+                        self.assertEqual(closing, "That is the whole team brief. No reply needed.")
+                    else:
+                        self.assertIn("starting in a new session", closing)
+                if not restarted:
+                    self.assertIn("Joined the team: @reviewer", prompts["lead-dev"])
+                    self.assertNotIn("@frontend-dev", prompts["lead-dev"])
+                    self.assertNotIn("@pm", prompts["lead-dev"])
+
+    def test_restart_with_no_saved_session_sends_no_join(self):
         with Env(UI) as e:
-            self.assertEqual(list((e.root / "cache/factory-skill").glob("*/sessions.jsonl")), [])
-            out = e.run("continue").stdout
-            self.assertIn("no member panes in this herdr session: continuing every member in factory.toml", out)
-            self.assertEqual(set(e.starts()), {"lead-dev", "frontend-dev", "reviewer", "pm"})
-            for call in e.starts().values():
-                self.assertTrue({"resume", "--resume", "--session"}.isdisjoint(native(call)))
-            tabs = e.calls("tab", "create")
-            self.assertEqual(len(tabs), 1)
-            self.assertEqual(flag(tabs[0], "--label"), "factory team")
-            self.assertIn(["tab", "rename", "w1:t1", "factory operator"], e.calls("tab", "rename"))
-            self.assertEqual(len(e.prompts()), 4)
-            for _, text in e.prompts():
-                self.assertIn("starting in a new session", text)
-                self.assertIn("Do not start anything yet", text)
-                self.assertIn("No reply needed", text)
-                self.assertNotIn("picking up where we left off", text)
-            self.assertIn("fresh sessions, no earlier context: @lead-dev, @frontend-dev, @reviewer, @pm. "
-                          "Send each its task, criteria and the evidence so far.", out)
+            e.run("up", "lead-dev", "pm", "--no-brief")
+            e.run("up", "pm", "--restart")
+            self.assertEqual([name for name, _ in e.prompts()], ["pm"])
+            self.assertIn("starting in a new session", e.prompts()[0][1])
+
+    def test_taken_name_prevents_an_earlier_restart(self):
+        with Env(UI) as e:
+            e.run("up", "lead-dev", "pm", "--no-brief")
+            state = e.fake_state()
+            state["panes"][e.pane_of("pm")["pane_id"]]["name"] = "reviewer"
+            e.write_fake(state)
+            before = len(e.calls())
+            p = e.run("up", "lead-dev", "reviewer", "--restart", check=False)
+            self.assertEqual(p.returncode, 2)
+            self.assertIn("outside this team", p.stderr)
+            calls = e.calls()[before:]
+            self.assertTrue(all(c[:2] in (["agent", "list"], ["pane", "list"]) for c in calls), calls)
+
+    def test_operator_pane_with_an_old_member_label_is_not_a_restart_target(self):
+        with Env(formation({"lead-dev": CATALOG_MEMBERS["lead-dev"]}, operator={"harness": "claude"})) as e:
+            state = e.fake_state()
+            pane = state["panes"]["w1:p1"]
+            pane.update(label="lead-dev", name="lead-dev",
+                        agent_session={"agent": "claude", "kind": "id", "value": "operator-session"})
+            e.write_fake(state)
+            self.assertIn("through the inbox", e.run("up", "--restart").stdout)
+            self.assertEqual(e.calls("pane", "close"), [])
+            self.assertEqual(e.pane_of("operator")["pane_id"], "w1:p1")
+            self.assertNotEqual(e.pane_of("lead-dev")["pane_id"], "w1:p1")
+            self.assertIn("That is the whole team brief.", dict(e.prompts())["lead-dev"])
+
+    def test_continue_stub_never_launches(self):
+        with Env(UI) as e:
+            for args in ((), ("pm", "--restart", "--fresh")):
+                p = e.run("continue", *args, check=False)
+                self.assertEqual(p.returncode, 2)
+                self.assertEqual((p.stdout + p.stderr).splitlines(), ["use factory.py up [names] [--fresh] [--restart]"])
+            self.assertEqual(e.calls(), [])
 
     def test_no_member_panes_resumes_noted_sessions(self):
         marker = "This brief applies to the resumed team."
@@ -1659,7 +1712,7 @@ class ContinueTests(unittest.TestCase):
             e.set_session("pm", {"agent": "pi", "kind": "path", "value": "/s/p.jsonl"})
             e.run("status")
             e.close("lead-dev", "frontend-dev", "reviewer", "pm")
-            out = e.run("continue").stdout
+            out = e.run("up").stdout
             self.assertEqual(len(e.calls("agent", "start")), 8)
             by = {n: native(c) for n, c in e.starts().items()}
             self.assertEqual(by["lead-dev"][:2], ["resume", "cx-1"])
@@ -1676,43 +1729,41 @@ class ContinueTests(unittest.TestCase):
                 self.assertIn("picking up where we left off", sent[name])
                 self.assertNotIn("No reply needed", sent[name])
             for name in ("frontend-dev", "reviewer"):
-                self.assertIn("starting in a new session", sent[name])
-            self.assertIn("fresh sessions, no earlier context: @frontend-dev, @reviewer. Send each", out)
+                self.assertIn("That is the whole team brief.", sent[name])
+                self.assertIn(f"started @{name}", out)
 
-    def test_some_panes_gone_continues_only_members_with_panes(self):
+    def test_bare_up_recovers_exited_and_closed_members_without_disturbing_live_members(self):
         with Env(UI) as e:
             e.run("up", "--no-brief")
+            for name in ("lead-dev", "reviewer"):
+                e.set_session(name, {"agent": "codex", "kind": "id", "value": f"saved-{name}"})
             e.kill("lead-dev")
             e.close("reviewer")
-            out = e.run("continue").stdout
-            self.assertEqual([c[2] for c in e.calls("agent", "start")[4:]], ["lead-dev"])
-            self.assertIn("no pane, not continued: @reviewer. To bring them back: factory.py continue reviewer", out)
-            self.assertNotIn("no member panes", out)
-            self.assertEqual(len(e.calls("tab", "rename")), 1)  # only up labels the operator's tab
-            sent = dict(e.prompts())
-            self.assertEqual(set(sent), {"lead-dev", "frontend-dev", "pm"})
-            for name in ("frontend-dev", "pm"):
-                self.assertIn("picking up where we left off", sent[name])
+            e.run("up")
+            self.assertEqual([c[2] for c in e.calls("agent", "start")[4:]], ["lead-dev", "reviewer"])
+            self.assertEqual([n for n, _ in e.prompts()], ["lead-dev", "reviewer"])
 
-    def test_continue_without_members_says_so(self):
+    def test_up_without_members_says_so(self):
         with Env(formation({})) as e:
-            result = e.run("continue", check=False)
+            result = e.run("up", check=False)
             self.assertEqual(result.returncode, 1)
             self.assertIn("no members in factory.toml; add one, then run `factory.py up`", result.stderr)
             self.assertEqual(e.starts(), {})
 
-    def test_cold_continue_checks_every_member_before_launch(self):
+    def test_cold_up_checks_every_member_before_launch(self):
         with Env(UI.replace('model = "gpt-6-luna"', 'model = "missing-model"')) as e:
-            result = e.run("continue", check=False)
+            result = e.run("up", check=False)
             self.assertEqual(result.returncode, 2)
             self.assertEqual(e.starts(), {})
             self.assertEqual(e.calls("tab", "create"), [])
 
     def test_failed_fresh_launch_is_not_reported_as_fresh(self):
         with Env(UI) as e:
-            result = e.run("continue", check=False, FAKE_START_FAIL="dead:lead-dev")
+            result = e.run("up", check=False, FAKE_START_FAIL="dead:lead-dev")
             self.assertEqual(result.returncode, 3)
-            self.assertIn("fresh sessions, no earlier context: @frontend-dev, @reviewer, @pm. Send each", result.stdout)
+            self.assertNotIn("started @lead-dev (", result.stdout)
+            for name in ("frontend-dev", "reviewer", "pm"):
+                self.assertIn(f"started @{name} (", result.stdout)
             self.assertEqual({n for n, _ in e.prompts()}, {"frontend-dev", "reviewer", "pm"})
 
     def test_brings_members_back_in_their_panes_and_sessions(self):
@@ -1721,17 +1772,18 @@ class ContinueTests(unittest.TestCase):
             e.set_session("lead-dev", {"source": "herdr:codex", "agent": "codex", "kind": "id", "value": "cx-1"})
             e.set_session("frontend-dev", {"source": "herdr:claude", "agent": "claude", "kind": "id", "value": "cl-1"})
             e.set_session("pm", {"source": "herdr:pi", "agent": "pi", "kind": "path", "value": "/s/2026_pi-1.jsonl"})
-            self.assertIn("every member is running", e.run("continue").stdout)  # named, running members are left alone
+            self.assertIn("already running", e.run("up", "lead-dev", "frontend-dev", "pm").stdout)
+            self.assertEqual(e.prompts(), [])
             self.assertEqual(e.calls("agent", "rename"), [["agent", "rename", "w1:p1", "operator"]])
             e.kill("lead-dev", "frontend-dev", "pm")
             panes_before = {n: e.pane_of(n)["pane_id"] for n in ("lead-dev", "frontend-dev", "pm")}
             # The brief changed while they were gone: lead-dev moves to Luna.
             e.write_brief(CATALOG.replace('model = "gpt-6-astra"\nthinking = "high"',
                                            'model = "gpt-6-luna"\nthinking = "medium"'))
-            self.assertIn("gone", e.run("status").stdout)
+            self.assertIn("`factory.py up lead-dev frontend-dev pm`", e.run("status").stdout)
 
             before = len(e.prompts())
-            e.run("continue")
+            e.run("up", "lead-dev", "frontend-dev", "pm")
             by = {c[2]: c for c in e.calls("agent", "start")[3:]}
             self.assertEqual({n: flag(c, "--pane") for n, c in by.items()}, panes_before)  # same panes, no new ones
             self.assertEqual(len(e.calls("tab", "create")) + len(e.calls("pane", "split")), 3)
@@ -1751,7 +1803,7 @@ class ContinueTests(unittest.TestCase):
 
             e.kill("pm")
             before = len(e.prompts())
-            e.run("continue", "pm")  # one member comes back: only it is re-briefed
+            e.run("up", "pm")  # one member comes back: only it is re-briefed
             self.assertEqual([n for n, _ in e.prompts()[before:]], ["pm"])
 
     def test_restart_checks_before_closing_and_reapplies_settings(self):
@@ -1762,13 +1814,13 @@ class ContinueTests(unittest.TestCase):
                       for n in ("operator", "reviewer", "frontend-dev", "pm")}
             e.set_session("lead-dev", {"agent": "codex", "kind": "id", "value": "restart-session"})
             e.write_brief(UI.replace('model = "gpt-6-astra"', 'model = "missing-model"'))
-            failed = e.run("continue", "lead-dev", "--restart", check=False)
+            failed = e.run("up", "lead-dev", "--restart", check=False)
             self.assertEqual(failed.returncode, 2)
             self.assertEqual(e.calls("pane", "close"), [])
             self.assertEqual(e.pane_of("lead-dev")["pane_id"], old)
             e.write_brief(UI.replace('model = "gpt-6-astra"', 'model = "gpt-6-luna"'))
             before = len(e.prompts())
-            e.run("continue", "lead-dev", "--restart")
+            e.run("up", "lead-dev", "--restart")
             argv = native(e.starts()["lead-dev"])
             self.assertEqual(argv[:2], ["resume", "restart-session"])
             self.assertEqual(flag(argv, "-m"), "gpt-6-luna")
@@ -1781,7 +1833,7 @@ class ContinueTests(unittest.TestCase):
             self.assertIn("herdr agent prompt operator", e.prompts()[-1][1])
             self.assertIn("picking up where we left off", e.prompts()[-1][1])
             self.assertEqual({n: {k: v for k, v in e.pane_of(n).items() if k != "rect"} for n in others}, others)
-            e.run("continue", "lead-dev", "--fresh", "--restart")
+            e.run("up", "lead-dev", "--fresh", "--restart")
             self.assertNotIn("resume", native(e.starts()["lead-dev"]))
             self.assertIn("starting in a new session", e.prompts()[-1][1])
 
@@ -1793,16 +1845,15 @@ class ContinueTests(unittest.TestCase):
             e.close("reviewer")
             e.write_brief(CATALOG.replace('model = "deepseek/deepseek-v4.1-flash-1017"', 'model = "gpt-6-sol"')
                           .replace('[members.pm]\nharness = "pi"', '[members.pm]\nharness = "codex"'))
-            out = e.run("continue", "pm", "reviewer").stdout
-            self.assertIn("@reviewer has no pane any more; it gets a new one", out)
+            out = e.run("up", "pm", "reviewer").stdout
+            self.assertIn("started @reviewer", out)
             by = {c[2]: native(c) for c in e.calls("agent", "start")[2:]}
             self.assertNotIn("resume", by["pm"])  # a pi session can't open in codex
             self.assertNotIn("resume", by["reviewer"])
             self.assertEqual(e.pane_of("reviewer")["pane_id"], "w1:p4")  # a new, labeled pane
             self.assertEqual(e.pane_of("reviewer")["tab_id"], e.pane_of("pm")["tab_id"])  # in the team tab
-            for _, text in e.prompts():
-                self.assertIn("starting in a new session", text)
-            self.assertIn("fresh sessions, no earlier context: @pm, @reviewer. Send each", out)
+            self.assertIn("starting in a new session", dict(e.prompts())["pm"])
+            self.assertIn("That is the whole team brief.", dict(e.prompts())["reviewer"])
 
     def test_opencode_member_gets_a_new_pane_and_the_old_label_is_cleared(self):
         with Env(formation({
@@ -1812,7 +1863,7 @@ class ContinueTests(unittest.TestCase):
             e.run("up", "pm", "reviewer", "--no-brief")
             e.set_session("reviewer", {"agent": "opencode", "kind": "id", "value": "ses_1"})
             e.kill("reviewer")
-            e.run("continue", "reviewer")
+            e.run("up", "reviewer")
             labeled = [p for p in e.fake_state()["panes"].values() if p["label"] == "reviewer"]
             self.assertEqual([p["pane_id"] for p in labeled], ["w1:p4"])  # its environment is set at creation
             self.assertEqual(native(e.calls("agent", "start")[-1]), ["--standalone", "--session", "ses_1", "--auto"])
@@ -1822,9 +1873,9 @@ class ContinueTests(unittest.TestCase):
             e.run("up", "pm", "reviewer", "--no-brief")
             e.set_session("pm", {"agent": "pi", "kind": "id", "value": "old"})
             e.kill("pm", "reviewer")
-            p = e.run("continue", check=False, FAKE_START_FAIL="dead:pm")
+            p = e.run("up", check=False, FAKE_START_FAIL="dead:pm")
             self.assertEqual(p.returncode, 3)
-            self.assertIn("factory.py continue pm --fresh", p.stdout)
+            self.assertIn("factory.py up pm --fresh", p.stdout)
             self.assertIn("started @reviewer", p.stdout)  # the others still came back
 
     def test_duplicate_session_observations_keep_latest_resume(self):
@@ -1838,7 +1889,7 @@ class ContinueTests(unittest.TestCase):
             with history.open("a") as f:
                 f.write(lines[-1] + "\n")
             e.kill("lead-dev")
-            e.run("continue", "lead-dev")
+            e.run("up", "lead-dev")
             self.assertEqual(native(e.starts()["lead-dev"])[:2], ["resume", "second"])
 
 
@@ -1857,7 +1908,7 @@ class ConfigTests(unittest.TestCase):
                 target = e.root / "missing target"
                 link.symlink_to(target)
                 before = self.files(e.repo)
-                commands = ("init",) if name == "factory.toml.sample" else ("init", "check", "up", "continue")
+                commands = ("init",) if name == "factory.toml.sample" else ("init", "check", "up")
                 for command in commands:
                     result = e.run(command, check=False)
                     self.assertEqual(result.returncode, 1)
@@ -1866,7 +1917,7 @@ class ConfigTests(unittest.TestCase):
                     self.assertEqual(self.files(e.repo), before)
                     self.assertFalse(target.exists())
                 if name == "factory.toml.sample":
-                    for command in (("check",), ("up", "--no-brief"), ("continue",)):
+                    for command in (("check",), ("up", "--no-brief")):
                         e.run(*command)
                     self.assertIn("queued message 1", e.run("inbox", "send", "--from", "lead-dev", "report").stdout)
                     self.assertEqual(self.files(e.repo), before)
