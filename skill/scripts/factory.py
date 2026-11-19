@@ -416,6 +416,9 @@ def configure_messages(cfg, team, operator, restart=()):
     reason = (f'[operator] messages = "typed" in {CONF}' if typed else
               f"[operator] harness is not set in {CONF}" if not conf else
               f"{CONF} says {conf}, herdr sees {live} in this pane" if conf != live else "")
+    if not typed and conf != live and live in TABLE:
+        reason += (f'. This pane is the operator. Set harness = "{live}" under [operator] in {CONF}'
+                   ' and run factory.py up again')
     try:
         with Inbox(cfg) as inbox:
             previous = inbox.state["mode"]

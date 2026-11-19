@@ -1,16 +1,16 @@
 # Setup
 
-- **The project already has `FACTORY.md`:** someone set the team up. Run `factory.py init`; it copies `factory.toml.sample` to your `factory.toml`. Ask only what the user wants different for themselves (other models or harnesses, one model for everything, fewer members) and edit `factory.toml`. Check `user`, a top-level key above `[operator]`: it is the first part of this person's worktree branches. `init` prints it when the sample sets one. Leave `FACTORY.md` alone unless they ask.
+- **The project already has `FACTORY.md`:** someone set the team up. Run `factory.py init`; it copies `factory.toml.sample` to your `factory.toml`. Ask only what the user wants different for themselves (other models or harnesses, one model for everything, fewer members) and edit `factory.toml`. Update the local `[operator]` fields for this session even if the sample specifies a different operator harness. Check `user`, a top-level key above `[operator]`: it is the first part of this person's worktree branches. `init` prints it when the sample sets one. Leave `FACTORY.md` alone unless they ask.
 - **Neither file exists:** follow the steps below.
-- **Both exist:** change only what the user requested.
+- **Both exist:** reconcile the local operator fields and apply the user’s requested changes.
 
 1. Inspect the repo's stack, UI and existing tracker. Run `factory.py harnesses`; recommend available models and report missing-harness fixes.
 2. Honor a formation the user already chose. Otherwise offer the default below and the same roles on your current harness as two choices. Label the second with the harness name, for example “Claude Code throughout”. If the installed harnesses cannot run the default mix, propose the one-harness team directly. Infer known facts; ask in one round only for missing project scope, UI needs, parallel work/worktrees, where tasks are tracked, what marks one ready to start, whether to keep notes and a private notes folder, any spec, browser or review tool the project uses, and whether work reaches the main branch through pull requests. Custom formations, model mixes and trackers remain available. The skill's `recipes/` hold tested choices for the optional sections: propose one when its check passes on this machine, name the alternative, and keep a tracker or tool the project already uses. For tasks, propose `gh` when the remote is GitHub, its check passes and the owner confirms issue-write permission, otherwise `TODO.md`; `todos` is the board choice.
-3. Show name, role, harness, model, thinking and project responsibility. Adjust until agreed; keep the current operator session unless the user requests a change.
+3. Show name, role, harness, model, thinking and project responsibility. Adjust the member roster until agreed.
 
 ## Default formation
 
-The default is [templates/factory.toml](../templates/factory.toml): @lead-dev, @reviewer and @pm, plus @frontend-dev only for a UI. `init` seeds a new project's `factory.toml.sample` from it; where the project already has a sample, `init` copies that to your `factory.toml`. Keep the current operator session; Claude Code Opus or Fable is recommended.
+The default is [templates/factory.toml](../templates/factory.toml): @lead-dev, @reviewer and @pm, plus @frontend-dev only for a UI. `init` seeds a new project's `factory.toml.sample` from it; where the project already has a sample, `init` copies that to your `factory.toml`.
 
 - Add catalog roles only for concrete work; an architect is optional for larger systems.
 - Tip for custom teams: a reviewer from a different model family can catch different mistakes. The template's reviewer stays the default.
@@ -27,7 +27,7 @@ Edit `factory.toml`, your formation:
 
 - Keep the chosen members, each with a harness and project-specific `notes`. Set the model explicitly unless using the agy default. `up` starts every member in it; there are no named rosters.
 - Use `worktree = true` for developers who work in parallel: each gets branch `<user>/<member>` (for example `peter/lead-dev`), so two people's branches do not collide when their `user` differs. `user` is a top-level key above `[operator]` and defaults to the system user name; set it when that name is generic (`root`, `ubuntu`).
-- Match the operator's model/thinking to the current session, not the template defaults.
+- In `[operator]`, record the invoking pane’s harness and its known model and thinking level. Omit any model or thinking value you cannot verify.
 
 Edit `FACTORY.md`, the shared brief, as plain Markdown without comments. Paste the chosen recipe's section and fill the names in capitals; names in angle brackets stay for members. Write it by role ("the operator", never an @name), so it holds for any person's formation:
 
@@ -38,7 +38,7 @@ Edit `FACTORY.md`, the shared brief, as plain Markdown without comments. Paste t
 - `## Review`: only when the project uses a review CLI for the deep lane. `## Pull requests`: only when work reaches the integration branch through pull requests. Each stands alone: a project may have either without the other. After its check passes, follow the recipe ([recipes/review-codegenie.md](../recipes/review-codegenie.md), [recipes/pull-requests-github.md](../recipes/pull-requests-github.md)): its setup directions as well as its pasteable section. For another tool or forge, write the same section in its own words, with a counterpart for every direction and line of the recipe and one cheap check command. The two permission lines of `## Pull requests` are the user's: write what they said and leave out what they have not decided. Then make the Workflow section's integration rule match.
 - `## Specs` (how specifications are written and where they live) and `## Browser` (the browser tool for UI work and QA): only for a tool the project uses, in that tool's own words: where, which tool, how to learn it, one cheap check command. Run the check before you write the section.
 
-When the formation should be the project's suggestion, copy `factory.toml` to `factory.toml.sample` and make the copy portable: remove `user` and `worktree_dir`, and any worktree branch or path that carries a person's name.
+When the formation should be the project's suggestion, copy `factory.toml` to `factory.toml.sample` and make the copy portable: omit the operator’s `harness`, `model` and `thinking`, along with `user`, `worktree_dir` and any worktree branch or path that carries a person’s name.
 
 Run `factory.py check`. Resolve each failure without substituting unapproved models or harnesses; unknown Claude IDs only warn. Preview with `factory.py brief`, show the result, and commit `FACTORY.md` and `factory.toml.sample` when authorized; never `factory.toml`. Next: `/factory up`.
 

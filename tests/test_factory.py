@@ -1013,7 +1013,9 @@ class InboxTests(unittest.TestCase):
     def test_typed_text_unchanged_and_mismatches_visible(self):
         with Env(UI) as e:
             prompt, brief = e.run("prompt", "lead-dev").stdout, e.run("brief").stdout
-            self.assertIn("harness is not set", e.run("up").stdout)
+            unset = e.run("up").stdout
+            self.assertIn("harness is not set", unset)
+            self.assertIn('Set harness = "claude" under [operator] in factory.toml', unset)
             e.set_session("lead-dev", {"agent": "codex", "kind": "id", "value": "saved"})
             e.run("up", "lead-dev", "--restart")
             closing = dict(e.prompts())["lead-dev"].split("We are picking up")[1]
@@ -1035,6 +1037,31 @@ class InboxTests(unittest.TestCase):
             e.write_brief(formation({"lead-dev": CATALOG_MEMBERS["lead-dev"]}, operator={"harness": "unknown"}))
             self.assertIn("[operator] harness 'unknown' is not one of", e.run("check", check=False).stderr)
         self.assertNotIn("inbox", factory.claude_settings("guarded"))
+
+    def test_stale_operator_sample_keeps_invoking_codex_pane(self):
+        members = {"architect": CATALOG_MEMBERS["architect"]}
+        with Env(formation(members, operator={"harness": "claude"})) as e:
+            local = e.repo / factory.CONF
+            sample = e.repo / factory.SAMPLE
+            local.rename(sample)
+            e.run("init")
+            e.update(None, agent="codex")
+            stale = e.run("up").stdout
+            self.assertIn('Set harness = "codex" under [operator] in factory.toml', stale)
+            self.assertEqual(e.pane_of("operator")["pane_id"], e.env["HERDR_PANE_ID"])
+            self.assertEqual(e.pane_of("operator")["agent"], "codex")
+            self.assertEqual(list(e.starts()), ["architect"])
+            self.assertEqual(kind(e.starts()["architect"]), "claude")
+            self.assertEqual(flag(native(e.starts()["architect"]), "--model"), members["architect"]["model"])
+            self.assertEqual(len(e.calls("tab", "create")), 1)  # the member tab
+
+            # Setup reconciles the local operator fields. Raw up leaves the sample alone.
+            local.write_text(local.read_text().replace('harness = "claude"', 'harness = "codex"', 1))
+            corrected = e.run("up").stdout
+            self.assertIn("through the inbox", corrected)
+            self.assertIn("wait in the foreground", corrected)
+            self.assertEqual(len(e.calls("agent", "start")), 1)
+            self.assertEqual(tomllib.loads(sample.read_text())["operator"]["harness"], "claude")
 
     def test_operator_messages_opt_out(self):
         members = {"lead-dev": {**CATALOG_MEMBERS["lead-dev"], "permissions": "guarded"},
@@ -2068,6 +2095,7 @@ class ConfigTests(unittest.TestCase):
                 self.assertIn(p["model"], factory.TABLE[p["harness"]]["models"], name)  # the template uses recommended models
                 self.assertEqual(p["permissions"], "full")
             self.assertEqual(cfg.operator["name"], "operator")
+            self.assertTrue({"harness", "model", "thinking"}.isdisjoint(cfg.operator))
             self.assertIn("tracked in `TODO.md`", cfg.body)  # where tasks live is prose in FACTORY.md, not a setting
             todo = (factory.SKILL / "templates/TODO.md").read_text().splitlines()
             self.assertEqual(todo[:2], ["TODO", "===="])
