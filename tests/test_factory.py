@@ -228,14 +228,25 @@ def formation(members, **tables):
 
 
 def assert_todo_items(case, text):
-    """Every checkbox line is followed by at least one 4-space '* ' description line."""
+    """Check item spacing within each section and indentation of detail bullets and nested lists."""
     lines = text.splitlines()
-    items = [i for i, line in enumerate(lines) if line.startswith(("- [ ] ", "- [x] "))]
-    case.assertTrue(items, "expected at least one TODO checkbox item")
-    for i in items:
-        case.assertLess(i + 1, len(lines), lines[i])
-        case.assertRegex(lines[i + 1], r"^    \* \S", (lines[i], lines[i + 1]))
-        case.assertNotRegex(lines[i + 1], r"^    \* (?:owner|criteria|work|verdict|next):(?:\s|$)", lines[i + 1])
+    checkbox = ("- [ ] ", "- [x] ")
+    case.assertTrue(any(line.startswith(checkbox) for line in lines), "expected a TODO checkbox item")
+    in_item = False
+    for i, line in enumerate(lines):
+        if line.startswith("## "):
+            in_item = False
+        elif line.startswith(checkbox):
+            if in_item:
+                case.assertEqual(lines[i - 1], "", f"missing blank line before {line}")
+                case.assertTrue(lines[i - 2].strip(), f"extra blank line before {line}")
+            in_item = True
+        elif in_item and line.strip():
+            case.assertTrue(lines[i - 1].strip(), f"blank line inside item before {line}")
+            if lines[i - 1].startswith(checkbox):
+                case.assertRegex(line, r"^    \* \S")
+            elif re.match(r"\s*(?:[-+*]|\d+[.)])(?:\s|$)", line):
+                case.assertRegex(line, r"^(?:    \*|        (?:[-+*]|\d+[.)])) \S")
 
 
 CATALOG_MEMBERS = {
@@ -2039,6 +2050,15 @@ class ConfigTests(unittest.TestCase):
         self.assertIn("name: factory\n", (factory.SKILL / "SKILL.md").read_text())
         self.assertTrue((factory.SKILL / "templates/FACTORY.md").read_text().startswith("# Factory\n"))
 
+    def test_todo_item_spacing(self):
+        first = "- [x] First\n    * verdict: approved"
+        second = "- [ ] Second"
+        assert_todo_items(self, first + "\n\n" + second)
+        for bad in (first + "\n" + second, first + "\n\n\n" + second, second + "\n\n    * detail",
+                    first + "\n  * misindented detail", first + "\n    - wrong marker"):
+            with self.subTest(text=bad), self.assertRaises(AssertionError):
+                assert_todo_items(self, bad)
+
     def test_template_is_consistent(self):
         with Env(TEMPLATE) as e:
             cfg = factory.Config(e.repo)
@@ -2060,6 +2080,7 @@ class ConfigTests(unittest.TestCase):
             example = re.search(r"```[^\n]*\n(.*?)\n```", tasks, re.S)
             self.assertIsNotNone(example)
             assert_todo_items(self, example.group(1))
+            self.assertRegex(example.group(1), r"\n\n- \[ \] [^\n]+\Z")  # the second example is title-only
             self.assertRegex(example.group(1), r"(?m)^        (?:\* |\d+\. )")
             self.assertNotIn("tracker", cfg.team)
             self.assertEqual(list(cfg.members), ["lead-dev", "reviewer", "pm"])
