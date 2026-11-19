@@ -40,6 +40,8 @@ To link instead, create the parent directory and use `ln -s "$PWD/skill" ~/.clau
 
 From your project directory, start a dedicated session with `herdr --session first-factory`. In its shell, check that you are in the project and start your signed-in harness (for example, `claude`). Enter `/factory setup`. Tell the operator your project goal, which harnesses are installed, and what work is ready. It proposes roles, models and project tools. For a first team, you can ask for one harness throughout, the built-in `TODO.md` tracker and the reviewer's own review. [Default team](README.md#the-team)
 
+To turn off prompt suggestions for your Claude Code operator as factory does for members, set `"promptSuggestionEnabled": false` in your own `.claude/settings.local.json` in this project.
+
 Setup writes the shared brief in `FACTORY.md` and the suggested formation in `factory.toml.sample`. Commit both so teammates can use them. Your personal formation goes in `factory.toml`, which setup adds to `.gitignore`.
 
 ## Launch

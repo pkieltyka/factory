@@ -653,7 +653,7 @@ def claude_settings(level, inbox=False):
     if level == "full":
         sock = os.environ.get("HERDR_SOCKET_PATH")
         sandbox["network"] = {"allowUnixSockets": [sock]} if sys.platform == "darwin" and sock else {"allowAllUnixSockets": True}
-    return json.dumps({"sandbox": sandbox, "skipDangerousModePermissionPrompt": True,
+    return json.dumps({"promptSuggestionEnabled": False, "sandbox": sandbox, "skipDangerousModePermissionPrompt": True,
                        "permissions": {"allow": [f"Bash({cmd})" for cmd in sandbox["excludedCommands"]]}},
                       separators=(",", ":"))
 
