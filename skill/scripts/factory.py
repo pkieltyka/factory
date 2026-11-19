@@ -166,8 +166,10 @@ def plan(cfg, name):
     worktree = m.get("worktree")
     branch = (f"{cfg.user}/{name}" if worktree is True else worktree) or None
     where = cfg.worktree_dir / re.sub(r"[^A-Za-z0-9._-]+", "-", branch) if branch else cfg.root
-    return {"name": name, "role": role, "harness": m["harness"], "model": m.get("model"),
-            "thinking": str(m.get("thinking") or meta["thinking"]),
+    model, thinking = m.get("model"), str(m.get("thinking") or meta["thinking"])
+    if m["harness"] == "agy":
+        model, thinking = agy_choice(m)
+    return {"name": name, "role": role, "harness": m["harness"], "model": model, "thinking": thinking,
             "readonly": meta["readonly"] == "true", "notes": m.get("notes", ""), "permissions": permissions,
             "args": [str(a) for a in m.get("args", [])], "branch": branch, "dir": str(where)}
 
@@ -741,6 +743,40 @@ def argv_opencode(m, prompt_file, resume):
     return argv, {"OPENCODE_CONFIG_CONTENT": json.dumps({"model": model})}
 
 
+# ---- agy (Antigravity CLI)
+def agy_effort(model):
+    suffix = model.rsplit("-", 1)[-1]
+    return suffix if suffix in TABLE["agy"]["thinking"] else None
+
+
+def agy_choice(member):
+    table = TABLE["agy"]
+    model = member.get("model", table["default_model"])
+    default = table["default_thinking"] if model in table["models"] else "default"
+    return model, str(member.get("thinking") or agy_effort(model) or default)
+
+
+def agy_models():
+    return {line.partition("\t")[0] for line in run_probe(["agy", "models"]).splitlines() if "\t" in line}
+
+
+def model_agy(checker, model, harness):
+    listed = checker.probe("agy-models", agy_models)
+    levels = [lv for lv in TABLE["agy"]["thinking"] if f"{model}-{lv}" in listed]
+    if model in listed:
+        levels.append(agy_effort(model) or "default")
+    if not levels:
+        raise Problem(f"agy does not offer {model}", "Choose a model listed by `agy models`.")
+    return model, levels
+
+
+def argv_agy(m, prompt_file, resume):
+    model = m["model"]
+    if m["thinking"] != "default" and not agy_effort(model):
+        model += "-" + m["thinking"]
+    return ["--model", model] + (["--conversation", session_id(resume)] if resume else []), {}
+
+
 Harness = collections.namedtuple("Harness", "model argv")
 CODE = {
     "claude": Harness(model_claude, argv_claude),
@@ -748,6 +784,7 @@ CODE = {
     "pi": Harness(model_pi, argv_pi),
     "omp": Harness(model_pi, argv_pi),
     "opencode": Harness(model_opencode, argv_opencode),
+    "agy": Harness(model_agy, argv_agy),
 }
 
 
@@ -1193,6 +1230,8 @@ def cmd_harnesses(args):
             print(f"{'':10}not configured: {', '.join(missing)}")
         if h == "codex":
             print(f"{'':10}Codex offers: {', '.join(sorted(checker.probe('codex', codex_models)))}")
+        if h == "agy":
+            print(f"{'':10}agy offers: {', '.join(sorted(checker.probe('agy-models', agy_models)))}")
 
 
 def cmd_check(args):
