@@ -1,6 +1,6 @@
 # Factory
 
-**Factory is a software factory skill.**
+**Factory is your minimal autonomous software engineering team, built for the tools you already use, and packaged as a simple skill.**
 
 It lets you build autonomous software engineering teams from the agents and models you already use: Claude Code, Codex, pi, omp, OpenCode and Antigravity (agy), across model families, on your own plans and subscriptions. Each member runs in its own native harness, in its own herdr pane, and the team talks it through: members message each other, share context and put their heads together on the work.
 
