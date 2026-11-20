@@ -44,4 +44,6 @@ Use these in the Claude Code operator conversation. For another harness, use its
 | `/factory status` | Shows each member's state and the message route. |
 | `/factory wait` | Returns when a message or member needs the operator. |
 | `/factory brief` | Previews or resends the team brief. |
-| `/factory say` | Sends an operator message to members. |
+| `/factory say` | Lets the operator send one message to one or more teammates. |
+
+Members send messages with the standalone command `factory.py say NAME --file <path>`.

@@ -12,11 +12,11 @@ You are the operator (`@operator`): form the team, assign tasks, decide architec
 
 Paths below are relative to this skill. `factory.py` means `python3 <skill>/scripts/factory.py`. A project has two files at its root. `FACTORY.md` is the brief every member reads: the project, where tasks are tracked, the workflow. It is committed and shared by everyone on the repo. `factory.toml` is your own formation: `[operator]` is you (`name`, default `operator`, is your @name, pane label and herdr agent name), then the members with their harnesses and models. It is not committed; `factory.toml.sample` is the project's suggestion, which `factory.py init` copies. One team runs per herdr session.
 
-The session receiving the request is the operator. Run `up` from its pane. During setup and before every `up`, check `herdr agent get "$HERDR_PANE_ID"` and reconcile the local `[operator]` fields in `factory.toml`. Record its supported harness kind and any known model and thinking level. Omit unknown or unsupported values. Roster choices apply to members. Hand off to another operator session only on the user's explicit request.
+The session receiving the request is the operator. Run `up` from its pane. Record any known operator harness, model and thinking level for the roster. The live operator harness determines the wait style. Roster choices apply to members. Hand off to another operator session only on the user's explicit request.
 
 After compaction, re-read the active command's reference, `references/leading.md`, `FACTORY.md` and the tracker. Preserve task owners, acceptance criteria, branches, verdicts and next steps there, not only in chat.
 
-Message teammates only with `factory.py say` or `herdr agent prompt`, never through a harness's own messaging (e.g. Claude Code's `SendMessage`): herdr works across harnesses and permission modes. One exception: on the inbox route members reach you with `factory.py inbox send`, which `wait` prints; nothing is typed into your pane. See `references/leading.md`.
+Use `factory.py say` to message teammates, never a harness's own messaging (e.g. Claude Code's `SendMessage`). Members send private drafts with `--file`, including reports to the operator. For several recipients, address each with `@name` in one draft and send it once. `wait` prints reports queued in your inbox. See `references/leading.md`.
 
 ## Before launch
 
@@ -32,8 +32,8 @@ Message teammates only with `factory.py say` or `herdr agent prompt`, never thro
 | `setup` | Read [references/cmd_setup.md](references/cmd_setup.md); form or change the team. |
 | `up` | Start or resume the team as under Launch. When returning to unfinished work, [reconcile before assigning](references/cmd_continue.md#reconcile-before-assigning). |
 | `status` / `wait` | Run the command; interpret results using [references/leading.md](references/leading.md). |
-| `brief` | `factory.py brief --send [names]` resends the brief; without `--send`, preview it. |
-| `say` | `factory.py say <names|all> "message"`, or `--file <path>`. Check delivery failures. |
+| `brief` | `factory.py brief --send [all|names]` resends the brief; without `--send`, preview it. |
+| `say` | `factory.py say NAME [NAME ...] --file <path>`. Separate names with spaces or commas. `all` selects members only. The operator can pass quoted text instead of `--file`. |
 
 Bare `/factory`: if either project file is missing, run setup. Otherwise run `status`. If no member is running, run `up`. If some are gone, run `up <names>` for those members. While others run, start never-started members only if the user asks. Inspect blocked members and resolve within existing authorization. When the tracker or Git shows unfinished work, reconcile as above, even if everyone is running. Carry on with the user's work or ask for the next task if none is known.
 
