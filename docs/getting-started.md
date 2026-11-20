@@ -62,11 +62,11 @@ Pushing, deploying, destructive actions, spending and sending anything outside t
 
 ## Stop and come back
 
-After members report, quit each member's harness in its pane to stop the members. To stop the whole dedicated session, run `herdr session stop first-factory` from another terminal. This ends every process in that session, including the operator. To leave work running instead, detach with **Ctrl+B**, then **q**. [How herdr sessions persist](https://herdr.dev/tui/docs/persistence-remote/)
+After members report, enter `/factory down` from the operator's pane. It records available member sessions and closes their panes, including any where work is still running. Use `/factory down <name>` to stop one member. To stop the whole dedicated session, run `herdr session stop first-factory` from another terminal. This ends every process in that session, including the operator. To leave work running, detach with **Ctrl+B**, then **q**. [How herdr sessions persist](https://herdr.dev/tui/docs/persistence-remote/)
 
-From the project, return with `herdr --session first-factory`. If the operator pane opens at a shell, start your harness there. If you left the session running, enter `/factory up`. It leaves live members alone and brings back the rest, including closed panes, resuming recorded sessions of the same harness when available. Use `/factory up --fresh` to start stopped members in new sessions. To keep a member out, name the others or remove it from `factory.toml`.
+Enter `/factory up` to bring members back. It leaves live members alone and resumes recorded sessions of the same harness when available. Use `/factory up --fresh` to start stopped members in new sessions. To keep a member out, name the others or remove it from `factory.toml`. If you left herdr, return from the project with `herdr --session first-factory` first. If the operator pane opens at a shell, start your harness there.
 
-After `herdr session stop first-factory` or a full server restart, herdr restores the panes and can reopen the operator's previous conversation. Use that conversation, or quit the restored harness and start it again in the same pane for a fresh one. Enter `/factory up --restart` to reapply member launch settings.
+After `herdr session stop first-factory` or a full server restart, herdr restores the panes and can reopen the operator's previous conversation. Use that conversation, or quit the restored harness and start it again in the same pane for a fresh one. Run `/factory down` before stopping herdr so the next `/factory up` starts the members with current factory flags. Use `/factory up --restart` to reapply launch settings to members herdr restored.
 
 ## Where the rules live
 
