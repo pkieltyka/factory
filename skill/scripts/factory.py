@@ -1383,6 +1383,7 @@ def cmd_up(args):
 
 def member_pane_before_close(name, pane_id):
     """Return (pane, error). A missing pane or an exited agent is already stopped."""
+    # Herdr has no conditional close, so an occupant change between this check and the close goes undetected.
     got = herdr("pane", "get", pane_id, check=False)
     if error := got.get("error"):
         return None, None if error.split(":", 1)[0] == "pane_not_found" else error
