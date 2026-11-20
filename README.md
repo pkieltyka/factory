@@ -24,3 +24,7 @@ From your project inside herdr, enter these commands in Claude Code. [Other oper
 - [tests/](tests/) — fake harness/herdr tests, real Git checks and the Gate 1 fixture; run `python3 tests/test_factory.py`. `FACTORY_LIVE=1 python3 tests/test_factory.py LiveFlags` checks installed harness flags.
 
 To add a harness, add its table (with `operator_wait`) in `skill/harnesses.toml`, its code block and a test fake.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
