@@ -495,16 +495,19 @@ def report_leftover_drafts(cfg):
     if cfg.session_dir.is_symlink() or cfg.messages.is_symlink():
         return
     for directory in sorted(cfg.messages.glob("*")):
-        if directory.is_symlink() or not directory.is_dir():
-            continue
-        for path in sorted(directory.iterdir()):
-            try:
-                info = path.lstat()
-            except FileNotFoundError:  # a pending send may have just finished
+        try:
+            if directory.is_symlink() or not directory.is_dir():
                 continue
-            if stat.S_ISREG(info.st_mode):
-                minutes = max(0, int((time.time() - info.st_mtime) / 60))
-                print(f"leftover draft for @{directory.name} ({minutes} min old): {path}. Check delivery before resending or discarding.")
+            for path in sorted(directory.iterdir()):
+                try:
+                    info = path.lstat()
+                except FileNotFoundError:  # a pending send may have just finished
+                    continue
+                if stat.S_ISREG(info.st_mode):
+                    minutes = max(0, int((time.time() - info.st_mtime) / 60))
+                    print(f"leftover draft for @{directory.name} ({minutes} min old): {path}. Check delivery before resending or discarding.")
+        except OSError as e:
+            print(f"warning: cannot scan drafts in {directory}: {e}", file=sys.stderr)
 
 
 def queue_message(cfg, sender, text):

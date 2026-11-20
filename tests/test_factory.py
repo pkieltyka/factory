@@ -876,6 +876,33 @@ class UpTests(unittest.TestCase):
             self.assertFalse(second.exists())
             self.assertTrue(first.exists())
 
+    def test_cold_up_warns_about_unreadable_drafts_and_lists_readable_siblings(self):
+        members = {name: CATALOG_MEMBERS[name] for name in ("architect", "reviewer")}
+        with Env(formation(members)) as e, patch.dict(os.environ, e.env), \
+                patch.object(factory, "HERDR", e.env["HERDR_BIN"]):
+            drafts = factory.Config(e.repo).messages
+            unreadable = drafts / "architect"
+            readable = drafts / "reviewer" / "pending-review.md"
+            unreadable.mkdir(parents=True)
+            readable.parent.mkdir()
+            readable.write_text("A pending review")
+            iterdir = pathlib.Path.iterdir
+
+            def scan(path):
+                if path == unreadable:
+                    raise PermissionError("permission denied")
+                return iterdir(path)
+
+            out, err = io.StringIO(), io.StringIO()
+            with patch.object(pathlib.Path, "iterdir", scan), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                factory.main(["up", "--cwd", str(e.repo), "--no-brief"])
+
+            self.assertIn(f"warning: cannot scan drafts in {unreadable}: permission denied", err.getvalue())
+            self.assertIn(str(readable), out.getvalue())
+            self.assertIn("leftover draft for @reviewer", out.getvalue())
+            self.assertEqual(set(e.starts()), set(members))
+            self.assertEqual(readable.read_text(), "A pending review")
+
     def test_brief_send_all_matches_implicit_broadcast(self):
         with Env() as e:
             e.run("up", "lead-dev", "pm", "--no-brief")
