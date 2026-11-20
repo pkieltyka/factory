@@ -44,7 +44,7 @@ cp "$SKILL/templates/TODO.md" TODO.md
 g add -A
 g commit -q -m "Start slug"
 
-# T1: done, reviewed and committed.
+# Item (1) is done, reviewed and committed.
 cat > slug.py <<'EOF'
 import re
 
@@ -70,25 +70,25 @@ if __name__ == "__main__":
     unittest.main()
 EOF
 g add -A
-g commit -q -m "T1: slugify joins words with hyphens"
+g commit -q -m "(1) Slugify joins words with hyphens"
 T1=$(git rev-parse --short HEAD)
 
-# The tracker as the team left it. T4 is the planted contradiction: no such commit, no such code.
+# The tracker as the team left it. Item (4) is the planted contradiction: no such commit, no such code.
 cat > TODO.md <<EOF
 TODO
 ====
 
 ## Ready
 
-- [ ] T3 Command line
+- [ ] (3) Command line
     * python3 -m slug prints the slug
     * owner: none yet
     * criteria: \`python3 -m slug "Hello World"\` prints \`hello-world\`.
-    * next: start after T2 is done; it changes the same function.
+    * next: start after item (2) is done because it changes the same function.
 
 ## In progress
 
-- [ ] T2 max_length (@lead-dev)
+- [ ] (2) max_length (@lead-dev)
     * limit the slug length
     * criteria: \`slugify(text, max_length=n)\` returns at most n characters and never ends with \`-\`; without max_length nothing changes; tests cover it.
     * work: uncommitted in the main checkout: \`slug.py\`, \`test_slug_length.py\`
@@ -101,14 +101,14 @@ TODO
 
 ## Done
 
-- [x] T1 Slugify joins words ($T1)
+- [x] (1) Slugify joins words ($T1)
     * join words with hyphens
     * owner: @lead-dev
     * criteria: \`slugify("Hello, World")\` returns \`hello-world\`; tests pass.
     * verdict: approve by @reviewer on $T1; ran \`python3 -m unittest\`, 2 passed
     * next: none
 
-- [x] T4 Strip accents (0f3a9c1)
+- [x] (4) Strip accents (0f3a9c1)
     * remove accents from the slug
     * owner: @lead-dev
     * criteria: \`slugify("Crème")\` returns \`creme\`.
@@ -118,7 +118,7 @@ EOF
 g add TODO.md
 g commit -q -m "Tracker"
 
-# T2: reviewed, changes required, never committed.
+# Item (2) was reviewed and requires changes.
 cat > slug.py <<'EOF'
 import re
 
@@ -147,5 +147,5 @@ EOF
 # A change no task explains.
 printf '\nReleases are cut from the `stable` branch every Friday.\n' >> README.md
 
-echo "Gate 1 fixture ready: $GATE (T1 is commit $T1)"
+echo "Gate 1 fixture ready: $GATE. Item (1) is commit $T1"
 git status --short

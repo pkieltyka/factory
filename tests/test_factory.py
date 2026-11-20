@@ -248,15 +248,20 @@ def formation(members, **tables):
 
 
 def assert_todo_items(case, text):
-    """Check item spacing within each section and indentation of detail bullets and nested lists."""
+    """Check ticket numbers, item spacing, and indentation of details and nested lists."""
     lines = text.splitlines()
-    checkbox = ("- [ ] ", "- [x] ")
-    case.assertTrue(any(line.startswith(checkbox) for line in lines), "expected a TODO checkbox item")
+    checkbox = ("- [ ]", "- [x]")
+    numbers = set()
     in_item = False
     for i, line in enumerate(lines):
         if line.startswith("## "):
             in_item = False
         elif line.startswith(checkbox):
+            match = re.match(r"^- \[[ x]\] \(([1-9][0-9]*)\) \S", line)
+            case.assertIsNotNone(match, f"expected a numbered TODO item in {line!r}")
+            number = match[1]
+            case.assertNotIn(number, numbers, f"duplicate TODO number ({number})")
+            numbers.add(number)
             if in_item:
                 case.assertEqual(lines[i - 1], "", f"missing blank line before {line}")
                 case.assertTrue(lines[i - 2].strip(), f"extra blank line before {line}")
@@ -267,6 +272,7 @@ def assert_todo_items(case, text):
                 case.assertRegex(line, r"^    \* \S")
             elif re.match(r"\s*(?:[-+*]|\d+[.)])(?:\s|$)", line):
                 case.assertRegex(line, r"^(?:    \*|        (?:[-+*]|\d+[.)])) \S")
+    case.assertTrue(numbers, "expected a TODO checkbox item")
 
 
 CATALOG_MEMBERS = {
@@ -2525,12 +2531,15 @@ class ConfigTests(unittest.TestCase):
         self.assertIn("name: factory\n", (factory.SKILL / "SKILL.md").read_text())
         self.assertTrue((factory.SKILL / "templates/FACTORY.md").read_text().startswith("# Factory\n"))
 
-    def test_todo_item_spacing(self):
-        first = "- [x] First\n    * verdict: approved"
-        second = "- [ ] Second"
+    def test_todo_item_format(self):
+        first = "- [x] (1) First\n    * verdict: approved"
+        second = "- [ ] (2) Second"
         assert_todo_items(self, first + "\n\n" + second)
+        assert_todo_items(self, "## Ready\n\n" + second + "\n\n## Done\n\n" + first)
         for bad in (first + "\n" + second, first + "\n\n\n" + second, second + "\n\n    * detail",
-                    first + "\n  * misindented detail", first + "\n    - wrong marker"):
+                    first + "\n  * misindented detail", first + "\n    - wrong marker",
+                    "- [ ] Title", "- [ ] (0) Title", "- [ ] (2)", "- [ ] Title (2)", "- [ ](2) Title",
+                    "## Ready\n\n- [ ] (1) Duplicate\n\n## Done\n\n" + first):
             with self.subTest(text=bad), self.assertRaises(AssertionError):
                 assert_todo_items(self, bad)
 
@@ -2556,7 +2565,7 @@ class ConfigTests(unittest.TestCase):
             example = re.search(r"```[^\n]*\n(.*?)\n```", tasks, re.S)
             self.assertIsNotNone(example)
             assert_todo_items(self, example.group(1))
-            self.assertRegex(example.group(1), r"\n\n- \[ \] [^\n]+\Z")  # the second example is title-only
+            self.assertRegex(example.group(1), r"\n\n- \[ \] \([1-9][0-9]*\) [^\n]+\Z")  # the second example is title-only
             self.assertRegex(example.group(1), r"(?m)^        (?:\* |\d+\. )")
             self.assertNotIn("tracker", cfg.team)
             self.assertEqual(list(cfg.members), ["lead-dev", "reviewer", "pm"])
@@ -2908,10 +2917,10 @@ class GateFixtureTests(unittest.TestCase):
                 t1 = run(GIT, "rev-parse", "--short", "HEAD~1", cwd=repo).stdout.strip()
                 self.assertNotIn(" -- ", todo)
                 self.assertEqual([line for line in todo.splitlines() if line.startswith("- [")], [
-                    "- [ ] T3 Command line",
-                    "- [ ] T2 max_length (@lead-dev)",
-                    f"- [x] T1 Slugify joins words ({t1})",
-                    "- [x] T4 Strip accents (0f3a9c1)",
+                    "- [ ] (3) Command line",
+                    "- [ ] (2) max_length (@lead-dev)",
+                    f"- [x] (1) Slugify joins words ({t1})",
+                    "- [x] (4) Strip accents (0f3a9c1)",
                 ])
                 assert_todo_items(self, todo)
                 self.assertIn("    * verdict: changes required by @reviewer", todo)
