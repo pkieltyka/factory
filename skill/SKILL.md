@@ -2,7 +2,7 @@
 name: factory
 description: >
   Form, launch and lead a software team in herdr across Claude Code, Codex, pi, omp,
-  OpenCode and Antigravity CLI (agy). Commands: setup, up, status, wait, brief, say, or bare
+  OpenCode and Antigravity CLI (agy). Commands: setup, up, down, status, wait, brief, say, or bare
   /factory. Use for team formation, delegation, peer review and session recovery.
 ---
 
@@ -31,6 +31,7 @@ Use `factory.py say` to message teammates, never a harness's own messaging (e.g.
 |---|---|
 | `setup` | Read [references/cmd_setup.md](references/cmd_setup.md); form or change the team. |
 | `up` | Start or resume the team as under Launch. When returning to unfinished work, [reconcile before assigning](references/cmd_continue.md#reconcile-before-assigning). |
+| `down` | `factory.py down [names]` closes running member panes after recording their sessions for `up`. Omit names to stop all members. |
 | `status` / `wait` | Run the command; interpret results using [references/leading.md](references/leading.md). |
 | `brief` | `factory.py brief --send [all|names]` resends the brief; without `--send`, preview it. |
 | `say` | `factory.py say NAME [NAME ...] --file <path>`. Separate names with spaces or commas. `all` selects members only. The operator can pass quoted text instead of `--file`. |

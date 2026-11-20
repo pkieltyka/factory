@@ -85,8 +85,17 @@ FAKE_HERDR = textwrap.dedent(r'''
         find(a[2])["name"] = a[3]; out({"type": "agent_info", "agent": view(find(a[3]), "agent")})
     if a[:2] == ["pane", "list"]:
         out({"type": "pane_list", "panes": [view(p, "pane") for p in panes.values()]})
+    if a[:2] == ["pane", "get"]:
+        p = panes.get(a[2])
+        out({"type": "pane_info", "pane": view(p, "pane")}) if p else fail("pane_not_found")
     if a[:2] == ["pane", "close"]:
-        del panes[a[2]]; out({"type": "pane_closed"})
+        if a[2] == os.environ.get("FAKE_CLOSE_FAIL"):
+            fail("close_refused", "could not close pane")
+        del panes[a[2]]
+        change = s.pop("after_close", None)
+        if change:
+            panes[change["pane"]].update(change["fields"])
+        out({"type": "pane_closed"})
     if a[:2] == ["pane", "rename"]:
         panes[a[2]]["label"] = None if a[3] == "--clear" else a[3]; out({"type": "pane_info", "pane": view(panes[a[2]], "pane")})
     if a[:2] == ["tab", "rename"]:
@@ -352,9 +361,9 @@ class Env:
     def pane_of(self, name):
         return next(p for p in self.fake_state()["panes"].values() if p.get("label") == name)
 
-    def update(self, name, **fields):
+    def update(self, pane_label, **fields):
         fs = self.fake_state()
-        next(p for p in fs["panes"].values() if p.get("label") == name).update(fields)
+        next(p for p in fs["panes"].values() if p.get("label") == pane_label).update(fields)
         self.write_fake(fs)
 
     def set_session(self, name, ref):
@@ -2302,6 +2311,147 @@ class UpRecoveryTests(unittest.TestCase):
             e.kill("lead-dev")
             e.run("up", "lead-dev")
             self.assertEqual(native(e.starts()["lead-dev"])[:2], ["resume", "second"])
+
+
+class DownTests(unittest.TestCase):
+    def test_down_records_sessions_for_up_and_preserves_messages(self):
+        with Env(UI) as e:
+            e.run("up", "lead-dev", "pm", "--no-brief")
+            e.set_session("lead-dev", {"agent": "codex", "kind": "id", "value": "old"})
+            e.run("status")
+            e.set_session("lead-dev", {"agent": "codex", "kind": "id", "value": "latest"})
+            e.set_session("pm", {"agent": "pi", "kind": "path", "value": "/sessions/pm.jsonl"})
+            e.update("lead-dev", agent_status="working")
+            e.update("pm", agent_status="blocked")
+            self.assertIn("queued message", e.say("lead-dev", "operator", "unread report").stdout)
+            with patch.dict(os.environ, e.env):
+                cfg = factory.Config(e.repo)
+                draft = cfg.messages / "pm" / "pending.md"
+                draft.write_text("unsent report")
+                instruction = cfg.session_dir / "pm.md"
+                with factory.Inbox(cfg) as inbox:
+                    self.assertEqual([row["text"] for row in inbox.unread], ["unread report"])
+                    preserved = {p: p.read_bytes() for p in (draft, instruction, inbox.path, inbox.state_path)}
+            operator = e.pane_of("operator")
+            targets = [e.pane_of(name)["pane_id"] for name in ("lead-dev", "pm")]
+            out = e.run("down").stdout
+            self.assertIn("stopped @lead-dev (was working)", out)
+            self.assertIn("stopped @pm (was blocked)", out)
+            self.assertIn("@reviewer was not running", out)
+            self.assertIn(str(draft), out)
+            self.assertEqual(e.calls("pane", "close"), [["pane", "close", pane] for pane in targets])
+            self.assertEqual(e.pane_of("operator"), operator)
+            self.assertEqual({p: p.read_bytes() for p in preserved}, preserved)
+            self.assertNotIn("stopped @", e.run("down").stdout)
+
+            # A plain up with current arguments resumes the sessions just saved by down.
+            e.write_brief(formation({"lead-dev": {**CATALOG_MEMBERS["lead-dev"], "args": ["--no-alt-screen"]},
+                                     "pm": CATALOG_MEMBERS["pm"]}))
+            e.run("up")
+            codex = native(e.starts()["lead-dev"])
+            self.assertEqual(codex[:2], ["resume", "latest"])
+            self.assertIn("--no-alt-screen", codex)
+            self.assertEqual(flag(native(e.starts()["pm"]), "--session"), "/sessions/pm.jsonl")
+            self.assertEqual([n for n, _ in e.prompts()], ["lead-dev", "pm"])
+            for _, brief in e.prompts():
+                self.assertIn("picking up where we left off", brief)
+
+    def test_down_selects_names_and_leaves_empty_panes_and_caller(self):
+        with Env(UI) as e:
+            e.run("up", "lead-dev", "frontend-dev", "pm", "--no-brief")
+            e.kill("frontend-dev")
+            empty = e.pane_of("frontend-dev")
+            e.set_session("pm", {"agent": "pi", "kind": "id", "value": "not-stopping"})
+            other = e.pane_of("pm")
+            e.update("operator", label="reviewer", agent=None, name=None)  # invoking shell has a stale member label
+            caller = e.pane_of("reviewer")
+            out = e.run("down", "@lead-dev", "lead-dev", "frontend-dev", "reviewer").stdout
+            self.assertEqual(out.count("stopped @lead-dev"), 1)
+            self.assertIn("no compatible session recorded for @lead-dev: up will start it fresh", out)
+            self.assertIn("@frontend-dev was not running", out)
+            self.assertIn("@reviewer was not running", out)
+            self.assertEqual(e.pane_of("frontend-dev"), empty)
+            self.assertEqual(e.pane_of("reviewer"), caller)
+            self.assertEqual(e.pane_of("pm"), other)
+            self.assertEqual(len(e.calls("pane", "close")), 1)
+            with patch.dict(os.environ, e.env):
+                self.assertNotIn("pm", factory.past_sessions(factory.Config(e.repo)))
+
+    def test_down_validates_before_closing_anything(self):
+        with Env(UI) as e:
+            e.run("up", "lead-dev", "pm", "--no-brief")
+            cases = [("not a member", ("lead-dev", "unknown"), {}),
+                     ("not a member", ("lead-dev", "operator"), {}),
+                     ("not inside herdr", (), {"HERDR_ENV": "0"}),
+                     ("HERDR_PANE_ID is not set", (), {"HERDR_PANE_ID": ""}),
+                     ("not a member pane", (), {"HERDR_PANE_ID": e.pane_of("pm")["pane_id"]})]
+            for message, args, env in cases:
+                with self.subTest(message=message, args=args):
+                    p = e.run("down", *args, check=False, **env)
+                    self.assertNotEqual(p.returncode, 0)
+                    self.assertIn(message, p.stderr)
+            self.assertEqual(e.calls("pane", "close"), [])
+
+    def test_down_leaves_mismatched_pane_and_continues_after_refusal(self):
+        with Env(UI) as e:
+            e.run("up", "lead-dev", "reviewer", "pm", "--no-brief")
+            e.update("reviewer", name="unrelated")
+            unrelated = e.pane_of("reviewer")
+            lead = e.pane_of("lead-dev")["pane_id"]
+            pm = e.pane_of("pm")["pane_id"]
+            p = e.run("down", check=False, FAKE_CLOSE_FAIL=lead)
+            self.assertEqual(p.returncode, 1)
+            self.assertIn("could not stop @reviewer: pane label and agent name", p.stderr)
+            self.assertIn("could not stop @lead-dev: close_refused", p.stderr)
+            self.assertIn("stopped @pm", p.stdout)
+            self.assertEqual(e.calls("pane", "close"), [["pane", "close", pane] for pane in (lead, pm)])
+            self.assertEqual(e.pane_of("reviewer"), unrelated)
+            self.assertIn("stopped @lead-dev", e.run("down", "lead-dev").stdout)
+
+    def test_down_leaves_members_running_when_sessions_cannot_be_recorded(self):
+        with Env(UI) as e:
+            e.run("up", "lead-dev", "--no-brief")
+            e.set_session("lead-dev", {"agent": "codex", "kind": "id", "value": "cx-1"})
+            with patch.dict(os.environ, e.env):
+                (factory.Config(e.repo).cache / "sessions.jsonl").mkdir()
+            p = e.run("down", check=False)
+            self.assertNotEqual(p.returncode, 0)
+            self.assertIn("could not record member sessions", p.stderr)
+            self.assertEqual(e.calls("pane", "close"), [])
+
+    def test_down_checks_each_target_again_before_closing(self):
+        for fields, error in (({"agent": None, "name": None}, False),
+                              ({"name": "unrelated", "label": "other"}, True)):
+            with self.subTest(fields=fields), Env(UI) as e:
+                e.run("up", "lead-dev", "pm", "--no-brief")
+                lead = e.pane_of("lead-dev")["pane_id"]
+                pm = e.pane_of("pm")
+                state = e.fake_state()
+                state["after_close"] = {"pane": pm["pane_id"], "fields": fields}
+                e.write_fake(state)
+                p = e.run("down", "lead-dev", "pm", check=False)
+                self.assertEqual(p.returncode, int(error))
+                if error:
+                    self.assertIn("could not stop @pm: member identity changed", p.stderr)
+                else:
+                    self.assertIn("@pm was not running", p.stdout)
+                self.assertEqual(e.calls("pane", "close"), [["pane", "close", lead]])
+                self.assertEqual(e.fake_state()["panes"][pm["pane_id"]], {**pm, **fields})
+
+    def test_down_resumes_with_an_interrupted_history_and_same_session_value(self):
+        with Env(UI) as e:
+            e.run("up", "lead-dev", "--no-brief")
+            current = {"agent": "codex", "kind": "id", "value": "same"}
+            e.set_session("lead-dev", current)
+            with patch.dict(os.environ, e.env):
+                cfg = factory.Config(e.repo)
+                stale = {"member": "lead-dev", **current, "agent": "claude", "kind": "path"}
+                (cfg.cache / "sessions.jsonl").write_text(json.dumps(stale) + '\n{"member":')
+            e.run("down", "lead-dev")
+            with patch.dict(os.environ, e.env):
+                self.assertEqual(factory.past_sessions(cfg)["lead-dev"], {"member": "lead-dev", **current})
+            e.run("up", "lead-dev")
+            self.assertEqual(native(e.starts()["lead-dev"])[:2], ["resume", "same"])
 
 
 class ConfigTests(unittest.TestCase):

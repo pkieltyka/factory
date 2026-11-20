@@ -969,7 +969,7 @@ class Team:
             if label and (label not in self.panes or p.get("agent")):  # a label can repeat: the live pane wins
                 self.panes[label] = p
         if record_sessions:
-            remember_sessions(cfg, self)
+            remember_sessions(cfg, {n: self.pane(n) for n in [cfg.operator["name"], *cfg.members]})
 
     def pane(self, name):
         return self.panes.get(name)
@@ -1188,17 +1188,26 @@ def past_sessions(cfg):
     return {o["member"]: o for o in (records(path) if path.exists() else ()) if o.get("member") and o.get("value")}
 
 
-def remember_sessions(cfg, team):
-    """Note each agent's current harness session, unless it is the one noted last."""
+def remember_sessions(cfg, panes):
+    """Record observed sessions and return the latest saved ref for each agent."""
     last, new = past_sessions(cfg), []
-    for name in [cfg.operator["name"], *cfg.members]:
-        ref = (team.pane(name) or {}).get("agent_session") or {}
-        if ref.get("value") and ref["value"] != last.get(name, {}).get("value"):
-            new.append({"member": name, **{k: ref.get(k) for k in ("agent", "kind", "value")}})
+    for name, pane in panes.items():
+        ref = (pane or {}).get("agent_session") or {}
+        entry = {"member": name, **{k: ref.get(k) for k in ("agent", "kind", "value")}}
+        if entry["value"] and entry != last.get(name):
+            last[name] = entry
+            new.append(entry)
     if new:
         cfg.cache.mkdir(parents=True, exist_ok=True)
-        with (cfg.cache / "sessions.jsonl").open("a") as f:
-            f.writelines(json.dumps(o) + "\n" for o in new)
+        with (cfg.cache / "sessions.jsonl").open("a+b") as f:
+            prefix = b""
+            if f.tell():
+                f.seek(-1, os.SEEK_END)
+                if f.read(1) != b"\n":
+                    prefix = b"\n"  # an interrupted append can leave a partial line
+            data = "".join(json.dumps(o) + "\n" for o in new).encode()
+            f.write(prefix + data)
+    return last
 
 
 # ================================================================ commands
@@ -1207,14 +1216,18 @@ def cfg_of(args, require=True):
     return Config(pathlib.Path(args.cwd or os.getcwd()), require)
 
 
-def selected(cfg, names):
-    """Plans for the named members, or for every member in factory.toml."""
+def selected_names(cfg, names):
+    """The named members, or every member in factory.toml."""
     names = [n.lstrip("@") for n in names] or list(cfg.members)
     strangers = [n for n in names if n not in cfg.members]
     if strangers:
         raise SystemExit(f"{', '.join(strangers)}: not a member in {CONF} (members: {', '.join(cfg.members)})."
                          f" To add a member, add its table to {CONF}.")
-    return [plan(cfg, n) for n in dict.fromkeys(names)]
+    return list(dict.fromkeys(names))
+
+
+def selected(cfg, names):
+    return [plan(cfg, n) for n in selected_names(cfg, names)]
 
 
 def print_plan(plans, extra_col=None):
@@ -1366,6 +1379,86 @@ def cmd_up(args):
             if others:
                 deliver(team, {n: f"{tag(operator)} Joined the team: {news}. No reply needed." for n in others}, "the news")
     report_failed(failed, team, undelivered)
+
+
+def member_pane_before_close(name, pane_id):
+    """Return (pane, error). A missing pane or an exited agent is already stopped."""
+    got = herdr("pane", "get", pane_id, check=False)
+    if error := got.get("error"):
+        return None, None if error.split(":", 1)[0] == "pane_not_found" else error
+    pane = got.get("pane") or {}
+    if pane.get("pane_id") != pane_id:
+        return None, f"could not verify pane {pane_id}"
+    if not pane.get("agent"):
+        return None, None
+    got = herdr("agent", "get", pane_id, check=False)
+    if error := got.get("error"):
+        return None, None if error.split(":", 1)[0] == "agent_not_found" else error
+    agent = got.get("agent") or {}
+    if pane.get("label") != name or agent.get("name") != name or agent.get("pane_id") != pane_id:
+        return None, f"member identity changed in pane {pane_id}"
+    return pane, None
+
+
+def cmd_down(args):
+    cfg = cfg_of(args)
+    names = selected_names(cfg, args.names)
+    require_herdr()
+    caller = os.environ.get("HERDR_PANE_ID")
+    if not caller:
+        raise SystemExit("HERDR_PANE_ID is not set; run down from the operator's herdr pane.")
+    got = herdr("agent", "get", caller, check=False)
+    if (error := got.get("error")) and error.split(":", 1)[0] != "agent_not_found":
+        raise SystemExit(f"herdr agent get {caller}: {error}")
+    if (got.get("agent") or {}).get("name") in cfg.members:
+        raise SystemExit("run down from the operator's pane, not a member pane.")
+
+    team = Team(cfg, exclude_pane=caller, record_sessions=False)
+    running = {name for name in cfg.members if team.live(name) or name in team.agent_panes}
+    targets = {name: team.pane(name) for name in names
+               if team.live(name) and team.pane(name)["pane_id"] == team.agent_panes.get(name)}
+    try:
+        saved = remember_sessions(cfg, targets) if targets else {}
+    except OSError as e:
+        raise SystemExit(f"could not record member sessions: {e}") from None
+
+    stopped, failed = False, False
+    for name in names:
+        if name not in running:
+            print(f"@{name} was not running")
+            continue
+        target = targets.get(name)
+        pane = None
+        if target is None:
+            error = "pane label and agent name do not point to the same pane"
+        else:
+            pane, error = member_pane_before_close(name, target["pane_id"])
+        if pane:
+            try:
+                if pane.get("agent_session") and pane["agent_session"] != target.get("agent_session"):
+                    saved = remember_sessions(cfg, {name: pane})
+            except OSError as e:
+                error = f"could not record member session: {e}"
+            else:
+                error = herdr("pane", "close", pane["pane_id"], check=False).get("error")
+        if error:
+            print(f"could not stop @{name}: {error}", file=sys.stderr)
+            failed = True
+            continue
+        running.remove(name)
+        if not pane:
+            print(f"@{name} was not running")
+            continue
+        print(f"stopped @{name} (was {pane.get('agent_status', '?')})")
+        if saved.get(name, {}).get("agent") != cfg.members[name]["harness"]:
+            print(f"no compatible session recorded for @{name}: up will start it fresh")
+        stopped = True
+    if stopped:
+        if not running:
+            report_leftover_drafts(cfg)
+        print("run factory.py up to bring members back")
+    if failed:
+        sys.exit(1)
 
 
 def harness_argv(info, harness):
@@ -1642,6 +1735,10 @@ def main(argv=None):
     up.add_argument("--restart", action="store_true", help="also relaunch running members with current settings")
     launching(up)
 
+    down = sub.add_parser("down", help="stop members and save their sessions for up")
+    selection(down)
+    common(down)
+
     st = sub.add_parser("status", help="members and whether they are running")
     common(st)
 
@@ -1679,7 +1776,7 @@ def main(argv=None):
         return cmd_inbox_seen(args)
     if args.cmd == "say":
         args.message = None if args.file else (args.to.pop() if len(args.to) > 1 else None)
-    {"init": cmd_init, "harnesses": cmd_harnesses, "check": cmd_check, "up": cmd_up,
+    {"init": cmd_init, "harnesses": cmd_harnesses, "check": cmd_check, "up": cmd_up, "down": cmd_down,
      "status": cmd_status, "wait": cmd_wait, "brief": cmd_brief, "say": cmd_say,
      "prompt": cmd_prompt}[args.cmd](args)
 
