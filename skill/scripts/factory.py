@@ -1322,6 +1322,7 @@ def cmd_up(args):
             sys.exit(2)
     if running:
         print(f"already running: {', '.join(running)}")
+        report_launch_drift(team, [m for m in plans if m["name"] in running])
     operator = ensure_operator(cfg, tab=True)
     configure_messages(cfg, Team(cfg), operator, restart=[m["name"] for m in plans] if args.restart else ())
     if not ready:
@@ -1329,9 +1330,9 @@ def cmd_up(args):
     pickup_text = ("We are picking up where we left off. Check the tracker the brief above names, then tell"
                    f" @{operator} in one line what you were doing and what you will do next. Send it with the"
                    f" say command in your standing instructions. A reply in your own pane does not reach @{operator}.")
-    fresh_text = ("You are starting in a new session and know nothing of the work so far. Do not start anything"
-                  f" yet: @{operator} will send your task, its criteria and the evidence"
-                  " so far. No reply needed.")
+    ready_text = (f"Send @{operator} one line saying `ready` with the say command in your standing instructions,"
+                  " then wait for your task.")
+    fresh_text = "You are starting in a new session and know nothing of the work so far. " + ready_text
     past = past_sessions(cfg)
     closing, joined, failed = {}, [], {}
     for m in ready:
@@ -1351,7 +1352,7 @@ def cmd_up(args):
         elif pane or ref:
             closing[name] = fresh_text
         else:
-            closing[name] = None  # first launch: the plain brief
+            closing[name] = ready_text
         if not was_live and not ref:  # also announce a successful retry of a first launch
             joined.append(m)
     team, undelivered = Team(cfg), {}
@@ -1365,6 +1366,31 @@ def cmd_up(args):
             if others:
                 deliver(team, {n: f"{tag(operator)} Joined the team: {news}. No reply needed." for n in others}, "the news")
     report_failed(failed, team, undelivered)
+
+
+def harness_argv(info, harness):
+    """The argv of the one foreground process that is this harness, else None: no data or ambiguous data."""
+    procs = [p.get("argv") for p in (info.get("process_info") or {}).get("foreground_processes") or []
+             if p.get("argv") and harness in (re.sub(r"^\.|-wrapped$", "", p.get("name") or ""),
+                                              os.path.basename(p["argv"][0]))]
+    return procs[0] if len(procs) == 1 else None
+
+
+def report_launch_drift(team, plans):
+    """herdr can restore a member itself, e.g. after its server restarts, without the flags factory launched it
+    with. Name the live members whose harness demonstrably lacks their permission flags or extra args."""
+    drifted = []
+    for m in plans:
+        wanted = [w for w in (TABLE[m["harness"]]["permissions"][m["permissions"]], m["args"]) if w]
+        if not wanted:
+            continue
+        argv = harness_argv(herdr("pane", "process-info", "--pane", team.pane(m["name"])["pane_id"], check=False),
+                            m["harness"])
+        if argv and not all(any(argv[i:i + len(w)] == w for i in range(len(argv) - len(w) + 1)) for w in wanted):
+            drifted.append(m["name"])
+    if drifted:
+        print(f"running without their factory launch flags, as after a herdr restart: {', '.join(drifted)}."
+              f" Run factory.py up {' '.join(drifted)} --restart")
 
 
 def cmd_status(args):

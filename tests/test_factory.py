@@ -107,6 +107,13 @@ FAKE_HERDR = textwrap.dedent(r'''
         tab = panes[opt("--pane")]["tab_id"]
         out({"type": "pane_layout", "layout": {"tab_id": tab, "panes": [
             {"pane_id": p["pane_id"], "rect": p["rect"]} for p in panes.values() if p["tab_id"] == tab]}})
+    if a[:2] == ["pane", "process-info"]:
+        p = panes[opt("--pane")]
+        procs = p.get("procs")  # a test's own foreground processes; else the harness as factory started it
+        if procs is None:
+            start = next((c for c in reversed(s["calls"]) if c[:2] == ["agent", "start"] and c[c.index("--pane") + 1] == p["pane_id"]), None)
+            procs = [{"pid": 1, "name": p["agent"], "argv": [p["agent"], *start[start.index("--") + 1:]]}] if start and p.get("agent") else []
+        out({"type": "pane_process_info", "process_info": {"pane_id": p["pane_id"], "foreground_processes": procs}})
     if a[:2] == ["pane", "read"]:
         asks = panes[a[2]].get("dialog", ["Allow this command? (y/n)"])[0]
         save(); print(f"...\n{asks}  [{a[2]}]"); sys.exit(0)  # plain text, like herdr
@@ -208,6 +215,7 @@ pax-vllm nvidia/Qwen3.8-Flash-Next-NVFP4
 """
 
 LEVELS = ["low", "medium", "high", "xhigh", "max"]
+READY = "Send @operator one line saying `ready` with the say command in your standing instructions, then wait for your task."
 CODEX_CACHE = {"models": [
     {"slug": "gpt-6.2-astra", "visibility": "list", "supported_reasoning_levels": [{"effort": e} for e in LEVELS + ["ultra"]]},
     {"slug": "gpt-6.2-sol", "visibility": "list", "supported_reasoning_levels": [{"effort": e} for e in LEVELS + ["ultra"]]},
@@ -440,7 +448,7 @@ class UpTests(unittest.TestCase):
             self.assertTrue(sent["reviewer"].startswith("[from @operator]: Your standing instructions"))  # Codex gets them here too
             self.assertIn("You are read-only", sent["reviewer"])
             for text in sent.values():
-                for needle in ("| **@lead-dev** | Codex, gpt-6-astra, high |", "## Workflow", "No reply needed."):
+                for needle in ("| **@lead-dev** | Codex, gpt-6-astra, high |", "## Workflow", READY):
                     self.assertIn(needle, text)
                 self.assertNotIn("+++", text)
             self.assertEqual(sorted(p.name for p in e.repo.iterdir()), ["FACTORY.md", "factory.toml", "sub"])  # nothing else
@@ -2003,10 +2011,11 @@ class UpRecoveryTests(unittest.TestCase):
                     closing = prompts[name].rstrip().rsplit("\n\n", 1)[-1]
                     if resumed:
                         self.assertIn("picking up where we left off", closing)
+                        self.assertNotIn("`ready`", closing)
                     elif name == "reviewer":
-                        self.assertEqual(closing, "That is the whole team brief. No reply needed.")
+                        self.assertEqual(closing, READY)
                     else:
-                        self.assertIn("starting in a new session", closing)
+                        self.assertEqual(closing, "You are starting in a new session and know nothing of the work so far. " + READY)
                 if not restarted:
                     self.assertIn("Joined the team: @reviewer", prompts["lead-dev"])
                     self.assertNotIn("@frontend-dev", prompts["lead-dev"])
@@ -2018,6 +2027,58 @@ class UpRecoveryTests(unittest.TestCase):
             e.run("up", "pm", "--restart")
             self.assertEqual([name for name, _ in e.prompts()], ["pm"])
             self.assertIn("starting in a new session", e.prompts()[0][1])
+
+    def test_ready_line_names_the_operator_and_manual_briefs_ask_nothing(self):
+        with Env(formation({"lead-dev": CATALOG_MEMBERS["lead-dev"]}, operator={"name": "boss"})) as e:
+            e.run("up")
+            self.assertTrue(e.prompts()[0][1].endswith(READY.replace("@operator", "@boss") + "\n"))
+            self.assertEqual(len(e.prompts()), 1)
+            e.run("up")  # already running: nothing sent
+            e.run("brief", "--send", "lead-dev")
+            self.assertEqual(len(e.prompts()), 2)
+            self.assertTrue(e.prompts()[1][1].endswith("That is the whole team brief. No reply needed.\n"))
+
+    def test_up_names_running_members_without_their_launch_flags(self):
+        restored = {"lead-dev": [{"pid": 7, "name": "codex", "argv": ["codex", "resume", "cx-1"]}],
+                    "frontend-dev": [{"pid": 8, "name": ".claude-wrapped", "argv": ["/bin/claude", "--resume", "c",
+                                                                                     "--permission-mode", "auto"]}]}
+        cases = {
+            "matching": ({}, None),
+            "missing flags": (restored, "lead-dev frontend-dev"),
+            "unrelated foreground process": ({"lead-dev": [{"pid": 9, "name": "bash", "argv": ["bash"]}]}, None),
+            "ambiguous": ({"lead-dev": restored["lead-dev"] * 2}, None),
+            "no data": ({"lead-dev": []}, None),
+            "no argv": ({"lead-dev": [{"pid": 7, "name": "codex"}]}, None),
+        }
+        for case, (procs, named) in cases.items():
+            with self.subTest(case), Env(UI) as e:
+                e.run("up", "lead-dev", "frontend-dev", "pm", "--no-brief")
+                for name, p in procs.items():
+                    e.update(name, procs=p)
+                before = len(e.calls())
+                out = e.run("up", "lead-dev", "frontend-dev", "pm").stdout
+                self.assertIn("already running: lead-dev, frontend-dev, pm", out)
+                # pi has no permission flags, so its process is never read
+                read = [c[3] for c in e.calls("pane", "process-info")]
+                self.assertEqual(read, [e.pane_of("lead-dev")["pane_id"], e.pane_of("frontend-dev")["pane_id"]])
+                if named:
+                    self.assertIn("running without their factory launch flags, as after a herdr restart:"
+                                  f" {named.replace(' ', ', ')}. Run factory.py up {named} --restart", out)
+                    self.assertNotIn("--resume", out)  # no raw argv
+                else:
+                    self.assertNotIn("launch flags", out)
+                calls = e.calls()[before:]
+                self.assertFalse([c for c in calls if c[:2] in (["pane", "close"], ["agent", "start"], ["agent", "prompt"])])
+
+    def test_launch_flags_check_needs_args_too_and_skips_restarts(self):
+        with Env(formation({"lead-dev": {**CATALOG_MEMBERS["lead-dev"], "args": ["-c", "x=1"]}})) as e:
+            e.run("up", "--no-brief")
+            argv = native(e.starts()["lead-dev"])
+            e.update("lead-dev", procs=[{"pid": 7, "name": "codex", "argv": ["codex", *[a for a in argv if a != "x=1"]]}])
+            self.assertIn("Run factory.py up lead-dev --restart", e.run("up").stdout)
+            e.run("up", "--restart")
+            self.assertNotIn("launch flags", e.run("up").stdout)  # the relaunch is checked by its own argv
+            self.assertEqual(len(e.calls("pane", "process-info")), 2)
 
     def test_taken_name_prevents_an_earlier_restart(self):
         with Env(UI) as e:
@@ -2043,7 +2104,7 @@ class UpRecoveryTests(unittest.TestCase):
             self.assertEqual(e.calls("pane", "close"), [])
             self.assertEqual(e.pane_of("operator")["pane_id"], "w1:p1")
             self.assertNotEqual(e.pane_of("lead-dev")["pane_id"], "w1:p1")
-            self.assertIn("That is the whole team brief.", dict(e.prompts())["lead-dev"])
+            self.assertIn(READY, dict(e.prompts())["lead-dev"])
 
     def test_continue_stub_never_launches(self):
         with Env(UI) as e:
@@ -2078,7 +2139,7 @@ class UpRecoveryTests(unittest.TestCase):
                 self.assertIn("picking up where we left off", sent[name])
                 self.assertNotIn("No reply needed", sent[name])
             for name in ("frontend-dev", "reviewer"):
-                self.assertIn("That is the whole team brief.", sent[name])
+                self.assertTrue(sent[name].endswith(READY + "\n"))
                 self.assertIn(f"started @{name}", out)
 
     def test_bare_up_recovers_exited_and_closed_members_without_disturbing_live_members(self):
@@ -2202,7 +2263,8 @@ class UpRecoveryTests(unittest.TestCase):
             self.assertEqual(e.pane_of("reviewer")["pane_id"], "w1:p4")  # a new, labeled pane
             self.assertEqual(e.pane_of("reviewer")["tab_id"], e.pane_of("pm")["tab_id"])  # in the team tab
             self.assertIn("starting in a new session", dict(e.prompts())["pm"])
-            self.assertIn("That is the whole team brief.", dict(e.prompts())["reviewer"])
+            self.assertTrue(dict(e.prompts())["pm"].endswith(READY + "\n"))  # a changed harness starts fresh
+            self.assertTrue(dict(e.prompts())["reviewer"].endswith(READY + "\n"))
 
     def test_opencode_member_gets_a_new_pane_and_the_old_label_is_cleared(self):
         with Env(formation({
@@ -2755,6 +2817,8 @@ class HerdrContract(unittest.TestCase):
             self.assertIn(field, agent)
         self.assertEqual(set(defs["AgentSessionInfo"]["properties"]), {"agent", "kind", "source", "value"})
         self.assertIn("text", defs["PaneReadResult"]["properties"])
+        self.assertIn("foreground_processes", defs["PaneProcessInfo"]["properties"])
+        self.assertLessEqual({"name", "argv"}, set(defs["PaneProcessInfoProcess"]["properties"]))
         self.assertEqual(set(defs["ErrorBody"]["properties"]), {"code", "message"})
         for params, field in (("TabCreateParams", "env"), ("PaneSplitParams", "env"), ("AgentStartParams", "args")):
             self.assertIn(field, defs[params]["properties"])

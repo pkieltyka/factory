@@ -14,7 +14,7 @@ Before any launch or restart, `up` checks the affected members with current `fac
 
 - Reuse the old shell pane only when its cwd matches the configured checkout and the harness needs no new pane environment. Otherwise create a replacement; clear the old label and leave that pane as a plain shell. Worktrees remain intact.
 - Codex receives an explicit working directory on resume; its saved session alone may point at an old checkout.
-- After a herdr restart, run `up --restart`: herdr restores names and sessions but omits factory launch settings and standing-instruction flags.
+- After a herdr restart, run `up --restart`: herdr restores names and sessions but omits factory launch settings and standing-instruction flags. Plain `up` names the members it finds running without their permission flags or `args`.
 - Failed resume: inspect the error and use `up <name> --fresh` if the saved session cannot reopen.
 - Failed brief delivery exits 3: resolve the cause and `factory.py brief --send <name>`.
 - The inbox outlives the team. A cold `up` (no member live, no `--restart`) announces unread messages; the last 100 acknowledged ones stay available to `factory.py inbox seen`.
