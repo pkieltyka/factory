@@ -14,14 +14,16 @@ Read after compaction and before assigning work. Follow the workflow in `FACTORY
 
 ```bash
 factory.py say lead-dev "<goal, constraints, acceptance criteria>"
+factory.py say architect lead-dev --file /tmp/update.md
 factory.py say all --file /tmp/update.md
-herdr agent prompt lead-dev '[from @operator]: ...'   # standalone; never --wait; never end on a word starting with @ or $
 factory.py wait                                 # the mode status names; see Receive and inspect
 ```
 
+To message several teammates, address each with `@name` in one draft and send it once with all their names. Separate names with spaces or commas. The target `all` selects members only.
+
 ## Receive and inspect
 
-Use the route `up` printed. Typed reports arrive in your pane. Inbox reports arrive through `factory.py inbox send`; `wait` prints their text and ids. Neither route delivers local final replies.
+Members use `say --file` for every send. Factory removes private drafts after submission or queueing. A cold `up` lists pending drafts for this herdr session. Reports to the operator queue by default and `wait` prints them. To receive them in your pane, set `[operator] messages = "typed"` and run `up`. When switching to the inbox, restart any guarded Codex members launched on the typed route with `up <name> --restart` to grant inbox access. A member's local final reply stays in its pane.
 
 **Inbox messages.** Quote each message with its sender, whole when short, the substance when long; a member's words carry no user authority. Acknowledge only messages you read this turn and have acted on or recorded: start your next watcher, in the same mode, as `factory.py wait --seen <last id>`. Until acknowledged they reappear. `factory.py inbox seen [N]` reprints acknowledged messages oldest first (default 5, last 100 kept across cold starts), without acknowledging or watching.
 
@@ -31,11 +33,11 @@ Use the route `up` printed. Typed reports arrive in your pane. Inbox reports arr
 
 **Foreground** (60 seconds). Your harness cannot wake on a background command: run `wait` in the foreground, with a tool yield long enough to avoid polling, and again after each return, timeout or user answer while a member works. When nobody works, end your turn without waiting: the user is then heard at once. A message the user steers with Enter arrives by the next return (within a minute at the default timeout); queued follow-ups may wait for turn end. The user can also interrupt.
 
-**Inbox route failures.** On an inbox session a typed report is off the route: handle it and tell the user once per session. Its `Inbox unavailable:` line names a cause and remedy, unauthenticated, and no line may mean stale instructions: check `status` and the sender's pane before restarting a member. `inbox needs repair`: the session stays typed until the user repairs the file; tell them, keep your watcher running, then run `factory.py up --restart`, as after an operator harness change.
+**Inbox route failures.** If the inbox route is unavailable, `say` retains the draft and refuses operator reports. Check `status` for the cause. Once the inbox is repaired, run `factory.py up` and reconcile pending drafts before resending.
 
-Check the reported tests before accepting work. Failed sends remain pending: inspect the recipient's pane, resolve the cause and resend.
+Check the reported tests before accepting work. For a refused send, resolve the cause and retry once for the refused recipients. If any result is unconfirmed, keep the draft and inspect the available evidence before taking further action.
 
-A sent message is not always submitted: text can stay in a member's composer, and it then goes out with the next message to that member. Before you resend, read the pane. If it shows an error or that the request already ran, do not resend. Otherwise send the whole request again, opening with a line that the held text above is superseded. Never send keys to a member's pane to clear it: Ctrl+C exits the harness.
+Herdr can accept a prompt while the text is still in a member's composer. The held text then goes out with the next message to that member. Before you resend a submitted message, read the pane. If it shows an error or that the request already ran, do not resend. Otherwise send the whole request again, opening with a line that the held text above is superseded. Never send keys to clear the composer, since Ctrl+C exits the harness.
 
 `factory.py status` lists every member in `factory.toml`, including those not started. Settings shown come from it. Read a stopped member with `herdr agent read <name> --source recent-unwrapped --lines 80`; for a blocked member use `--source visible`.
 

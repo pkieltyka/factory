@@ -70,6 +70,11 @@ def refuse_dangling_links(root):
                              " Repair or remove the link.")
 
 
+def session_key():
+    session = os.environ.get("HERDR_SESSION") or "default"
+    return re.sub(r"[^A-Za-z0-9_.-]", "-", session)[:24] + "-" + hashlib.sha1(session.encode()).hexdigest()[:8]
+
+
 def parse_role(path):
     _, head, body = path.read_text().split("---\n", 2)
     meta = {}
@@ -141,6 +146,14 @@ class Config:
         return base / "factory-skill" / key
 
     @property
+    def session_dir(self):
+        return self.cache / session_key()
+
+    @property
+    def messages(self):
+        return self.session_dir / "messages"
+
+    @property
     def worktree_dir(self):
         """Where members' git worktrees live: next to the repo unless factory.toml sets `worktree_dir`."""
         return (self.root / (self.team.get("worktree_dir") or f"../{self.root.name}.worktrees")).resolve()
@@ -171,7 +184,8 @@ def plan(cfg, name):
         model, thinking = agy_choice(m)
     return {"name": name, "role": role, "harness": m["harness"], "model": model, "thinking": thinking,
             "readonly": meta["readonly"] == "true", "notes": m.get("notes", ""), "permissions": permissions,
-            "args": [str(a) for a in m.get("args", [])], "branch": branch, "dir": str(where)}
+            "args": [str(a) for a in m.get("args", [])], "branch": branch, "dir": str(where),
+            "draft_dir": cfg.messages / name}
 
 
 # ================================================================ availability checks
@@ -240,27 +254,26 @@ def resolve_listed(model, listed, harness):
 
 class InboxDamage(ValueError):
     def __init__(self, path, line, reason):
-        super().__init__(f"inbox needs repair: {path}, line {line}: {reason}. This session runs on typed messages."
-                         " After repairing the file, run factory.py up --restart.")
+        super().__init__(f"inbox needs repair: {path}, line {line}: {reason}. Operator messages are unavailable."
+                         " After repairing the file, run factory.py up.")
 
 
 class Inbox:
     """Session-local transport. Hold the stable lock for file operations, never while waiting on agents."""
     def __init__(self, cfg):
         self.directory = cfg.cache
-        session = os.environ.get("HERDR_SESSION") or "default"
-        key = re.sub(r"[^A-Za-z0-9_.-]", "-", session)[:24] + "-" + hashlib.sha1(session.encode()).hexdigest()[:8]
-        self.path = self.directory / f"inbox-{key}.jsonl"
+        self.path = self.directory / f"inbox-{session_key()}.jsonl"
         self.state_path = self.path.with_suffix(".json")
         self.lock_path = self.path.with_suffix(".lock")
 
     @staticmethod
-    def private_open(path, flags):
+    def private_open(path, flags, *, read_only=False):
         fd = os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
         try:
             if not stat.S_ISREG(os.fstat(fd).st_mode):
                 raise OSError(f"not a regular file: {path}")
-            os.fchmod(fd, 0o600)
+            if not read_only:
+                os.fchmod(fd, 0o600)
             return fd
         except BaseException:
             os.close(fd)
@@ -276,15 +289,9 @@ class Inbox:
         self.lock = self.private_open(self.lock_path, os.O_CREAT | os.O_RDWR)
         try:
             fcntl.flock(self.lock, fcntl.LOCK_EX)
-            raw = self.read(self.state_path)
-            self.state = {"mode": "typed", "seen": 0} if raw is None else self.decode(raw, self.state_path, 1)
-            if (not isinstance(self.state, dict) or self.state.get("mode") not in ("inbox", "typed")
-                    or type(self.state.get("seen")) is not int or self.state["seen"] < 0):
-                raise InboxDamage(self.state_path, 1, "expected mode and non-negative integer seen")
-            history = self.state.get("history", [])
-            self.validate_rows(history, self.state_path)
-            if len(history) > 100 or (history and history[-1]["id"] > self.state["seen"]):
-                raise InboxDamage(self.state_path, 1, "expected at most 100 acknowledged history entries, none above seen")
+            saved = self.read_state()
+            self.has_state = saved is not None
+            self.state = saved if self.has_state else {"mode": "typed", "seen": 0}
             raw = self.read(self.path) or b""
             if raw and not raw.endswith(b"\n"):
                 raise InboxDamage(self.path, raw.count(b"\n") + 1, "incomplete line")
@@ -298,13 +305,28 @@ class Inbox:
     def __exit__(self, *_):
         os.close(self.lock)
 
-    def read(self, path):
+    def read(self, path, *, read_only=False):
         try:
-            fd = self.private_open(path, os.O_RDONLY)
+            fd = self.private_open(path, os.O_RDONLY, read_only=read_only)
         except FileNotFoundError:
             return None
         with os.fdopen(fd, "rb") as f:
             return f.read()
+
+    def read_state(self, *, read_only=False):
+        # save_state replaces the file atomically, so reading the route alone needs no lock.
+        raw = self.read(self.state_path, read_only=read_only)
+        if raw is None:
+            return None
+        state = self.decode(raw, self.state_path, 1)
+        if (not isinstance(state, dict) or state.get("mode") not in ("inbox", "typed")
+                or type(state.get("seen")) is not int or state["seen"] < 0):
+            raise InboxDamage(self.state_path, 1, "expected mode and non-negative integer seen")
+        history = state.get("history", [])
+        self.validate_rows(history, self.state_path)
+        if len(history) > 100 or (history and history[-1]["id"] > state["seen"]):
+            raise InboxDamage(self.state_path, 1, "expected at most 100 acknowledged history entries, none above seen")
+        return state
 
     @staticmethod
     def decode(raw, path, line):
@@ -353,6 +375,7 @@ class Inbox:
 
     def save_state(self):
         self.replace(self.state_path, (json.dumps(self.state) + "\n").encode())
+        self.has_state = True
 
     def remove_seen(self):
         unread = self.unread
@@ -393,35 +416,28 @@ def cmd_inbox_seen(args):
         raise SystemExit(2)
 
 
+def configured_route(cfg, state):
+    if state and (state["mode"] == "inbox" or cfg.operator.get("messages") == "typed"):
+        return state["mode"]
+    return "unavailable"
+
+
 def message_route(cfg):
-    """Previews outside herdr and damaged transport files use the original typed instructions."""
-    if os.environ.get("HERDR_ENV") != "1" or getattr(cfg, "inbox_unavailable", False):
-        return "typed"
     try:
-        with Inbox(cfg) as inbox:
-            return inbox.state["mode"]
+        return configured_route(cfg, Inbox(cfg).read_state(read_only=True))
     except (InboxDamage, OSError):
-        return "typed"
+        return "unavailable"
 
 
-def operator_wait(cfg, route):
-    harness = cfg.operator.get("harness")
-    return TABLE.get(harness, {}).get("operator_wait", "foreground") if route == "inbox" and harness else "background"
+def operator_wait(harness, route):
+    return TABLE.get(harness, {}).get("operator_wait", "foreground") if route == "inbox" else "background"
 
 
 def configure_messages(cfg, team, operator, restart=()):
-    conf, live = cfg.operator.get("harness"), (team.pane(operator) or {}).get("agent")
-    typed = cfg.operator.get("messages", "inbox") == "typed"
-    mode = "inbox" if not typed and conf and conf == live else "typed"
-    reason = (f'[operator] messages = "typed" in {CONF}' if typed else
-              f"[operator] harness is not set in {CONF}" if not conf else
-              f"{CONF} says {conf}, herdr sees {live} in this pane" if conf != live else "")
-    if not typed and conf != live and live in TABLE:
-        reason += (f'. This pane is the operator. Set harness = "{live}" under [operator] in {CONF}'
-                   ' and run factory.py up again')
+    mode = cfg.operator.get("messages", "inbox")
     try:
         with Inbox(cfg) as inbox:
-            previous = inbox.state["mode"]
+            previous = inbox.state["mode"] if inbox.has_state else None
             if not restart and not any(team.live(n) for n in cfg.members):
                 inbox.remove_seen()
                 if inbox.unread:
@@ -431,25 +447,26 @@ def configure_messages(cfg, team, operator, restart=()):
             inbox.save_state()
     except (InboxDamage, OSError) as e:
         print(str(e) if isinstance(e, InboxDamage) else
-              f"inbox unavailable: {str(e).rstrip('.')}. This session runs on typed messages."
-              " After fixing it, run factory.py up --restart.")
-        mode, previous = "typed", "typed"
-        cfg.inbox_unavailable = True  # Later rendering in this invocation must not reselect the stored route.
+              f"inbox unavailable: {str(e).rstrip('.')}. Operator messages are unavailable."
+              " After fixing it, run factory.py up.")
+        return
     if mode == "inbox":
-        wait = operator_wait(cfg, mode)
+        wait = operator_wait((team.pane(operator) or {}).get("agent"), mode)
         action = ("in the background and end your turn; it wakes you with messages and problems" if wait == "background" else
                   "in the foreground, and again each time it returns while a member works")
-        print(f"members reach @{operator} through the inbox (factory.py inbox send); run factory.py wait {action}")
+        print(f"members reach @{operator} through the inbox; run factory.py wait {action}")
     else:
-        print(f"members reach @{operator} by typed herdr messages" + (": " + reason if reason else ""))
-    if mode != previous and any(team.live(n) and n not in restart for n in cfg.members):
-        print(f"the route to @{operator} changed to {mode}: run factory.py up --restart so running members get it")
+        print(f'members reach @{operator} by typed herdr messages ([operator] messages = "typed")')
+    if previous == "typed" and mode == "inbox" and any(
+        n not in restart and (team.pane(n) or {}).get("agent") == "codex"
+        and (member.get("permissions") or cfg.team.get("permissions")) == "guarded"
+        for n, member in cfg.members.items()
+    ):
+        print("Restart any guarded Codex members launched on the typed route with factory.py up <name> --restart"
+              " to grant inbox access.")
 
 
-def cmd_inbox_send(args):
-    cfg = cfg_of(args)
-    if args.sender not in cfg.members:
-        raise SystemExit(f"not a member of {CONF}: {args.sender}")
+def message_text(args):
     if bool(args.file) == (args.message is not None):
         raise SystemExit("give a message or --file, not both")
     try:
@@ -458,15 +475,47 @@ def cmd_inbox_send(args):
         raise SystemExit(f"cannot read message file {args.file}: {e}") from None
     if not text.strip():
         raise SystemExit("give a non-empty message")
+    return text
+
+
+def remove_delivered_draft(cfg, sender, filename):
+    """Only consume the sender's own managed draft. Other --file inputs belong to the caller."""
+    if not filename:
+        return
+    path = pathlib.Path(filename).absolute()
+    directory = cfg.messages / sender
+    if path.parent == directory and not any(p.is_symlink() for p in (cfg.session_dir, cfg.messages, directory)):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as e:
+            print(f"delivered, but could not remove {path}: {e}. Discard it without resending.", file=sys.stderr)
+
+
+def report_leftover_drafts(cfg):
+    if cfg.session_dir.is_symlink() or cfg.messages.is_symlink():
+        return
+    for directory in sorted(cfg.messages.glob("*")):
+        if directory.is_symlink() or not directory.is_dir():
+            continue
+        for path in sorted(directory.iterdir()):
+            try:
+                info = path.lstat()
+            except FileNotFoundError:  # a pending send may have just finished
+                continue
+            if stat.S_ISREG(info.st_mode):
+                minutes = max(0, int((time.time() - info.st_mtime) / 60))
+                print(f"leftover draft for @{directory.name} ({minutes} min old): {path}. Check delivery before resending or discarding.")
+
+
+def queue_message(cfg, sender, text):
     started = False
     try:
         with Inbox(cfg) as inbox:
-            if inbox.state["mode"] != "inbox":
-                raise ValueError("the operator takes typed messages in this session; this member has inbox instructions,"
-                                 f" restart it with factory.py up {args.sender} --restart")
+            if not inbox.has_state or inbox.state["mode"] != "inbox":
+                return "refused", "the operator inbox route changed. Check factory.py status before retrying."
             inbox.remove_seen()
             row = {"id": inbox.highest + 1, "at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                   "from": args.sender, "text": text}
+                   "from": sender, "text": text}
             payload = (json.dumps(row, ensure_ascii=False) + "\n").encode()
             fd = inbox.private_open(inbox.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
             try:
@@ -480,23 +529,9 @@ def cmd_inbox_send(args):
                 inbox.sync_directory()
             finally:
                 os.close(fd)
-        print(f"queued message {row['id']}")
     except (OSError, ValueError) as e:
-        if started:
-            print(f"not confirmed: {e}. The message may or may not be stored. Do not send it again by any route.",
-                  file=sys.stderr)
-            raise SystemExit(1)
-        reason = str(e).rstrip(".")
-        if isinstance(e, InboxDamage):
-            advice = "needs repair; after the repair: factory.py up --restart"
-        elif isinstance(e, OSError):
-            advice = "cannot write; check this member's sandbox and the cache path"
-        else:
-            advice = f"no inbox route; factory.py up {args.sender} --restart"
-        print(f"not stored: {reason}. Nothing was queued. Send it typed, once, exactly as printed:", file=sys.stderr)
-        fallback = f"{tag(args.sender)} Inbox unavailable: {advice}.\n{text}\n"
-        print(shlex.join(["herdr", "agent", "prompt", cfg.operator["name"], fallback]), file=sys.stderr)
-        raise SystemExit(5)
+        return ("unconfirmed" if started else "refused"), str(e)
+    return "queued", row["id"]
 
 
 class Checker:
@@ -647,19 +682,23 @@ def records(path):
 
 
 # ---- claude
-def claude_settings(level, inbox=False):
-    """Inline settings for a member. herdr's messaging commands run outside a sandbox the user has turned on,
+def claude_settings(level, draft_dir=None):
+    """Launch settings for a member. herdr's messaging commands run outside a sandbox the user has turned on,
     when they are the whole command line. At `full` herdr's socket is also allowed inside it, so a message gets
     through in any command shape (Linux can only allow every Unix socket; macOS can name herdr's). The last key
     skips the warning Claude Code shows the first time it starts in bypassPermissions mode."""
-    sandbox = {"excludedCommands": ["herdr agent prompt *", "herdr agent list"]}
-    if inbox:
-        sandbox["excludedCommands"].append(shlex.join(["python3", str(SKILL / "scripts/factory.py"), "inbox", "send"]) + " *")
+    say = shlex.join(["python3", str(SKILL / "scripts/factory.py"), "say"]) + " *"
+    sandbox = {"excludedCommands": [say, "herdr agent list"]}
     if level == "full":
         sock = os.environ.get("HERDR_SOCKET_PATH")
         sandbox["network"] = {"allowUnixSockets": [sock]} if sys.platform == "darwin" and sock else {"allowAllUnixSockets": True}
+    permissions = {"allow": [f"Bash({cmd})" for cmd in sandbox["excludedCommands"]]}
+    if draft_dir:
+        permissions["additionalDirectories"] = [str(draft_dir)]
+        permissions["allow"].append(f"Write(/{draft_dir}/**)")
+        sandbox["filesystem"] = {"allowWrite": [str(draft_dir)]}
     return json.dumps({"promptSuggestionEnabled": False, "sandbox": sandbox, "skipDangerousModePermissionPrompt": True,
-                       "permissions": {"allow": [f"Bash({cmd})" for cmd in sandbox["excludedCommands"]]}},
+                       "permissions": permissions},
                       separators=(",", ":"))
 
 
@@ -676,7 +715,7 @@ def model_claude(checker, model, harness):
 
 def argv_claude(m, prompt_file, resume):
     argv = ["--model", m["model"], "--effort", m["thinking"], "--append-system-prompt-file", str(prompt_file),
-            "--name", m["name"], "--settings", claude_settings(m["permissions"], bool(m.get("inbox_dir")))]
+            "--name", m["name"], "--settings", str(prompt_file.with_suffix(".settings.json"))]
     return argv + (["--resume", session_id(resume)] if resume else []), {}
 
 
@@ -711,8 +750,8 @@ def argv_codex(m, prompt_file, resume):
     # member's directory keeps it where factory.toml says, also after its worktree changed.
     argv = ["-m", m["model"], "-C", m["dir"], "-c", f"model_reasoning_effort={json.dumps(m['thinking'])}",
             "-c", f"developer_instructions={json.dumps(pointer)}"]
-    if m["permissions"] == "guarded" and m.get("inbox_dir"):
-        argv += ["--add-dir", m["inbox_dir"]]
+    if m["permissions"] == "guarded":
+        argv += ["--add-dir", str(m.get("inbox_dir") or m["draft_dir"])]
     return (["resume", session_id(resume)] if resume else []) + argv, {}
 
 
@@ -824,21 +863,12 @@ def member_prompt(m, operator, cfg):
         rules.append("- You are read-only: do not edit the project's files. You may read anything, build and run"
                      f" tests. Write only scratch files outside the repo, or a document @{operator} asks you for.")
     text = (SKILL / "templates/member-prompt.md").read_text()
-    inbox = message_route(cfg) == "inbox"
-    to_operator = "" if not inbox else """
-To reach {operator}, do not use herdr. Run this as a standalone command, your message as one single-quoted argument or `--file <path>`:
-```bash
-{inbox_send} '<message>'
-```
-It queues the message without typing into {operator}'s pane. `queued message N` means stored, not read. `not stored` prints a herdr command: run it once, exactly as printed. Any other failure: do not send the message again by any route; say so in your pane and stop.
-"""
-    text = text.replace("{teammates}", "teammates other than {operator}" if inbox else "teammates")
-    text = text.replace("{to_operator}", to_operator)
-    text = text.replace("{inbox_send}", shlex.join(["python3", str(SKILL / "scripts/factory.py"), "inbox", "send",
-                                                   "--cwd", str(cfg.root), "--from", m["name"]]))
     for key, value in {"role_rules": cfg.roles[m["role"]][1], "name": m["name"], "role": m["role"], "operator": f"@{operator}",
+                       "draft_dir": str(m["draft_dir"]),
+                       "draft": shlex.quote(str(m["draft_dir"])) + "/FILENAME",
+                       "say": shlex.join(["python3", str(SKILL / "scripts/factory.py"), "say", "--cwd", str(cfg.root)]),
                        "brief": str(cfg.brief_file), "where": where, "rules": "\n".join(rules),
-                       "instructions": str(cfg.cache / f"{m['name']}.md"),
+                       "instructions": str(cfg.session_dir / f"{m['name']}.md"),
                        "notes": str(SKILL / "references/notes.md")}.items():
         text = text.replace("{" + key + "}", value)
     return text.rstrip() + "\n"
@@ -870,10 +900,7 @@ def render_team_brief(cfg, members, operator, closing=None):
                 " checkout, and `git -C <its path> status` shows what it has not committed yet. When you ask for a"
                 " review, name your branch."]
     names = ", ".join("`" + m["name"] + "`" for m in members)
-    messaging = " Message anyone with `herdr agent prompt <name> '[from @you]: ...'`; your standing instructions say how."
-    if message_route(cfg) == "inbox":
-        messaging = (" Message a teammate with `herdr agent prompt <name> '[from @you]: ...'` and "
-                     f"`{operator}` with the inbox command in your standing instructions; they say how.")
+    messaging = " Use the standalone `factory.py say` command in your standing instructions to message one or more teammates."
     out += ["", "## Talking to each other", "",
             f"Everyone has an @name, which is also their herdr pane's name: {names}, and `{operator}` for the operator."
             + messaging,
@@ -926,7 +953,7 @@ class Team:
     """The running team as herdr sees it: one team per herdr session. A member's pane carries the member's
     @name as its label, and herdr knows the pane, the agent in it (if any) and its harness session."""
 
-    def __init__(self, cfg, exclude_pane=None):
+    def __init__(self, cfg, exclude_pane=None, record_sessions=True):
         self.cfg = cfg
         # `pane list` has labels and sessions but no agent names; `agent list` has the names.
         self.agent_panes = {a["name"]: a.get("pane_id") for a in herdr("agent", "list").get("agents", [])
@@ -938,7 +965,8 @@ class Team:
             label = p.get("label")
             if label and (label not in self.panes or p.get("agent")):  # a label can repeat: the live pane wins
                 self.panes[label] = p
-        remember_sessions(cfg, self)
+        if record_sessions:
+            remember_sessions(cfg, self)
 
     def pane(self, name):
         return self.panes.get(name)
@@ -1026,11 +1054,21 @@ def place(team, m, env):
 def launch(cfg, team, m, operator, timeout, resume=None):
     """Start one member in its own labeled pane: the one it had if that is free, else a new pane in the team
     tab. -> None, or why it did not come up."""
-    prompt_file = cfg.cache / f"{m['name']}.md"
-    prompt_file.parent.mkdir(parents=True, exist_ok=True)
+    prompt_file = cfg.session_dir / f"{m['name']}.md"
+    for directory in (cfg.session_dir, cfg.messages, m["draft_dir"]):
+        if directory.is_symlink():
+            return f"expected a private directory at {directory}, found a symbolic link"
+        try:
+            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        except OSError as e:
+            return f"could not prepare the message directory: {e}"
     prompt_file.write_text(member_prompt(m, operator, cfg))  # written fresh at each launch
-    if message_route(cfg) == "inbox":
+    if cfg.operator.get("messages", "inbox") == "inbox":
         m = {**m, "inbox_dir": str(cfg.cache)}
+    if m["harness"] == "claude":
+        # Keep the typed launch command below macOS's 1024-byte line limit.
+        prompt_file.with_suffix(".settings.json").write_text(
+            claude_settings(m["permissions"], m["draft_dir"]))
     argv, env = launch_argv(m, prompt_file, resume)
     err = ensure_worktree(cfg, m) if m["branch"] else None
     if err:
@@ -1075,21 +1113,32 @@ def launch(cfg, team, m, operator, timeout, resume=None):
           f" permissions {m['permissions']} in {pane}{where}")
 
 
+def delivery_refused(reason):
+    return reason.split(":", 1)[0] in ("agent_blocked", "agent_not_found", "agent_not_ready")
+
+
+def prompt_error(name, text):
+    # A trailing newline prevents the harness from completing a last word beginning with @ or $.
+    reply = herdr("agent", "prompt", name, text if text.endswith("\n") else text + "\n", check=False)
+    if reply.get("type") != "agent_prompted":
+        return reply.get("error") or "unexpected reply from herdr"
+    return None
+
+
 def deliver(team, texts, what):
     """Send {member: text}. herdr refuses a prompt to an agent that is waiting on an approval, so say who
-    did not get it. -> {member: reason}.
-    A harness may complete a last word that starts with @ or $ and swallow Enter; a final newline prevents it."""
+    did not get it. -> {member: reason}."""
     failed = {}
     for name, text in texts.items():
-        err = herdr("agent", "prompt", name, text if text.endswith("\n") else text + "\n", check=False).get("error")
-        if err:
-            failed[name] = err
+        error = prompt_error(name, text)
+        if error:
+            failed[name] = error
     ok = [n for n in texts if n not in failed]
     if ok:
         print(f"sent {what} to {', '.join('@' + n for n in ok)}")
     for name, err in failed.items():
-        print(f"NOT delivered to @{name}: {err}. Read its pane (herdr agent read {name}"
-              " --source visible) and send it again.")
+        status = "NOT delivered" if delivery_refused(err) else "delivery unconfirmed"
+        print(f"{status} to @{name}: {err}")
     return failed
 
 
@@ -1256,6 +1305,8 @@ def cmd_up(args):
     require_herdr()
     # The operator pane may still carry a member name or label from an earlier team.
     team = Team(cfg, exclude_pane=os.environ.get("HERDR_PANE_ID"))
+    if not any(team.live(n) for n in cfg.members):
+        report_leftover_drafts(cfg)
     running = [m["name"] for m in plans if not args.restart and team.live(m["name"])]
     ready = checked(cfg, [m for m in plans if m["name"] not in running])
     for m in ready:
@@ -1271,11 +1322,8 @@ def cmd_up(args):
     if not ready:
         return
     pickup_text = ("We are picking up where we left off. Check the tracker the brief above names, then tell"
-                   f" @{operator} in one line what you were doing and what you will do next. Send it:"
-                   f" `herdr agent prompt {operator} '[from @you]: ...'`. A reply in your own pane does not reach @{operator}.")
-    if message_route(cfg) == "inbox":
-        pickup_text = pickup_text.replace(f"Send it: `herdr agent prompt {operator} '[from @you]: ...'`.",
-                                          "Send it with the inbox command in your standing instructions.")
+                   f" @{operator} in one line what you were doing and what you will do next. Send it with the"
+                   f" say command in your standing instructions. A reply in your own pane does not reach @{operator}.")
     fresh_text = ("You are starting in a new session and know nothing of the work so far. Do not start anything"
                   f" yet: @{operator} will send your task, its criteria and the evidence"
                   " so far. No reply needed.")
@@ -1332,11 +1380,13 @@ def cmd_status(args):
         with Inbox(cfg) as inbox:
             suffix = (f"; {len(inbox.unread)} unread message{'s' if len(inbox.unread) != 1 else ''}"
                       " (factory.py wait prints them)") if inbox.unread else ""
-            if inbox.state["mode"] == "inbox":
-                suffix = f", {operator_wait(cfg, 'inbox')} wait" + suffix
-            print(f"operator messages: {inbox.state['mode']}{suffix}")
+            route = configured_route(cfg, inbox.state if inbox.has_state else None)
+            if route == "inbox":
+                style = operator_wait((team.pane(operator) or {}).get("agent"), route)
+                suffix = f", {style} wait" + suffix
+            print(f"operator messages: {route}{suffix}")
     except (OSError, ValueError) as e:
-        print(f"inbox unavailable: {e}" if isinstance(e, OSError) else str(e))
+        print(f"operator messages: unavailable ({e})")
     for state, hint in (("blocked", "blocked: waiting on an approval or a question. Read the pane and ask the user."),
                         ("gone", "gone: run `factory.py up {names}` to bring them back.")):
         hit = [r[0] for r in rows[2:] if state in r[5]]
@@ -1353,8 +1403,13 @@ def cmd_wait(args):
     require_herdr()
     cfg = cfg_of(args)
     watch = [n.lstrip("@") for n in args.names]
-    route = message_route(cfg)
-    wait = operator_wait(cfg, route)
+    try:
+        with Inbox(cfg) as inbox:
+            route = configured_route(cfg, inbox.state if inbox.has_state else None)
+    except (InboxDamage, OSError):
+        route = "unavailable"
+    live = herdr("agent", "get", cfg.operator["name"], check=False) if route == "inbox" else {}
+    wait = operator_wait((live.get("agent") or {}).get("agent"), route)
     quiet = route == "inbox" and wait == "background" and not watch
     if args.timeout is None:
         args.timeout = 60 if wait == "foreground" else 1800
@@ -1434,7 +1489,9 @@ def cmd_brief(args):
         require_herdr()
         operator = ensure_operator(cfg)
         team = Team(cfg)
-        missing = [n for n in names if not team.live(n)]
+        if names == ["all"]:
+            names = []
+        missing = [n for n in names if n not in cfg.members or not team.live(n)]
         if missing:
             raise SystemExit(f"not running: {', '.join(missing)}")
         if send_brief(cfg, team, operator, names=set(names) or None):
@@ -1444,20 +1501,62 @@ def cmd_brief(args):
 
 
 def cmd_say(args):
-    """Message members as the operator: `say all ...` or `say lead-dev frontend-dev ...`."""
+    """Send directly from the invoking member's pane, or as the operator."""
     require_herdr()
     cfg = cfg_of(args)
-    operator = ensure_operator(cfg)
-    team = Team(cfg)
-    text = pathlib.Path(args.file).read_text() if args.file else args.message
-    if not text:
-        raise SystemExit("give a message or --file")
-    names = [m["name"] for m in team.members()] if args.to == ["all"] else [n.lstrip("@") for n in args.to]
-    missing = [n for n in names if not team.live(n)]
-    if missing or not names:
-        raise SystemExit(f"not running: {', '.join(missing) or 'any member'}")
-    if deliver(team, {n: f"{tag(operator)} {text}" for n in names}, "your message"):
+    team = Team(cfg, record_sessions=False)
+    pane = os.environ.get("HERDR_PANE_ID")
+    member = next((n for n in cfg.members if pane and team.agent_panes.get(n) == pane), None)
+    if member and (team.pane(member) or {}).get("pane_id") != pane:
+        raise SystemExit(f"this @{member} agent is outside its team's labeled pane")
+    if member and args.file:
+        path = pathlib.Path(args.file)
+        if path.parent.resolve() == (cfg.messages / member).resolve() and not re.fullmatch(r"[A-Za-z0-9-]+\.[A-Za-z0-9]+", path.name):
+            raise SystemExit("nothing sent: use letters, digits and dashes in the draft name, plus a plain extension such as .md")
+    text = message_text(args)
+    sender = member or ensure_operator(cfg)
+    targets = re.findall(r"[^,\s]+", " ".join(args.to))
+    names = ([m["name"] for m in team.members() if m["name"] != member] if targets == ["all"]
+             else [n.lstrip("@") for n in targets])
+    operator = cfg.operator["name"]
+    if sender in names:
+        raise SystemExit("choose another teammate as the recipient")
+    if not names:
+        raise SystemExit("not running: any member")
+    route = message_route(cfg) if operator in names else None
+    refused, unconfirmed = [], False
+    for name in dict.fromkeys(names):
+        if name == operator and route == "inbox":
+            outcome, detail = queue_message(cfg, sender, text)
+        elif name == operator and route != "typed":
+            outcome, detail = "refused", "operator messages are unavailable. Check factory.py status and rerun factory.py up."
+        elif (name != operator and name not in cfg.members) or not team.live(name):
+            outcome, detail = "refused", f"not running: {name}"
+        else:
+            detail = prompt_error(name, f"{tag(sender)} {text}")
+            outcome = "submitted" if detail is None else "refused" if delivery_refused(detail) else "unconfirmed"
+        if outcome == "queued":
+            print(f"queued message {detail} for @{name}")
+        elif outcome == "submitted":
+            print(f"submitted your message to @{name}")
+        elif outcome == "refused":
+            print(f"not sent to @{name}: {detail}")
+            refused.append(name)
+        else:
+            print(f"delivery unconfirmed to @{name}: {detail}")
+            unconfirmed = True
+    if refused or unconfirmed:
+        if unconfirmed:
+            print("Delivery unconfirmed. Keep the draft and report the result without resending.")
+        elif args.file:
+            print_retry(cfg, refused, args.file)
         sys.exit(1)
+    remove_delivered_draft(cfg, sender, args.file)
+
+
+def print_retry(cfg, names, filename):
+    cmd = ["python3", str(SKILL / "scripts/factory.py"), "say", "--cwd", str(cfg.root), *names, "--file", filename]
+    print(f"Retry once when ready: {shlex.join(cmd)}")
 
 
 def cmd_prompt(args):
@@ -1523,13 +1622,8 @@ def main(argv=None):
     wt.add_argument("--seen", type=int, help="acknowledge inbox messages through this id, then wait")
     common(wt)
 
-    ib = sub.add_parser("inbox", help="send messages or reprint acknowledged messages")
+    ib = sub.add_parser("inbox", help="reprint acknowledged messages")
     commands = ib.add_subparsers(dest="inbox_cmd", required=True)
-    send = commands.add_parser("send", help="queue a message")
-    send.add_argument("--from", dest="sender", required=True, help="your member name")
-    send.add_argument("message", nargs="?")
-    send.add_argument("--file", help="send this file's contents")
-    common(send)
     seen = commands.add_parser("seen", help="reprint recent acknowledged messages without waiting")
     seen.add_argument("count", nargs="?", type=int, default=5, help="last N messages (default: 5; up to 100 kept)")
     common(seen)
@@ -1539,8 +1633,9 @@ def main(argv=None):
     bf.add_argument("--send", action="store_true")
     common(bf)
 
-    sy = sub.add_parser("say", help="message members as the operator")
-    sy.add_argument("to", nargs="+", help="member names, or `all`; the last word is the message unless --file")
+    sy = sub.add_parser("say", help="message teammates from your member or operator pane")
+    sy.add_argument("to", nargs="+", help="recipient names separated by spaces or commas, or all for members only; "
+                    "the last argument is the message unless --file")
     sy.add_argument("--file", help="send this file's contents")
     common(sy)
 
@@ -1550,7 +1645,7 @@ def main(argv=None):
 
     args = ap.parse_args(argv)
     if args.cmd == "inbox":
-        return {"send": cmd_inbox_send, "seen": cmd_inbox_seen}[args.inbox_cmd](args)
+        return cmd_inbox_seen(args)
     if args.cmd == "say":
         args.message = None if args.file else (args.to.pop() if len(args.to) > 1 else None)
     {"init": cmd_init, "harnesses": cmd_harnesses, "check": cmd_check, "up": cmd_up,
