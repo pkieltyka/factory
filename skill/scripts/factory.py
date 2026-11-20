@@ -1027,7 +1027,9 @@ def ensure_worktree(cfg, m):
     git = ["git", "-C", str(cfg.root)]
     known = subprocess.run(git + ["rev-parse", "--verify", "--quiet", f"refs/heads/{m['branch']}"],
                            capture_output=True).returncode == 0
-    add = ["worktree", "add", str(path), m["branch"]] if known else ["worktree", "add", "-b", m["branch"], str(path)]
+    add = ["worktree", "add", str(path), m["branch"]] if known else [
+        "worktree", "add", "-b", m["branch"], "--no-track", str(path),
+    ]
     p = subprocess.run(git + add, capture_output=True, text=True)
     if p.returncode:
         return f"could not create the worktree {path}: {p.stderr.strip()}"

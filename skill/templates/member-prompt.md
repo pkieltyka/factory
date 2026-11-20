@@ -33,5 +33,6 @@ Check the send succeeded, then finish locally with `Report sent to @<requester>`
 ## Rules
 - Meet the task's acceptance criteria. Ask about ambiguity that changes behavior or scope; choose reversible implementation details yourself and state material assumptions.
 - Do not start, stop, close or rename panes or agents.
+- If Git cannot lock its config, check the current branch and status, report them and the error to {operator}, and leave the lock alone.
 - When the team brief enables notes, read `{notes}` before your first task: it covers searching, writing and the `learned:` line of a report. Otherwise there is no notes workflow.
 {rules}

@@ -1106,6 +1106,20 @@ class WorktreeTests(unittest.TestCase):
             e.kill("backend-dev")
             self.assertNotIn("created worktree", e.run("up", "backend-dev").stdout)  # the checkout is kept
 
+    def test_new_worktree_branch_passes_no_track(self):
+        env = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "branch.autoSetupMerge", "GIT_CONFIG_VALUE_0": "always"}
+        with Env(team_brief(self.BRIEF), git=True) as e, patch.dict(os.environ, {**e.env, **env}):
+            cfg = factory.Config(e.repo)
+            member = factory.plan(cfg, "backend-dev")
+            config = e.repo / ".git/config"
+            before = config.read_bytes()
+            with patch.object(factory.subprocess, "run", wraps=subprocess.run) as run, contextlib.redirect_stdout(io.StringIO()):
+                self.assertIsNone(factory.ensure_worktree(cfg, member))
+                self.assertEqual(run.call_args.args[0], [
+                    "git", "-C", str(e.repo), "worktree", "add", "-b", "ada/backend-dev", "--no-track", member["dir"],
+                ])
+            self.assertEqual(config.read_bytes(), before)
+
     def test_numbered_worktree_and_no_repository(self):
         with Env(formation({**CATALOG_MEMBERS, "reviewer-2": {
             "role": "reviewer", "harness": "codex", "model": "gpt-6-luna", "worktree": True,

@@ -20,7 +20,7 @@ During setup, add the owner's decided permissions on two separate lines: pushing
 Work reaches BASE_BRANCH only through a pull request on GitHub, repository OWNER/REPO. Ticket branches are `<user>/<ticket>`; the team merges only by squash merge. CI: CI_DESCRIPTION. The task record links its PR and closes only after a confirmed merge.
 Run from the checkout. Learn the commands with `gh pr --help`; check access with `gh auth status`.
 
-- Push/open/update: `git push -u origin <branch>`; `gh pr create --base BASE_BRANCH --head <branch>`; later pushes update the PR.
+- Push with `git push origin <branch>` and open with `gh pr create --base BASE_BRANCH --head <branch>`. Later pushes update the PR.
 - Wait for checks: `timeout 900 gh pr checks <branch> --watch --interval 60`. Fit the command limit to the harness; restart the watcher if it times out with checks pending.
 - Read head/checks/mergeability: `gh pr view <branch> --json state,headRefOid,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup`; comments/reviews: `gh pr view <branch> --comments`.
 - Review threads: `gh api graphql --paginate --slurp -F owner=OWNER -F repo=REPO -F number=<pr> -f query='query($owner:String!,$repo:String!,$number:Int!,$endCursor:String){repository(owner:$owner,name:$repo){pullRequest(number:$number){headRefOid reviewThreads(first:100,after:$endCursor){nodes{id isResolved isOutdated path line comments(first:1){nodes{url}}} pageInfo{hasNextPage endCursor}}}}}'`. An unresolved thread has `isResolved` false; read its linked discussion.
