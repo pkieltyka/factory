@@ -6,6 +6,19 @@ It lets you build autonomous software engineering teams from the agents and mode
 
 It's a full autonomous software factory, yet it's just a skill: a few plain files and one script. That keeps it lightweight, easy to tweak and clear about how it works. Your project's `FACTORY.md`, which starts from a template, is where you describe your team's rules and how you want the factory to work.
 
+Factory feels like a big upgrade to a coding agent flow yet with the same tools we're already using. In our experience the results come out more refined and sharper.
+
+**Mix model families by role.** A favourite setup:
+
+| Role | Model |
+|---|---|
+| architect, architect-2 | Claude Fable, Codex Astra |
+| lead-dev, lead-dev-2 | Claude Opus, Codex Sol |
+| reviewer, pm | Codex Luna |
+| frontend-dev | Claude Opus |
+
+Or run pi with GLM 5.3 as the operator, sending work to Fable and Opus, with Luna reviewing. Or pair a Fable architect with a DeepSeek lead developer. Spreading the work across roles lets you balance cost and intelligence, and use each model for what it's best at. It's all configured in `FACTORY.md` and `factory.toml`.
+
 **How you work with it.** You pick an operator: the harness and model you talk to, and a medium-level model is plenty. The operator directs the whole team, each member in its role. You sit in the operator's cockpit and lead, the way a head of engineering or CTO works with their engineering team: members do the work, review each other, and report back to you. Make the team as big or as small as you like. The team's brief, behaviour and roles live in `FACTORY.md`, committed with your project. Your own `factory.toml` says which harness and model fills each role, so every person who uses the factory can run the same team with their own favourite harnesses and models.
 
 [Get started](docs/getting-started.md) · [The factory on one page](docs/README.md)
