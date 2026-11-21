@@ -1095,8 +1095,9 @@ def launch(cfg, team, m, operator, timeout, resume=None):
     # A member that is not ready for another reason gets a few seconds: an update banner clears by itself.
     answered, waiting = {}, lambda: "agent_not_ready" in started.get("error", "")
     for _ in range(8):
-        screen = herdr("pane", "read", pane, "--source", "visible", check=False).get("text", "")
-        asked = [d for d in TABLE[m["harness"]].get("dialogs", []) if d[0] in screen]
+        # A narrow pane wraps a question over several lines, so compare without whitespace.
+        screen = "".join(herdr("pane", "read", pane, "--source", "visible", check=False).get("text", "").split())
+        asked = [d for d in TABLE[m["harness"]].get("dialogs", []) if "".join(d[0].split()) in screen]
         for text, keys in asked:
             if text not in answered:
                 answered[text] = herdr("pane", "send-keys", pane, *keys, check=False).get("error")

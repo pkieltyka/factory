@@ -38,7 +38,7 @@ FAKE_HERDR = textwrap.dedent(r'''
     # A herdr stand-in. Like herdr: `pane list` carries labels but no agent names, `agent list` carries names
     # but no labels; a pane keeps its label but loses its agent_session when its agent exits; a prompt to a
     # blocked agent is refused; errors are JSON on stderr with exit status 1.
-    import json, os, sys
+    import json, os, sys, textwrap
     path = os.environ["FAKE_HERDR"]
     s = json.load(open(path))
     s["calls"].append(sys.argv[1:])
@@ -125,6 +125,8 @@ FAKE_HERDR = textwrap.dedent(r'''
         out({"type": "pane_process_info", "process_info": {"pane_id": p["pane_id"], "foreground_processes": procs}})
     if a[:2] == ["pane", "read"]:
         asks = panes[a[2]].get("dialog", ["Allow this command? (y/n)"])[0]
+        if width := int(os.environ.get("FAKE_DIALOG_WRAP", "0")):  # a narrow pane wraps the question
+            asks = "\n".join(textwrap.wrap(asks, width))
         save(); print(f"...\n{asks}  [{a[2]}]"); sys.exit(0)  # plain text, like herdr
     if a[:2] == ["pane", "send-keys"]:
         if os.environ.get("FAKE_DIALOG_STUCK"):
@@ -145,8 +147,10 @@ FAKE_HERDR = textwrap.dedent(r'''
                 "codex": ["> 1. Trust and continue  2. Back", ["enter"]],
                 "agy": ["Do you trust the contents of this project?\n> Yes, I trust this folder", ["enter"]],
             }.get(kind, ["> No, exit\n  Yes, I trust this folder", ["down", "enter"]])
-            if kind == "codex":  # herdr 0.9.5 calls Codex ready while its trust question is up
-                panes[pane]["agent_status"] = how = "idle"
+            if os.environ.get("FAKE_DIALOG_TEXT"):  # a question the harness table does not know
+                panes[pane]["dialog"][0] = os.environ["FAKE_DIALOG_TEXT"]
+            if kind == "codex" or os.environ.get("FAKE_DIALOG_WRAP"):  # herdr 0.9.5 calls Codex, and agy in a
+                panes[pane]["agent_status"] = how = "idle"  # narrow pane, ready while its trust question is up
         if how in ("blocked", "banner", "dialog"):  # a banner clears by itself: the agent is idle a moment later
             fail("agent_not_ready", "agent is waiting on a dialog")
         out({"type": "agent_started", "agent": view(panes[pane], "agent")})
@@ -544,6 +548,30 @@ class UpTests(unittest.TestCase):
             self.assertEqual(result.returncode, 3)
             self.assertIn("still asks", result.stdout)
             self.assertIn("input_failed", result.stdout)
+            self.assertEqual(e.prompts(), [])
+
+    def test_wrapped_startup_question_is_answered_once_before_the_brief(self):
+        # A narrow pane wraps agy's trust question and herdr calls agy ready. Unanswered, the question took the
+        # Enter that ends the brief, and the brief was lost (gate-010).
+        agy = formation({"pm": {"harness": "agy"}}, operator={"harness": "claude"})
+        for width in ("27", "4"):
+            with self.subTest(width=width), Env(agy) as e:
+                e.run("up", FAKE_START_FAIL="dialog:pm", FAKE_DIALOG_WRAP=width)
+                calls = e.fake_state()["calls"]
+                keys = [i for i, c in enumerate(calls) if c[:2] == ["pane", "send-keys"]]
+                prompts = [i for i, c in enumerate(calls) if c[:3] == ["agent", "prompt", "pm"]]
+                self.assertEqual([calls[i][3:] for i in keys], [["enter"]])
+                self.assertEqual(len(prompts), 1)
+                self.assertLess(keys[0], prompts[0])
+        with self.subTest("a question the table does not know"), Env(agy) as e:
+            e.run("up", FAKE_START_FAIL="dialog:pm", FAKE_DIALOG_WRAP="27",
+                  FAKE_DIALOG_TEXT="Do you trust the contents of this?")
+            self.assertEqual(e.calls("pane", "send-keys"), [])
+        with self.subTest("the question stays after its answer"), Env(agy) as e:
+            result = e.run("up", check=False, FAKE_START_FAIL="dialog:pm", FAKE_DIALOG_WRAP="27", FAKE_DIALOG_STUCK="1")
+            self.assertEqual(result.returncode, 3)
+            self.assertIn("still asks", result.stdout)
+            self.assertEqual(len(e.calls("pane", "send-keys")), 1)
             self.assertEqual(e.prompts(), [])
 
     def test_lead_detection_preserves_socket_error(self):
