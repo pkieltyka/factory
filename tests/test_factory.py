@@ -1413,6 +1413,25 @@ class InboxTests(unittest.TestCase):
             self.assertEqual(ex.exception.code, 4)
             self.assertIn(f"timeout after {expected}s", out.getvalue())
 
+        def idle_wait(e):
+            now = 0
+
+            def advance(_):
+                nonlocal now
+                now += 1
+
+            # The deadline passes between looks regardless of how long fake herdr takes.
+            clock = types.SimpleNamespace(monotonic=lambda: now, sleep=advance)
+            out = io.StringIO()
+            code = 0
+            with patch.dict(os.environ, e.env), patch.object(factory, "HERDR", e.env["HERDR_BIN"]), \
+                    patch.object(factory, "time", clock), contextlib.redirect_stdout(out):
+                try:
+                    factory.main(["wait", "--cwd", str(e.repo), "--interval", "0", "--timeout", "0.1"])
+                except SystemExit as ex:
+                    code = ex.code
+            return code, out.getvalue()
+
         for harness, mode, seconds in (("claude", "background", 1800), ("opencode", "background", 1800),
                                        ("omp", "background", 1800), ("codex", "foreground", 60), ("pi", "foreground", 60)):
             with self.subTest(harness=harness), Env(formation({"lead-dev": CATALOG_MEMBERS["lead-dev"]},
@@ -1423,10 +1442,10 @@ class InboxTests(unittest.TestCase):
                 self.assertIn(f"operator messages: inbox, {mode} wait", e.run("status").stdout)
                 self.assertIn("queued message N", e.run("prompt", "lead-dev").stdout)
                 e.update("lead-dev", agent_status="done")
-                idle = e.run("wait", "--interval", "0", "--timeout", "0.1", check=False)
-                self.assertIn("nobody is working", idle.stdout)
-                self.assertEqual(idle.returncode, 4 if mode == "background" else 0)
-                self.assertEqual("End your turn" in idle.stdout, mode == "foreground")
+                code, idle = idle_wait(e)
+                self.assertIn("nobody is working", idle)
+                self.assertEqual(code, 4 if mode == "background" else 0)
+                self.assertEqual("End your turn" in idle, mode == "foreground")
                 timeout(e, seconds)
                 timeout(e, 7, explicit=7)
                 self.prepare(e, "typed")
