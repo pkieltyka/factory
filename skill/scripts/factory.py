@@ -400,7 +400,7 @@ def print_messages(rows):
         print("\n".join("    " + line for line in row["text"].splitlines()))
 
 
-def cmd_inbox_seen(args):
+def cmd_inbox(args):
     require_herdr()
     if args.count < 1:
         raise SystemExit("give a positive number of acknowledged messages")
@@ -1749,14 +1749,13 @@ def main(argv=None):
     wt.add_argument("names", nargs="*", help="watch only these members (default: every member)")
     wt.add_argument("--timeout", type=float, help="seconds before giving up (exit 4; default: foreground inbox 60, otherwise 1800)")
     wt.add_argument("--interval", type=float, default=5, help="seconds between looks")
-    wt.add_argument("--seen", type=int, help="acknowledge inbox messages through this id, then wait")
+    wt.add_argument("--seen", type=int, help="acknowledge inbox messages through this id, then wait. "
+                                            "Reread them with factory.py inbox")
     common(wt)
 
-    ib = sub.add_parser("inbox", help="reprint acknowledged messages")
-    commands = ib.add_subparsers(dest="inbox_cmd", required=True)
-    seen = commands.add_parser("seen", help="reprint recent acknowledged messages without waiting")
-    seen.add_argument("count", nargs="?", type=int, default=5, help="last N messages (default: 5; up to 100 kept)")
-    common(seen)
+    ib = sub.add_parser("inbox", help="reprint recent acknowledged inbox messages")
+    ib.add_argument("count", nargs="?", type=int, default=5, help="last N messages (default 5, up to 100 kept)")
+    common(ib)
 
     bf = sub.add_parser("brief", help="print the team brief as members get it, or --send it")
     bf.add_argument("names", nargs="*", help="with --send: only these members")
@@ -1774,12 +1773,10 @@ def main(argv=None):
     common(pr)
 
     args = ap.parse_args(argv)
-    if args.cmd == "inbox":
-        return cmd_inbox_seen(args)
     if args.cmd == "say":
         args.message = None if args.file else (args.to.pop() if len(args.to) > 1 else None)
     {"init": cmd_init, "harnesses": cmd_harnesses, "check": cmd_check, "up": cmd_up, "down": cmd_down,
-     "status": cmd_status, "wait": cmd_wait, "brief": cmd_brief, "say": cmd_say,
+     "status": cmd_status, "wait": cmd_wait, "inbox": cmd_inbox, "brief": cmd_brief, "say": cmd_say,
      "prompt": cmd_prompt}[args.cmd](args)
 
 
