@@ -17,7 +17,7 @@ Before any launch or restart, `up` checks the affected members with current `fac
 - After a herdr restart, run `up --restart`: herdr restores names and sessions but omits factory launch settings and standing-instruction flags. Plain `up` names the members it finds running without their permission flags or `args`.
 - Failed resume: inspect the error and use `up <name> --fresh` if the saved session cannot reopen.
 - Failed brief delivery exits 3: resolve the cause and `factory.py brief --send <name>`.
-- The inbox outlives the team. A cold `up` (no member live, no `--restart`) announces unread messages; the last 100 acknowledged ones stay available to `factory.py inbox seen`.
+- The inbox outlives the team. A cold `up` (no member live, no `--restart`) announces unread messages. Use `factory.py inbox 100` to reread the last 100 acknowledged messages.
 
 ## Reconcile before assigning
 

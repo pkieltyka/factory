@@ -348,8 +348,7 @@ class Env:
 
     def run(self, *args, check=True, cwd=None, **env):
         command = list(args)
-        at = 2 if args[0] == "inbox" else 1
-        command[at:at] = ["--cwd", str(cwd or self.repo)]
+        command[1:1] = ["--cwd", str(cwd or self.repo)]
         p = subprocess.run([sys.executable, str(SCRIPT), *command],
                            capture_output=True, text=True, env={**self.env, **env})
         if check and p.returncode:
@@ -1548,25 +1547,28 @@ class InboxTests(unittest.TestCase):
 
     def test_acknowledged_history_recovers_text_without_watching_or_writing(self):
         with Env() as e:
+            self.assertIn("inbox reprint recent acknowledged inbox messages", " ".join(e.run("--help").stdout.split()))
+            self.assertIn("Reread them with factory.py inbox", " ".join(e.run("wait", "--help").stdout.split()))
             inbox = self.prepare(e)
             original = inbox.state_path.read_bytes()  # Old state has no history field.
-            self.assertEqual(e.run("inbox", "seen").stdout, "no acknowledged messages kept\n")
+            self.assertEqual(e.run("inbox").stdout, "no acknowledged messages kept\n")
             self.assertEqual(inbox.state_path.read_bytes(), original)
             self.assertFalse(inbox.path.exists())
-            text = "A report accidentally acknowledged\nUnicode: café 日本語"
+            text = "A report accidentally acknowledged\n" + "a" * 500 + "\nDecision: approve café 日本語"
             self.seed(e, text)
             self.seed(e, "still unread")
             e.run("wait", "--seen", "1")
             before = inbox.path.read_bytes(), inbox.state_path.read_bytes(), e.calls()
-            result = e.run("inbox", "seen")
+            result = e.run("inbox")
             self.assertIn("[Message 1 from @lead-dev at ", result.stdout)
             self.assertIn("    " + text.replace("\n", "\n    "), result.stdout)
             self.assertNotIn("still unread", result.stdout)
             self.assertNotIn("wait --seen", result.stdout)
+            self.assertEqual(e.run("inbox", "seen", check=False).returncode, 2)
             self.assertEqual((inbox.path.read_bytes(), inbox.state_path.read_bytes(), e.calls()), before)
-            self.assertIn("no acknowledged messages kept", e.run("inbox", "seen", HERDR_SESSION="other").stdout)
+            self.assertIn("no acknowledged messages kept", e.run("inbox", HERDR_SESSION="other").stdout)
             for count in ("0", "-1", "invalid"):
-                self.assertNotEqual(e.run("inbox", "seen", count, check=False).returncode, 0)
+                self.assertNotEqual(e.run("inbox", count, check=False).returncode, 0)
 
     def test_history_is_bounded_ordered_and_acknowledged_only_once(self):
         with Env() as e:
@@ -1581,7 +1583,7 @@ class InboxTests(unittest.TestCase):
             for seen in (105, 104):
                 e.run("wait", "--seen", str(seen))
             for count, expected in ((None, range(101, 106)), ("2", range(104, 106)), ("200", range(6, 106))):
-                result = e.run("inbox", "seen", *([] if count is None else [count]))
+                result = e.run("inbox", *([] if count is None else [count]))
                 ids = [line.split()[1] for line in result.stdout.splitlines() if line.startswith("[Message ")]
                 self.assertEqual(ids, [str(n) for n in expected])
             self.assertEqual((inbox.path.read_bytes(), inbox.state_path.read_bytes()), before)
@@ -1597,7 +1599,7 @@ class InboxTests(unittest.TestCase):
             self.assertEqual((inbox.path.read_bytes(), inbox.state_path.read_bytes()), before)
             self.assertIn("recover me", e.run("wait").stdout)
             e.run("wait", "--seen", "1", check=False)
-            self.assertIn("recover me", e.run("inbox", "seen").stdout)
+            self.assertIn("recover me", e.run("inbox").stdout)
 
     def test_history_damage_and_unavailable_state_fail_without_writes(self):
         row = {"id": 1, "from": "lead-dev", "at": "time", "text": "old"}
@@ -1608,7 +1610,7 @@ class InboxTests(unittest.TestCase):
                 self.seed(e, "unread")
                 inbox.state_path.write_text(json.dumps({"mode": "inbox", "seen": 1, "history": history}))
                 before = inbox.path.read_bytes(), inbox.state_path.read_bytes()
-                for command in (("inbox", "seen"), ("wait", "--seen", "1")):
+                for command in (("inbox",), ("wait", "--seen", "1")):
                     result = e.run(*command, check=False)
                     self.assertEqual(result.returncode, 2)
                     self.assertIn("inbox needs repair", result.stderr)
@@ -1619,7 +1621,7 @@ class InboxTests(unittest.TestCase):
             inbox.state_path.rename(target)
             inbox.state_path.symlink_to(target)
             before = target.read_bytes()
-            result = e.run("inbox", "seen", check=False)
+            result = e.run("inbox", check=False)
             self.assertEqual(result.returncode, 2)
             self.assertNotIn("Traceback", result.stderr)
             self.assertEqual(target.read_bytes(), before)
@@ -1695,7 +1697,7 @@ class InboxTests(unittest.TestCase):
             self.assertEqual(3, self.seed(e, "three"))
             self.assertEqual([r["id"] for r in map(json.loads, inbox.path.read_text().splitlines())], [2, 3])
             e.run("wait", "--seen", "1")
-            history = e.run("inbox", "seen").stdout
+            history = e.run("inbox").stdout
             self.assertEqual(history.count("[Message 1 from"), 1)
             self.assertIn("    one", history)
 
@@ -1827,7 +1829,7 @@ class InboxTests(unittest.TestCase):
                 if acknowledge:
                     self.assertEqual(inbox.path.read_bytes(), b"")
                     self.assertNotIn("unread messages from the earlier team", result.stdout)
-                    self.assertIn("earlier message", e.run("inbox", "seen").stdout)
+                    self.assertIn("earlier message", e.run("inbox").stdout)
                     self.assertIn("queued message 2", self.send(e).stdout)
                 else:
                     self.assertIn("1 unread message from the earlier team", result.stdout)
