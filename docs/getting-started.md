@@ -48,6 +48,23 @@ cp -R skill ~/.claude/skills/factory
 
 To link instead, create the parent directory and use `ln -s "$PWD/skill" ~/.claude/skills/factory` in place of the copy command. To update either installation, run `git pull` in the factory clone. A link follows the update. For a copy, refresh the contents with `cp -R skill/. ~/.claude/skills/factory/`. To give running members the updated instructions, finish their current work and have the operator run `/factory up --restart`.
 
+### Codex operator access
+
+If a sandboxed Codex operator is denied access to Herdr, you can approve a single run or save a reusable approval for a recurring operation. For a Factory command, ask the operator to request a prefix consisting of `python3`, the absolute path of the installed script, and the subcommand. Review it before saving and keep the script outside the sandbox's writable roots. A saved allow runs matching commands outside the sandbox. [Codex rules](https://developers.openai.com/codex/rules)
+
+The prefix `["python3", "/absolute/trusted/install/scripts/factory.py", "wait"]` covers both of these calls.
+
+```bash
+python3 /absolute/trusted/install/scripts/factory.py wait --seen 12 --timeout 120
+python3 /absolute/trusted/install/scripts/factory.py wait --seen 15 --timeout 60
+```
+
+Choose which other prefixes to save, one operation at a time. Common candidates are the same script with `status`, `inbox` or `say`, and the separate Herdr prefixes `herdr agent read` and `herdr integration status`. Keep approvals for team-changing commands such as `up` and `down` separate. Run each command standalone so Codex can match the prefix.
+
+Writable roots for the Factory cache or external worktrees (`--add-dir`) and Unix socket access are separate permissions. The workspace setting `sandbox_workspace_write.network_access=true` grants broader network access. If Codex runs in an externally sandboxed VM, you can explicitly start the operator with `codex --dangerously-bypass-approvals-and-sandbox`, which disables both controls for that session. `-a never` alone keeps the configured sandbox. Factory's `full` and `guarded` settings apply to the members it launches. [Codex permissions](https://developers.openai.com/codex/permissions) · [Configuration reference](https://developers.openai.com/codex/config-reference) · [Member permissions](../skill/references/cmd_setup.md#permissions)
+
+With the inbox, a Codex operator keeps `wait` in the foreground and resumes the same tool handle after a yield. [Wait recipes](../skill/references/leading.md#receive-and-inspect)
+
 ## Form the team
 
 From your project directory, start a dedicated session with `herdr --session first-factory`. In its shell, check that you are in the project and start your signed-in harness (for example, `claude`). Enter `/factory setup`. Tell the operator your project goal, which harnesses are installed, and what work is ready. It proposes roles, models and project tools. For a first team, you can ask for one harness throughout, the built-in `TODO.md` tracker and the reviewer's own review. [Default team](README.md#the-team)
