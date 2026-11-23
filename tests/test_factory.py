@@ -124,6 +124,10 @@ FAKE_HERDR = textwrap.dedent(r'''
             procs = [{"pid": 1, "name": p["agent"], "argv": [p["agent"], *start[start.index("--") + 1:]]}] if start and p.get("agent") else []
         out({"type": "pane_process_info", "process_info": {"pane_id": p["pane_id"], "foreground_processes": procs}})
     if a[:2] == ["pane", "read"]:
+        if os.environ.get("FAKE_READ_FAIL"):
+            fail("PermissionDenied", "Operation not permitted: socket blocked")
+        if "screen" in panes[a[2]]:
+            save(); print(panes[a[2]]["screen"]); sys.exit(0)
         asks = panes[a[2]].get("dialog", ["Allow this command? (y/n)"])[0]
         if width := int(os.environ.get("FAKE_DIALOG_WRAP", "0")):  # a narrow pane wraps the question
             asks = "\n".join(textwrap.wrap(asks, width))
@@ -1261,6 +1265,9 @@ class WorktreeTests(unittest.TestCase):
 
 
 class InboxTests(unittest.TestCase):
+    codex_screen = "• Working (13s…\n\n\n› Ask Codex t\n\n  GPT-6.2-Sol\n"
+    pi_screen = " Elapsed 43.0s\n\n\n── ⠼ Working ──────────────\n\n───────────────────────────\n~/Dev/scratch/factory-13...\n"
+
     def prepare(self, e, mode="inbox"):
         with patch.dict(os.environ, e.env), factory.Inbox(factory.Config(e.repo)) as inbox:
             inbox.state["mode"] = mode
@@ -1432,7 +1439,7 @@ class InboxTests(unittest.TestCase):
             out = io.StringIO()
             with patch.dict(os.environ, e.env), patch.object(factory, "HERDR", e.env["HERDR_BIN"]), \
                     patch.object(factory, "Team") as team, \
-                    patch.object(factory.time, "monotonic", side_effect=[0, 10000]), contextlib.redirect_stdout(out):
+                    patch.object(factory.time, "monotonic", side_effect=[0, expected]), contextlib.redirect_stdout(out):
                 team.return_value.pane.return_value = {"pane_id": "fake"}
                 team.return_value.status.return_value = "working"
                 with self.assertRaises(SystemExit) as ex:
@@ -1460,7 +1467,8 @@ class InboxTests(unittest.TestCase):
             return code, out.getvalue()
 
         for harness, mode, seconds in (("claude", "background", 1800), ("opencode", "background", 1800),
-                                       ("omp", "background", 1800), ("codex", "foreground", 60), ("pi", "foreground", 60)):
+                                       ("omp", "background", 1800), ("agy", "foreground", 60),
+                                       ("codex", "foreground", None), ("pi", "foreground", 2_147_183)):
             with self.subTest(harness=harness), Env(formation({"lead-dev": CATALOG_MEMBERS["lead-dev"]},
                                                             operator={"harness": harness})) as e:
                 e.update(None, agent=harness)  # up has not named the operator pane yet.
@@ -1469,11 +1477,14 @@ class InboxTests(unittest.TestCase):
                 self.assertIn(f"operator messages: inbox, {mode} wait", e.run("status").stdout)
                 self.assertIn("queued message N", e.run("prompt", "lead-dev").stdout)
                 e.update("lead-dev", agent_status="done")
+                if harness in factory.COMPOSER_WAIT:
+                    e.update("operator", screen=self.codex_screen if harness == "codex" else self.pi_screen)
                 code, idle = idle_wait(e)
                 self.assertIn("nobody is working", idle)
-                self.assertEqual(code, 4 if mode == "background" else 0)
-                self.assertEqual("End your turn" in idle, mode == "foreground")
-                timeout(e, seconds)
+                self.assertEqual(code, 0 if harness == "agy" else 4)
+                self.assertEqual("End your turn" in idle, harness == "agy")
+                if seconds is not None:
+                    timeout(e, seconds)
                 timeout(e, 7, explicit=7)
                 self.prepare(e, "typed")
                 timeout(e, 1800)
@@ -1491,6 +1502,125 @@ class InboxTests(unittest.TestCase):
             timeout(e, 60)  # A new harness without the key must not assume background wake.
             self.prepare(e, "typed")
             timeout(e, 1800)
+
+    def run_at_polls(self, e, advance, *args, **env):
+        now, sleeps = 0, []
+
+        def sleep(interval):
+            nonlocal now
+            sleeps.append(interval)
+            self.assertLessEqual(len(sleeps), 5, "wait did not return")
+            now += advance(len(sleeps))
+
+        clock = types.SimpleNamespace(monotonic=lambda: now, sleep=sleep)
+        out = io.StringIO()
+        code = 0
+        with patch.dict(os.environ, {**e.env, **env}), patch.object(factory, "HERDR", e.env["HERDR_BIN"]), \
+                patch.object(factory, "time", clock), contextlib.redirect_stdout(out):
+            try:
+                factory.main(["wait", "--cwd", str(e.repo), *args])
+            except SystemExit as ex:
+                code = ex.code
+        return code, out.getvalue(), sleeps
+
+    def test_foreground_operator_wait_delivers_unread_and_wrapped_codex_cue(self):
+        with Env(formation({"lead-dev": CATALOG_MEMBERS["lead-dev"]})) as e:
+            e.update(None, agent="codex")
+            e.run("up")
+            e.update("operator", screen=self.codex_screen)
+            self.assertEqual(self.seed(e, "already handled"), 1)
+            resumed = self.codex_screen.replace("• Working (13s…", "• Waiting for …\n  └ python3 /h…")
+
+            def queue_after_idle(look):
+                if look == 2:  # intact draft and resized chrome are not a cue
+                    e.update("operator", screen=resumed.replace("Ask Codex t", "café Ω"))
+                if look == 3:
+                    self.assertEqual(self.seed(e, "new idle-team handoff"), 2)
+                return 301  # Default Codex watch stays up through long idle stretches.
+
+            print_messages = factory.print_messages
+
+            def cue_during_report(rows):
+                print_messages(rows)
+                e.update("operator", screen=resumed.replace("\n\n\n›", "\n\n• Queued\n"
+                         "  follow-up\n  inputs\n  ↳ private café Ω\n\n›"))
+
+            with patch.object(factory, "print_messages", side_effect=cue_during_report):
+                code, output, sleeps = self.run_at_polls(e, queue_after_idle, "--seen", "1")
+            self.assertEqual((code, sleeps), (0, [2, 2, 2]))
+            self.assertIn("new idle-team handoff", output)
+            self.assertIn("wait --seen 2", output)
+            self.assertIn("Owner follow-up queued. End your turn", output)
+            self.assertNotIn("cannot verify", output)
+            self.assertNotIn("private", output)
+            self.assertNotIn("already handled", output)
+            self.assertIn("new idle-team handoff", e.run("wait", "--timeout", "0").stdout)
+            self.assertIn("already handled", e.run("inbox").stdout)
+            self.assertIn(["pane", "read", e.env["HERDR_PANE_ID"], "--source", "visible"], e.calls("pane", "read"))
+
+    def test_pi_uses_current_editor_for_both_queue_modes(self):
+        with Env(formation({"lead-dev": CATALOG_MEMBERS["lead-dev"]})) as e:
+            e.update(None, agent="pi")
+            e.run("up")
+            for heading, reason in (("Steering:", "Owner steering queued"), ("Follow-up:", "Owner follow-up queued")):
+                with self.subTest(heading=heading):
+                    quote = f" {heading} old text\n ↳ Alt+Up to edit all queued messages\n\n"
+                    draft = self.pi_screen.replace("43.0s", "8h 2m 0s").replace("\n\n───", f"\n{heading} unsent text\n───")
+                    e.update("operator", screen=quote + draft)
+
+                    def queue(look):
+                        if look == 2:
+                            e.update("operator", screen=self.pi_screen.replace("\n\n── ⠼", f"\n {heading} private\n"
+                                     " ↳ Alt+Up to edit all q...\n\n── ⠼"))
+                        return 301  # A readable pi composer keeps the long stretch.
+
+                    code, output, sleeps = self.run_at_polls(e, queue)
+                    self.assertEqual((code, sleeps), (0, [2, 2]))
+                    self.assertIn(reason, output)
+                    self.assertNotIn("private", output)
+
+    def test_composer_fallback_preserves_deadline_and_is_bounded(self):
+        with Env(formation({"lead-dev": CATALOG_MEMBERS["lead-dev"]})) as e:
+            e.run("up")
+            for harness, screen, cap, env in (
+                    ("codex", "• Queued follow-up inputs\n  ↳ old transcript\n\n› draft", 60, {}),
+                    ("pi", self.pi_screen.replace("Elapsed 43.0s", "Future UI: pending"), 300, {}),
+                    ("pi", self.pi_screen, 300, {"FAKE_READ_FAIL": "1"})):
+                with self.subTest(harness=harness, screen=screen, env=env):
+                    e.update("operator", agent=harness, screen=screen)
+                    code, output, _ = self.run_at_polls(e, lambda _: cap / 2, **env)
+                    self.assertEqual(code, 4)
+                    self.assertIn(f"timeout after {cap}s", output)
+                    self.assertEqual(output.count("cannot verify the operator composer"), 1)
+                    if env:
+                        self.assertIn("socket blocked", output)
+                    self.assertNotIn("old transcript", output)
+                    code, output, _ = self.run_at_polls(e, lambda _: 1, "--timeout", "1", **env)
+                    self.assertEqual(code, 4)
+                    self.assertIn("timeout after 1s", output)
+
+    def test_composer_wait_keeps_lifecycle_and_checks_only_the_operator_pane(self):
+        with Env(formation({"lead-dev": CATALOG_MEMBERS["lead-dev"]})) as e:
+            e.update(None, agent="codex", screen=self.codex_screen)
+            e.run("up")
+            member = e.pane_of("lead-dev")["pane_id"]
+            prior_reads = e.calls("pane", "read")
+            result = e.run("wait", "--interval", "0", HERDR_PANE_ID=member)
+            self.assertIn("nobody is working", result.stdout)
+            result = e.run("wait", "lead-dev", "--interval", "0")
+            self.assertIn("@lead-dev stopped (idle)", result.stdout)
+            self.assertEqual(e.calls("pane", "read"), prior_reads)
+
+            def work_then_stop(look):
+                if look == 2:
+                    e.update("lead-dev", agent_status="working")
+                if look == 3:
+                    e.update("lead-dev", agent_status="done")
+                return 2
+
+            code, output, sleeps = self.run_at_polls(e, work_then_stop)
+            self.assertEqual((code, sleeps), (0, [2, 2, 2]))
+            self.assertIn("@lead-dev stopped (done)", output)
 
     def test_worktree_uses_explicit_main_root_and_rejects_invalid_messages(self):
         with Env(formation({"lead-dev": {**CATALOG_MEMBERS["lead-dev"], "worktree": True}},
