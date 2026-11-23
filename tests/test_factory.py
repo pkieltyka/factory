@@ -2428,7 +2428,7 @@ class UpRecoveryTests(unittest.TestCase):
             self.assertEqual([name for name, _ in e.prompts()], ["pm"])
             self.assertIn("starting in a new session", e.prompts()[0][1])
 
-    def test_ready_line_names_the_operator_and_manual_briefs_ask_nothing(self):
+    def test_launch_reports_name_the_operator_and_manual_briefs_ask_nothing(self):
         with Env(formation({"lead-dev": CATALOG_MEMBERS["lead-dev"]}, operator={"name": "boss"})) as e:
             e.run("up")
             self.assertTrue(e.prompts()[0][1].endswith(READY.replace("@operator", "@boss") + "\n"))
@@ -2437,6 +2437,11 @@ class UpRecoveryTests(unittest.TestCase):
             e.run("brief", "--send", "lead-dev")
             self.assertEqual(len(e.prompts()), 2)
             self.assertTrue(e.prompts()[1][1].endswith("That is the whole team brief. No reply needed.\n"))
+            e.set_session("lead-dev", {"agent": "codex", "kind": "id", "value": "saved"})
+            e.run("up", "lead-dev", "--restart")
+            self.assertEqual(len(e.prompts()), 3)
+            self.assertIn("send @boss a new one-line pickup report for this launch, even if you sent one before.",
+                          e.prompts()[2][1])
 
     def test_up_names_running_members_without_their_launch_flags(self):
         restored = {"lead-dev": [{"pid": 7, "name": "codex", "argv": ["codex", "resume", "cx-1"]}],
