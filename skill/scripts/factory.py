@@ -1739,6 +1739,8 @@ def wait_for_events(args, cfg, route, operator):
     watch_composer = (route == "inbox" and wait == "foreground" and not watch and harness in COMPOSER_WAIT
                       and bool(pane) and operator.get("pane_id") == pane)
     default_timeout, fallback = COMPOSER_WAIT[harness] if watch_composer else (60 if wait == "foreground" else 1800, None)
+    if args.background_task and harness == "omp":
+        default_timeout = 240
     timeout = args.timeout if args.timeout is not None else default_timeout
     interval = min(args.interval, 2) if watch_composer else args.interval
     started = time.monotonic()
@@ -1984,8 +1986,8 @@ def main(argv=None):
     wt.add_argument("--background-task", action="store_true",
                     help="declare a native background launch (required for Claude Code, omp and OpenCode operators)")
     wt.add_argument("--timeout", type=float, help="seconds before giving up (exit 4). Operator Codex/pi inbox waits "
-                    "default to no deadline and 2147183 seconds respectively. Other foreground inbox waits default to 60, "
-                    "all others to 1800")
+                    "default to no deadline and 2147183 seconds respectively. Native omp background waits default to 240, "
+                    "other foreground inbox waits to 60, and all others to 1800")
     wt.add_argument("--interval", type=float, default=5, help="seconds between looks (up to 2 in operator Codex/pi inbox waits)")
     wt.add_argument("--seen", type=int, help="acknowledge inbox messages through this id, then wait. "
                                             "Reread them with factory.py inbox")
