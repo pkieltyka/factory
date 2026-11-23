@@ -39,7 +39,13 @@ Or run pi with GLM 5.3 as the operator, sending work to Fable and Opus, with Lun
 
 ## Quickstart
 
-By default, members run with approval prompts off. Use a sandbox or VM, or ask setup for guarded permissions for Claude Code and Codex. [Install the skill](docs/getting-started.md#install-the-skill).
+By default, members run with approval prompts off. Use a sandbox or VM, or ask setup for guarded permissions for Claude Code and Codex.
+
+Install the skill for your operator harness with the [skills CLI](https://github.com/vercel-labs/skills) (it asks which harnesses to install to), or [install it by hand](docs/getting-started.md#install-the-skill):
+
+```bash
+npx skills add pkieltyka/factory -g
+```
 
 From your project inside herdr, in Claude Code ([other operator harnesses](docs/getting-started.md#operator-harnesses)):
 

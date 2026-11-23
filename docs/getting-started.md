@@ -8,7 +8,17 @@ Install [herdr](https://herdr.dev), Python 3.11+, Git and one supported coding h
 
 ## Install the skill
 
-Only the operator's harness needs the skill installed. At launch the operator writes each member's instructions and delivers them through its harness. Clone the skill somewhere you can keep it, separate from the project your team will change.
+Only the operator's harness needs the skill installed. At launch the operator writes each member's instructions and delivers them through its harness.
+
+The quickest way is the [skills CLI](https://github.com/vercel-labs/skills), which needs Node.js. It asks which harnesses to install to; add `-a claude-code` (or another agent name) to choose up front. `-g` installs for your user rather than one project:
+
+```bash
+npx skills add pkieltyka/factory -g
+```
+
+Update it later with `npx skills update factory`, then see the note on restarting members below.
+
+To install by hand instead, clone the skill somewhere you can keep it, separate from the project your team will change.
 
 ```bash
 git clone https://github.com/pkieltyka/factory
