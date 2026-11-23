@@ -2,7 +2,7 @@
 
 ## Before you start
 
-Install [herdr](https://herdr.dev), Python 3.11+, Git and one supported coding harness. Start the harness and sign in or configure its provider. Any operator harness below can also run members. Run `herdr integration install <harness>` once for each harness you will use, with `claude`, `codex`, `pi`, `omp`, `opencode` or `antigravity-cli` (for `agy` members) as the argument. [Harness installation sources](../skill/harnesses.toml)
+Install [herdr](https://herdr.dev), Python 3.11+, Git and one supported coding harness. Start the harness and sign in or configure its provider. Any operator harness below can also run members. Check `herdr integration status` for each harness you will use. For a missing, outdated, or broken integration, the operator asks for your approval before running `herdr integration install <harness>`. This changes files shared with other factories. Use `antigravity-cli` as the install target for `agy`. [Harness installation sources](../skill/harnesses.toml)
 
 **Choose where members will run before launch.** The default `full` setting bypasses permission prompts in Claude Code, disables approvals and sandboxing in Codex, and runs pi, omp and OpenCode unattended. Antigravity CLI uses its session-only `always-proceed` preset, which still blocks denied commands. Use a sandbox or VM for full permissions. If you want Claude Code or Codex to keep its own guard, ask for `guarded` during setup. That setting only changes those two harnesses. [Permission details](../skill/references/cmd_setup.md#permissions)
 
