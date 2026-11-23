@@ -473,6 +473,11 @@ def watcher_status(cfg):
 
 # Default deadline and the shorter stretch if we cannot recognize the current composer.
 COMPOSER_WAIT = {"codex": (float("inf"), 60), "pi": (2_147_183, 300)}
+# What a composer wait tells a Codex or pi operator when it ends while members are live.
+LIVE = "Members are live: run factory.py wait again now; do not end your turn."
+REARM = "After replying, run factory.py wait again."
+KEEP = "Members are live: keep polling this wait until it exits; do not end your turn while it runs."
+STATUS_LIVE = "Members are live: run factory.py wait now and keep it running."
 
 
 def configure_messages(cfg, team, operator, restart=()):
@@ -499,7 +504,7 @@ def configure_messages(cfg, team, operator, restart=()):
             action = "in the background with --background-task and end your turn; it wakes you with messages and problems"
         else:
             action = "in the foreground, and again each time it returns while "
-            action += "members are live" if harness in COMPOSER_WAIT else "a member works"
+            action += "members are live, without --timeout" if harness in COMPOSER_WAIT else "a member works"
         print(f"members reach @{operator} through the inbox; run factory.py wait {action}")
     else:
         print(f'members reach @{operator} by typed herdr messages ([operator] messages = "typed")')
@@ -1565,6 +1570,12 @@ def cmd_status(args):
                 style = operator_wait(harness, route)
                 suffix = f", {style} wait" + suffix
             print(f"operator messages: {route}{suffix}")
+        # Codex and pi operators check status between waits; tell them to keep listening while members are live.
+        pane = os.environ.get("HERDR_PANE_ID")
+        if (route == "inbox" and harness in COMPOSER_WAIT and pane and operator_pane.get("pane_id") == pane
+                and team.agent_panes.get(operator) == pane
+                and any(team.pane(n) and team.status(n) != "gone" for n in cfg.members)):
+            print(STATUS_LIVE)
     except (OSError, ValueError) as e:
         print(f"operator messages: unavailable ({e})")
     for state, hint in (("blocked", "blocked: waiting on an approval or a question. Read the pane and ask the user."),
@@ -1578,8 +1589,11 @@ def cmd_status(args):
 
 def codex_wait_render(block):
     heading, _, terminal = block.partition("\n")
+    if heading.startswith("• Working ("):
+        # Codex can hang a hint below its status line ("  └ Tip: ..."), wrapped onto indented lines.
+        return not terminal or bool(re.fullmatch(r"  └ \w[\w ]{0,15}: \S.*(?:\n {4,}\S.*)*", terminal))
     if not terminal:
-        return heading.startswith("• Working (")
+        return False
     # During a poll of an existing command, Codex shows the terminal below a different status line.
     waiting = "• Waiting for background terminal"
     clipped = heading.removesuffix("…").rstrip()
@@ -1684,17 +1698,17 @@ def wait_for_events(args, cfg, route, operator):
     started = time.monotonic()
     seen, worked, looks = None, set(), 0
     warned = False
-    composer_warned = False
+    unsure_until, unsure_detail = None, ""  # the shorter deadline while the composer stays unrecognized
+    if watch_composer:  # a Codex tool yield shows only this, so it must keep the operator polling
+        print(KEEP, flush=True)
     while True:
         cue = None
         if watch_composer:
             cue, error = read_composer(pane, harness)
-            if cue == "unknown" and not composer_warned:
-                timeout = min(timeout, time.monotonic() - started + fallback)
-                detail = f" ({error})" if error else ""
-                print(f"cannot verify the operator composer{detail}. Wait will time out within {fallback}s"
-                      " if no event arrives.", flush=True)
-                composer_warned = True
+            if cue != "unknown":  # Codex shows no working line for a moment between its own polls
+                unsure_until = None
+            elif unsure_until is None:
+                unsure_until, unsure_detail = time.monotonic() - started + fallback, f" ({error})" if error else ""
         unread = []
         try:
             with Inbox(cfg) as inbox:
@@ -1720,9 +1734,9 @@ def wait_for_events(args, cfg, route, operator):
         if unread and watch_composer and cue not in ("follow-up", "steering"):
             cue, _ = read_composer(pane, harness)
         if cue == "follow-up":
-            print("Owner follow-up queued. End your turn to receive it.")
+            print(f"Owner follow-up queued. End your turn to receive it. {REARM}")
         elif cue == "steering":
-            print("Owner steering queued. Let the harness deliver it before starting another wait.")
+            print(f"Owner steering queued. Let the harness deliver it before starting another wait. {REARM}")
         if unread or cue in ("follow-up", "steering"):
             return
         team = Team(cfg)
@@ -1743,10 +1757,18 @@ def wait_for_events(args, cfg, route, operator):
         stopped = [] if quiet else [n for n in settled if n in worked or (n in watch and looks > 1)]
         if closed or needs or stopped or (not quiet and looks > 1 and (unclear or (not working and not watch_composer))):
             break
-        remaining = timeout - (time.monotonic() - started)
+        deadline = min(timeout, unsure_until) if unsure_until is not None else timeout
+        remaining = deadline - (time.monotonic() - started)
         if remaining <= 0:
-            activity = "still working: " + ", ".join("@" + n for n in working) if working else "nobody is working"
             unknown = "; status unknown: " + ", ".join("@" + n for n in unclear) if unclear else ""
+            if deadline < timeout:
+                print(f"cannot verify the operator composer{unsure_detail}: it stayed unrecognized for {fallback}s.")
+                timeout = deadline
+            if watch_composer:
+                still = "; still working: " + ", ".join("@" + n for n in working) if working else ""
+                print(f"timeout after {timeout:.9g}s{still}{unknown}. {LIVE}")
+                sys.exit(4)
+            activity = "still working: " + ", ".join("@" + n for n in working) if working else "nobody is working"
             print(f"timeout after {timeout:.9g}s; {activity}{unknown}")
             sys.exit(4)
         worked.update(working)
@@ -1767,6 +1789,8 @@ def wait_for_events(args, cfg, route, operator):
     for n in stopped:
         print(f"@{n} stopped ({state[n]}). If it sent no report, read its pane:"
               f" herdr agent read {n} --source recent-unwrapped --lines 80")
+    if watch_composer and any(n not in closed and state[n] != "gone" for n in state):
+        print("Members are live: after you act on this, run factory.py wait again; do not end your turn.")
     if not (closed or needs or unclear or stopped):
         hint = ". End your turn; run factory.py wait again after you assign work." if wait == "foreground" else ""
         print(f"nobody is working: {', '.join('@' + n + ' ' + s for n, s in state.items())}{hint}")

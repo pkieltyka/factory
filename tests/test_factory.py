@@ -1277,6 +1277,24 @@ class WorktreeTests(unittest.TestCase):
 
 class InboxTests(unittest.TestCase):
     codex_screen = "• Working (13s…\n\n\n› Ask Codex t\n\n  GPT-6.2-Sol\n"
+    # Codex 0.171.0 during a live wait, captured in the #134 gate: a hint hangs below the working line.
+    codex_tip_screen = textwrap.dedent("""\
+        ✔ You approved codex to always run commands that start with python3 .agents/skills/factory-e10f274/scripts/factory.py
+          wait
+
+        • Running python3 .agents/skills/factory-e10f274/scripts/factory.py wait
+          └ cannot verify the operator composer. Wait will time out within 60s if no event arrives.
+
+        • Working (1m 13s • esc to interrupt)
+          └ Tip: Use /export to save your conversation as Markdown.
+
+
+        › Ask Codex to do anything
+
+          GPT-6-Sol medium · ~/Dev/scratch/e2e-codex-r2 · master · Working · Context 90% left · 258K window · 32.3K used ·
+          1.14M in · 6.43K out
+          ← for agents · ? for shortcuts
+        """)
     pi_screen = " Elapsed 43.0s\n\n\n── ⠼ Working ──────────────\n\n───────────────────────────\n~/Dev/scratch/factory-13...\n"
 
     def prepare(self, e, mode="inbox"):
@@ -1492,7 +1510,8 @@ class InboxTests(unittest.TestCase):
                 if harness in factory.COMPOSER_WAIT:
                     e.update("operator", screen=self.codex_screen if harness == "codex" else self.pi_screen)
                 code, idle = idle_wait(e)
-                self.assertIn("nobody is working", idle)
+                self.assertIn(factory.LIVE if harness in factory.COMPOSER_WAIT else "nobody is working", idle)
+                self.assertEqual("nobody is working" in idle, harness not in factory.COMPOSER_WAIT)
                 self.assertEqual(code, 0 if harness == "agy" else 4)
                 self.assertEqual("End your turn" in idle, harness == "agy")
                 if seconds is not None:
@@ -1719,6 +1738,95 @@ class InboxTests(unittest.TestCase):
             code, output, sleeps = self.run_at_polls(e, work_then_stop)
             self.assertEqual((code, sleeps), (0, [2, 2, 2]))
             self.assertIn("@lead-dev stopped (done)", output)
+
+    def test_codex_hint_below_working_line_still_reads_as_waiting(self):
+        state, tip = factory.composer_state, self.codex_tip_screen
+        hint = "  └ Tip: Use /export to save your conversation as Markdown."
+        self.assertEqual(state("codex", tip), "waiting")
+        self.assertEqual(state("codex", tip.replace(hint, "  └ Tip: Use /export to save\n    your conversation as\n    Markdown.")),
+                         "waiting")  # a narrow pane wraps the hint
+        self.assertEqual(state("codex", tip.replace("interrupt)", "interrupt) · 1 background terminal running · /ps to view")),
+                         "waiting")
+        queued = tip.replace("\n\n\n› Ask", "\n\n• Queued follow-up inputs\n  ↳ hello\n    shift+← edit last queued message"
+                                           "\n\n\n› Ask")
+        self.assertEqual(state("codex", queued), "follow-up")
+        working = "• Working (1m 13s • esc to interrupt)\n" + hint + "\n"
+        for bad in (tip.replace("• Working (1m 13s • esc to interrupt)\n", ""),  # a hint alone is not the working line
+                    tip.replace(hint, "  └ python3 factory.py wait"),  # output, not a hint
+                    tip.replace(hint, "  └ Tip: one\n  stray line"),  # broken hint structure
+                    tip.replace(working, "• Done.\n").replace("› Ask Codex to do anything", "› " + working.strip()),  # draft
+                    tip.replace(working, working + "\n• Quoting the screen above, all is well.\n"),  # quoted, not current
+                    tip.replace("› Ask Codex to do anything", "› • Queued follow-up inputs ↳ draft").replace(hint, "  └ ok")):
+            with self.subTest(screen=bad):
+                self.assertEqual(state("codex", bad), "unknown")
+
+    def test_codex_pause_between_its_own_polls_does_not_shorten_the_wait(self):
+        with Env(formation({"lead-dev": CATALOG_MEMBERS["lead-dev"]})) as e:
+            e.update(None, agent="codex", screen=self.codex_tip_screen)
+            e.run("up")
+            e.update("lead-dev", agent_status="done")
+            between = ("• Still watching. No new messages have arrived.\n\n"
+                       "  1 background terminal running · /ps to view · /stop to close\n\n\n› Ask Codex to do anything\n")
+            cue = self.codex_tip_screen.replace("\n\n\n› Ask", "\n\n• Queued follow-up inputs\n  ↳ hi\n\n\n› Ask")
+            screens = {1: between, 2: self.codex_tip_screen, 3: self.codex_tip_screen, 4: cue}
+
+            def look(n):
+                e.update("operator", screen=screens[n])
+                return 40  # past the 60-second fallback that the pause alone would have set
+
+            code, output, sleeps = self.run_at_polls(e, look)
+            self.assertEqual((code, len(sleeps)), (0, 4))
+            self.assertNotIn("cannot verify", output)
+            self.assertIn("Owner follow-up queued", output)
+
+    def test_composer_wait_output_tells_codex_and_pi_to_wait_again(self):
+        with Env(formation({"lead-dev": CATALOG_MEMBERS["lead-dev"]})) as e:
+            e.update(None, agent="codex", screen=self.codex_tip_screen)
+            self.assertIn("members are live, without --timeout", e.run("up").stdout)
+            e.update("lead-dev", agent_status="done")
+            steering = self.pi_screen.replace("\n\n── ⠼", "\n Steering: hi\n ↳ Alt+Up to edit all queued messages\n\n── ⠼")
+            follow_up = self.codex_tip_screen.replace("\n\n\n› Ask", "\n\n• Queued follow-up inputs\n  ↳ hi\n\n\n› Ask")
+            for harness, screen, cue, reason in (
+                    ("codex", self.codex_tip_screen, follow_up, "Owner follow-up queued. End your turn to receive it."),
+                    ("pi", self.pi_screen, steering, "Owner steering queued.")):
+                with self.subTest(harness=harness):
+                    e.update("operator", agent=harness, screen=screen)
+                    code, output, _ = self.run_at_polls(e, lambda _: 1, "--timeout", "1")
+                    self.assertEqual((code, output), (4, f"{factory.KEEP}\ntimeout after 1s. {factory.LIVE}\n"))
+                    e.update("lead-dev", agent_status="working")
+                    code, output, _ = self.run_at_polls(e, lambda _: 1, "--timeout", "1")
+                    self.assertEqual((code, output),
+                                     (4, f"{factory.KEEP}\ntimeout after 1s; still working: @lead-dev. {factory.LIVE}\n"))
+                    e.update("operator", screen=cue)
+                    code, output, _ = self.run_at_polls(e, lambda _: 1)
+                    self.assertEqual(code, 0)
+                    self.assertIn(reason, output)
+                    self.assertTrue(output.rstrip().endswith(factory.REARM), output)
+                    e.update("operator", screen=screen)
+
+                    def stop(look):
+                        if look == 2:
+                            e.update("lead-dev", agent_status="done")
+                        return 1
+
+                    code, output, _ = self.run_at_polls(e, stop)
+                    self.assertEqual(code, 0)
+                    self.assertIn("@lead-dev stopped (done)", output)
+                    self.assertIn("Members are live: after you act on this, run factory.py wait again", output)
+                    self.assertIn(factory.STATUS_LIVE, e.run("status").stdout)
+                    member_view = e.run("status", HERDR_PANE_ID=e.pane_of("lead-dev")["pane_id"]).stdout
+                    self.assertNotIn(factory.STATUS_LIVE, member_view)  # only the verified operator pane
+                    named = e.wait("lead-dev", "--interval", "0").stdout  # a named watch keeps its old output
+                    self.assertIn("@lead-dev stopped", named)
+                    self.assertNotIn("Members are live", named)
+                    elsewhere = e.wait("--interval", "0", HERDR_PANE_ID=e.pane_of("lead-dev")["pane_id"]).stdout
+                    self.assertNotIn(factory.KEEP, elsewhere)  # not the operator pane: no composer watch
+            for harness in ("claude", "omp", "opencode", "agy"):
+                e.update("operator", agent=harness)
+                self.assertNotIn("Members are live", e.run("status").stdout)
+            e.update("operator", agent="codex")
+            e.run("down")
+            self.assertNotIn(factory.STATUS_LIVE, e.run("status").stdout)
 
     def test_worktree_uses_explicit_main_root_and_rejects_invalid_messages(self):
         with Env(formation({"lead-dev": {**CATALOG_MEMBERS["lead-dev"], "worktree": True}},
