@@ -995,7 +995,43 @@ def herdr(*args, check=True, timeout=HERDR_TIMEOUT):
     try:
         return json.loads(p.stdout).get("result") or {}
     except (json.JSONDecodeError, AttributeError):
-        return {"text": p.stdout}  # `pane read` prints the pane's text
+        return {"text": p.stdout}  # `pane read` and `integration status` print text
+
+
+def integration_target(harness):
+    return "antigravity-cli" if harness == "agy" else harness
+
+
+def integration_statuses():
+    """Read Herdr's text status. Omitted and unrecognized rows remain unknown."""
+    try:
+        got = herdr("integration", "status", check=False, timeout=5)
+    except OSError as e:
+        return {}, str(e)
+    if error := got.get("error"):
+        return {}, error.splitlines()[0]
+    rows = re.findall(r"^([^:\n]+): (not installed|(?:current|needs repair|outdated) \([^)]+\)) \(.+\)$",
+                      got.get("text", ""), re.MULTILINE)
+    return dict(rows), None
+
+
+def warn_integrations(plans):
+    if not plans:
+        return
+    statuses, error = integration_statuses()
+    verify = "Run `herdr integration status` to verify."
+    if error:
+        print(f"warning: could not check herdr integrations ({error}). {verify}", file=sys.stderr)
+        return
+    for harness in dict.fromkeys(p["harness"] for p in plans):
+        target, label = integration_target(harness), TABLE[harness]["label"]
+        state = statuses.get(target)
+        if not state:
+            print(f"warning: could not verify the {label} herdr integration. {verify}", file=sys.stderr)
+        elif not state.startswith("current "):
+            print(f"warning: {label} herdr integration {state}. Herdr may miss session IDs."
+                  f" Ask the user before running `herdr integration install {target}`."
+                  " It changes files shared with other factories.", file=sys.stderr)
 
 
 def require_herdr():
@@ -1385,6 +1421,7 @@ def cmd_up(args):
             print(f"an agent outside this team is already named {name}. One team runs per herdr session:"
                   " rename that agent, or use another session.", file=sys.stderr)
             sys.exit(2)
+    warn_integrations(ready)
     if running:
         print(f"already running: {', '.join(running)}")
         report_launch_drift(team, [m for m in plans if m["name"] in running])
@@ -1477,6 +1514,7 @@ def cmd_down(args):
         raise SystemExit(f"could not record member sessions: {e}") from None
 
     stopped, failed = False, False
+    integrations = None
     for name in names:
         if name not in running:
             print(f"@{name} was not running")
@@ -1504,8 +1542,15 @@ def cmd_down(args):
             print(f"@{name} was not running")
             continue
         print(f"stopped @{name} (was {pane.get('agent_status', '?')})")
-        if saved.get(name, {}).get("agent") != cfg.members[name]["harness"]:
-            print(f"no compatible session recorded for @{name}: up will start it fresh")
+        harness, ref = cfg.members[name]["harness"], saved.get(name, {})
+        if ref.get("agent") != harness:
+            hint = ""
+            if not ref and pane.get("agent") == harness:
+                if integrations is None:
+                    integrations, _ = integration_statuses()
+                if integrations.get(integration_target(harness), "").startswith("needs repair "):
+                    hint = ". Its herdr integration needs repair and may have prevented session recording."
+            print(f"no compatible session recorded for @{name}: up will start it fresh{hint}")
         stopped = True
     if stopped:
         if not running:

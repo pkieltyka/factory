@@ -62,6 +62,12 @@ FAKE_HERDR = textwrap.dedent(r'''
         panes[pid] = {"pane_id": pid, "tab_id": tab, "workspace_id": "w1", "label": None, "agent_status": "unknown",
                       "foreground_cwd": opt("--cwd"), "cwd": opt("--cwd"), "rect": rect, "env": [a[i + 1] for i, x in enumerate(a) if x == "--env"]}
         return panes[pid]
+    if a == ["integration", "status"]:
+        if os.environ.get("FAKE_INTEGRATION_FAIL"):
+            fail("status_failed", "cannot read integration status")
+        current = "\n".join(f"{h}: current (v1) (/hooks/{h})"
+                            for h in ("claude", "codex", "pi", "omp", "opencode", "antigravity-cli"))
+        save(); print(os.environ.get("FAKE_INTEGRATION_STATUS", current)); sys.exit(0)
     if a[:2] == ["agent", "list"]:
         if os.environ.get("FAKE_LIST_FAIL"):
             fail("PermissionDenied", "Operation not permitted: socket blocked")
@@ -428,6 +434,47 @@ def kind(call):
 
 
 class UpTests(unittest.TestCase):
+    def test_up_warns_once_for_each_integration_it_will_use(self):
+        members = {n: CATALOG_MEMBERS[n] for n in ("lead-dev", "reviewer", "pm", "frontend-dev")}
+        members["designer"] = {"harness": "agy"}
+        status = textwrap.dedent("""\
+            claude: outdated (v2 < v3) (/hooks/claude)
+            codex: not installed (/hooks/codex)
+            pi: current (v2) (/hooks/pi)
+            opencode: needs repair (v13) (/hooks/opencode)
+            antigravity-cli: needs repair (v4) (/hooks/antigravity-cli)
+            """)
+        with Env(formation(members)) as e:
+            p = e.run("up", "--fresh", "--no-brief", FAKE_INTEGRATION_STATUS=status)
+            self.assertEqual(set(e.starts()), set(members))
+            self.assertEqual(p.stderr.count("Codex herdr integration not installed"), 1)
+            self.assertIn("Claude Code herdr integration outdated (v2 < v3)", p.stderr)
+            self.assertIn("Antigravity CLI herdr integration needs repair (v4)", p.stderr)
+            for target in ("claude", "codex", "antigravity-cli"):
+                self.assertIn(f"Ask the user before running `herdr integration install {target}`", p.stderr)
+            self.assertNotIn("pi herdr integration", p.stderr)
+            self.assertNotIn("OpenCode", p.stderr)
+            e.run("up", "--no-brief", FAKE_INTEGRATION_STATUS=status)  # already running: no query
+            self.assertEqual(e.calls("integration"), [["integration", "status"]])
+            calls = e.calls()
+            self.assertLess(calls.index(["integration", "status"]), calls.index(e.calls("pane", "rename")[0]))
+
+    def test_up_integration_status_failure_and_unknown_rows_only_warn(self):
+        brief = formation({"lead-dev": CATALOG_MEMBERS["lead-dev"]})
+        cases = (
+            ({"FAKE_INTEGRATION_FAIL": "1"}, "could not check herdr integrations (status_failed:"),
+            ({"FAKE_INTEGRATION_STATUS": "pi: current (v2) (/hooks/pi)"}, "could not verify the Codex herdr integration"),
+            ({"FAKE_INTEGRATION_STATUS": "codex: new state (v2) (/hooks/codex)"}, "could not verify the Codex herdr integration"),
+        )
+        for env, warning in cases:
+            with self.subTest(env=env), Env(brief) as e:
+                p = e.run("up", "--no-brief", **env)
+                self.assertIn(warning, p.stderr)
+                self.assertIn("Run `herdr integration status` to verify", p.stderr)
+                self.assertNotIn("integration install", p.stderr)
+                self.assertEqual(e.calls("integration"), [["integration", "status"]])
+                self.assertIn("lead-dev", e.starts())
+
     def test_ui_team_launches_in_the_team_tab_and_is_briefed(self):
         with Env(UI) as e:
             self.assertEqual(factory.Config(e.repo).operator["name"], "operator")  # the default name
@@ -2710,6 +2757,25 @@ class UpRecoveryTests(unittest.TestCase):
 
 
 class DownTests(unittest.TestCase):
+    def test_down_hints_at_repair_only_when_no_session_was_recorded(self):
+        names = ("architect", "designer", "lead-dev", "reviewer")
+        members = {name: {"harness": "opencode", "model": "openrouter/z-ai/glm-5.3"} for name in names}
+        with Env(formation(members)) as e:
+            e.run("up", "--no-brief")
+            e.set_session("architect", {"agent": "opencode", "kind": "id", "value": "compatible"})
+            e.set_session("designer", {"agent": "claude", "kind": "id", "value": "older"})
+            e.run("status")  # save both older refs
+            for name in ("architect", "designer"):
+                e.set_session(name, None)
+            p = e.run("down", FAKE_INTEGRATION_STATUS="opencode: needs repair (v13) (/hooks/opencode)")
+            hints = [line for line in p.stdout.splitlines() if "may have prevented session recording" in line]
+            self.assertEqual(len(hints), 2)
+            self.assertIn("@lead-dev", hints[0])
+            self.assertIn("@reviewer", hints[1])
+            self.assertIn("no compatible session recorded for @designer: up will start it fresh\n", p.stdout)
+            self.assertNotIn("no compatible session recorded for @architect", p.stdout)
+            self.assertEqual(e.calls("integration"), [["integration", "status"]] * 2)  # one for up, one for down
+
     def test_down_records_sessions_for_up_and_preserves_messages(self):
         with Env(UI) as e:
             e.run("up", "lead-dev", "pm", "--no-brief")

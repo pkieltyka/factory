@@ -10,7 +10,7 @@ factory.py up --restart      # reapply settings to running members
 factory.py up lead-dev --fresh --restart  # new session
 ```
 
-Before any launch or restart, `up` checks the affected members with current `factory.toml` settings. A failure exits 2. It names each member it starts fresh or resumes from its last noted session of the same harness. Use `--fresh` to bypass saved sessions. To keep a stopped member out, name the others or remove it from `factory.toml`. Observations live in `~/.cache/factory-skill/<repo>/sessions.jsonl`; herdr forgets a session when its agent exits.
+Before any launch or restart, `up` checks the affected members with current `factory.toml` settings. A launch check failure exits 2. Integration status problems warn and launch continues. It names each member it starts fresh or resumes from its last noted session of the same harness. Use `--fresh` to bypass saved sessions. To keep a stopped member out, name the others or remove it from `factory.toml`. Observations live in `~/.cache/factory-skill/<repo>/sessions.jsonl`; herdr forgets a session when its agent exits.
 
 - Reuse the old shell pane only when its cwd matches the configured checkout and the harness needs no new pane environment. Otherwise create a replacement; clear the old label and leave that pane as a plain shell. Worktrees remain intact.
 - Codex receives an explicit working directory on resume; its saved session alone may point at an old checkout.
