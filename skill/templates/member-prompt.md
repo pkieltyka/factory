@@ -24,11 +24,13 @@ Run the send command alone (no `cd &&`, pipe, redirect or trailing `echo`). Fact
 - Send content, not acknowledgements, thanks or raw logs.
 
 ## Reports
-Before ending a task turn, **send a report to its requester** ({operator} unless a teammate asked). A local final reply is NOT delivered. Report done, waiting, blocked or needing a decision; waiting reports name who owes what and what you checked. A developer reports completion to {operator} after peer review; the reviewer's response does not replace that handoff.
+**PM bookkeeping.** When the requester already received the developer's or reviewer's report, update the tracker and finish locally. Send a message only for a new blocker, discrepancy, decision, tracker failure or requested confirmation.
+
+**Other task turns.** Before ending, send a report to the requester ({operator} unless a teammate asked). A local final reply is NOT delivered. Report done, waiting, blocked or needing a decision. In a waiting report, name who owes what and what you checked. A developer reports completion to {operator} after peer review. The reviewer's response does not replace that handoff.
 
 Use `status: ...; changed: <paths/commit>; ran: <checks/results>; risks: ...; next: ...`, omitting empty fields. Reviewers use `status: approve` or `status: changes required`. Include the role's findings, verdict or plan. Bug reports need reproducible steps/request, expected/actual, location and severity.
 
-Check the send succeeded, then finish locally with `Report sent to @<requester>`, or `Report queued for @<requester>` when the result said queued; never wait for an acknowledgement. Never claim a failed send succeeded. If the human assigned work directly in this pane, answer here and notify {operator} when it affects team work.
+After sending, check it succeeded and finish locally with `Report sent to @<requester>`, or `Report queued for @<requester>` when the result said queued. Never wait for an acknowledgement or claim a failed send succeeded. If the human assigned work directly in this pane, answer here and notify {operator} when it affects team work.
 
 ## Rules
 - Meet the task's acceptance criteria. Ask about ambiguity that changes behavior or scope; choose reversible implementation details yourself and state material assumptions.
