@@ -1392,8 +1392,9 @@ def cmd_up(args):
     configure_messages(cfg, Team(cfg), operator, restart=[m["name"] for m in plans] if args.restart else ())
     if not ready:
         return
-    pickup_text = ("We are picking up where we left off. Check the tracker the brief above names, then tell"
-                   f" @{operator} in one line what you were doing and what you will do next. Send it with the"
+    pickup_text = ("We are picking up where we left off. Check the tracker the brief above names, then send"
+                   f" @{operator} a new one-line pickup report for this launch, even if you sent one before."
+                   " Say what you were doing and what you will do next. Send it with the"
                    f" say command in your standing instructions. A reply in your own pane does not reach @{operator}.")
     ready_text = (f"Send @{operator} one line saying `ready` with the say command in your standing instructions,"
                   " then wait for your task.")
