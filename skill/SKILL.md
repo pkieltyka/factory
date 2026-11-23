@@ -18,7 +18,7 @@ After compaction, re-read the active command's reference, `references/leading.md
 
 Use `factory.py say` to message teammates, never a harness's own messaging (e.g. Claude Code's `SendMessage`). Members send private drafts with `--file`, including reports to the operator. For several recipients, address each with `@name` in one draft and send it once.
 
-Start one `wait` in the mode `status` names. In background mode, start it as a background task and end your turn. When it returns, read the full output and act on or record messages before acknowledging them with the next watcher. Run `wait` directly, outside any loop or helper that restarts it or handles messages. Use `inbox` to reread acknowledged messages. See [references/leading.md](references/leading.md#receive-and-inspect).
+Start one `wait` in the mode `status` names. In background mode, start it as a background task and end your turn. Codex and pi operators using the inbox keep their foreground wait while members are live, even when idle. Resume a live Codex tool handle after a yield. When `wait` exits, read the full output and act on or record messages before acknowledging them with the next watcher. End your turn for a queued owner follow-up. Run `wait` directly, outside any loop or helper that restarts it or handles messages. Use `inbox` to reread acknowledged messages. See [references/leading.md](references/leading.md#receive-and-inspect).
 
 ## Before launch
 
