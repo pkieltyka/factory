@@ -1544,7 +1544,7 @@ class InboxTests(unittest.TestCase):
             return code, out.getvalue()
 
         for harness, mode, seconds in (("claude", "background", 1800), ("opencode", "background", 1800),
-                                       ("omp", "background", 1800), ("agy", "foreground", 60),
+                                       ("omp", "background", 240), ("agy", "foreground", 60),
                                        ("codex", "foreground", None), ("pi", "foreground", 2_147_183)):
             with self.subTest(harness=harness), Env(formation({"lead-dev": CATALOG_MEMBERS["lead-dev"]},
                                                             operator={"harness": harness})) as e:
@@ -1565,11 +1565,11 @@ class InboxTests(unittest.TestCase):
                     timeout(e, seconds)
                 timeout(e, 7, explicit=7)
                 self.prepare(e, "typed")
-                timeout(e, 1800)
+                timeout(e, 240 if harness == "omp" else 1800)
                 e.write_brief(formation({"lead-dev": CATALOG_MEMBERS["lead-dev"]},
                                         operator={"harness": harness, "messages": "typed"}))
                 e.run("up")
-                timeout(e, 1800)
+                timeout(e, 240 if harness == "omp" else 1800)
         with Env() as e:
             self.prepare(e)
             timeout(e, 60)  # No operator pane yet. Default to foreground for an inbox route.
@@ -1819,7 +1819,8 @@ class InboxTests(unittest.TestCase):
 
             def look(n):
                 e.update("operator", screen=screens[n])
-                return 40  # past the 60-second fallback that the pause alone would have set
+                # Pass both the short fallback and pi's finite deadline with Codex's composer recognized.
+                return 2_147_184 if n == 3 else 40
 
             code, output, sleeps = self.run_at_polls(e, look)
             self.assertEqual((code, len(sleeps)), (0, 4))
