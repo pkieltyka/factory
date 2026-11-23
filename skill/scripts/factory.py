@@ -433,6 +433,44 @@ def operator_wait(harness, route):
     return TABLE.get(harness, {}).get("operator_wait", "foreground") if route == "inbox" else "background"
 
 
+def watcher_lock(cfg, *, register=False):
+    """Retain the session directory lock for a watcher, or probe it while holding the inbox mutex."""
+    inbox, directory = Inbox(cfg), cfg.session_dir
+    for path in (inbox.directory.parent, inbox.directory, directory):
+        if path.is_symlink():
+            raise OSError(f"expected a private directory, found a symbolic link: {path}")
+    flags = os.O_RDWR if register else os.O_RDONLY
+    mutex = inbox.private_open(inbox.lock_path, flags, read_only=True)
+    try:
+        fcntl.flock(mutex, fcntl.LOCK_EX if register else fcntl.LOCK_SH)
+        if register:
+            directory.mkdir(mode=0o700, exist_ok=True)
+        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            mode = fcntl.LOCK_EX if register else fcntl.LOCK_SH
+            fcntl.flock(fd, mode | fcntl.LOCK_NB)
+        except BaseException:
+            os.close(fd)
+            raise
+        if register:
+            return fd
+        os.close(fd)
+    finally:
+        os.close(mutex)
+
+
+def watcher_status(cfg):
+    try:
+        watcher_lock(cfg)
+    except BlockingIOError:
+        return "running"
+    except FileNotFoundError:
+        return "absent"
+    except OSError as e:
+        return f"unknown ({e})"
+    return "absent"
+
+
 # Default deadline and the shorter stretch if we cannot recognize the current composer.
 COMPOSER_WAIT = {"codex": (float("inf"), 60), "pi": (2_147_183, 300)}
 
@@ -458,7 +496,7 @@ def configure_messages(cfg, team, operator, restart=()):
         harness = (team.pane(operator) or {}).get("agent")
         wait = operator_wait(harness, mode)
         if wait == "background":
-            action = "in the background and end your turn; it wakes you with messages and problems"
+            action = "in the background with --background-task and end your turn; it wakes you with messages and problems"
         else:
             action = "in the foreground, and again each time it returns while "
             action += "members are live" if harness in COMPOSER_WAIT else "a member works"
@@ -1499,24 +1537,32 @@ def report_launch_drift(team, plans):
 def cmd_status(args):
     require_herdr()
     cfg = cfg_of(args)
+    watcher = watcher_status(cfg)
+    print(f"registered operator watcher process: {watcher}", flush=True)
     team = Team(cfg)
     rows = [("Member", "Role", "Harness", "Model", "Thinking", "Status", "Pane")]
     operator = cfg.operator["name"]
+    operator_pane = team.pane(operator) or {}
     rows.append(("@" + operator, "operator", cfg.operator.get("harness", ""), cfg.operator.get("model", ""), cfg.operator.get("thinking", ""),
-                 team.status(operator), (team.pane(operator) or {}).get("pane_id", "")))
+                 team.status(operator), operator_pane.get("pane_id", "")))
     for name in cfg.members:
         p = plan(cfg, name)
         pane = team.pane(name)
         rows.append(("@" + name, p["role"], p["harness"], p["model"] or "?", p["thinking"], team.status(name),
                      (pane or {}).get("pane_id", "")))
     print_table(rows)
+    harness = operator_pane.get("agent")
+    if (watcher == "absent" and operator_wait(harness, "inbox") == "background"
+            and team.agent_panes.get(operator) == operator_pane.get("pane_id")
+            and any(team.status(n).startswith("working") for n in cfg.members)):
+        print("No operator watcher is registered. Check native tasks before starting a background wait.")
     try:
         with Inbox(cfg) as inbox:
             suffix = (f"; {len(inbox.unread)} unread message{'s' if len(inbox.unread) != 1 else ''}"
                       " (factory.py wait prints them)") if inbox.unread else ""
             route = configured_route(cfg, inbox.state if inbox.has_state else None)
             if route == "inbox":
-                style = operator_wait((team.pane(operator) or {}).get("agent"), route)
+                style = operator_wait(harness, route)
                 suffix = f", {style} wait" + suffix
             print(f"operator messages: {route}{suffix}")
     except (OSError, ValueError) as e:
@@ -1589,14 +1635,43 @@ def cmd_wait(args):
     """Watch messages and lifecycle changes, and keep verified Codex/pi operators listening through idle."""
     require_herdr()
     cfg = cfg_of(args)
-    watch = [n.lstrip("@") for n in args.names]
     try:
         with Inbox(cfg) as inbox:
             route = configured_route(cfg, inbox.state if inbox.has_state else None)
     except (InboxDamage, OSError):
         route = "unavailable"
-    live = herdr("agent", "get", cfg.operator["name"], check=False) if route == "inbox" else {}
+    name = cfg.operator["name"]
+    live = herdr("agent", "get", name, check=False)
     operator = live.get("agent") or {}
+    pane = os.environ.get("HERDR_PANE_ID")
+    native = (pane and operator.get("pane_id") == pane and operator.get("name") == name
+              and operator_wait(operator.get("agent"), "inbox") == "background")
+    if not args.background_task and native:
+        print("Start factory.py wait --background-task as a native background task and end your turn."
+              " See leading.md.", file=sys.stderr)
+        sys.exit(2)
+    if not args.background_task:
+        return wait_for_events(args, cfg, route, operator)
+    if not native:
+        print("cannot verify a background-capable operator in this pane. Check factory.py status and the operator pane.",
+              file=sys.stderr)
+        sys.exit(2)
+    try:
+        fd = watcher_lock(cfg, register=True)
+    except BlockingIOError:
+        print("operator wait already running. Reconcile the existing native task before starting another.", file=sys.stderr)
+        sys.exit(2)
+    except OSError as e:
+        print(f"cannot register the operator watcher: {e}", file=sys.stderr)
+        sys.exit(2)
+    try:
+        return wait_for_events(args, cfg, route, operator)
+    finally:
+        os.close(fd)
+
+
+def wait_for_events(args, cfg, route, operator):
+    watch = [n.lstrip("@") for n in args.names]
     harness = operator.get("agent")
     wait = operator_wait(harness, route)
     quiet = route == "inbox" and wait == "background" and not watch
@@ -1630,9 +1705,10 @@ def cmd_wait(args):
             if unread:
                 print_messages(unread)
                 next_watch = f", acknowledge by starting your next watcher in the {wait}" if route == "inbox" else ""
+                background_flag = " --background-task" if args.background_task else ""
                 print(f"{len(unread)} unread message{'s' if len(unread) != 1 else ''}."
                       f" After you have acted on or recorded these messages{next_watch}:"
-                      f" factory.py wait --seen {unread[-1]['id']}")
+                      f" factory.py wait{background_flag} --seen {unread[-1]['id']}")
         except (OSError, ValueError) as e:
             if args.seen is not None or quiet:
                 print(e, file=sys.stderr)
@@ -1835,6 +1911,8 @@ def main(argv=None):
     wt = sub.add_parser("wait", help="return for unread inbox messages or a blocked, gone or closed member; "
                                      "an operator's Codex/pi inbox watch also returns for queued owner input")
     wt.add_argument("names", nargs="*", help="watch only these members (default: every member)")
+    wt.add_argument("--background-task", action="store_true",
+                    help="declare a native background launch (required for Claude Code, omp and OpenCode operators)")
     wt.add_argument("--timeout", type=float, help="seconds before giving up (exit 4). Operator Codex/pi inbox waits "
                     "default to no deadline and 2147183 seconds respectively. Other foreground inbox waits default to 60, "
                     "all others to 1800")
