@@ -11,6 +11,7 @@
 #   prompt       how a member gets its standing instructions: `file` (appended to the system prompt),
 #                `pointer` (a system line names the file; the text also goes in the first message), `message`
 #   operator_wait  background (native task completion) or foreground; omit for member-only harnesses
+#   operator_wait_timeout  foreground operator's default wait in seconds (60 if omitted)
 #   dialogs      start-up questions `up` answers itself: text on the screen, then the herdr keys that accept it
 #   [x.permissions]  native flags per permission level. `full` (default) never stops for approval and adds no
 #                sandbox. `guarded` keeps the harness's own guard; only Claude Code and Codex have one.
@@ -48,6 +49,7 @@ full = ["--dangerously-bypass-approvals-and-sandbox"]
 guarded = ["--approve-for-me", "-c", "sandbox_workspace_write.network_access=true"]
 
 [pi]
+operator_wait = "foreground"
 label = "pi"
 install = "Install pi (`npm i -g @earendil-works/pi-coding-agent`) and configure a provider (`pi auth --help`)."
 models = ["openai/gpt-6-astra", "z-ai/glm-5.3", "moonshotai/kimi-k3", "x-ai/grok-4.7", "z-ai/glm-5.3-flash", "deepseek/deepseek-v4.1-flash-1017"]
@@ -60,6 +62,8 @@ full = []
 guarded = []
 
 [omp]
+operator_wait = "foreground"
+operator_wait_timeout = 240  # leave time before the 300-second Bash tool limit
 label = "omp"
 install = "Install oh-my-pi so `omp` is on PATH, and configure a provider."
 models = ["openai/gpt-6-astra", "z-ai/glm-5.3", "moonshotai/kimi-k3", "x-ai/grok-4.7", "z-ai/glm-5.3-flash", "deepseek/deepseek-v4.1-flash-1017"]

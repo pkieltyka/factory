@@ -1340,7 +1340,7 @@ def cmd_up(args):
         report_pending_messages(cfg)
     print(f"members reach @{operator} through the inbox. Run factory.py wait"
           + (" in a native background task." if wait == "background" else
-             " in the foreground during active work. Codex is not qualified for unattended idle delivery."))
+             " in the foreground during active work. This mode is not qualified for unattended idle delivery."))
     if not ready:
         return
     pickup_text = ("We are picking up where we left off. Check the tracker the brief above names, then send"
@@ -1564,13 +1564,14 @@ def cmd_wait(args):
                 warned = True
         team = Team(cfg)
         pane = team.pane(operator) or {}
-        wait = operator_wait(pane.get("agent"))
+        harness = pane.get("agent")
+        wait = operator_wait(harness)
         quiet = not watch and wait == "background"
         state = {n: team.status(n) for n in cfg.members if (not watch or n in watch) and team.pane(n)}
         if seen is None:  # the members this watch is about: a pane that closes later is noticed
             if timeout is None:
                 if wait == "foreground" and pane["pane_id"] == team.agent_panes.get(operator):
-                    timeout = 60
+                    timeout = TABLE[harness].get("operator_wait_timeout", 60)
                 elif watch:
                     timeout = 1800
                 if timeout is not None:
