@@ -17,13 +17,13 @@ Before any launch or restart, `up` checks the affected members with current `fac
 - After a herdr restart, run `up --restart`: herdr restores names and sessions but omits factory launch settings and standing-instruction flags. Plain `up` names the members it finds running without their permission flags or `args`.
 - Failed resume: inspect the error and use `up <name> --fresh` if the saved session cannot reopen.
 - `up` exits 3 for failed launches or brief deliveries and reports the affected members by name.
-- The inbox outlives the team. A cold `up` (no member live, no `--restart`) announces unread messages. Use `factory.py inbox 100` to reread the last 100 acknowledged messages.
+- The inbox outlives the team. A cold `up` (no member live, no `--restart`) announces unread messages. Use `factory.py wait --timeout 0` to read pending reports and `factory.py inbox 100` to reread the last 100 acknowledged messages.
 
 ## Reconcile before assigning
 
 When everyone is running, `up` sends nothing. Check the tracker and Git and use `say` to ask the members concerned for a one-line status.
 
-Read in this order: `FACTORY.md`, `factory.toml` and project plans; the tracker; Git (`git status`, `git log --oneline -10`, `git worktree list`, each worktree's `git -C <path> status` and `git diff <main>...<branch>`, and PRs and CI when the project has them); last, members' replies and the unread messages `wait` prints. Where they disagree, Git and CI outrank the tracker, and the tracker outranks anyone's memory, yours included. Have the tracker's owner correct a stale record; do not act on it.
+Read in this order: `FACTORY.md`, `factory.toml` and project plans; the tracker; Git (`git status`, `git log --oneline -10`, `git worktree list`, each worktree's `git -C <path> status` and `git diff <main>...<branch>`, and PRs and CI when the project has them); last, members' replies and the unread messages `wait --timeout 0` prints. Where they disagree, Git and CI outrank the tracker, and the tracker outranks anyone's memory, yours included. Have the tracker's owner correct a stale record; do not act on it.
 
 - Match every uncommitted change to an in-progress item before any member writes. A change no item explains is not built on, committed or discarded: ask the user.
 - A verdict covers only the commit or paths it names. Ask for a new review when the record has no verdict or no checks, when the branch moved past the reviewed commit, or when approved work was never committed.

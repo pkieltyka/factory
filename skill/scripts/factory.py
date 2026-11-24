@@ -111,8 +111,6 @@ class Config:
         harness = self.operator.get("harness")
         if harness is not None and (not isinstance(harness, str) or harness not in TABLE):
             raise SystemExit(f"[operator] harness {harness!r} is not one of {', '.join(TABLE)}")
-        if self.operator.get("messages", "inbox") not in ("inbox", "typed"):
-            raise SystemExit(f"[operator] messages {self.operator['messages']!r} must be inbox or typed")
         self.members = self.team.get("members", {})
         if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", str(self.operator["name"])) or self.operator["name"] in self.members:
             raise SystemExit(f"{self.conf_file}: [operator] name {self.operator['name']!r} must be lowercase letters,"
@@ -185,7 +183,7 @@ def plan(cfg, name):
     return {"name": name, "role": role, "harness": m["harness"], "model": model, "thinking": thinking,
             "readonly": meta["readonly"] == "true", "notes": m.get("notes", ""), "permissions": permissions,
             "args": [str(a) for a in m.get("args", [])], "branch": branch, "dir": str(where),
-            "draft_dir": cfg.messages / name}
+            "draft_dir": cfg.messages / name, "inbox_dir": cfg.cache}
 
 
 # ================================================================ availability checks
@@ -267,13 +265,12 @@ class Inbox:
         self.lock_path = self.path.with_suffix(".lock")
 
     @staticmethod
-    def private_open(path, flags, *, read_only=False):
+    def private_open(path, flags):
         fd = os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
         try:
             if not stat.S_ISREG(os.fstat(fd).st_mode):
                 raise OSError(f"not a regular file: {path}")
-            if not read_only:
-                os.fchmod(fd, 0o600)
+            os.fchmod(fd, 0o600)
             return fd
         except BaseException:
             os.close(fd)
@@ -289,9 +286,7 @@ class Inbox:
         self.lock = self.private_open(self.lock_path, os.O_CREAT | os.O_RDWR)
         try:
             fcntl.flock(self.lock, fcntl.LOCK_EX)
-            saved = self.read_state()
-            self.has_state = saved is not None
-            self.state = saved if self.has_state else {"mode": "typed", "seen": 0}
+            self.state = self.read_state()
             raw = self.read(self.path) or b""
             if raw and not raw.endswith(b"\n"):
                 raise InboxDamage(self.path, raw.count(b"\n") + 1, "incomplete line")
@@ -305,28 +300,26 @@ class Inbox:
     def __exit__(self, *_):
         os.close(self.lock)
 
-    def read(self, path, *, read_only=False):
+    def read(self, path):
         try:
-            fd = self.private_open(path, os.O_RDONLY, read_only=read_only)
+            fd = self.private_open(path, os.O_RDONLY)
         except FileNotFoundError:
             return None
         with os.fdopen(fd, "rb") as f:
             return f.read()
 
-    def read_state(self, *, read_only=False):
-        # save_state replaces the file atomically, so reading the route alone needs no lock.
-        raw = self.read(self.state_path, read_only=read_only)
+    def read_state(self):
+        raw = self.read(self.state_path)
         if raw is None:
-            return None
+            return {"seen": 0}
         state = self.decode(raw, self.state_path, 1)
-        if (not isinstance(state, dict) or state.get("mode") not in ("inbox", "typed")
-                or type(state.get("seen")) is not int or state["seen"] < 0):
-            raise InboxDamage(self.state_path, 1, "expected mode and non-negative integer seen")
+        if not isinstance(state, dict) or type(state.get("seen")) is not int or state["seen"] < 0:
+            raise InboxDamage(self.state_path, 1, "expected non-negative integer seen")
         history = state.get("history", [])
         self.validate_rows(history, self.state_path)
         if len(history) > 100 or (history and history[-1]["id"] > state["seen"]):
             raise InboxDamage(self.state_path, 1, "expected at most 100 acknowledged history entries, none above seen")
-        return state
+        return {"seen": state["seen"], "history": history}
 
     @staticmethod
     def decode(raw, path, line):
@@ -375,7 +368,6 @@ class Inbox:
 
     def save_state(self):
         self.replace(self.state_path, (json.dumps(self.state) + "\n").encode())
-        self.has_state = True
 
     def remove_seen(self):
         unread = self.unread
@@ -416,54 +408,20 @@ def cmd_inbox(args):
         raise SystemExit(2)
 
 
-def configured_route(cfg, state):
-    if state and (state["mode"] == "inbox" or cfg.operator.get("messages") == "typed"):
-        return state["mode"]
-    return "unavailable"
+def operator_wake(harness):
+    return TABLE.get(harness, {}).get("operator_wake")
 
 
-def message_route(cfg):
-    try:
-        return configured_route(cfg, Inbox(cfg).read_state(read_only=True))
-    except (InboxDamage, OSError):
-        return "unavailable"
-
-
-def operator_wait(harness, route):
-    return TABLE.get(harness, {}).get("operator_wait", "foreground") if route == "inbox" else "background"
-
-
-def configure_messages(cfg, team, operator, restart=()):
-    mode = cfg.operator.get("messages", "inbox")
+def report_pending_messages(cfg):
     try:
         with Inbox(cfg) as inbox:
-            previous = inbox.state["mode"] if inbox.has_state else None
-            if not restart and not any(team.live(n) for n in cfg.members):
-                inbox.remove_seen()
-                if inbox.unread:
-                    print(f"{len(inbox.unread)} unread message{'s' if len(inbox.unread) != 1 else ''}"
-                          " from the earlier team; factory.py wait prints them")
-            inbox.state["mode"] = mode
-            inbox.save_state()
+            inbox.remove_seen()
+            unread = inbox.unread
+        if unread:
+            print(f"{len(unread)} unread message{'s' if len(unread) != 1 else ''}"
+                  " from the earlier team; run factory.py wait --timeout 0")
     except (InboxDamage, OSError) as e:
-        print(str(e) if isinstance(e, InboxDamage) else
-              f"inbox unavailable: {str(e).rstrip('.')}. Operator messages are unavailable."
-              " After fixing it, run factory.py up.")
-        return
-    if mode == "inbox":
-        wait = operator_wait((team.pane(operator) or {}).get("agent"), mode)
-        action = ("in the background and end your turn; it wakes you with messages and problems" if wait == "background" else
-                  "in the foreground, and again each time it returns while a member works")
-        print(f"members reach @{operator} through the inbox; run factory.py wait {action}")
-    else:
-        print(f'members reach @{operator} by typed herdr messages ([operator] messages = "typed")')
-    if previous == "typed" and mode == "inbox" and any(
-        n not in restart and (team.pane(n) or {}).get("agent") == "codex"
-        and (member.get("permissions") or cfg.team.get("permissions")) == "guarded"
-        for n, member in cfg.members.items()
-    ):
-        print("Restart any guarded Codex members launched on the typed route with factory.py up <name> --restart"
-              " to grant inbox access.")
+        print(str(e) if isinstance(e, InboxDamage) else f"inbox unavailable: {e}")
 
 
 def message_text(args):
@@ -514,8 +472,6 @@ def queue_message(cfg, sender, text):
     started = False
     try:
         with Inbox(cfg) as inbox:
-            if not inbox.has_state or inbox.state["mode"] != "inbox":
-                return "refused", "the operator inbox route changed. Check factory.py status before retrying."
             inbox.remove_seen()
             row = {"id": inbox.highest + 1, "at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                    "from": sender, "text": text}
@@ -754,7 +710,7 @@ def argv_codex(m, prompt_file, resume):
     argv = ["-m", m["model"], "-C", m["dir"], "-c", f"model_reasoning_effort={json.dumps(m['thinking'])}",
             "-c", f"developer_instructions={json.dumps(pointer)}"]
     if m["permissions"] == "guarded":
-        argv += ["--add-dir", str(m.get("inbox_dir") or m["draft_dir"])]
+        argv += ["--add-dir", str(m["inbox_dir"])]
     return (["resume", session_id(resume)] if resume else []) + argv, {}
 
 
@@ -1028,9 +984,7 @@ class Team:
         return p.get("agent_status", "?")
 
 
-def ensure_operator(cfg, tab=False):
-    """Name the operator's agent and label its pane after `[operator] name`; when launching, label its tab
-    too. Returns the name."""
+def caller_agent():
     pane = os.environ.get("HERDR_PANE_ID")
     if not pane:
         raise SystemExit("HERDR_PANE_ID is not set; run this from the operator's herdr pane.")
@@ -1038,8 +992,16 @@ def ensure_operator(cfg, tab=False):
     info = got.get("agent") or {}
     if "error" in got and "not_found" not in got["error"]:  # herdr itself failed: say that, not "no agent"
         raise SystemExit(f"herdr agent get {pane}: {got['error']}")
-    if not info:
+    if not info or info.get("pane_id") != pane:
         raise SystemExit(f"herdr sees no agent in this pane ({pane}). Run factory.py from the operator's pane.")
+    return info
+
+
+def ensure_operator(cfg, tab=False, info=None):
+    """Name and label the operator's pane, and its tab when launching. Return the name."""
+    if info is None:
+        info = caller_agent()
+    pane = info["pane_id"]
     name = cfg.operator["name"]
     if info.get("name") != name:
         clash = [a for a in herdr("agent", "list").get("agents", []) if a.get("name") == name]
@@ -1104,8 +1066,6 @@ def launch(cfg, team, m, operator, timeout, resume=None):
         except OSError as e:
             return f"could not prepare the message directory: {e}"
     prompt_file.write_text(member_prompt(m, operator, cfg))  # written fresh at each launch
-    if cfg.operator.get("messages", "inbox") == "inbox":
-        m = {**m, "inbox_dir": str(cfg.cache)}
     if m["harness"] == "claude":
         # Keep the typed launch command below macOS's 1024-byte line limit.
         prompt_file.with_suffix(".settings.json").write_text(
@@ -1353,9 +1313,15 @@ def cmd_up(args):
     if not plans:
         raise SystemExit(f"no members in {CONF}; add one, then run `factory.py up`")
     require_herdr()
+    info = caller_agent()
+    wake = operator_wake(info.get("agent"))
+    if not wake:
+        print(f"{info.get('agent') or 'unknown harness'} is not supported as operator yet.", file=sys.stderr)
+        sys.exit(2)
     # The operator pane may still carry a member name or label from an earlier team.
     team = Team(cfg, exclude_pane=os.environ.get("HERDR_PANE_ID"))
-    if not any(team.live(n) for n in cfg.members):
+    cold = not any(team.live(n) for n in cfg.members)
+    if cold:
         report_leftover_drafts(cfg)
     running = [m["name"] for m in plans if not args.restart and team.live(m["name"])]
     ready = checked(cfg, [m for m in plans if m["name"] not in running])
@@ -1369,8 +1335,11 @@ def cmd_up(args):
     if running:
         print(f"already running: {', '.join(running)}")
         report_launch_drift(team, [m for m in plans if m["name"] in running])
-    operator = ensure_operator(cfg, tab=True)
-    configure_messages(cfg, Team(cfg), operator, restart=[m["name"] for m in plans] if args.restart else ())
+    operator = ensure_operator(cfg, tab=True, info=info)
+    if cold and not args.restart:
+        report_pending_messages(cfg)
+    print(f"members reach @{operator} through the inbox; run factory.py wait"
+          + (" in a native background task" if wake == "background" else " --timeout 0 to read pending reports"))
     if not ready:
         return
     pickup_text = ("We are picking up where we left off. Check the tracker the brief above names, then send"
@@ -1512,6 +1481,41 @@ def harness_argv(info, harness):
     return procs[0] if len(procs) == 1 else None
 
 
+def codex_thread(info):
+    ref = info.get("agent_session")
+    if (info.get("agent") != "codex" or not isinstance(ref, dict) or ref.get("agent") != "codex"
+            or ref.get("kind") not in ("id", "path") or not isinstance(ref.get("value"), str)):
+        return None
+    thread = session_id(ref)
+    return thread if re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", thread) else None
+
+
+def wake_codex(team, name):
+    """Try one fixed reminder after the inbox append. Return an advisory reason on failure."""
+    pane_id = team.agent_panes.get(name)
+    if not pane_id or (team.pane(name) or {}).get("pane_id") != pane_id:
+        return "the operator's pane could not be verified"
+    try:
+        agent = herdr("agent", "get", name, check=False, timeout=2).get("agent") or {}
+        thread = codex_thread(agent)
+        if agent.get("name") != name or agent.get("pane_id") != pane_id or not thread:
+            return "the operator's current Codex thread could not be verified"
+        processes = herdr("pane", "process-info", "--pane", pane_id, check=False, timeout=2)
+        argv = harness_argv(processes, "codex")
+        if not argv or any(arg.split("=", 1)[0] == "--remote" for arg in argv):
+            return "the operator's Codex process could not be verified as local"
+        pane = herdr("pane", "get", pane_id, check=False, timeout=2).get("pane") or {}
+        if pane.get("pane_id") != pane_id or pane.get("label") != name or codex_thread(pane) != thread:
+            return "the operator's Codex pane or thread changed"
+        result = subprocess.run(["codex", "queue", "--thread", thread, "--message", "run factory.py wait --timeout 0"],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+        if result.returncode:
+            return f"codex queue exited {result.returncode}"
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return str(e)
+    return None
+
+
 def report_launch_drift(team, plans):
     """herdr can restore a member itself, e.g. after its server restarts, without the flags factory launched it
     with. Name the live members whose harness demonstrably lacks their permission flags or extra args."""
@@ -1545,13 +1549,10 @@ def cmd_status(args):
     print_table(rows)
     try:
         with Inbox(cfg) as inbox:
-            suffix = (f"; {len(inbox.unread)} unread message{'s' if len(inbox.unread) != 1 else ''}"
-                      " (factory.py wait prints them)") if inbox.unread else ""
-            route = configured_route(cfg, inbox.state if inbox.has_state else None)
-            if route == "inbox":
-                style = operator_wait((team.pane(operator) or {}).get("agent"), route)
-                suffix = f", {style} wait" + suffix
-            print(f"operator messages: {route}{suffix}")
+            unread = len(inbox.unread)
+            suffix = (f"; {unread} unread message{'s' if unread != 1 else ''}"
+                      " (factory.py wait --timeout 0 prints them)") if unread else ""
+            print(f"operator messages: inbox{suffix}")
     except (OSError, ValueError) as e:
         print(f"operator messages: unavailable ({e})")
     for state, hint in (("blocked", "blocked: waiting on an approval or a question."),
@@ -1564,23 +1565,16 @@ def cmd_status(args):
 
 
 def cmd_wait(args):
-    """Watch messages and problems. Unnamed background inbox watches ignore idle/done/unknown transitions;
-    other watches also return when a member stops, status is unknown, or nobody works. Named watches track
-    only those members' lifecycle changes. Inbox messages from any member always end the wait."""
+    """Read inbox messages or wait for reports and member events."""
     require_herdr()
     cfg = cfg_of(args)
     watch = [n.lstrip("@") for n in args.names]
-    try:
-        with Inbox(cfg) as inbox:
-            route = configured_route(cfg, inbox.state if inbox.has_state else None)
-    except (InboxDamage, OSError):
-        route = "unavailable"
-    live = herdr("agent", "get", cfg.operator["name"], check=False) if route == "inbox" else {}
-    wait = operator_wait((live.get("agent") or {}).get("agent"), route)
-    quiet = route == "inbox" and wait == "background" and not watch
-    if args.timeout is None:
-        args.timeout = 60 if wait == "foreground" else 1800
-    deadline, seen, worked, looks = time.monotonic() + args.timeout, None, set(), 0
+    snapshot = not watch and args.timeout == 0
+    timeout = args.timeout
+    if timeout is None and watch:
+        timeout = 1800
+    deadline = None if snapshot or timeout is None else time.monotonic() + timeout
+    seen, worked, looks = None, set(), 0
     warned = False
     while True:
         try:
@@ -1591,19 +1585,20 @@ def cmd_wait(args):
                 unread = inbox.unread
             if unread:
                 print_messages(unread)
-                next_watch = f", acknowledge by starting your next watcher in the {wait}" if route == "inbox" else ""
                 print(f"{len(unread)} unread message{'s' if len(unread) != 1 else ''}."
-                      f" After you have acted on or recorded these messages{next_watch}:"
-                      f" factory.py wait --seen {unread[-1]['id']}")
+                      " After you have acted on or recorded these messages:"
+                      f" factory.py wait --seen {unread[-1]['id']} --timeout 0")
+            if unread or snapshot:
                 return
         except (OSError, ValueError) as e:
-            if args.seen is not None or quiet:
+            if args.seen is not None or not watch:
                 print(e, file=sys.stderr)
                 raise SystemExit(2)
             if not warned:
                 print(f"inbox unavailable: {e}" if isinstance(e, OSError) else str(e), flush=True)
                 warned = True
         team = Team(cfg)
+        quiet = not watch and operator_wake((team.pane(cfg.operator["name"]) or {}).get("agent")) == "background"
         state = {n: team.status(n) for n in cfg.members if (not watch or n in watch) and team.pane(n)}
         if seen is None:  # the members this watch is about: a pane that closes later is noticed
             missing = [n for n in watch if n not in state]
@@ -1621,10 +1616,10 @@ def cmd_wait(args):
         stopped = [] if quiet else [n for n in settled if n in worked or (n in watch and looks > 1)]
         if closed or needs or stopped or (not quiet and looks > 1 and (unclear or not working)):
             break
-        if time.monotonic() >= deadline:
+        if deadline is not None and time.monotonic() >= deadline:
             activity = "still working: " + ", ".join("@" + n for n in working) if working else "nobody is working"
             unknown = "; status unknown: " + ", ".join("@" + n for n in unclear) if unclear else ""
-            print(f"timeout after {args.timeout:g}s; {activity}{unknown}")
+            print(f"timeout after {timeout:g}s; {activity}{unknown}")
             sys.exit(4)
         worked.update(working)
         time.sleep(args.interval)
@@ -1640,8 +1635,7 @@ def cmd_wait(args):
     for n in stopped:
         print(f"@{n} stopped ({state[n]}).")
     if not (closed or needs or unclear or stopped):
-        hint = ". End your turn; run factory.py wait again after you assign work." if wait == "foreground" else ""
-        print(f"nobody is working: {', '.join('@' + n + ' ' + s for n, s in state.items())}{hint}")
+        print(f"nobody is working: {', '.join('@' + n + ' ' + s for n, s in state.items())}")
 
 
 def cmd_brief(args):
@@ -1685,20 +1679,22 @@ def cmd_say(args):
         raise SystemExit("choose another teammate as the recipient")
     if not names:
         raise SystemExit("not running: any member")
-    route = message_route(cfg) if operator in names else None
     refused, unconfirmed = [], False
     for name in dict.fromkeys(names):
-        if name == operator and route == "inbox":
+        if name == operator:
             outcome, detail = queue_message(cfg, sender, text)
-        elif name == operator and route != "typed":
-            outcome, detail = "refused", "operator messages are unavailable. Check factory.py status and rerun factory.py up."
-        elif (name != operator and name not in cfg.members) or not team.live(name):
+        elif name not in cfg.members or not team.live(name):
             outcome, detail = "refused", f"not running: {name}"
         else:
             detail = prompt_error(name, f"{tag(sender)} {text}")
             outcome = "submitted" if detail is None else "refused" if delivery_refused(detail) else "unconfirmed"
         if outcome == "queued":
             print(f"queued message {detail} for @{name}")
+            if member and operator_wake((team.pane(name) or {}).get("agent")) == "queue":
+                reason = wake_codex(team, name)
+                if reason:
+                    print(f"operator wake unconfirmed for @{name}: {reason}. "
+                          "The report is in the inbox; run factory.py wait --timeout 0 to read it.", file=sys.stderr)
         elif outcome == "submitted":
             print(f"submitted your message to @{name}")
         elif outcome == "refused":
@@ -1783,7 +1779,7 @@ def main(argv=None):
     wt = sub.add_parser("wait", help="return for unread inbox messages or a blocked, gone or closed member; "
                                      "outside a quiet watch also when a member stops or nobody is working")
     wt.add_argument("names", nargs="*", help="watch only these members (default: every member)")
-    wt.add_argument("--timeout", type=float, help="seconds before giving up (exit 4; default: foreground inbox 60, otherwise 1800)")
+    wt.add_argument("--timeout", type=float, help="seconds before giving up (exit 4); 0 without names reads the inbox once")
     wt.add_argument("--interval", type=float, default=5, help="seconds between looks")
     wt.add_argument("--seen", type=int, help="acknowledge inbox messages through this id, then wait. "
                                             "Reread them with factory.py inbox")

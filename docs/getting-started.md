@@ -27,14 +27,12 @@ cd factory
 
 ### Operator harnesses
 
-Claude Code and Codex make good operators, and medium to high thinking works well. Feel free to try any harness and model. The session where you run setup stays the operator when you run `up`.
+Claude Code and OpenCode receive reports through native background task completion. Local Codex receives native queue reminders when senders can reach its thread. Use it unattended only after verifying wake across thread changes and with your sender permissions. pi, omp and agy are supported as members and are not supported as operators yet. The session where you run setup stays the operator when you run `up`.
 
 | Operator harness | Install the skill at | Enter in its conversation |
 |---|---|---|
 | Claude Code | `~/.claude/skills/factory` | `/factory setup` |
 | Codex | `~/.agents/skills/factory` | `$factory setup` |
-| pi | `~/.pi/agent/skills/factory` | `/skill:factory setup` |
-| omp | `~/.omp/agent/skills/factory` | `/skill:factory setup` with skill commands enabled |
 | [OpenCode v2](https://opencode.ai/docs/skills/#loading) | `~/.config/opencode/skills/factory` | `@factory setup` |
 
 The Claude Code invocation has been tried live. The other entries were checked against the harness documentation or source. The commands below use Claude Code's spelling. In another harness, keep its prefix and replace `setup` with the command you need.
@@ -55,15 +53,13 @@ If a sandboxed Codex operator is denied access to Herdr, you can approve a singl
 The prefix `["python3", "/absolute/trusted/install/scripts/factory.py", "wait"]` covers both of these calls.
 
 ```bash
-python3 /absolute/trusted/install/scripts/factory.py wait --seen 12 --timeout 120
-python3 /absolute/trusted/install/scripts/factory.py wait --seen 15 --timeout 60
+python3 /absolute/trusted/install/scripts/factory.py wait --seen 12 --timeout 0
+python3 /absolute/trusted/install/scripts/factory.py wait --seen 15 --timeout 0
 ```
 
 Choose which other prefixes to save, one operation at a time. Common candidates are the same script with `status`, `inbox` or `say`, and `herdr integration status`. Keep approvals for team-changing commands such as `up` and `down` separate. Run each command standalone so Codex can match the prefix.
 
 Writable roots for the Factory cache or external worktrees (`--add-dir`) and Unix socket access are separate permissions. The workspace setting `sandbox_workspace_write.network_access=true` grants broader network access. If Codex runs in an externally sandboxed VM, you can explicitly start the operator with `codex --dangerously-bypass-approvals-and-sandbox`, which disables both controls for that session. `-a never` alone keeps the configured sandbox. Factory's `full` and `guarded` settings apply to the members it launches. [Codex permissions](https://developers.openai.com/codex/permissions) · [Configuration reference](https://developers.openai.com/codex/config-reference) · [Member permissions](../skill/references/cmd_setup.md#permissions)
-
-With the inbox, a Codex operator keeps `wait` in the foreground and resumes the same tool handle after a yield. [Wait recipes](../skill/references/leading.md#receive-and-inspect)
 
 ## Form the team
 

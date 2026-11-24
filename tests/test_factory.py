@@ -69,6 +69,8 @@ FAKE_HERDR = textwrap.dedent(r'''
                             for h in ("claude", "codex", "pi", "omp", "opencode", "antigravity-cli"))
         save(); print(os.environ.get("FAKE_INTEGRATION_STATUS", current)); sys.exit(0)
     if a[:2] == ["agent", "list"]:
+        if os.environ.get("FAKE_ROSTER_FAIL"):
+            fail("roster_failed")
         change = s.get("on_second_poll")
         if change:
             s["polls"] = s.get("polls", 0) + 1
@@ -93,6 +95,8 @@ FAKE_HERDR = textwrap.dedent(r'''
         out({"type": "pane_list", "panes": [view(p, "pane") for p in panes.values()]})
     if a[:2] == ["pane", "get"]:
         p = panes.get(a[2])
+        if p and p.get("label") == "operator" and s.get("operator_thread_on_pane_get"):
+            p["agent_session"]["value"] = s.pop("operator_thread_on_pane_get")
         out({"type": "pane_info", "pane": view(p, "pane")}) if p else fail("pane_not_found")
     if a[:2] == ["pane", "close"]:
         if a[2] == os.environ.get("FAKE_CLOSE_FAIL"):
@@ -556,7 +560,7 @@ class UpTests(unittest.TestCase):
             self.assertIn("Cannot launch: 1 member(s)", p.stdout)
             self.assertIn("pi has no model z-ai/glm-9 configured", p.stdout)
             self.assertIn("OpenRouter key", p.stdout)
-            self.assertTrue(all(c[:2] in (["agent", "list"], ["pane", "list"]) for c in e.calls()), e.calls())
+            self.assertEqual(e.calls(), [["agent", "get", e.env["HERDR_PANE_ID"]], ["agent", "list"], ["pane", "list"]])
 
     def test_up_can_be_run_again_after_a_partial_launch(self):
         with Env(UI) as e:
@@ -1012,48 +1016,22 @@ class UpTests(unittest.TestCase):
             e.run("brief", "--send", "all")
             self.assertEqual(e.prompts(), expected + expected)
 
-    def test_member_addresses_configured_operator_on_its_route(self):
-        for mode in ("typed", "inbox", "missing", "damaged", "unreadable", "implicit-typed"):
-            typed = mode in ("typed", "missing", "damaged")
-            operator = {"name": "lead", "messages": "typed" if typed else "inbox"}
-            with self.subTest(mode=mode), Env(formation({"reviewer": CATALOG_MEMBERS["reviewer"]},
-                                                         operator=operator)) as e:
-                e.run("up", "--no-brief")
-                with patch.dict(os.environ, e.env):
-                    cfg = factory.Config(e.repo)
-                    draft = cfg.messages / "reviewer/message-one.md"
-                    inbox = factory.Inbox(cfg)
-                text = "Reviewer's report with `literal` $ and a final @lead"
-                draft.write_text(text)
-                if mode == "inbox":
-                    e.close("lead")  # queueing does not require an operator pane
-                elif mode == "missing":
-                    inbox.state_path.unlink()
-                elif mode == "damaged":
-                    inbox.state_path.write_text('{"mode":"typed"')
-                elif mode == "unreadable":
-                    inbox.state_path.unlink()
-                    inbox.state_path.mkdir()
-                elif mode == "implicit-typed":
-                    inbox.state_path.write_text('{"mode":"typed","seen":0}')
-                result = e.say("reviewer", "lead", "--file", str(draft), check=False)
-                if mode == "typed":
-                    self.assertEqual(result.returncode, 0)
-                    self.assertEqual(e.prompts(), [("lead", "[from @reviewer]: " + text + "\n")])
-                    self.assertFalse(draft.exists())
-                elif mode == "inbox":
-                    self.assertEqual(result.returncode, 0)
-                    self.assertIn("queued message 1 for @lead", result.stdout)
-                    self.assertFalse(e.prompts())
-                    self.assertFalse(draft.exists())
-                    row = json.loads(inbox.path.read_text())
-                    self.assertEqual((row["from"], row["text"]), ("reviewer", text))
-                else:
-                    self.assertEqual(result.returncode, 1)
-                    self.assertIn("not sent to @lead: operator messages are unavailable", result.stdout)
-                    self.assertFalse(e.prompts())
-                    self.assertFalse(inbox.path.exists())
-                    self.assertEqual(draft.read_text(), text)
+    def test_member_queues_for_configured_operator_without_a_pane(self):
+        with Env(formation({"reviewer": CATALOG_MEMBERS["reviewer"]}, operator={"name": "lead"})) as e:
+            e.run("up", "--no-brief")
+            with patch.dict(os.environ, e.env):
+                cfg = factory.Config(e.repo)
+                draft = cfg.messages / "reviewer/message-one.md"
+                inbox = factory.Inbox(cfg)
+            text = "Reviewer's report with `literal` $ and a final @lead"
+            draft.write_text(text)
+            e.close("lead")
+            self.assertIn("queued message 1 for @lead", e.say("reviewer", "lead", "--file", str(draft)).stdout)
+            self.assertFalse(e.prompts())
+            self.assertFalse(draft.exists())
+            row = json.loads(inbox.path.read_text())
+            self.assertEqual((row["from"], row["text"]), ("reviewer", text))
+
 
     def test_draft_name_validation_is_scoped_to_the_sender_folder(self):
         with Env(UI) as e:
@@ -1231,7 +1209,7 @@ class WorktreeTests(unittest.TestCase):
             p = e.run("up", "backend-dev", check=False)
             self.assertEqual(p.returncode, 2)
             self.assertIn("a worktree needs a git repository with a commit", p.stdout)
-            self.assertTrue(all(c[:2] in (["agent", "list"], ["pane", "list"]) for c in e.calls()), e.calls())
+            self.assertEqual(e.calls(), [["agent", "get", e.env["HERDR_PANE_ID"]], ["agent", "list"], ["pane", "list"]])
 
     def test_distinct_branches_cannot_share_a_worktree_path(self):
         brief = formation({
@@ -1311,9 +1289,8 @@ class WorktreeTests(unittest.TestCase):
 
 
 class InboxTests(unittest.TestCase):
-    def prepare(self, e, mode="inbox"):
+    def prepare(self, e):
         with patch.dict(os.environ, e.env), factory.Inbox(factory.Config(e.repo)) as inbox:
-            inbox.state["mode"] = mode
             inbox.save_state()
             return inbox
 
@@ -1330,7 +1307,7 @@ class InboxTests(unittest.TestCase):
         with patch.dict(os.environ, e.env):
             return factory.queue_message(factory.Config(e.repo), "lead-dev", "literal '$herdr' @pm.")
 
-    def test_operator_route_and_generated_text_for_every_member_harness(self):
+    def test_inbox_and_generated_text_for_every_member_harness(self):
         members = {"lead-dev": {**CATALOG_MEMBERS["lead-dev"], "permissions": "guarded"},
                    "architect": CATALOG_MEMBERS["architect"], "pm": CATALOG_MEMBERS["pm"],
                    "reviewer": {"harness": "omp", "model": "openai/gpt-6-astra", "thinking": "high"},
@@ -1369,13 +1346,13 @@ class InboxTests(unittest.TestCase):
             prompt, brief = e.run("prompt", "lead-dev").stdout, e.run("brief").stdout
             unset = e.run("up").stdout
             self.assertIn("through the inbox", unset)
-            self.assertIn("wait in the background", unset)
+            self.assertIn("wait in a native background task", unset)
             e.set_session("lead-dev", {"agent": "codex", "kind": "id", "value": "saved"})
             e.run("up", "lead-dev", "--restart")
             closing = dict(e.prompts())["lead-dev"].split("We are picking up")[1]
             e.write_brief(formation({n: CATALOG_MEMBERS[n] for n in ("lead-dev", "frontend-dev", "reviewer", "pm")},
                                     operator={"harness": "codex"}))
-            e.update("operator", agent="pi")
+            e.update("operator", agent="codex")
             e.run("up", "lead-dev", "--restart")
             self.assertEqual(prompt, e.run("prompt", "lead-dev").stdout)
             # The Roles row changes with configuration; the generated messaging sentence does not.
@@ -1384,10 +1361,9 @@ class InboxTests(unittest.TestCase):
             self.assertEqual(closing, dict(e.prompts())["lead-dev"].split("We are picking up")[1])
             e.write_brief(formation({"lead-dev": CATALOG_MEMBERS["lead-dev"]}, operator={"harness": "claude"}))
             e.update("operator", agent="codex")
-            self.assertIn("wait in the foreground", e.run("up").stdout)
+            self.assertIn("wait --timeout 0", e.run("up").stdout)
             e.update("operator", agent="claude")
-            self.assertIn("wait in the background", e.run("up").stdout)
-            self.assertNotIn("route to @operator changed", e.run("up", "--restart").stdout)
+            self.assertIn("wait in a native background task", e.run("up").stdout)
             e.write_brief(formation({"lead-dev": CATALOG_MEMBERS["lead-dev"]}, operator={"harness": "unknown"}))
             self.assertIn("[operator] harness 'unknown' is not one of", e.run("check", check=False).stderr)
         self.assertNotIn("inbox", factory.claude_settings("guarded"))
@@ -1402,7 +1378,7 @@ class InboxTests(unittest.TestCase):
             e.update(None, agent="codex")
             stale = e.run("up").stdout
             self.assertIn("through the inbox", stale)
-            self.assertIn("wait in the foreground", stale)
+            self.assertIn("wait --timeout 0", stale)
             self.assertEqual(e.pane_of("operator")["pane_id"], e.env["HERDR_PANE_ID"])
             self.assertEqual(e.pane_of("operator")["agent"], "codex")
             self.assertEqual(list(e.starts()), ["architect"])
@@ -1414,133 +1390,22 @@ class InboxTests(unittest.TestCase):
             local.write_text(local.read_text().replace('harness = "claude"', 'harness = "codex"', 1))
             corrected = e.run("up").stdout
             self.assertIn("through the inbox", corrected)
-            self.assertIn("wait in the foreground", corrected)
+            self.assertIn("wait --timeout 0", corrected)
             self.assertEqual(len(e.calls("agent", "start")), 1)
             self.assertEqual(tomllib.loads(sample.read_text())["operator"]["harness"], "claude")
 
-    def test_operator_messages_opt_out(self):
-        members = {"lead-dev": {**CATALOG_MEMBERS["lead-dev"], "permissions": "guarded"},
-                   "architect": CATALOG_MEMBERS["architect"]}
-        for harness, mode in (("claude", "background"), ("codex", "foreground")):
-            with self.subTest(harness=harness), Env(formation(members, operator={"harness": harness,
-                                                                                 "messages": "typed"})) as e:
+    def test_preflight_refuses_unsupported_operator_harnesses(self):
+        for harness in ("pi", "omp", "agy"):
+            with self.subTest(harness=harness), Env(UI) as e:
                 e.update(None, agent=harness)
-                before = e.run("prompt", "lead-dev").stdout
-                self.assertIn('by typed herdr messages ([operator] messages = "typed")',
-                              e.run("up").stdout)
-                self.assertEqual(before, e.run("prompt", "lead-dev").stdout)
-                self.assertIn("operator messages: typed", e.run("status").stdout)
-                starts = {c[2]: c for c in e.calls("agent", "start")}
-                self.assertTrue(flag(starts["lead-dev"], "--add-dir").endswith("/messages/lead-dev"))
-                self.assertNotIn("inbox send", " ".join(starts["architect"]))
-                with patch.dict(os.environ, e.env):
-                    with factory.Inbox(factory.Config(e.repo)) as inbox:
-                        self.assertEqual(inbox.state["mode"], "typed")
-                for name in members:
-                    e.update(name, agent_status="done")
-                self.assertNotIn("End your turn", e.run("wait", "--interval", "0").stdout)
+                result = e.run("up", check=False)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(f"{harness} is not supported as operator yet", result.stderr)
+                self.assertEqual(e.calls(), [["agent", "get", e.env["HERDR_PANE_ID"]]])
+                self.assertIn("operator messages: inbox", e.run("status").stdout)
+                self.assertEqual(e.run("wait", "--timeout", "0").stdout, "")
+                e.run("down")
 
-                e.write_brief(formation(members, operator={"harness": harness, "messages": "inbox"}))
-                switch = e.run("up").stdout
-                self.assertIn("through the inbox", switch)
-                self.assertIn("Restart any guarded Codex members launched on the typed route", switch)
-                explicit = e.run("prompt", "lead-dev").stdout
-                e.write_brief(formation(members, operator={"harness": harness}))
-                self.assertIn("through the inbox", e.run("up").stdout)
-                self.assertEqual(explicit, e.run("prompt", "lead-dev").stdout)
-                self.send(e, "pending before opt-out")
-                self.assertIn(f"acknowledge by starting your next watcher in the {mode}: factory.py wait --seen 1",
-                              e.run("wait").stdout)
-                with patch.dict(os.environ, e.env):
-                    path = factory.Inbox(factory.Config(e.repo)).path
-                pending = path.read_bytes()
-                e.write_brief(formation(members, operator={"harness": harness, "messages": "typed"}))
-                switch = e.run("up").stdout
-                self.assertIn("by typed herdr messages", switch)
-                self.assertNotIn("--restart", switch)
-                self.assertEqual(pending, path.read_bytes())
-                output = e.run("wait").stdout
-                self.assertIn("pending before opt-out", output)
-                self.assertIn("After you have acted on or recorded these messages: factory.py wait --seen 1", output)
-                e.run("wait", "--seen", "1", "--interval", "0", check=False)
-                self.assertEqual(path.read_bytes(), b"")
-                path.with_suffix(".json").unlink()
-                recreated = e.run("up").stdout
-                self.assertIn("by typed herdr messages", recreated)
-                self.assertNotIn("changed", recreated)
-                self.assertNotIn("--restart", recreated)
-
-        for value in ("invalid", "", True, 1, ["typed"]):
-            with self.subTest(value=value), Env(formation(members, operator={"messages": value})) as e:
-                result = e.run("check", check=False)
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn(f"[operator] messages {value!r} must be inbox or typed", result.stderr)
-
-    def test_operator_wait_modes_and_timeout_defaults(self):
-        def timeout(e, expected, explicit=None):
-            args = types.SimpleNamespace(cwd=str(e.repo), names=[], seen=None, timeout=explicit, interval=0)
-            out = io.StringIO()
-            with patch.dict(os.environ, e.env), patch.object(factory, "HERDR", e.env["HERDR_BIN"]), \
-                    patch.object(factory, "Team") as team, \
-                    patch.object(factory.time, "monotonic", side_effect=[0, 10000]), contextlib.redirect_stdout(out):
-                team.return_value.pane.return_value = {"pane_id": "fake"}
-                team.return_value.status.return_value = "working"
-                with self.assertRaises(SystemExit) as ex:
-                    factory.cmd_wait(args)
-            self.assertEqual(ex.exception.code, 4)
-            self.assertIn(f"timeout after {expected}s", out.getvalue())
-
-        def idle_wait(e):
-            now = 0
-
-            def advance(_):
-                nonlocal now
-                now += 1
-
-            # The deadline passes between looks regardless of how long fake herdr takes.
-            clock = types.SimpleNamespace(monotonic=lambda: now, sleep=advance)
-            out = io.StringIO()
-            code = 0
-            with patch.dict(os.environ, e.env), patch.object(factory, "HERDR", e.env["HERDR_BIN"]), \
-                    patch.object(factory, "time", clock), contextlib.redirect_stdout(out):
-                try:
-                    factory.main(["wait", "--cwd", str(e.repo), "--interval", "0", "--timeout", "0.1"])
-                except SystemExit as ex:
-                    code = ex.code
-            return code, out.getvalue()
-
-        for harness, mode, seconds in (("claude", "background", 1800), ("opencode", "background", 1800),
-                                       ("omp", "background", 1800), ("codex", "foreground", 60), ("pi", "foreground", 60)):
-            with self.subTest(harness=harness), Env(formation({"lead-dev": CATALOG_MEMBERS["lead-dev"]},
-                                                            operator={"harness": harness})) as e:
-                e.update(None, agent=harness)  # up has not named the operator pane yet.
-                output = e.run("up").stdout
-                self.assertIn(f"run factory.py wait in the {mode}", output)
-                self.assertIn(f"operator messages: inbox, {mode} wait", e.run("status").stdout)
-                self.assertIn("queued message N", e.run("prompt", "lead-dev").stdout)
-                e.update("lead-dev", agent_status="done")
-                code, idle = idle_wait(e)
-                self.assertIn("nobody is working", idle)
-                self.assertEqual(code, 4 if mode == "background" else 0)
-                self.assertEqual("End your turn" in idle, mode == "foreground")
-                timeout(e, seconds)
-                timeout(e, 7, explicit=7)
-                self.prepare(e, "typed")
-                timeout(e, 1800)
-                e.write_brief(formation({"lead-dev": CATALOG_MEMBERS["lead-dev"]},
-                                        operator={"harness": harness, "messages": "typed"}))
-                e.run("up")
-                timeout(e, 1800)
-        with Env() as e:
-            self.prepare(e)
-            timeout(e, 60)  # No operator pane yet. Default to foreground for an inbox route.
-        with patch.dict(factory.TABLE, {"future-harness": {}}), \
-                Env(formation({"lead-dev": CATALOG_MEMBERS["lead-dev"]},
-                              operator={"harness": "future-harness"})) as e:
-            self.prepare(e)
-            timeout(e, 60)  # A new harness without the key must not assume background wake.
-            self.prepare(e, "typed")
-            timeout(e, 1800)
 
     def test_worktree_uses_explicit_main_root_and_rejects_invalid_messages(self):
         with Env(formation({"lead-dev": {**CATALOG_MEMBERS["lead-dev"], "worktree": True}},
@@ -1579,7 +1444,7 @@ class InboxTests(unittest.TestCase):
             self.assertIn("[Message 1 from @lead-dev at ", first)
             self.assertIn("[Message 2 from @reviewer at ", first)
             self.assertNotIn("#1", first)
-            self.assertIn("2 unread messages. After you have acted on or recorded these messages,", first)
+            self.assertIn("2 unread messages. After you have acted on or recorded these messages:", first)
             self.assertIn("wait --seen 2", first)
             rows = [json.loads(s) for s in inbox.path.read_text().splitlines()]
             self.assertEqual([r["text"] for r in rows], [text, text])
@@ -1589,7 +1454,7 @@ class InboxTests(unittest.TestCase):
             self.assertIn("queued message 3", self.send(e).stdout)
             self.assertIn("1 unread message.", e.run("wait").stdout)
             self.assertIn("; 1 unread message (", e.run("status").stdout)
-            e.run("wait", "--seen", "1")  # an old acknowledgement cannot move seen backwards
+            e.run("wait", "--seen", "1", "--timeout", "0")  # an old acknowledgement cannot move seen backwards
             before = (inbox.path.read_bytes(), inbox.state_path.read_bytes())
             self.assertEqual(e.run("wait", "--seen", "9", check=False).returncode, 2)
             self.assertEqual(before, (inbox.path.read_bytes(), inbox.state_path.read_bytes()))
@@ -1607,7 +1472,7 @@ class InboxTests(unittest.TestCase):
             text = "A report accidentally acknowledged\n" + "a" * 500 + "\nDecision: approve café 日本語"
             self.seed(e, text)
             self.seed(e, "still unread")
-            e.run("wait", "--seen", "1")
+            e.run("wait", "--seen", "1", "--timeout", "0")
             before = inbox.path.read_bytes(), inbox.state_path.read_bytes(), e.calls()
             result = e.run("inbox")
             self.assertIn("[Message 1 from @lead-dev at ", result.stdout)
@@ -1648,7 +1513,7 @@ class InboxTests(unittest.TestCase):
                     current.acknowledge(1)
             self.assertEqual((inbox.path.read_bytes(), inbox.state_path.read_bytes()), before)
             self.assertIn("recover me", e.run("wait").stdout)
-            e.run("wait", "--seen", "1", check=False)
+            e.run("wait", "--seen", "1", "--timeout", "0")
             self.assertIn("recover me", e.run("inbox").stdout)
 
     def test_history_damage_and_unavailable_state_fail_without_writes(self):
@@ -1658,7 +1523,7 @@ class InboxTests(unittest.TestCase):
             with self.subTest(history=history), Env() as e:
                 inbox = self.prepare(e)
                 self.seed(e, "unread")
-                inbox.state_path.write_text(json.dumps({"mode": "inbox", "seen": 1, "history": history}))
+                inbox.state_path.write_text(json.dumps({"seen": 1, "history": history}))
                 before = inbox.path.read_bytes(), inbox.state_path.read_bytes()
                 for command in (("inbox",), ("wait", "--seen", "1")):
                     result = e.run(*command, check=False)
@@ -1703,16 +1568,11 @@ class InboxTests(unittest.TestCase):
                 self.assertEqual(self.invoke(e), ("unconfirmed", "failed fsync"))
             self.assertEqual(e.calls(), [])
 
-    def test_queue_rechecks_the_route_before_appending(self):
+    def test_queue_accepts_missing_acknowledgement_state(self):
         with Env() as e:
-            inbox = self.prepare(e)
-            with patch.dict(os.environ, e.env):
-                self.assertEqual(factory.message_route(factory.Config(e.repo)), "inbox")
-            inbox.state_path.unlink()
-            outcome, reason = self.invoke(e)
-            self.assertEqual(outcome, "refused")
-            self.assertIn("route changed", reason)
-            self.assertFalse(inbox.path.exists())
+            self.assertEqual(self.invoke(e), ("queued", 1))
+            self.assertIn("literal '$herdr' @pm.", e.run("wait", "--timeout", "0").stdout)
+
 
     def test_short_writes_and_private_modes(self):
         with Env() as e:
@@ -1746,7 +1606,7 @@ class InboxTests(unittest.TestCase):
             self.assertEqual(before, inbox.path.read_bytes())
             self.assertEqual(3, self.seed(e, "three"))
             self.assertEqual([r["id"] for r in map(json.loads, inbox.path.read_text().splitlines())], [2, 3])
-            e.run("wait", "--seen", "1")
+            e.run("wait", "--seen", "1", "--timeout", "0")
             history = e.run("inbox").stdout
             self.assertEqual(history.count("[Message 1 from"), 1)
             self.assertIn("    one", history)
@@ -1765,9 +1625,9 @@ class InboxTests(unittest.TestCase):
                 self.assertIn("not sent to @operator", failure.stdout)
                 self.assertFalse(e.prompts())
                 self.assertEqual(e.run("wait", "--seen", "1", check=False).returncode, 2)
-                result = e.run("wait", "--interval", "0.01")
+                result = e.run("wait", "lead-dev", "--interval", "0.01")
                 self.assertEqual(result.stdout.count("inbox needs repair"), 1)
-                self.assertIn("nobody is working", result.stdout)
+                self.assertIn("@lead-dev stopped (idle)", result.stdout)
                 self.assertIn("inbox needs repair", e.run("status").stdout)
                 self.assertEqual(before, (inbox.path.read_bytes(), inbox.state_path.read_bytes()))
                 fake = e.fake_state()
@@ -1791,12 +1651,11 @@ class InboxTests(unittest.TestCase):
             self.assertIn("Use this command for teammates", e.run("prompt", "lead-dev").stdout)
             self.assertIn("Use the standalone `factory.py say`", e.run("brief").stdout)
             self.assertIn("operator messages: unavailable", e.run("status").stdout)
-            waiting = e.run("wait", "--interval", "0.01").stdout
-            self.assertEqual(waiting.count("inbox unavailable:"), 1)
+            waiting = e.run("wait", "--timeout", "0", check=False)
+            self.assertEqual(waiting.returncode, 2)
+            self.assertIn(str(inbox.state_path), waiting.stderr)
             self.assertTrue(inbox.state_path.is_symlink())
             self.assertEqual(target.read_bytes(), before)
-            with patch.dict(os.environ, e.env), patch.object(factory.Inbox, "read_state", side_effect=PermissionError("denied")):
-                self.assertEqual(factory.message_route(factory.Config(e.repo)), "unavailable")
         for parent in (False, True):
             with self.subTest(parent=parent), Env(brief) as e:
                 inbox = self.prepare(e)
@@ -1809,34 +1668,6 @@ class InboxTests(unittest.TestCase):
                 self.assertIn("queued message 1", self.send(e).stdout)
                 self.assertTrue(path.is_symlink())
                 self.assertEqual(target.stat().st_mode & 0o777, 0o700)
-
-    def test_failed_route_setup_reports_unavailable_without_changing_saved_state(self):
-        brief = formation({"lead-dev": CATALOG_MEMBERS["lead-dev"]}, operator={"harness": "claude"})
-        with Env(brief) as e:
-            inbox = self.prepare(e)
-            before = inbox.state_path.read_bytes()
-            args = types.SimpleNamespace(cwd=str(e.repo), names=[], timeout=1000, no_brief=False, restart=False, fresh=False)
-            replace = os.replace
-            def denied(source, target):
-                if target == inbox.state_path:
-                    raise PermissionError("state replace denied")
-                return replace(source, target)
-            out = io.StringIO()
-            with patch.dict(os.environ, e.env), patch.object(factory, "HERDR", e.env["HERDR_BIN"]), \
-                    patch.object(os, "replace", denied), contextlib.redirect_stdout(out):
-                cfg = factory.Config(e.repo)
-                with patch.object(factory, "cfg_of", return_value=cfg):
-                    factory.cmd_up(args)
-                prompt = factory.member_prompt(factory.plan(cfg, "lead-dev"), "operator", cfg)
-                self.assertIn("Use this command for teammates", prompt)
-                self.assertNotIn("To reach @operator, write a new draft", prompt)
-            self.assertIn("inbox unavailable: state replace denied. Operator messages are unavailable."
-                          " After fixing it, run factory.py up.", out.getvalue())
-            self.assertNotIn("by typed herdr messages", out.getvalue())
-            self.assertIn("started @lead-dev", out.getvalue())
-            self.assertIn("Use the standalone `factory.py say`", dict(e.prompts())["lead-dev"])
-            self.assertNotIn("--add-dir", e.calls("agent", "start")[0])  # full Codex
-            self.assertEqual(inbox.state_path.read_bytes(), before)
 
     def test_message_file_read_errors_are_clean_and_do_not_queue(self):
         with Env() as e:
@@ -1862,10 +1693,9 @@ class InboxTests(unittest.TestCase):
                 inbox = self.prepare(e)
                 self.seed(e, "earlier message")
                 if acknowledge:
-                    e.run("wait", "--seen", "1", check=False)
+                    e.run("wait", "--seen", "1", "--timeout", "0")
                 with patch.dict(os.environ, {**e.env, "HERDR_SESSION": "another/session"}):
                     with factory.Inbox(factory.Config(e.repo)) as other:
-                        other.state["mode"] = "typed"
                         other.save_state()
                     other.path.write_bytes(b"untouched")
                 before_other = (other.path.read_bytes(), other.state_path.read_bytes())
@@ -1874,7 +1704,6 @@ class InboxTests(unittest.TestCase):
                 self.assertEqual(inbox.lock_path.stat().st_ino, inode)
                 self.assertEqual(before_other, (other.path.read_bytes(), other.state_path.read_bytes()))
                 state = json.loads(inbox.state_path.read_text())
-                self.assertEqual(state["mode"], "inbox")
                 self.assertEqual(state["seen"], 1 if acknowledge else 0)
                 if acknowledge:
                     self.assertEqual(inbox.path.read_bytes(), b"")
@@ -1930,6 +1759,140 @@ class InboxTests(unittest.TestCase):
             self.assertIn("question", e.run("wait").stdout)
 
 
+class StockTransportTests(unittest.TestCase):
+    thread = "01234567-89ab-cdef-0123-456789abcdef"
+    other_thread = "12345678-9abc-def0-1234-56789abcdef0"
+
+    def codex_operator(self, e):
+        e.update(None, agent="codex")
+        e.run("up", "lead-dev", "pm", "--no-brief")
+        e.update("operator", agent_session={"agent": "codex", "kind": "id", "value": self.thread},
+                 procs=[{"name": "codex", "argv": ["codex"]}])
+        e.queue_log = e.root / "queue.log"
+        with patch.dict(os.environ, e.env):
+            cfg = factory.Config(e.repo)
+            inbox = factory.Inbox(cfg)
+            draft = cfg.messages / "lead-dev/report.md"
+        e.env.update(QUEUE_LOG=str(e.queue_log), INBOX_LOCK=str(inbox.lock_path))
+        (e.root / "bin/codex").write_text(textwrap.dedent("""\
+            #!/usr/bin/env python3
+            import fcntl, json, os, pathlib, sys
+            lock_path = pathlib.Path(os.environ["INBOX_LOCK"])
+            with lock_path.open("rb") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                assert lock_path.with_suffix(".jsonl").stat().st_size > 0
+            with open(os.environ["QUEUE_LOG"], "a") as log:
+                print(json.dumps(sys.argv[1:]), file=log)
+            sys.exit(int(os.environ.get("QUEUE_EXIT", "0")))
+            """))
+        return draft
+
+    def test_snapshot_ack_and_errors_without_herdr_metadata(self):
+        with Env(UI) as e:
+            e.run("up", "lead-dev", "--no-brief")
+            for i, report in enumerate(("first report", "second report"), 1):
+                self.assertIn(f"queued message {i}", e.say("lead-dev", "operator", report).stdout)
+            e.run("down")
+            e.close("operator")
+            calls = e.calls()
+            blocked = {"FAKE_ROSTER_FAIL": "1", "FAKE_GET_FAIL": "1"}
+            with patch.dict(os.environ, e.env):
+                inbox = factory.Inbox(factory.Config(e.repo))
+            self.assertFalse(inbox.state_path.exists())
+            before = inbox.path.read_bytes()
+            self.assertIn("second report", e.run("wait", **blocked).stdout)
+            first = e.run("wait", "--timeout", "0", **blocked).stdout
+            self.assertIn("first report", first)
+            self.assertIn("second report", first)
+            invalid = e.run("wait", "--timeout", "0", "--seen", "3", check=False, **blocked)
+            self.assertEqual(invalid.returncode, 2)
+            self.assertIn("invalid inbox id 3", invalid.stderr)
+            self.assertFalse(inbox.state_path.exists())
+            self.assertEqual(inbox.path.read_bytes(), before)
+            remaining = e.run("wait", "--timeout", "0", "--seen", "1", **blocked).stdout
+            self.assertNotIn("first report", remaining)
+            self.assertIn("second report", remaining)
+            self.assertIn("wait --seen 2 --timeout 0", remaining)
+            self.assertEqual(e.run("wait", "--timeout", "0", "--seen", "2", **blocked).stdout, "")
+            self.assertIn("first report", e.run("inbox", **blocked).stdout)
+            inbox.path.write_text('{"torn":')
+            damaged = e.run("wait", "--timeout", "0", check=False, **blocked)
+            self.assertEqual(damaged.returncode, 2)
+            self.assertIn("inbox needs repair", damaged.stderr)
+            self.assertEqual(e.calls(), calls)
+
+    def test_queue_attempts_once_per_report_after_append_in_this_session(self):
+        with Env(UI) as e:
+            self.codex_operator(e)
+            for i, report in enumerate(("first", "second", "third"), 1):
+                result = e.say("lead-dev", "operator", report)
+                self.assertIn(f"queued message {i}", result.stdout)
+                self.assertEqual(result.stderr, "")
+            argv = ["queue", "--thread", self.thread, "--message", "run factory.py wait --timeout 0"]
+            self.assertEqual([json.loads(row) for row in e.queue_log.read_text().splitlines()], [argv] * 3)
+            self.assertEqual(e.prompts(), [])
+            self.assertEqual(e.calls("pane", "send-keys"), [])
+            self.assertEqual(e.run("wait", "--timeout", "0", HERDR_SESSION="other").stdout, "")
+            self.assertIn("third", e.run("wait", "--timeout", "0").stdout)
+
+    def test_queue_failure_keeps_inbox_delivery_and_retries_only_refused_peer(self):
+        with Env(UI) as e:
+            draft = self.codex_operator(e)
+            draft.write_text("guarded handoff")
+            result = e.say("lead-dev", "operator", "--file", str(draft), QUEUE_EXIT="1")
+            self.assertIn("queued message 1 for @operator", result.stdout)
+            self.assertIn("operator wake unconfirmed for @operator: codex queue exited 1", result.stderr)
+            self.assertFalse(draft.exists())
+            draft.write_text("mixed handoff")
+            result = e.say("lead-dev", "operator", "pm", "--file", str(draft), QUEUE_EXIT="1",
+                           FAKE_PROMPT_FAIL="pm", check=False)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("queued message 2 for @operator", result.stdout)
+            self.assertIn("operator wake unconfirmed", result.stderr)
+            retry = result.stdout.split("Retry once when ready: ", 1)[1]
+            self.assertEqual(shlex.split(retry)[-3:], ["pm", "--file", str(draft)])
+            self.assertTrue(draft.exists())
+            e.say("lead-dev", "pm", "--file", str(draft))
+            self.assertFalse(draft.exists())
+            self.assertEqual(len(e.queue_log.read_text().splitlines()), 2)
+            pending = e.run("wait", "--timeout", "0").stdout
+            self.assertIn("guarded handoff", pending)
+            self.assertIn("mixed handoff", pending)
+
+    def test_queue_launch_failure_is_advisory(self):
+        with Env(UI) as e:
+            draft = self.codex_operator(e)
+            (e.root / "bin/codex").unlink()
+            draft.write_text("saved report")
+            result = e.say("lead-dev", "operator", "--file", str(draft))
+            self.assertIn("queued message 1", result.stdout)
+            self.assertIn("operator wake unconfirmed", result.stderr)
+            self.assertFalse(draft.exists())
+            self.assertIn("saved report", e.run("wait", "--timeout", "0").stdout)
+
+    def test_queue_refuses_stale_remote_or_unverified_target(self):
+        for invalid in ("changed", "remote", "invalid", "lookup failed"):
+            with self.subTest(invalid=invalid), Env(UI) as e:
+                draft = self.codex_operator(e)
+                if invalid == "changed":
+                    state = e.fake_state()
+                    state["operator_thread_on_pane_get"] = self.other_thread
+                    e.write_fake(state)
+                elif invalid == "remote":
+                    e.update("operator", procs=[{"name": "codex", "argv": ["codex", "--remote=example:9090"]}])
+                elif invalid == "invalid":
+                    e.set_session("operator", {"agent": "codex", "kind": "id", "value": "not-a-uuid"})
+                else:
+                    e.env["FAKE_GET_FAIL"] = "1"
+                draft.write_text("saved report")
+                result = e.say("lead-dev", "operator", "--file", str(draft))
+                self.assertIn("queued message 1", result.stdout)
+                self.assertIn("operator wake unconfirmed", result.stderr)
+                self.assertFalse(e.queue_log.exists())
+                self.assertFalse(draft.exists())
+                self.assertIn("saved report", e.run("wait", "--timeout", "0").stdout)
+
+
 class WaitTests(unittest.TestCase):
     def test_quiet_watch_ignores_idle_until_message_or_inbox_failure(self):
         brief = formation({"lead-dev": CATALOG_MEMBERS["lead-dev"]}, operator={"harness": "claude"})
@@ -1955,12 +1918,11 @@ class WaitTests(unittest.TestCase):
                             inbox.path.symlink_to(e.root / "missing")
                     elif len(sleeps) > 2:
                         self.fail("watch did not return after message or inbox error")
-                args = types.SimpleNamespace(cwd=str(e.repo), names=[], seen=None, timeout=5, interval=0)
+                args = types.SimpleNamespace(cwd=str(e.repo), names=[], seen=None, timeout=None, interval=0)
                 out, err = io.StringIO(), io.StringIO()
                 # Patch factory's binding: changing time.sleep also intercepts subprocess timeout polling.
                 with patch.dict(os.environ, e.env), patch.object(factory, "HERDR", e.env["HERDR_BIN"]), \
-                        patch.object(factory, "time", types.SimpleNamespace(monotonic=factory.time.monotonic,
-                                                                          sleep=after_poll)), \
+                        patch.object(factory, "time", types.SimpleNamespace(sleep=after_poll)), \
                         contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
                     if event == "message":
                         factory.cmd_wait(args)
@@ -2004,7 +1966,8 @@ class WaitTests(unittest.TestCase):
             self.assertIn("nobody is working; status unknown: @lead-dev", result.stdout)
 
     def test_wait_returns_when_the_lead_is_needed(self):
-        with Env(formation(CATALOG_MEMBERS, operator={"messages": "typed"})) as e:
+        with Env() as e:
+            e.update(None, agent="codex")
             self.assertIn("not started: any member", e.run("wait", check=False).stderr)
             e.run("up", "lead-dev", "reviewer", "pm", "--no-brief")
             for name in ("lead-dev", "reviewer", "pm"):
@@ -2031,7 +1994,8 @@ class WaitTests(unittest.TestCase):
             self.assertIn("nobody is working: @lead-dev idle, @reviewer idle, @pm idle", e.run("wait", "--interval", "0.05").stdout)
 
     def test_default_wait_notices_a_finished_member_while_others_work(self):
-        with Env(formation(CATALOG_MEMBERS, operator={"messages": "typed"})) as e:
+        with Env() as e:
+            e.update(None, agent="codex")
             e.run("up", "lead-dev", "reviewer", "--no-brief")
             e.update("lead-dev", agent_status="working")
             e.update("reviewer", agent_status="working")
@@ -2082,7 +2046,8 @@ class WaitTests(unittest.TestCase):
 
     def test_wait_reports_disappearance_and_unknown(self):
         for change, expected in (({"close": True}, "closed"), ({"status": "unknown"}, "unknown")):
-            with self.subTest(change=change), Env(formation(CATALOG_MEMBERS, operator={"messages": "typed"})) as e:
+            with self.subTest(change=change), Env() as e:
+                e.update(None, agent="codex")
                 e.run("up", "lead-dev", "reviewer", "--no-brief")
                 e.update("lead-dev", agent_status="working")
                 e.update("reviewer", agent_status="working")
@@ -2233,7 +2198,7 @@ class UpRecoveryTests(unittest.TestCase):
             self.assertEqual(p.returncode, 2)
             self.assertIn("outside this team", p.stderr)
             calls = e.calls()[before:]
-            self.assertTrue(all(c[:2] in (["agent", "list"], ["pane", "list"]) for c in calls), calls)
+            self.assertEqual(calls, [["agent", "get", e.env["HERDR_PANE_ID"]], ["agent", "list"], ["pane", "list"]])
 
     def test_operator_pane_with_an_old_member_label_is_not_a_restart_target(self):
         with Env(formation({"lead-dev": CATALOG_MEMBERS["lead-dev"]}, operator={"harness": "claude"})) as e:
@@ -2475,6 +2440,8 @@ class DownTests(unittest.TestCase):
             e.set_session("pm", {"agent": "pi", "kind": "path", "value": "/sessions/pm.jsonl"})
             e.update("lead-dev", agent_status="working")
             e.update("pm", agent_status="blocked")
+            e.say("lead-dev", "operator", "acknowledged report")
+            e.run("wait", "--seen", "1", "--timeout", "0")
             self.assertIn("queued message", e.say("lead-dev", "operator", "unread report").stdout)
             with patch.dict(os.environ, e.env):
                 cfg = factory.Config(e.repo)
@@ -2722,7 +2689,7 @@ class ConfigTests(unittest.TestCase):
         for h, t in factory.TABLE.items():  # every harness has the same shape, and code to go with it
             self.assertEqual(set(t["permissions"]), set(factory.LEVELS), h)
             self.assertIn(t["prompt"], ("file", "pointer", "message"), h)
-            self.assertIn(t["operator_wait"], ("background", "foreground"), h)
+            self.assertIn(t.get("operator_wake"), ("background", "queue", None), h)
             self.assertNotIn("operator_messages", t, h)
             self.assertIn(h, factory.CODE)
 

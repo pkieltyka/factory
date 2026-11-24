@@ -17,7 +17,7 @@ Factory feels like a big upgrade to a coding agent flow yet with the same tools 
 | reviewer, pm | Codex Luna |
 | frontend-dev | Claude Opus |
 
-Or run pi with GLM 5.3 as the operator, sending work to Fable and Opus, with Luna reviewing. Or pair a Fable architect with a DeepSeek lead developer. Spreading the work across roles lets you balance cost and intelligence, and use each model for what it's best at. It's all configured in `FACTORY.md` and `factory.toml`.
+Or run GLM 5.3 as a pi member, with a Fable architect, an Opus lead developer and Luna reviewing. Spreading the work across roles lets you balance cost and intelligence, and use each model for what it's best at. It's all configured in `FACTORY.md` and `factory.toml`.
 
 **How you work with it.** You pick an operator: the harness and model you talk to, and a medium-level model is plenty. The operator directs the whole team, each member in its role. You sit in the operator's cockpit and lead, the way a head of engineering or CTO works with their engineering team: members do the work, review each other, and report back to you. Make the team as big or as small as you like. The team's brief, behaviour and roles live in `FACTORY.md`, committed with your project. Your own `factory.toml` says which harness and model fills each role, so every person who uses the factory can run the same team with their own favourite harnesses and models.
 
@@ -64,7 +64,7 @@ Pluggable project context (notes, specs and knowledge per project), and cost and
 - [docs/](docs/README.md) — the team, command map and getting-started guide.
 - [tests/](tests/) — fake harness/herdr tests, real Git checks and the Gate 1 fixture; run `python3 tests/test_factory.py`. `FACTORY_LIVE=1 python3 tests/test_factory.py LiveFlags` checks installed harness flags.
 
-To add a harness, add its table (with `operator_wait`) in `skill/harnesses.toml`, its code block and a test fake.
+To add a harness, add its table in `skill/harnesses.toml`, its code block and a test fake.
 
 ## Tips
 
