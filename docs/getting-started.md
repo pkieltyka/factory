@@ -27,7 +27,7 @@ cd factory
 
 ### Operator harnesses
 
-Claude Code and OpenCode receive reports through native background task completion. Local Codex receives native queue reminders when senders can reach its thread. Use it unattended only after verifying wake across thread changes and with your sender permissions. pi, omp and agy are supported as members and are not supported as operators yet. The session where you run setup stays the operator when you run `up`.
+Claude Code and OpenCode receive reports through native background task completion. Codex is supported with an active foreground wait and is not qualified for unattended idle delivery. Idle reports stay in the inbox until the next turn. pi, omp and agy are supported as members and are not supported as operators yet. The session where you run setup stays the operator when you run `up`.
 
 | Operator harness | Install the skill at | Enter in its conversation |
 |---|---|---|

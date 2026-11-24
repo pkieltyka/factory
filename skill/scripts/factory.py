@@ -408,8 +408,8 @@ def cmd_inbox(args):
         raise SystemExit(2)
 
 
-def operator_wake(harness):
-    return TABLE.get(harness, {}).get("operator_wake")
+def operator_wait(harness):
+    return TABLE.get(harness, {}).get("operator_wait")
 
 
 def report_pending_messages(cfg):
@@ -1314,8 +1314,8 @@ def cmd_up(args):
         raise SystemExit(f"no members in {CONF}; add one, then run `factory.py up`")
     require_herdr()
     info = caller_agent()
-    wake = operator_wake(info.get("agent"))
-    if not wake:
+    wait = operator_wait(info.get("agent"))
+    if not wait:
         print(f"{info.get('agent') or 'unknown harness'} is not supported as operator yet.", file=sys.stderr)
         sys.exit(2)
     # The operator pane may still carry a member name or label from an earlier team.
@@ -1338,8 +1338,9 @@ def cmd_up(args):
     operator = ensure_operator(cfg, tab=True, info=info)
     if cold and not args.restart:
         report_pending_messages(cfg)
-    print(f"members reach @{operator} through the inbox; run factory.py wait"
-          + (" in a native background task" if wake == "background" else " --timeout 0 to read pending reports"))
+    print(f"members reach @{operator} through the inbox. Run factory.py wait"
+          + (" in a native background task." if wait == "background" else
+             " in the foreground during active work. Codex is not qualified for unattended idle delivery."))
     if not ready:
         return
     pickup_text = ("We are picking up where we left off. Check the tracker the brief above names, then send"
@@ -1481,41 +1482,6 @@ def harness_argv(info, harness):
     return procs[0] if len(procs) == 1 else None
 
 
-def codex_thread(info):
-    ref = info.get("agent_session")
-    if (info.get("agent") != "codex" or not isinstance(ref, dict) or ref.get("agent") != "codex"
-            or ref.get("kind") not in ("id", "path") or not isinstance(ref.get("value"), str)):
-        return None
-    thread = session_id(ref)
-    return thread if re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", thread) else None
-
-
-def wake_codex(team, name):
-    """Try one fixed reminder after the inbox append. Return an advisory reason on failure."""
-    pane_id = team.agent_panes.get(name)
-    if not pane_id or (team.pane(name) or {}).get("pane_id") != pane_id:
-        return "the operator's pane could not be verified"
-    try:
-        agent = herdr("agent", "get", name, check=False, timeout=2).get("agent") or {}
-        thread = codex_thread(agent)
-        if agent.get("name") != name or agent.get("pane_id") != pane_id or not thread:
-            return "the operator's current Codex thread could not be verified"
-        processes = herdr("pane", "process-info", "--pane", pane_id, check=False, timeout=2)
-        argv = harness_argv(processes, "codex")
-        if not argv or any(arg.split("=", 1)[0] == "--remote" for arg in argv):
-            return "the operator's Codex process could not be verified as local"
-        pane = herdr("pane", "get", pane_id, check=False, timeout=2).get("pane") or {}
-        if pane.get("pane_id") != pane_id or pane.get("label") != name or codex_thread(pane) != thread:
-            return "the operator's Codex pane or thread changed"
-        result = subprocess.run(["codex", "queue", "--thread", thread, "--message", "run factory.py wait --timeout 0"],
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
-        if result.returncode:
-            return f"codex queue exited {result.returncode}"
-    except (OSError, subprocess.TimeoutExpired) as e:
-        return str(e)
-    return None
-
-
 def report_launch_drift(team, plans):
     """herdr can restore a member itself, e.g. after its server restarts, without the flags factory launched it
     with. Name the live members whose harness demonstrably lacks their permission flags or extra args."""
@@ -1569,10 +1535,9 @@ def cmd_wait(args):
     require_herdr()
     cfg = cfg_of(args)
     watch = [n.lstrip("@") for n in args.names]
+    operator = cfg.operator["name"]
     snapshot = not watch and args.timeout == 0
     timeout = args.timeout
-    if timeout is None and watch:
-        timeout = 1800
     deadline = None if snapshot or timeout is None else time.monotonic() + timeout
     seen, worked, looks = None, set(), 0
     warned = False
@@ -1598,9 +1563,18 @@ def cmd_wait(args):
                 print(f"inbox unavailable: {e}" if isinstance(e, OSError) else str(e), flush=True)
                 warned = True
         team = Team(cfg)
-        quiet = not watch and operator_wake((team.pane(cfg.operator["name"]) or {}).get("agent")) == "background"
+        pane = team.pane(operator) or {}
+        wait = operator_wait(pane.get("agent"))
+        quiet = not watch and wait == "background"
         state = {n: team.status(n) for n in cfg.members if (not watch or n in watch) and team.pane(n)}
         if seen is None:  # the members this watch is about: a pane that closes later is noticed
+            if timeout is None:
+                if wait == "foreground" and pane["pane_id"] == team.agent_panes.get(operator):
+                    timeout = 60
+                elif watch:
+                    timeout = 1800
+                if timeout is not None:
+                    deadline = time.monotonic() + timeout
             missing = [n for n in watch if n not in state]
             if missing or not state:
                 raise SystemExit(f"not started: {', '.join(missing) or 'any member'}")
@@ -1690,11 +1664,6 @@ def cmd_say(args):
             outcome = "submitted" if detail is None else "refused" if delivery_refused(detail) else "unconfirmed"
         if outcome == "queued":
             print(f"queued message {detail} for @{name}")
-            if member and operator_wake((team.pane(name) or {}).get("agent")) == "queue":
-                reason = wake_codex(team, name)
-                if reason:
-                    print(f"operator wake unconfirmed for @{name}: {reason}. "
-                          "The report is in the inbox; run factory.py wait --timeout 0 to read it.", file=sys.stderr)
         elif outcome == "submitted":
             print(f"submitted your message to @{name}")
         elif outcome == "refused":
