@@ -1393,17 +1393,26 @@ class InboxTests(unittest.TestCase):
             self.assertEqual(len(e.calls("agent", "start")), 1)
             self.assertEqual(tomllib.loads(sample.read_text())["operator"]["harness"], "claude")
 
-    def test_preflight_refuses_unsupported_operator_harnesses(self):
-        for harness in ("pi", "omp", "agy"):
+    def test_up_supports_pi_and_omp_foreground_operators(self):
+        for harness in ("pi", "omp"):
             with self.subTest(harness=harness), Env(UI) as e:
                 e.update(None, agent=harness)
-                result = e.run("up", check=False)
-                self.assertEqual(result.returncode, 2)
-                self.assertIn(f"{harness} is not supported as operator yet", result.stderr)
-                self.assertEqual(e.calls(), [["agent", "get", e.env["HERDR_PANE_ID"]]])
-                self.assertIn("operator messages: inbox", e.run("status").stdout)
-                self.assertEqual(e.run("wait", "--timeout", "0").stdout, "")
-                e.run("down")
+                result = e.run("up", "lead-dev", "--no-brief")
+                self.assertIn("wait in the foreground during active work", result.stdout)
+                self.assertIn("not qualified for unattended idle delivery", result.stdout)
+                self.assertEqual(e.pane_of("operator")["agent"], harness)
+                self.assertEqual(list(e.starts()), ["lead-dev"])
+
+    def test_preflight_refuses_agy_operator(self):
+        with Env(UI) as e:
+            e.update(None, agent="agy")
+            result = e.run("up", check=False)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("agy is not supported as operator yet", result.stderr)
+            self.assertEqual(e.calls(), [["agent", "get", e.env["HERDR_PANE_ID"]]])
+            self.assertIn("operator messages: inbox", e.run("status").stdout)
+            self.assertEqual(e.run("wait", "--timeout", "0").stdout, "")
+            e.run("down")
 
 
     def test_worktree_uses_explicit_main_root_and_rejects_invalid_messages(self):
@@ -1820,6 +1829,8 @@ class StockTransportTests(unittest.TestCase):
 class WaitTests(unittest.TestCase):
     def test_wait_deadline_uses_the_first_verified_operator(self):
         codex = {"agent": "codex", "pane_id": "w1:p1"}
+        pi = {"agent": "pi", "pane_id": "w1:p1"}
+        omp = {"agent": "omp", "pane_id": "w1:p1"}
         claude = {"agent": "claude", "pane_id": "w1:p1"}
         opencode = {"agent": "opencode", "pane_id": "w1:p1"}
 
@@ -1832,12 +1843,20 @@ class WaitTests(unittest.TestCase):
 
         cases = (
             ("Codex", codex, "w1:p1", None, 60, 60),
+            ("pi", pi, "w1:p1", None, 60, 60),
+            ("omp", omp, "w1:p1", None, 240, 240),
             ("Claude", claude, "w1:p1", None, 1800, None),
             ("OpenCode", opencode, "w1:p1", None, 1800, None),
             ("missing pane", None, "w1:p1", None, 1800, None),
             ("unbound Codex pane", codex, None, None, 1800, None),
             ("mismatched Codex", codex, "w1:p2", None, 1800, None),
+            ("unbound pi pane", pi, None, None, 1800, None),
+            ("mismatched pi", pi, "w1:p2", None, 1800, None),
+            ("unbound omp pane", omp, None, None, 1800, None),
+            ("mismatched omp", omp, "w1:p2", None, 1800, None),
             ("explicit Codex", codex, "w1:p1", 12, 12, 12),
+            ("explicit pi", pi, "w1:p1", 12, 12, 12),
+            ("explicit omp", omp, "w1:p1", 12, 12, 12),
             ("explicit background", claude, "w1:p1", 12, 12, 12),
         )
         brief = formation({"lead-dev": CATALOG_MEMBERS["lead-dev"]},
