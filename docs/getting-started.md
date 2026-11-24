@@ -59,7 +59,7 @@ python3 /absolute/trusted/install/scripts/factory.py wait --seen 12 --timeout 12
 python3 /absolute/trusted/install/scripts/factory.py wait --seen 15 --timeout 60
 ```
 
-Choose which other prefixes to save, one operation at a time. Common candidates are the same script with `status`, `inbox` or `say`, and the separate Herdr prefixes `herdr agent read` and `herdr integration status`. Keep approvals for team-changing commands such as `up` and `down` separate. Run each command standalone so Codex can match the prefix.
+Choose which other prefixes to save, one operation at a time. Common candidates are the same script with `status`, `inbox` or `say`, and `herdr integration status`. Keep approvals for team-changing commands such as `up` and `down` separate. Run each command standalone so Codex can match the prefix.
 
 Writable roots for the Factory cache or external worktrees (`--add-dir`) and Unix socket access are separate permissions. The workspace setting `sandbox_workspace_write.network_access=true` grants broader network access. If Codex runs in an externally sandboxed VM, you can explicitly start the operator with `codex --dangerously-bypass-approvals-and-sandbox`, which disables both controls for that session. `-a never` alone keeps the configured sandbox. Factory's `full` and `guarded` settings apply to the members it launches. [Codex permissions](https://developers.openai.com/codex/permissions) · [Configuration reference](https://developers.openai.com/codex/config-reference) · [Member permissions](../skill/references/cmd_setup.md#permissions)
 
@@ -79,7 +79,7 @@ Enter `/factory up`. After checking the formation, the operator renames its tab 
 
 ## Give it one task
 
-Ask the operator for a small change with a visible result. For example, “Add a test for this bug, fix it, and have the reviewer check the change.” Read the result in the operator pane.
+Ask the operator for a small change with a visible result. For example, “Add a test for this bug, fix it, and have the reviewer check the change.”
 
 ## Ready items and autopilot
 

@@ -130,7 +130,7 @@ FAKE_HERDR = textwrap.dedent(r'''
             procs = [{"pid": 1, "name": p["agent"], "argv": [p["agent"], *start[start.index("--") + 1:]]}] if start and p.get("agent") else []
         out({"type": "pane_process_info", "process_info": {"pane_id": p["pane_id"], "foreground_processes": procs}})
     if a[:2] == ["pane", "read"]:
-        asks = panes[a[2]].get("dialog", ["Allow this command? (y/n)"])[0]
+        asks = panes[a[2]].get("dialog", [""])[0]
         if width := int(os.environ.get("FAKE_DIALOG_WRAP", "0")):  # a narrow pane wraps the question
             asks = "\n".join(textwrap.wrap(asks, width))
         save(); print(f"...\n{asks}  [{a[2]}]"); sys.exit(0)  # plain text, like herdr
@@ -567,8 +567,8 @@ class UpTests(unittest.TestCase):
             self.assertEqual([c[3:] for c in e.calls("pane", "send-keys")], [["enter"]])
             self.assertIn("@frontend-dev did not come up: timeout: agent did not appear", p.stdout)  # herdr's reason is shown
             self.assertIn("factory.py up frontend-dev", p.stdout)
-            self.assertIn("@pm started but is waiting on a dialog: agent_not_ready", p.stdout)
-            self.assertIn("factory.py brief --send pm", p.stdout)
+            self.assertIn("@pm launch incomplete: agent_not_ready", p.stdout)
+            self.assertIn("Brief withheld.", p.stdout)
             self.assertEqual(sorted(e.starts()), ["frontend-dev", "lead-dev", "pm", "reviewer"])  # it went on past both
             self.assertEqual({n for n, _ in e.prompts()}, {"lead-dev", "reviewer"})  # only those that came up were briefed
 
@@ -845,11 +845,14 @@ class UpTests(unittest.TestCase):
         with Env() as e:
             p = e.run("up", "lead-dev", check=False, FAKE_PROMPT_FAIL="lead-dev")
             self.assertEqual(p.returncode, 3)
-            self.assertIn("factory.py brief --send lead-dev", p.stdout)
+            self.assertIn("NOT delivered to @lead-dev: agent_blocked", p.stdout)
+            self.assertEqual(len(e.prompts()), 1)
             e.kill("lead-dev")
-            p = e.run("up", "lead-dev", check=False, FAKE_PROMPT_FAIL="lead-dev")
+            p = e.run("up", "lead-dev", check=False, FAKE_UNCONFIRMED="lead-dev")
             self.assertEqual(p.returncode, 3)
-            self.assertIn("factory.py brief --send lead-dev", p.stdout)
+            self.assertIn("delivery unconfirmed to @lead-dev: unexpected reply from herdr", p.stdout)
+            self.assertNotIn("brief --send", p.stdout)
+            self.assertEqual(len(e.prompts()), 2)
             self.assertEqual(e.run("brief", "--send", "lead-dev").returncode, 0)
 
     def test_say_reports_who_did_not_get_the_message(self):
@@ -2010,10 +2013,9 @@ class WaitTests(unittest.TestCase):
             self.assertEqual(p.returncode, 4)
             self.assertIn("still working: @lead-dev, @reviewer, @pm", p.stdout)
 
-            e.update("reviewer", agent_status="blocked")  # an approval dialog: back at once, with what it shows
+            e.update("reviewer", agent_status="blocked")
             out = e.run("wait").stdout
             self.assertIn("@reviewer is blocked: it needs an answer", out)
-            self.assertIn("Allow this command? (y/n)  [w1:p3]", out)
             e.update("reviewer", agent_status="working")
             e.kill("pm")
             self.assertIn("@pm is gone: its agent exited. `factory.py up pm`", e.run("wait").stdout)
@@ -2092,6 +2094,30 @@ class WaitTests(unittest.TestCase):
                 self.assertIn(expected, result.stdout)
                 self.assertNotIn("@lead-dev stopped", result.stdout)
                 self.assertNotIn("nobody is working", result.stdout)
+
+    def test_terminal_reads_and_keys_are_limited_to_known_startup_dialogs(self):
+        with Env() as e:
+            launched = e.run("up", "lead-dev", "pm", check=False, FAKE_START_FAIL="dialog:lead-dev,blocked:pm")
+            self.assertEqual(launched.returncode, 3)
+            self.assertIn("@pm launch incomplete", launched.stdout)
+            pane = e.pane_of("lead-dev")["pane_id"]
+            self.assertIn("@pm blocked:", e.run("status").stdout)
+            for state, expected in (("blocked", "@pm is blocked"), ("unknown", "@pm: status unknown"),
+                                    ("idle", "@pm stopped (idle)")):
+                e.update("pm", agent_status=state)
+                self.assertIn(expected, e.run("wait", "pm", "--interval", "0", "--timeout", "20").stdout)
+            failed = e.run("brief", "--send", "pm", check=False, FAKE_UNCONFIRMED="pm")
+            self.assertIn("delivery unconfirmed to @pm", failed.stdout)
+            self.assertIn("queued message 1", e.say("lead-dev", "operator", "a report").stdout)
+            self.assertIn("a report", e.run("wait").stdout)
+            e.run("wait", "--seen", "1", "--timeout", "0", check=False)
+            self.assertIn("a report", e.run("inbox").stdout)
+            e.run("down", "lead-dev", "pm")
+
+            read = ["pane", "read", pane, "--source", "visible"]
+            terminal_calls = [c for c in e.calls() if len(c) > 1 and c[0] in ("pane", "agent", "terminal")
+                              and c[1] in ("read", "snapshot", "wait-output", "send-keys")]
+            self.assertEqual(terminal_calls, [read, ["pane", "send-keys", pane, "enter"], read])
 
 
 class UpRecoveryTests(unittest.TestCase):
