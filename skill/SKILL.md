@@ -14,11 +14,11 @@ Paths below are relative to this skill. `factory.py` means `python3 <skill>/scri
 
 The session receiving the request is the operator. Run `up` from its pane. Record any known operator harness, model and thinking level for the roster. The live operator harness determines the wait style. Roster choices apply to members. Hand off to another operator session only on the user's explicit request.
 
-After compaction, re-read the active command's reference, `references/leading.md`, `FACTORY.md` and the tracker. Reconcile `status` with the native task before replacing a background watcher. Background mode remains mandatory on Claude Code, omp and OpenCode. Preserve task owners, acceptance criteria, branches, verdicts and next steps there, not only in chat.
+After compaction, re-read the active command's reference, `references/leading.md`, `FACTORY.md` and the tracker. Preserve task owners, acceptance criteria, branches, verdicts and next steps there, not only in chat.
 
 Use `factory.py say` to message teammates, never a harness's own messaging (e.g. Claude Code's `SendMessage`). Members send private drafts with `--file`, including reports to the operator. For several recipients, address each with `@name` in one draft and send it once.
 
-Claude Code, omp and OpenCode must start `wait --background-task` through the harness's native background tool and end the turn once it is pending. After Esc, reconcile `status` with the task before replacing it. Codex and pi operators using the inbox keep one foreground wait while members are live, even when idle. Resume a live Codex tool handle after a yield. When `wait` exits, read the full output and act on or record messages before acknowledging them with the next watcher. End your turn for a queued owner follow-up. Run `wait` directly, outside any loop or helper that restarts it or handles messages. Use `inbox` to reread acknowledged messages. See [references/leading.md](references/leading.md#receive-and-inspect).
+Start one `wait` in the mode `status` names. In background mode, start it as a background task and end your turn. When it returns, read the full output and act on or record messages before acknowledging them with the next watcher. Run `wait` directly, outside any loop or helper that restarts it or handles messages. Use `inbox` to reread acknowledged messages. See [references/leading.md](references/leading.md#receive-and-inspect).
 
 ## Before launch
 
