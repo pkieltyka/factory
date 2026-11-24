@@ -88,6 +88,7 @@ full = ["--auto"]
 guarded = ["--auto"]
 
 [agy]
+operator_wait = "background"
 label = "Antigravity CLI"
 default_model = "gemini-4-neon"
 default_thinking = "high"
@@ -98,6 +99,6 @@ never = []
 prompt = "message"
 dialogs = [["Do you trust the contents of this project?", ["enter"]]]
 
-[agy.permissions]   # guarded equals full because agy's sandbox and auto mode do not work on NixOS
+[agy.permissions]   # Factory has no guarded mode for agy. Both levels use the same flags.
 full = ["--mode", "accept-edits", "--settings", '{"toolPermission":"always-proceed"}']
 guarded = ["--mode", "accept-edits", "--settings", '{"toolPermission":"always-proceed"}']
