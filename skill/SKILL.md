@@ -38,7 +38,7 @@ Start one `wait` in the mode `status` names. In background mode, start it as a b
 | `brief` | `factory.py brief --send [all|names]` resends the brief; without `--send`, preview it. |
 | `say` | `factory.py say NAME [NAME ...] --file <path>`. Separate names with spaces or commas. `all` selects members only. The operator can pass quoted text instead of `--file`. |
 
-Bare `/factory`: if either project file is missing, run setup. Otherwise run `status`. If no member is running, run `up`. If some are gone, run `up <names>` for those members. While others run, start never-started members only if the user asks. Inspect blocked members and resolve within existing authorization. When the tracker or Git shows unfinished work, reconcile as above, even if everyone is running. Carry on with the user's work or ask for the next task if none is known.
+Bare `/factory`: if either project file is missing, run setup. Otherwise run `status`. If no member is running, run `up`. If some are gone, run `up <names>` for those members. While others run, start never-started members only if the user asks. Report blocked members by name. When the tracker or Git shows unfinished work, reconcile as above, even if everyone is running. Carry on with the user's work or ask for the next task if none is known.
 
 ## Launch
 
@@ -51,8 +51,7 @@ factory.py up reviewer pm           # selected members
 
 On success, the script labels the operator tab `factory operator`, creates a balanced `factory team` tab, prepares worktrees, starts members and sends their briefs. Re-running `up` leaves live members alone and resumes matching sessions for stopped members. Use `--fresh` for new sessions and `--restart` to relaunch running members too.
 
-- Failed start: read the reported pane, fix the cause, then `factory.py up <name>`.
-- Undelivered brief: resolve the error and `factory.py brief --send <name>` before assigning work. Failed starts or briefing exit 3; preflight failures exit 2.
-- Known startup dialogs are answered automatically. For any other dialog, read `herdr agent read <name> --source visible`; resolve it within existing authorization or ask for the missing decision, then resend the brief.
+- For a failed start, fix the reported cause and run `factory.py up <name>`. Known startup dialogs are answered automatically.
+- Failed starts or brief deliveries exit 3 and name the affected members. Preflight failures exit 2. Report missing ready or pickup replies by name before assigning those members.
 
 Check `status`, then assign self-contained tasks as in [leading.md](references/leading.md). Add members only in `factory.toml`: use the role's next name (`reviewer`, then `reviewer-2`, `reviewer-3`), explicit harness/model, and `role` for numbered names. Run `check`, then `up` or `up <name>`. Change running members in `factory.toml` and restart with `up <name> --restart`. Names are never reassigned or renumbered; the operator's name stays fixed while the team runs, and tab labels are fixed.

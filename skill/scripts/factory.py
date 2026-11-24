@@ -944,7 +944,7 @@ def herdr(*args, check=True, timeout=HERDR_TIMEOUT):
     try:
         return json.loads(p.stdout).get("result") or {}
     except (json.JSONDecodeError, AttributeError):
-        return {"text": p.stdout}  # `pane read` and `integration status` print text
+        return {"text": p.stdout}  # Some herdr commands return plain text.
 
 
 def integration_target(harness):
@@ -1126,14 +1126,15 @@ def launch(cfg, team, m, operator, timeout, resume=None):
         team.panes[m["name"]] = {"pane_id": pane, "label": m["name"]}
     started = herdr("agent", "start", m["name"], "--kind", m["harness"], "--pane", pane, "--timeout", str(timeout),
                     "--", *argv, check=False, timeout=timeout / 1000 + 30)
-    # A harness may stop at a first-run question (trust this folder?), and herdr does not always see that it
-    # did. So look at the screen: a question the harness table knows is answered, once, and must then go away.
-    # A member that is not ready for another reason gets a few seconds: an update banner clears by itself.
+    # Answer known startup questions once. Other startup delays settle based on herdr's status.
+    dialogs = TABLE[m["harness"]].get("dialogs", [])
     answered, waiting = {}, lambda: "agent_not_ready" in started.get("error", "")
     for _ in range(8):
-        # A narrow pane wraps a question over several lines, so compare without whitespace.
-        screen = "".join(herdr("pane", "read", pane, "--source", "visible", check=False).get("text", "").split())
-        asked = [d for d in TABLE[m["harness"]].get("dialogs", []) if "".join(d[0].split()) in screen]
+        asked = []
+        if dialogs:
+            # A narrow pane wraps a question over several lines, so compare without whitespace.
+            screen = "".join(herdr("pane", "read", pane, "--source", "visible", check=False).get("text", "").split())
+            asked = [d for d in dialogs if "".join(d[0].split()) in screen]
         for text, keys in asked:
             if text not in answered:
                 answered[text] = herdr("pane", "send-keys", pane, *keys, check=False).get("error")
@@ -1198,18 +1199,12 @@ def send_brief(cfg, team, operator, names=None, closing=None):
 
 
 def report_failed(failed, team, undelivered=()):
-    """Members that did not start; one that is live was stopped by a dialog of its own. A member that started
-    but did not get its brief (`undelivered`) fails the command too, and is told how to repair it."""
+    """Report failed launches by name. Brief delivery has its own per-recipient output."""
     for name, err in failed.items():
         if team.live(name):
-            print(f"@{name} started but is waiting on a dialog: {err}. Read its pane (herdr agent read {name}"
-                  f" --source visible), tell the user what it asks, and once it is answered run:"
-                  f" factory.py brief --send {name}")
+            print(f"@{name} launch incomplete: {err}. Brief withheld.")
         else:
-            print(f"@{name} did not come up: {err}. Read the pane, fix the cause, then run: factory.py up {name}")
-    if undelivered:
-        print(f"The team brief did not reach {', '.join('@' + n for n in undelivered)}. Once they can take a message,"
-              f" run: factory.py brief --send {' '.join(undelivered)}")
+            print(f"@{name} did not come up: {err}. Fix the reported cause, then run: factory.py up {name}")
     if failed or undelivered:
         sys.exit(3)
 
@@ -1559,7 +1554,7 @@ def cmd_status(args):
             print(f"operator messages: {route}{suffix}")
     except (OSError, ValueError) as e:
         print(f"operator messages: unavailable ({e})")
-    for state, hint in (("blocked", "blocked: waiting on an approval or a question. Read the pane and ask the user."),
+    for state, hint in (("blocked", "blocked: waiting on an approval or a question."),
                         ("gone", "gone: run `factory.py up {names}` to bring them back.")):
         hit = [r[0] for r in rows[2:] if state in r[5]]
         if hit:
@@ -1639,16 +1634,11 @@ def cmd_wait(args):
         if state[n] == "gone":
             print(f"@{n} is gone: its agent exited. `factory.py up {n}` brings it back.")
             continue
-        print(f"@{n} is {state[n]}: it needs an answer. Its pane ends:")
-        # herdr cannot scroll a blocked agent's history, so read what is on its screen
-        tail = herdr("pane", "read", team.panes[n]["pane_id"], "--source", "visible", check=False)
-        print("\n".join("    " + l for l in (tail.get("text") or tail.get("error") or "").strip().splitlines()[-15:]))
+        print(f"@{n} is {state[n]}: it needs an answer.")
     for n in unclear:
-        print(f"@{n}: status unknown (herdr reports {state[n]!r}), so it may be working or stuck. Read its pane:"
-              f" herdr agent read {n} --source visible")
+        print(f"@{n}: status unknown (herdr reports {state[n]!r}).")
     for n in stopped:
-        print(f"@{n} stopped ({state[n]}). If it sent no report, read its pane:"
-              f" herdr agent read {n} --source recent-unwrapped --lines 80")
+        print(f"@{n} stopped ({state[n]}).")
     if not (closed or needs or unclear or stopped):
         hint = ". End your turn; run factory.py wait again after you assign work." if wait == "foreground" else ""
         print(f"nobody is working: {', '.join('@' + n + ' ' + s for n, s in state.items())}{hint}")
