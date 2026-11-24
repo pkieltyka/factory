@@ -27,7 +27,7 @@ cd factory
 
 ### Operator harnesses
 
-Claude Code and OpenCode receive reports through native background task completion. Codex, pi and omp are supported with an active foreground wait and are not qualified for unattended idle delivery. Re-run the foreground wait while members work. Idle reports stay in the inbox until you return. agy is member-only. The session where you run setup stays the operator when you run `up`.
+Claude Code, OpenCode and agy receive reports through native background task completion. Codex, pi and omp are supported with an active foreground wait and are not qualified for unattended idle delivery. Re-run the foreground wait while members work. Idle reports stay in the inbox until you return. The session where you run setup stays the operator when you run `up`.
 
 | Operator harness | Install the skill at | Enter in its conversation |
 |---|---|---|
@@ -36,6 +36,7 @@ Claude Code and OpenCode receive reports through native background task completi
 | pi | `~/.pi/agent/skills/factory` | `/skill:factory setup` |
 | omp | `~/.omp/agent/skills/factory` | `/skill:factory setup` with skill commands enabled |
 | [OpenCode v2](https://opencode.ai/docs/skills/#loading) | `~/.config/opencode/skills/factory` | `@factory setup` |
+| Antigravity CLI (agy) | `.agents/skills/factory` in the project or `~/.gemini/config/skills/factory` | `/factory setup` |
 
 The Claude Code invocation has been tried live. The other entries were checked against the harness documentation or source. The commands below use Claude Code's spelling. In another harness, keep its prefix and replace `setup` with the command you need.
 

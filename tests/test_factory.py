@@ -1403,16 +1403,13 @@ class InboxTests(unittest.TestCase):
                 self.assertEqual(e.pane_of("operator")["agent"], harness)
                 self.assertEqual(list(e.starts()), ["lead-dev"])
 
-    def test_preflight_refuses_agy_operator(self):
+    def test_up_supports_agy_background_operator(self):
         with Env(UI) as e:
             e.update(None, agent="agy")
-            result = e.run("up", check=False)
-            self.assertEqual(result.returncode, 2)
-            self.assertIn("agy is not supported as operator yet", result.stderr)
-            self.assertEqual(e.calls(), [["agent", "get", e.env["HERDR_PANE_ID"]]])
-            self.assertIn("operator messages: inbox", e.run("status").stdout)
-            self.assertEqual(e.run("wait", "--timeout", "0").stdout, "")
-            e.run("down")
+            result = e.run("up", "lead-dev", "--no-brief")
+            self.assertIn("wait in a native background task", result.stdout)
+            self.assertEqual(e.pane_of("operator")["agent"], "agy")
+            self.assertEqual(list(e.starts()), ["lead-dev"])
 
 
     def test_worktree_uses_explicit_main_root_and_rejects_invalid_messages(self):
@@ -1894,9 +1891,11 @@ class WaitTests(unittest.TestCase):
                             self.assertEqual(team.call_count, 3)
 
     def test_quiet_watch_ignores_idle_until_message_or_inbox_failure(self):
-        brief = formation({"lead-dev": CATALOG_MEMBERS["lead-dev"]}, operator={"harness": "claude"})
-        for event in ("message", "damage", "unavailable"):
-            with self.subTest(event=event), Env(brief) as e:
+        for harness, event in (("claude", "message"), ("claude", "damage"), ("claude", "unavailable"),
+                               ("agy", "message")):
+            brief = formation({"lead-dev": CATALOG_MEMBERS["lead-dev"]}, operator={"harness": harness})
+            with self.subTest(harness=harness, event=event), Env(brief) as e:
+                e.update(None, agent=harness)
                 e.run("up", "--no-brief")
                 e.update("lead-dev", agent_status="working")
                 state = e.fake_state()

@@ -12,7 +12,7 @@ You are the operator (`@operator`): form the team, assign tasks, decide architec
 
 Paths below are relative to this skill. `factory.py` means `python3 <skill>/scripts/factory.py`. A project has two files at its root. `FACTORY.md` is the brief every member reads: the project, where tasks are tracked, the workflow. It is committed and shared by everyone on the repo. `factory.toml` is your own formation: `[operator]` is you (`name`, default `operator`, is your @name, pane label and herdr agent name), then the members with their harnesses and models. It is not committed; `factory.toml.sample` is the project's suggestion, which `factory.py init` copies. One team runs per herdr session.
 
-The session receiving the request is the operator. Run `up` from its pane. Record any known operator harness, model and thinking level for the roster. Claude Code and OpenCode use native background tasks. Codex, pi and omp are supported with an active foreground wait and are not qualified for unattended idle delivery. agy remains member-only. Roster choices apply to members. Hand off to another operator session only on the user's explicit request.
+The session receiving the request is the operator. Run `up` from its pane. Record any known operator harness, model and thinking level for the roster. Claude Code, OpenCode and agy use native background tasks. Codex, pi and omp are supported with an active foreground wait and are not qualified for unattended idle delivery. Roster choices apply to members. Hand off to another operator session only on the user's explicit request.
 
 After compaction, re-read the active command's reference, `references/leading.md`, `FACTORY.md` and the tracker. Preserve task owners, acceptance criteria, branches, verdicts and next steps there, not only in chat.
 
@@ -20,7 +20,7 @@ Use `factory.py say` to message teammates, never a harness's own messaging (e.g.
 
 Read pending reports with `wait --timeout 0` on activation or return. Acknowledge only messages you acted on or recorded, and handle any rows the acknowledgment returns. Use `inbox` to reread acknowledged messages.
 
-In Claude Code and OpenCode, handle an immediate or completed watcher result in the same turn, even during owner work. If members may still report, start its native successor before ending the turn. Keep an already-pending task. Handle immediate results until one task is pending. If a persistent lifecycle or inbox error prevents arming, report it once and resume after resolution. In Codex, pi and omp, run a foreground `wait` and re-run it while members work. End your turn when the team settles. Idle reports stay in the inbox until you return. See [references/leading.md](references/leading.md#receive-and-inspect).
+In Claude Code, OpenCode and agy, handle an immediate or completed watcher result in the same turn, even during owner work. If members may still report, start its native successor before ending the turn. Keep an already-pending task. Handle immediate results until one task is pending. If a persistent lifecycle or inbox error prevents arming, report it once and resume after resolution. In Codex, pi and omp, run a foreground `wait` and re-run it while members work. End your turn when the team settles. Idle reports stay in the inbox until you return. See [references/leading.md](references/leading.md#receive-and-inspect).
 
 ## Before launch
 
