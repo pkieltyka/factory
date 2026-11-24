@@ -11,6 +11,7 @@ import json
 import os
 import pathlib
 import re
+import selectors
 import shlex
 import shutil
 import subprocess
@@ -21,7 +22,7 @@ import tomllib
 import types
 import unittest
 from urllib.parse import unquote, urlsplit
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 SCRIPT = pathlib.Path(__file__).resolve().parent.parent / "skill/scripts/factory.py"
 spec = importlib.util.spec_from_file_location("factory", SCRIPT)
@@ -38,8 +39,10 @@ FAKE_HERDR = textwrap.dedent(r'''
     # A herdr stand-in. Like herdr: `pane list` carries labels but no agent names, `agent list` carries names
     # but no labels; a pane keeps its label but loses its agent_session when its agent exits; a prompt to a
     # blocked agent is refused; errors are JSON on stderr with exit status 1.
-    import json, os, sys, textwrap
+    import fcntl, json, os, sys, textwrap
     path = os.environ["FAKE_HERDR"]
+    lock = open(path + ".lock", "a")
+    fcntl.flock(lock, fcntl.LOCK_EX)
     s = json.load(open(path))
     s["calls"].append(sys.argv[1:])
     a = sys.argv[1:]
@@ -1355,8 +1358,9 @@ class InboxTests(unittest.TestCase):
 
     def seed(self, e, text="done", sender="lead-dev"):
         with patch.dict(os.environ, e.env):
-            outcome, number = factory.queue_message(factory.Config(e.repo), sender, text)
+            outcome, number, advisory = factory.queue_message(factory.Config(e.repo), sender, text)
         self.assertEqual(outcome, "queued", number)
+        self.assertIsNone(advisory)
         return number
 
     def invoke(self, e):
@@ -1720,6 +1724,7 @@ class InboxTests(unittest.TestCase):
             self.assertNotIn("already handled", output)
             self.assertIn("new idle-team handoff", e.wait("--timeout", "0").stdout)
             self.assertIn("already handled", e.run("inbox").stdout)
+            self.assertIn("watcher process: absent", e.run("status").stdout)
             self.assertIn(["pane", "read", e.env["HERDR_PANE_ID"], "--source", "visible"], e.calls("pane", "read"))
 
     def test_pi_uses_current_editor_for_both_queue_modes(self):
@@ -2021,7 +2026,7 @@ class InboxTests(unittest.TestCase):
                 cfg = factory.Config(e.repo)
                 results = list(pool.map(lambda n: factory.queue_message(cfg, "lead-dev", str(n)), range(6)))
             waiter.communicate(timeout=15)
-            self.assertTrue(all(outcome == "queued" for outcome, _ in results))
+            self.assertTrue(all(outcome == "queued" for outcome, _, _ in results))
             rows = [json.loads(s) for s in inbox.path.read_text().splitlines()]
             self.assertEqual([r["id"] for r in rows], list(range(2, 8)))
             self.assertEqual({r["text"] for r in rows}, {str(n) for n in range(6)})
@@ -2032,9 +2037,9 @@ class InboxTests(unittest.TestCase):
         with Env() as e:
             self.prepare(e)
             with patch.object(factory.Inbox, "private_open", side_effect=PermissionError("denied")):
-                self.assertEqual(self.invoke(e), ("refused", "denied"))
+                self.assertEqual(self.invoke(e), ("refused", "denied", None))
             with patch.object(factory.os, "fsync", side_effect=OSError("failed fsync")):
-                self.assertEqual(self.invoke(e), ("unconfirmed", "failed fsync"))
+                self.assertEqual(self.invoke(e), ("unconfirmed", "failed fsync", None))
             self.assertEqual(e.calls(), [])
 
     def test_queue_rechecks_the_route_before_appending(self):
@@ -2043,8 +2048,9 @@ class InboxTests(unittest.TestCase):
             with patch.dict(os.environ, e.env):
                 self.assertEqual(factory.message_route(factory.Config(e.repo)), "inbox")
             inbox.state_path.unlink()
-            outcome, reason = self.invoke(e)
+            outcome, reason, advisory = self.invoke(e)
             self.assertEqual(outcome, "refused")
+            self.assertIsNone(advisory)
             self.assertIn("route changed", reason)
             self.assertFalse(inbox.path.exists())
 
@@ -2056,7 +2062,7 @@ class InboxTests(unittest.TestCase):
             inbox.lock_path.chmod(0o644)
             write = os.write
             with patch.object(factory.os, "write", side_effect=lambda fd, data: write(fd, data[:3])):
-                self.assertEqual(self.invoke(e), ("queued", 1))
+                self.assertEqual(self.invoke(e), ("queued", 1, None))
             self.assertEqual(inbox.directory.stat().st_mode & 0o777, 0o700)
             for path in (inbox.path, inbox.state_path, inbox.lock_path):
                 self.assertEqual(path.stat().st_mode & 0o777, 0o600)
@@ -2264,6 +2270,415 @@ class InboxTests(unittest.TestCase):
             self.assertIn("question", e.wait().stdout)
 
 
+class CodexDoorbellTests(unittest.TestCase):
+    thread_a = "01accdef-0123-7654-9abc-123456789012"
+    thread_b = "01accdef-9876-7654-9abc-123456789012"
+    members = {n: CATALOG_MEMBERS[n] for n in ("lead-dev", "reviewer")}
+
+    def team(self, e):
+        e.update(None, agent="codex")
+        e.run("up", "--no-brief")
+        e.update("operator", procs=[{"name": "codex", "argv": ["codex"]}])
+        self.thread(e, self.thread_a)
+        fake = e.root / "bin/codex"
+        fake.write_text(textwrap.dedent(r'''
+            #!/usr/bin/env python3
+            import json, os, sys
+            with open(os.environ["FAKE_CODEX_QUEUE"], "a") as f:
+                print(json.dumps(sys.argv[1:]), file=f)
+            sys.exit(int(os.environ.get("FAKE_CODEX_FAILURE", "0")))
+        ''').lstrip())
+        e.env["FAKE_CODEX_QUEUE"] = str(e.root / "queue.jsonl")
+        with patch.dict(os.environ, e.env):
+            return factory.Config(e.repo)
+
+    def thread(self, e, thread, kind="id", agent="codex"):
+        e.set_session("operator", {"agent": agent, "kind": kind, "value": thread})
+
+    def calls(self, e):
+        path = pathlib.Path(e.env["FAKE_CODEX_QUEUE"])
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def wake(self, thread):
+        return ["queue", "--thread", thread, "--message", "run factory.py wait"]
+
+    def send(self, e, text="a report", **env):
+        return e.say("lead-dev", "operator", text, **env)
+
+    def draft(self, e, cfg):
+        with patch.dict(os.environ, e.env):
+            draft = cfg.messages / "lead-dev/doorbell.md"
+        draft.write_text("delivery text\nsecond line")
+        return draft
+
+    def ack(self, e, number):
+        result = e.wait("--seen", str(number), "--timeout", "0", check=False)
+        self.assertIn(result.returncode, (0, 4), result.stderr)
+        return result.stdout
+
+    def test_one_wake_per_batch_across_partial_ack_and_thread_switches(self):
+        with Env(formation(self.members)) as e:
+            cfg = self.team(e)
+            e.update("operator", agent_status="idle")
+            draft = self.draft(e, cfg)
+            result = e.say("lead-dev", "operator", "--file", str(draft))
+            self.assertEqual(result.stdout, "queued message 1 for @operator\n")
+            self.assertFalse(draft.exists())
+            self.thread(e, self.thread_b)
+            self.send(e, "second report")
+            self.assertIn("second report", self.ack(e, 1))
+            self.assertIn("delivery text\n    second line", e.run("inbox").stdout)
+            self.thread(e, self.thread_a)
+            self.send(e, "third report")
+            self.assertEqual(self.calls(e), [self.wake(self.thread_a)])
+            self.ack(e, 3)
+            self.thread(e, f"/sessions/rollout-2026-11-23T00-00-00-{self.thread_b}.jsonl", "path")
+            e.update("operator", agent_status="working")
+            self.assertIn("queued message 4", self.send(e).stdout)
+            self.assertEqual(self.calls(e), [self.wake(self.thread_a), self.wake(self.thread_b)])
+            with patch.dict(os.environ, e.env), factory.Inbox(cfg) as inbox:
+                self.assertEqual(inbox.state["seen"], 3)
+                self.assertEqual([row["id"] for row in inbox.unread], [4])
+            self.assertFalse(e.calls("agent", "prompt"))
+            self.assertFalse(e.calls("pane", "send-keys"))
+
+    def test_wake_verifies_operator_and_never_uses_a_remote_endpoint(self):
+        with Env(formation(self.members, operator={"harness": "codex"})) as e:
+            cfg = self.team(e)
+            cases = (
+                {"agent_session": {"agent": "codex", "kind": "id", "value": "invalid"}},
+                {"agent_session": {"agent": "codex", "kind": "other", "value": self.thread_a}},
+                {"agent_session": {"agent": "pi", "kind": "id", "value": self.thread_a}},
+                {"agent_session": None},
+                {"name": "another-operator"},
+                {"procs": [{"name": "codex", "argv": ["codex", "--remote=wss://example.invalid"]}]},
+                {"procs": []},
+            )
+            original = e.pane_of("operator").copy()
+            for number, fields in enumerate(cases, 1):
+                with self.subTest(fields=fields):
+                    e.update("operator", **{**original, **fields})
+                    result = self.send(e)
+                    self.assertIn(f"queued message {number}", result.stdout)
+                    self.assertIn("Operator wake unavailable", result.stderr)
+                    self.assertEqual(self.calls(e), [])
+                    with patch.dict(os.environ, e.env), factory.Inbox(cfg) as inbox:
+                        self.assertNotIn("codex_wake", inbox.state)
+            e.update("operator", **original)
+            # A different CODEX_HOME can reject a verified UUID. The native invocation is local and never resumes.
+            result = self.send(e, CODEX_HOME=str(e.root / "foreign"), FAKE_CODEX_FAILURE="1")
+            self.assertIn("queued message 8", result.stdout)
+            self.assertIn("codex queue exited 1", result.stderr)
+            self.assertEqual(self.calls(e), [self.wake(self.thread_a)])
+            self.send(e)
+            self.assertEqual(len(self.calls(e)), 1)  # An ambiguous result keeps the claim.
+            self.ack(e, 9)
+            e.update("operator", agent="pi")
+            self.assertEqual(self.send(e).stderr, "")
+            e.update("operator", agent="codex")
+            e.write_brief(formation(self.members, operator={"harness": "codex", "messages": "typed"}))
+            e.run("up", "--no-brief")
+            self.assertIn("submitted", self.send(e).stdout)
+            self.assertEqual(len(self.calls(e)), 1)
+
+    def test_concurrent_sends_and_separate_herdr_sessions(self):
+        with Env(formation(self.members)) as e:
+            cfg = self.team(e)
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                results = list(pool.map(lambda n: self.send(e, f"report {n}"), range(4)))
+            self.assertEqual({int(r.stdout.split()[2]) for r in results}, {1, 2, 3, 4})
+            self.assertEqual(self.calls(e), [self.wake(self.thread_a)])
+            env = {**e.env, "HERDR_SESSION": "second-session"}
+            with patch.dict(os.environ, env), factory.Inbox(cfg) as inbox:
+                inbox.state["mode"] = "inbox"
+                inbox.save_state()
+            self.assertIn("queued message 1", self.send(e, HERDR_SESSION="second-session").stdout)
+            self.assertEqual(self.calls(e), [self.wake(self.thread_a)] * 2)
+
+    @contextlib.contextmanager
+    def at_checkpoint(self, e, checkpoint, command, *args, caller=None):
+        code = textwrap.dedent('''
+            import functools, runpy, sys
+            f = runpy.run_path(sys.argv[1])['main'].__globals__
+            def pause():
+                print('checkpoint', file=sys.stderr, flush=True)
+                assert sys.stdin.readline() == '\\n'
+            def wrap(key, *, after=False):
+                original = f[key]
+                @functools.wraps(original)
+                def gated(*args, **kwargs):
+                    if not after:
+                        pause()
+                    result = original(*args, **kwargs)
+                    if after:
+                        pause()
+                    return result
+                f[key] = gated
+            checkpoint = sys.argv[2]
+            if checkpoint == 'release':
+                register, close = f['watcher_lock'], f['os'].close
+                held = None
+                def remember(*args, **kwargs):
+                    global held
+                    held = register(*args, **kwargs)
+                    return held
+                def finish(fd):
+                    if fd == held:
+                        pause()
+                    close(fd)
+                f['watcher_lock'], f['os'].close = remember, finish
+            else:
+                wrap(checkpoint, after=checkpoint == 'watcher_lock')
+            f['main'](sys.argv[3:])
+        ''')
+        env = dict(e.env)
+        if command == "say":
+            caller = "lead-dev"
+        if caller:
+            env["HERDR_PANE_ID"] = e.pane_of(caller)["pane_id"]
+        argv = [sys.executable, "-c", code, str(SCRIPT), checkpoint, command, "--cwd", str(e.repo), *args]
+        with subprocess.Popen(argv, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True) as process:
+            try:
+                with selectors.DefaultSelector() as ready:
+                    ready.register(process.stderr, selectors.EVENT_READ)
+                    self.assertTrue(ready.select(timeout=10), f"no {checkpoint} checkpoint")
+                self.assertEqual(process.stderr.readline(), "checkpoint\n")
+                yield process
+            finally:
+                if process.poll() is None:
+                    process.kill()
+
+    def resume(self, process, *, code=0):
+        out, err = process.communicate("\n", timeout=10)
+        self.assertEqual(process.returncode, code, out + err)
+        return out, err
+
+    def test_sender_first_reserves_then_a_registered_wait_takes_over(self):
+        with Env(formation(self.members)) as e:
+            self.team(e)
+            with self.at_checkpoint(e, "wake_codex_operator", "say", "operator", "reservation first") as sender:
+                with self.at_checkpoint(e, "watcher_lock", "wait", "lead-dev", "--timeout", "0") as waiter:
+                    self.assertIn("queued message 1", self.resume(sender)[0])
+                    self.assertEqual(self.calls(e), [])
+                    duplicate = e.wait("--seen", "1", "--timeout", "0", check=False)
+                    self.assertEqual(duplicate.returncode, 2)
+                    self.assertIn("operator wait already running", duplicate.stderr)
+                    out, _ = self.resume(waiter)
+                    self.assertIn("reservation first", out)
+                    self.assertEqual(out.count("wait --seen 1"), 1)
+            # A was displayed but remains unacknowledged. B can reserve the batch after A's watcher released it.
+            self.assertIn("queued message 2", self.send(e, "after the reader").stdout)
+            self.assertEqual(self.calls(e), [self.wake(self.thread_a)])
+
+    def test_append_between_last_poll_and_deadline_is_returned_without_a_wake(self):
+        with Env(formation(self.members)) as e:
+            self.team(e)
+            with self.at_checkpoint(e, "Team", "wait", "--timeout", "0") as waiter:
+                # The reader holds its directory lock and already polled an empty inbox.
+                with self.at_checkpoint(e, "queue_message", "say", "operator", "late but covered") as sender:
+                    self.assertIn("queued message 1", self.resume(sender)[0])
+                self.assertEqual(self.calls(e), [])
+                out, _ = self.resume(waiter)
+                self.assertIn("late but covered", out)
+                self.assertEqual(out.count("[Message 1 from"), 1)
+                self.assertEqual(out.count("wait --seen 1"), 1)
+                self.assertNotIn("timeout after", out)
+            self.assertIn("watcher process: absent", e.run("status").stdout)
+
+    def test_lifecycle_exit_also_returns_reports_committed_after_the_poll(self):
+        with Env(formation(self.members)) as e:
+            self.team(e)
+            e.update("lead-dev", agent_status="blocked")
+            with self.at_checkpoint(e, "Team", "wait") as waiter:
+                self.assertIn("queued message 1", self.send(e, "late lifecycle handoff").stdout)
+                out, _ = self.resume(waiter)
+            self.assertIn("@lead-dev is blocked", out)
+            self.assertIn("late lifecycle handoff", out)
+            self.assertEqual(out.count("wait --seen 1"), 1)
+            self.assertEqual(self.calls(e), [])
+
+    def test_append_after_a_final_empty_snapshot_opens_a_wake(self):
+        with Env(formation(self.members)) as e:
+            self.team(e)
+            with self.at_checkpoint(e, "release", "wait", "--timeout", "0") as waiter:
+                with self.at_checkpoint(e, "queue_message", "say", "operator", "after final snapshot") as sender:
+                    sender.stdin.write("\n")
+                    sender.stdin.flush()
+                    self.assertIn("timeout after 0s", self.resume(waiter, code=4)[0])
+                    out, err = sender.communicate(timeout=10)
+                    self.assertEqual(sender.returncode, 0, out + err)
+                    self.assertIn("queued message 1", out)
+            self.assertEqual(self.calls(e), [self.wake(self.thread_a)])
+
+    def test_member_inspection_does_not_register_an_operator_wait(self):
+        with Env(formation(self.members)) as e:
+            self.team(e)
+            with self.at_checkpoint(e, "Team", "wait", "--timeout", "0", caller="reviewer") as inspection:
+                self.assertIn("watcher process: absent", e.run("status").stdout)
+                self.send(e, "operator handoff during a member inspection")
+                self.assertIn("timeout after 0s", self.resume(inspection, code=4)[0])
+            self.assertEqual(self.calls(e), [self.wake(self.thread_a)])
+
+    def test_revalidation_releases_only_its_own_reservation(self):
+        with Env(formation(self.members)) as e:
+            cfg = self.team(e)
+            with self.at_checkpoint(e, "wake_codex_operator", "say", "operator", "old thread") as sender:
+                self.ack(e, 1)
+                self.thread(e, self.thread_b)
+                self.send(e, "new batch")
+                out, err = self.resume(sender)
+                self.assertIn("queued message 1", out)
+                self.assertEqual(err, "")
+            with patch.dict(os.environ, e.env), factory.Inbox(cfg) as inbox:
+                self.assertEqual(inbox.state["codex_wake"], {"id": 2, "thread": self.thread_b})
+            self.assertEqual(self.calls(e), [self.wake(self.thread_b)])
+
+    def test_coalesced_report_survives_original_wake_target_changing(self):
+        for replacement in (self.thread_b, None):
+            with self.subTest(replacement=replacement), Env(formation(self.members)) as e:
+                cfg = self.team(e)
+                with self.at_checkpoint(e, "wake_codex_operator", "say", "operator", "report A") as sender:
+                    later = self.send(e, "report B")
+                    self.assertIn("queued message 2", later.stdout)
+                    self.assertEqual(later.stderr, "")
+                    self.thread(e, replacement)
+                    out, err = self.resume(sender)
+                    self.assertIn("queued message 1", out)
+                with patch.dict(os.environ, e.env), factory.Inbox(cfg) as inbox:
+                    self.assertEqual([row["text"] for row in inbox.unread], ["report A", "report B"])
+                    if replacement:
+                        self.assertEqual(inbox.state["codex_wake"], {"id": 1, "thread": replacement})
+                    else:
+                        self.assertNotIn("codex_wake", inbox.state)
+                self.assertEqual(self.calls(e), [self.wake(replacement)] if replacement else [])
+                if replacement:
+                    self.assertEqual(err, "")
+                else:
+                    self.assertIn("could not verify a live local", err)
+                    self.assertIn("read the unread batch with factory.py wait", err)
+
+    def test_unknown_claim_metadata_allows_reads_and_full_ack(self):
+        with Env(formation(self.members)) as e:
+            cfg = self.team(e)
+            self.send(e, "original")
+            with patch.dict(os.environ, e.env), factory.Inbox(cfg) as inbox:
+                inbox.state["codex_wake"] = {"future_format": [True, None, 3]}
+                inbox.save_state()
+            self.send(e, "new report")
+            self.assertEqual(self.calls(e), [self.wake(self.thread_a)])
+            self.assertIn("new report", e.wait().stdout)
+            self.assertIn("new report", self.ack(e, 1))
+            self.ack(e, 2)
+            self.assertIn("original", e.run("inbox").stdout)
+            self.send(e)
+            self.assertEqual(self.calls(e), [self.wake(self.thread_a)] * 2)
+
+    def test_guarded_sender_mixed_refusal_retries_only_the_peer(self):
+        members = {**self.members, "lead-dev": {**self.members["lead-dev"], "permissions": "guarded"}}
+        with Env(formation(members)) as e:
+            cfg = self.team(e)
+            draft = self.draft(e, cfg)
+            e.update("reviewer", agent_status="blocked")
+            result = e.say("lead-dev", "operator", "reviewer", "--file", str(draft), check=False)
+            self.assertEqual(result.returncode, 1, result.stdout)
+            self.assertIn("queued message 1 for @operator", result.stdout)
+            self.assertIn("guarded Codex sender", result.stderr)
+            retry = shlex.split(next(line.removeprefix("Retry once when ready: ")
+                                     for line in result.stdout.splitlines() if line.startswith("Retry once")))
+            self.assertEqual(retry[-3:], ["reviewer", "--file", str(draft)])
+            self.assertTrue(draft.exists())
+            e.update("reviewer", agent_status="idle")
+            env = {**e.env, "HERDR_PANE_ID": e.pane_of("lead-dev")["pane_id"]}
+            subprocess.run(retry, env=env, capture_output=True, check=True)
+            self.assertFalse(draft.exists())
+            self.assertEqual(self.calls(e), [])
+            with patch.dict(os.environ, e.env), factory.Inbox(cfg) as inbox:
+                self.assertEqual([row["id"] for row in inbox.unread], [1])
+                self.assertNotIn("codex_wake", inbox.state)
+            e.say("reviewer", "operator", "now a capable sender")
+            self.assertEqual(self.calls(e), [self.wake(self.thread_a)])
+
+    def test_post_append_failures_preserve_delivery_and_draft_consumption(self):
+        for failure in ("watch probe", "claim write", "identity recheck", "watch recheck",
+                        "missing executable", "timeout", "interrupt at launch"):
+            with self.subTest(failure=failure), Env(formation(self.members)) as e:
+                cfg = self.team(e)
+                draft = self.draft(e, cfg)
+                env = {**e.env, "HERDR_PANE_ID": e.pane_of("lead-dev")["pane_id"]}
+                launch = subprocess.Popen
+                child = MagicMock()
+                child.wait.side_effect = subprocess.TimeoutExpired("codex queue", 10)
+                wake_attempts = []
+
+                def popen(argv, *args, **kwargs):
+                    if argv[0] != "codex":
+                        return launch(argv, *args, **kwargs)
+                    wake_attempts.append(argv)
+                    if failure == "missing executable":
+                        raise FileNotFoundError("codex not installed")
+                    if failure == "interrupt at launch":
+                        raise KeyboardInterrupt
+                    return child
+
+                fault = {
+                    "watch probe": patch.object(factory, "watcher_registered", side_effect=PermissionError("probe denied")),
+                    "claim write": patch.object(factory.Inbox, "save_state", side_effect=OSError("save failed")),
+                    "identity recheck": patch.object(factory, "harness_argv", side_effect=OSError("herdr failed")),
+                    "watch recheck": patch.object(factory, "watcher_registered",
+                                                  side_effect=[False, OSError("recheck failed"), OSError("probe failed")]),
+                }.get(failure, patch.object(factory.subprocess, "Popen", side_effect=popen))
+                out, err = io.StringIO(), io.StringIO()
+                with patch.dict(os.environ, env), patch.object(factory, "HERDR", e.env["HERDR_BIN"]), fault, \
+                        contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    factory.main(["say", "--cwd", str(e.repo), "operator", "--file", str(draft)])
+                self.assertIn("queued message 1", out.getvalue())
+                self.assertIn("Operator wake unavailable or unconfirmed", err.getvalue())
+                self.assertFalse(draft.exists())
+                with patch.dict(os.environ, e.env), factory.Inbox(cfg) as inbox:
+                    self.assertEqual([row["text"] for row in inbox.unread], ["delivery text\nsecond line"])
+                    self.assertEqual("codex_wake" in inbox.state, failure in ("timeout", "interrupt at launch"))
+                if failure == "timeout":
+                    child.wait.assert_called_once_with(timeout=10)
+                    child.kill.assert_called_once_with()
+                expected_attempts = {"missing executable": 2, "timeout": 1, "interrupt at launch": 1}
+                self.assertEqual(len(wake_attempts), expected_attempts.get(failure, 0))
+
+    def test_claim_directory_sync_failure_after_state_replacement(self):
+        for repeated in (False, True):
+            with self.subTest(repeated=repeated), Env(formation(self.members)) as e:
+                cfg = self.team(e)
+                draft = self.draft(e, cfg)
+                env = {**e.env, "HERDR_PANE_ID": e.pane_of("lead-dev")["pane_id"]}
+                sync_directory = factory.Inbox.sync_directory
+                claim_syncs = []
+
+                def fail_after_replace(inbox):
+                    state = inbox.read_state(read_only=True)
+                    if "codex_wake" in state:
+                        claim_syncs.append(state["codex_wake"])
+                        if repeated or len(claim_syncs) == 1:
+                            raise OSError("claim directory sync failed")
+                    sync_directory(inbox)
+
+                out, err = io.StringIO(), io.StringIO()
+                with patch.dict(os.environ, env), patch.object(factory, "HERDR", e.env["HERDR_BIN"]), \
+                        patch.object(factory.Inbox, "sync_directory", fail_after_replace), \
+                        contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    factory.main(["say", "--cwd", str(e.repo), "operator", "--file", str(draft)])
+                self.assertIn("queued message 1", out.getvalue())
+                self.assertFalse(draft.exists())
+                self.assertEqual(claim_syncs, [{"id": 1, "thread": self.thread_a}] * 2)
+                if repeated:
+                    self.assertIn("read the unread batch with factory.py wait", err.getvalue())
+                    self.assertEqual(self.calls(e), [])
+                else:
+                    self.assertEqual(err.getvalue(), "")
+                    self.assertEqual(self.calls(e), [self.wake(self.thread_a)])
+                self.assertIn("queued message 2", self.send(e, "next report").stdout)
+                self.assertEqual(self.calls(e), [self.wake(self.thread_a)])
+
+
 class WaitTests(unittest.TestCase):
     def test_quiet_watch_ignores_idle_until_message_or_inbox_failure(self):
         brief = formation({"lead-dev": CATALOG_MEMBERS["lead-dev"]}, operator={"harness": "claude"})
@@ -2282,7 +2697,7 @@ class WaitTests(unittest.TestCase):
                     if len(sleeps) == 2:
                         if event == "message":
                             self.assertEqual(factory.queue_message(factory.Config(e.repo), "lead-dev",
-                                                                   "report after idle"), ("queued", 1))
+                                                                   "report after idle"), ("queued", 1, None))
                         elif event == "damage":
                             inbox.path.write_bytes(b'{"torn":')
                         else:

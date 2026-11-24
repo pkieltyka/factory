@@ -46,6 +46,8 @@ On sandboxed Linux, start each Claude watcher outside the sandbox through its no
 - **Codex.** Request the longest initial yield (normally 30 seconds), then poll the same process with the longest supported empty poll (normally 300 seconds). Resume a Code Mode cell by cell ID and a yielded terminal process by session ID. Preserve the live handle through compaction. The default wait has no deadline while Factory recognizes the composer. Codex picks its own poll length: with gpt-6-sol on 0.171.0 an idle team cost a continuation every 30 to 40 seconds, about 115 an hour. Long waits add context.
 - **pi.** Keep one Bash call active overnight. With a tool limit of 2,147,483 seconds, its default Factory deadline is 2,147,183 seconds. The Python polls add no tool calls or model context while Bash stays active.
 
+If a Codex operator's wait is absent, Factory can queue one native `run factory.py wait` reminder per unread batch for a live local thread. The reminder leaves the composer and inbox untouched. If the command fails before launching, Factory rechecks the batch and can try the current thread once. After Esc or restart, check `status`, resume any live foreground wait or run `wait`, and handle the reports before acknowledging with `wait --seen N`. A killed wait, interrupted send or unconfirmed reminder can leave reports queued until you check.
+
 **Other foreground waits** (60 seconds). Run `wait` again after each return, timeout or user answer while a member works. When nobody works, end your turn so the user can be heard.
 
 **Inbox route failures.** If the inbox route is unavailable, `say` retains the draft and refuses operator reports. Check `status` for the cause. Once the inbox is repaired, run `factory.py up` and reconcile pending drafts before resending.
@@ -84,7 +86,7 @@ When the user gives a goal and tells you to keep going, work through it without 
 - Also stop when a decision is the user's, no ready item is left, a task is not approved within the review rounds `FACTORY.md` allows, or a member cannot be recovered.
 - Always the user's, whatever the goal says: pushing, deploying, destructive operations, spending money, and anything sent outside the team. The exception is standing permission in a `## Pull requests` section of `FACTORY.md`: to push ticket branches and open pull requests, and separately to merge.
 - Autopilot assumes the safe machine that `full` permissions assume (see SKILL.md).
-- On stopping, say why and what comes next in your pane, and run `herdr notification show "factory stopped" --body "<why>" --sound request`.
+- **Stop taking items. Keep listening.** Say why you stopped and what comes next in a progress update, run `herdr notification show "factory stopped" --body "<why>" --sound request`, then follow the wait recipe above while members are live. Codex and pi keep the foreground turn open and resume the same wait handle through tool yields. Claude Code, omp and OpenCode end the turn with the native background task pending. Acknowledge with the next watcher. Never acknowledge with a throwaway `wait --timeout 1` and then end the turn.
 - Nothing restarts you. If your session ends, the user runs `/factory up`; keep the tracker current enough for that.
 
 ## Keep state current
