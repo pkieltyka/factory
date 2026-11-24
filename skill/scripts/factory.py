@@ -390,8 +390,6 @@ class Inbox:
             moved = [r for r in self.unread if r["id"] <= seen]
             self.state["history"] = (self.state.get("history", []) + moved)[-100:]
             self.state["seen"] = seen
-            if not self.unread:
-                self.state.pop("codex_wake", None)
             self.save_state()  # Save recovery text and seen together before removing inbox rows.
         self.remove_seen()
 
@@ -435,64 +433,6 @@ def operator_wait(harness, route):
     return TABLE.get(harness, {}).get("operator_wait", "foreground") if route == "inbox" else "background"
 
 
-def check_watcher_directory(directory):
-    for path in (directory.parent.parent, directory.parent, directory):
-        if path.is_symlink():
-            raise OSError(f"expected a private directory, found a symbolic link: {path}")
-
-
-def lock_watcher_directory(directory, *, register=False):
-    """With the inbox mutex held, acquire the directory lock without waiting for its owner."""
-    check_watcher_directory(directory)
-    if register:
-        directory.mkdir(mode=0o700, exist_ok=True)
-    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    try:
-        mode = fcntl.LOCK_EX if register else fcntl.LOCK_SH
-        fcntl.flock(fd, mode | fcntl.LOCK_NB)
-    except BaseException:
-        os.close(fd)
-        raise
-    return fd
-
-
-def watcher_lock(cfg, *, register=False):
-    """Retain the directory lock for a watcher, or probe it through the existing inbox mutex."""
-    inbox, directory = Inbox(cfg), cfg.session_dir
-    check_watcher_directory(directory)
-    flags = os.O_RDWR if register else os.O_RDONLY
-    mutex = inbox.private_open(inbox.lock_path, flags, read_only=True)
-    try:
-        fcntl.flock(mutex, fcntl.LOCK_EX if register else fcntl.LOCK_SH)
-        fd = lock_watcher_directory(directory, register=register)
-        if register:
-            return fd
-        os.close(fd)
-    finally:
-        os.close(mutex)
-
-
-def watcher_status(cfg):
-    try:
-        watcher_lock(cfg)
-    except BlockingIOError:
-        return "running"
-    except FileNotFoundError:
-        return "absent"
-    except OSError as e:
-        return f"unknown ({e})"
-    return "absent"
-
-
-# Default deadline and the shorter stretch if we cannot recognize the current composer.
-COMPOSER_WAIT = {"codex": (float("inf"), 60), "pi": (2_147_183, 300)}
-# What a composer wait tells a Codex or pi operator when it ends while members are live.
-LIVE = "Members are live: run factory.py wait again now; do not end your turn."
-REARM = "After replying, run factory.py wait again."
-KEEP = "Members are live: keep polling this wait until it exits; do not end your turn while it runs."
-STATUS_LIVE = "Members are live: run factory.py wait now and keep it running."
-
-
 def configure_messages(cfg, team, operator, restart=()):
     mode = cfg.operator.get("messages", "inbox")
     try:
@@ -511,13 +451,9 @@ def configure_messages(cfg, team, operator, restart=()):
               " After fixing it, run factory.py up.")
         return
     if mode == "inbox":
-        harness = (team.pane(operator) or {}).get("agent")
-        wait = operator_wait(harness, mode)
-        if wait == "background":
-            action = "in the background with --background-task and end your turn; it wakes you with messages and problems"
-        else:
-            action = "in the foreground, and again each time it returns while "
-            action += "members are live, without --timeout" if harness in COMPOSER_WAIT else "a member works"
+        wait = operator_wait((team.pane(operator) or {}).get("agent"), mode)
+        action = ("in the background and end your turn; it wakes you with messages and problems" if wait == "background" else
+                  "in the foreground, and again each time it returns while a member works")
         print(f"members reach @{operator} through the inbox; run factory.py wait {action}")
     else:
         print(f'members reach @{operator} by typed herdr messages ([operator] messages = "typed")')
@@ -574,159 +510,12 @@ def report_leftover_drafts(cfg):
             print(f"warning: cannot scan drafts in {directory}: {e}", file=sys.stderr)
 
 
-def watcher_registered(cfg):
-    """Probe under the inbox mutex. A registered reader may be waiting for that same mutex to finish."""
-    try:
-        os.close(lock_watcher_directory(cfg.session_dir))
-    except FileNotFoundError:
-        pass
-    except BlockingIOError:
-        return True
-    return False
-
-
-def codex_thread(pane):
-    ref = pane.get("agent_session")
-    if (pane.get("agent") != "codex" or not isinstance(ref, dict) or ref.get("agent") != "codex"
-            or ref.get("kind") not in ("id", "path") or not isinstance(ref.get("value"), str)):
-        return None
-    thread = session_id(ref)
-    return thread if re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", thread) else None
-
-
-def save_codex_wake(inbox, token):
-    previous = inbox.state.get("codex_wake")
-    inbox.state["codex_wake"] = token
-    try:
-        inbox.save_state()
-    except OSError:
-        # The state file is synced before replacement. A visible replacement only needs its directory synced.
-        saved = inbox.read_state(read_only=True) or {}
-        current = saved.get("codex_wake")
-        if current != token:
-            if previous is not None and current == previous:
-                inbox.state = saved
-                release_codex_wake(inbox, previous)
-            raise
-        try:
-            inbox.sync_directory()
-        except OSError:
-            release_codex_wake(inbox, token)
-            raise
-
-
-def claim_codex_wake(inbox, cfg, team, sender, number):
-    name = cfg.operator["name"]
-    pane = team.pane(name) or {}
-    if (pane.get("agent") or cfg.operator.get("harness")) != "codex":
-        return None
-    if "codex_wake" in inbox.state or watcher_registered(cfg):
-        return None
-    member = cfg.members[sender]
-    if ((team.pane(sender) or {}).get("agent") == "codex"
-            and (member.get("permissions") or cfg.team.get("permissions")) == "guarded"):
-        raise ValueError("guarded Codex sender")
-    pane_id, thread = pane.get("pane_id"), codex_thread(pane)
-    if not pane_id or team.agent_panes.get(name) != pane_id or not thread:
-        raise ValueError("could not verify the operator's Codex thread")
-    token = {"id": number, "thread": thread}
-    save_codex_wake(inbox, token)
-    return pane_id, token
-
-
-def release_codex_wake(inbox, token):
-    if inbox.state.get("codex_wake") == token:
-        del inbox.state["codex_wake"]
-        inbox.save_state()
-
-
-def live_codex_target(cfg):
-    name = cfg.operator["name"]
-    agent = herdr("agent", "get", name, check=False, timeout=2).get("agent") or {}
-    pane_id, thread = agent.get("pane_id"), codex_thread(agent)
-    if not pane_id or agent.get("name") != name or not thread:
-        return None
-    pane = herdr("pane", "get", pane_id, check=False, timeout=2).get("pane") or {}
-    if pane.get("pane_id") != pane_id or pane.get("label") != name or codex_thread(pane) != thread:
-        return None
-    info = herdr("pane", "process-info", "--pane", pane_id, check=False, timeout=2)
-    argv = harness_argv(info, "codex")
-    if argv and not any(arg.split("=", 1)[0] == "--remote" for arg in argv):
-        return pane_id, thread
-    return None
-
-
-class WakeRefused(ValueError):
-    """The native wake command did not start."""
-
-
-def dispatch_codex_wake(cfg, pane_id, token):
-    thread = token["thread"]
-    try:
-        if live_codex_target(cfg) != (pane_id, thread):
-            raise ValueError("could not verify a live local Codex operator thread")
-        with Inbox(cfg) as inbox:
-            if inbox.state.get("codex_wake") != token:
-                return
-            if watcher_registered(cfg):
-                release_codex_wake(inbox, token)
-                return
-        # The local CLI checks its own thread store. Never resume an unloaded thread or forward the report.
-        child = subprocess.Popen(["codex", "queue", "--thread", thread, "--message", "run factory.py wait"],
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except (OSError, ValueError) as e:
-        raise WakeRefused(str(e)) from e
-    # Once launch might have occurred, retain the batch claim on error or interruption.
-    with child:
-        try:
-            code = child.wait(timeout=10)
-        except BaseException:
-            child.kill()
-            raise
-    if code:
-        raise ValueError(f"codex queue exited {code}")
-
-
-def wake_codex_operator(cfg, pane_id, token):
-    try:
-        dispatch_codex_wake(cfg, pane_id, token)
-    except WakeRefused:
-        # Retain the reservation while refreshing the target so coalesced reports still have a sender handling the batch.
-        try:
-            target = live_codex_target(cfg)
-        except (OSError, ValueError):
-            target = None
-        with Inbox(cfg) as inbox:
-            if inbox.state.get("codex_wake") != token:
-                return
-            try:
-                covered = not inbox.unread or watcher_registered(cfg)
-            except OSError:
-                release_codex_wake(inbox, token)
-                raise
-            if covered or target is None:
-                release_codex_wake(inbox, token)
-                if covered:
-                    return
-                raise ValueError("could not verify a live local Codex operator thread")
-            pane_id, thread = target
-            if thread != token["thread"]:
-                token = {**token, "thread": thread}
-                save_codex_wake(inbox, token)
-        try:
-            dispatch_codex_wake(cfg, pane_id, token)
-        except WakeRefused:
-            with Inbox(cfg) as inbox:
-                release_codex_wake(inbox, token)
-            raise
-
-
-def queue_message(cfg, sender, text, *, team=None):
-    started = durable = False
+def queue_message(cfg, sender, text):
+    started = False
     try:
         with Inbox(cfg) as inbox:
             if not inbox.has_state or inbox.state["mode"] != "inbox":
-                return "refused", "the operator inbox route changed. Check factory.py status before retrying.", None
+                return "refused", "the operator inbox route changed. Check factory.py status before retrying."
             inbox.remove_seen()
             row = {"id": inbox.highest + 1, "at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                    "from": sender, "text": text}
@@ -741,19 +530,11 @@ def queue_message(cfg, sender, text, *, team=None):
                     payload = payload[written:]
                 os.fsync(fd)
                 inbox.sync_directory()
-                durable = True
             finally:
                 os.close(fd)
-            wake = claim_codex_wake(inbox, cfg, team, sender, row["id"]) if team else None
-        if wake:
-            wake_codex_operator(cfg, *wake)
-    except (OSError, ValueError, subprocess.TimeoutExpired, KeyboardInterrupt) as e:
-        if durable:
-            return "queued", row["id"], str(e) or "wake interrupted"
-        if isinstance(e, KeyboardInterrupt):
-            raise
-        return ("unconfirmed" if started else "refused"), str(e), None
-    return "queued", row["id"], None
+    except (OSError, ValueError) as e:
+        return ("unconfirmed" if started else "refused"), str(e)
+    return "queued", row["id"]
 
 
 class Checker:
@@ -1756,40 +1537,26 @@ def report_launch_drift(team, plans):
 def cmd_status(args):
     require_herdr()
     cfg = cfg_of(args)
-    watcher = watcher_status(cfg)
-    print(f"registered operator watcher process: {watcher}", flush=True)
     team = Team(cfg)
     rows = [("Member", "Role", "Harness", "Model", "Thinking", "Status", "Pane")]
     operator = cfg.operator["name"]
-    operator_pane = team.pane(operator) or {}
     rows.append(("@" + operator, "operator", cfg.operator.get("harness", ""), cfg.operator.get("model", ""), cfg.operator.get("thinking", ""),
-                 team.status(operator), operator_pane.get("pane_id", "")))
+                 team.status(operator), (team.pane(operator) or {}).get("pane_id", "")))
     for name in cfg.members:
         p = plan(cfg, name)
         pane = team.pane(name)
         rows.append(("@" + name, p["role"], p["harness"], p["model"] or "?", p["thinking"], team.status(name),
                      (pane or {}).get("pane_id", "")))
     print_table(rows)
-    harness = operator_pane.get("agent")
-    if (watcher == "absent" and operator_wait(harness, "inbox") == "background"
-            and team.agent_panes.get(operator) == operator_pane.get("pane_id")
-            and any(team.status(n).startswith("working") for n in cfg.members)):
-        print("No operator watcher is registered. Check native tasks before starting a background wait.")
     try:
         with Inbox(cfg) as inbox:
             suffix = (f"; {len(inbox.unread)} unread message{'s' if len(inbox.unread) != 1 else ''}"
                       " (factory.py wait prints them)") if inbox.unread else ""
             route = configured_route(cfg, inbox.state if inbox.has_state else None)
             if route == "inbox":
-                style = operator_wait(harness, route)
+                style = operator_wait((team.pane(operator) or {}).get("agent"), route)
                 suffix = f", {style} wait" + suffix
             print(f"operator messages: {route}{suffix}")
-        # Codex and pi operators check status between waits; tell them to keep listening while members are live.
-        pane = os.environ.get("HERDR_PANE_ID")
-        if (route == "inbox" and harness in COMPOSER_WAIT and pane and operator_pane.get("pane_id") == pane
-                and team.agent_panes.get(operator) == pane
-                and any(team.pane(n) and team.status(n) != "gone" for n in cfg.members)):
-            print(STATUS_LIVE)
     except (OSError, ValueError) as e:
         print(f"operator messages: unavailable ({e})")
     for state, hint in (("blocked", "blocked: waiting on an approval or a question. Read the pane and ask the user."),
@@ -1801,172 +1568,39 @@ def cmd_status(args):
         print(f"\nNo member of {CONF} has a pane in this herdr session. Run `factory.py up` to start or resume its members.")
 
 
-def codex_wait_render(block):
-    heading, _, terminal = block.partition("\n")
-    if heading.startswith("• Working ("):
-        # Codex can hang a hint below its status line ("  └ Tip: ..."), wrapped onto indented lines.
-        return not terminal or bool(re.fullmatch(r"  └ \w[\w ]{0,15}: \S.*(?:\n {4,}\S.*)*", terminal))
-    if not terminal:
-        return False
-    # During a poll of an existing command, Codex shows the terminal below a different status line.
-    waiting = "• Waiting for background terminal"
-    clipped = heading.removesuffix("…").rstrip()
-    return terminal.lstrip().startswith("└ ") and (
-        heading.startswith(waiting) or (clipped.startswith("• Waiting for") and waiting.startswith(clipped)))
-
-
-def composer_state(harness, screen):
-    """Read only the visible region adjacent to the editor. A cue needs its neighboring UI, not just its text."""
-    lines = screen.splitlines()
-    if harness == "codex":
-        editor = next((i for i in reversed(range(len(lines))) if re.match(r"^›(?: |$)", lines[i])), None)
-        if editor is None:
-            return "unknown"
-        blocks = re.split(r"\n[ \t]*\n\s*", "\n".join(lines[:editor]).rstrip())
-        if codex_wait_render(blocks[-1]):
-            return "waiting"
-        head, arrow, _ = blocks[-1].partition("↳")
-        if (len(blocks) > 1 and codex_wait_render(blocks[-2]) and arrow
-                and "".join(head.split()) == "•Queuedfollow-upinputs"):
-            return "follow-up"
-        return "unknown"
-
-    # pi draws the working line as the top border of the editor; the bottom border remains plain.
-    border = next((i for i in reversed(range(len(lines))) if re.fullmatch(r"─{3,}", lines[i])), 0)
-    working = next((i for i in reversed(range(border)) if lines[i].startswith("──")), None)
-    if working is None or not re.fullmatch(r"─+ [\u2800-\u28ff] Working ─+", lines[working]):
-        return "unknown"
-    block = re.split(r"\n[ \t]*\n\s*", "\n".join(lines[:working]).rstrip())[-1]
-    queued, arrow, hint = block.rpartition("↳")
-    if arrow and "".join(hint.split()).startswith("Alt+Uptoedit"):
-        rows = [line.strip() for line in queued.splitlines()]
-        if any(line.startswith("Follow-up:") for line in rows):
-            return "follow-up"
-        if any(line.startswith("Steering:") for line in rows):
-            return "steering"
-    if re.fullmatch(r"Elapsed (?:\d+h )?(?:\d+m )?\d+(?:\.\d+)?s", block.strip()):
-        return "waiting"
-    return "unknown"
-
-
-def read_composer(pane, harness):
-    try:
-        got = herdr("pane", "read", pane, "--source", "visible", check=False, timeout=1)
-    except OSError:
-        return "unknown", "could not start herdr"
-    if "error" in got:
-        return "unknown", got["error"].split("\n", 1)[0]
-    return composer_state(harness, got.get("text") or ""), None
-
-
 def cmd_wait(args):
-    """Watch messages and lifecycle changes, and keep verified Codex/pi operators listening through idle."""
+    """Watch messages and problems. Unnamed background inbox watches ignore idle/done/unknown transitions;
+    other watches also return when a member stops, status is unknown, or nobody works. Named watches track
+    only those members' lifecycle changes. Inbox messages from any member always end the wait."""
     require_herdr()
     cfg = cfg_of(args)
+    watch = [n.lstrip("@") for n in args.names]
     try:
         with Inbox(cfg) as inbox:
             route = configured_route(cfg, inbox.state if inbox.has_state else None)
     except (InboxDamage, OSError):
         route = "unavailable"
-    name = cfg.operator["name"]
-    live = herdr("agent", "get", name, check=False)
-    operator = live.get("agent") or {}
-    pane = os.environ.get("HERDR_PANE_ID")
-    verified = pane and operator.get("pane_id") == pane and operator.get("name") == name
-    native = verified and operator_wait(operator.get("agent"), "inbox") == "background"
-    codex = verified and route == "inbox" and operator.get("agent") == "codex"
-    if not args.background_task and native:
-        print("Start factory.py wait --background-task as a native background task and end your turn."
-              " See leading.md.", file=sys.stderr)
-        sys.exit(2)
-    if args.background_task and not native:
-        print("cannot verify a background-capable operator in this pane. Check factory.py status and the operator pane.",
-              file=sys.stderr)
-        sys.exit(2)
-    if not (args.background_task or codex):
-        return wait_for_events(args, cfg, route, operator)
-    try:
-        fd = watcher_lock(cfg, register=True)
-    except BlockingIOError:
-        print("operator wait already running. Reconcile the existing native task before starting another.", file=sys.stderr)
-        sys.exit(2)
-    except OSError as e:
-        print(f"cannot register the operator watcher: {e}", file=sys.stderr)
-        sys.exit(2)
-    def finish():
-        nonlocal fd
-        # Read while holding both locks. Senders holding the mutex only probe the directory with LOCK_NB.
-        try:
-            with Inbox(cfg) as inbox:
-                unread = inbox.unread
-                os.close(fd)
-                fd = None
-            return unread
-        except (OSError, ValueError) as e:
-            print(f"cannot finish the operator inbox wait: {e}", file=sys.stderr)
-            raise SystemExit(2)
-
-    try:
-        return wait_for_events(args, cfg, route, operator, finish=finish if codex else None)
-    finally:
-        if fd is not None:
-            os.close(fd)
-
-
-def wait_for_events(args, cfg, route, operator, *, finish=None):
-    watch = [n.lstrip("@") for n in args.names]
-    harness = operator.get("agent")
-    wait = operator_wait(harness, route)
+    live = herdr("agent", "get", cfg.operator["name"], check=False) if route == "inbox" else {}
+    wait = operator_wait((live.get("agent") or {}).get("agent"), route)
     quiet = route == "inbox" and wait == "background" and not watch
-    pane = os.environ.get("HERDR_PANE_ID")
-    watch_composer = (route == "inbox" and wait == "foreground" and not watch and harness in COMPOSER_WAIT
-                      and bool(pane) and operator.get("pane_id") == pane)
-    default_timeout, fallback = COMPOSER_WAIT[harness] if watch_composer else (60 if wait == "foreground" else 1800, None)
-    if args.background_task and harness == "omp":
-        default_timeout = 240
-    timeout = args.timeout if args.timeout is not None else default_timeout
-    interval = min(args.interval, 2) if watch_composer else args.interval
-    started = time.monotonic()
-    seen, worked, looks = None, set(), 0
+    if args.timeout is None:
+        args.timeout = 60 if wait == "foreground" else 1800
+    deadline, seen, worked, looks = time.monotonic() + args.timeout, None, set(), 0
     warned = False
-    unsure_until, unsure_detail = None, ""  # the shorter deadline while the composer stays unrecognized
-
-    def report_unread(unread, cue):
-        if finish:
-            unread = finish()
-        if unread:
-            print_messages(unread)
-            next_watch = f", acknowledge by starting your next watcher in the {wait}" if route == "inbox" else ""
-            background_flag = " --background-task" if args.background_task else ""
-            print(f"{len(unread)} unread message{'s' if len(unread) != 1 else ''}."
-                  f" After you have acted on or recorded these messages{next_watch}:"
-                  f" factory.py wait{background_flag} --seen {unread[-1]['id']}")
-        # The owner may submit while we are taking the inbox snapshot or printing the reports.
-        if unread and watch_composer and cue not in ("follow-up", "steering"):
-            cue, _ = read_composer(pane, harness)
-        if cue == "follow-up":
-            print(f"Owner follow-up queued. End your turn to receive it. {REARM}")
-        elif cue == "steering":
-            print(f"Owner steering queued. Let the harness deliver it before starting another wait. {REARM}")
-        return bool(unread or cue in ("follow-up", "steering"))
-
-    if watch_composer:  # a Codex tool yield shows only this, so it must keep the operator polling
-        print(KEEP, flush=True)
     while True:
-        cue = None
-        if watch_composer:
-            cue, error = read_composer(pane, harness)
-            if cue != "unknown":  # Codex shows no working line for a moment between its own polls
-                unsure_until = None
-            elif unsure_until is None:
-                unsure_until, unsure_detail = time.monotonic() - started + fallback, f" ({error})" if error else ""
-        unread = []
         try:
             with Inbox(cfg) as inbox:
                 if args.seen is not None:
                     inbox.acknowledge(args.seen)
                     args.seen = None
                 unread = inbox.unread
+            if unread:
+                print_messages(unread)
+                next_watch = f", acknowledge by starting your next watcher in the {wait}" if route == "inbox" else ""
+                print(f"{len(unread)} unread message{'s' if len(unread) != 1 else ''}."
+                      f" After you have acted on or recorded these messages{next_watch}:"
+                      f" factory.py wait --seen {unread[-1]['id']}")
+                return
         except (OSError, ValueError) as e:
             if args.seen is not None or quiet:
                 print(e, file=sys.stderr)
@@ -1974,9 +1608,6 @@ def wait_for_events(args, cfg, route, operator, *, finish=None):
             if not warned:
                 print(f"inbox unavailable: {e}" if isinstance(e, OSError) else str(e), flush=True)
                 warned = True
-        if unread or cue in ("follow-up", "steering"):
-            report_unread(unread, cue)
-            return
         team = Team(cfg)
         state = {n: team.status(n) for n in cfg.members if (not watch or n in watch) and team.pane(n)}
         if seen is None:  # the members this watch is about: a pane that closes later is noticed
@@ -1993,28 +1624,15 @@ def wait_for_events(args, cfg, route, operator, *, finish=None):
         # A prompt takes a moment to turn into `working`, so a named member counts as stopped, and the team as
         # idle, only from the second look on. The same goes for a status herdr has not worked out yet.
         stopped = [] if quiet else [n for n in settled if n in worked or (n in watch and looks > 1)]
-        if closed or needs or stopped or (not quiet and looks > 1 and (unclear or (not working and not watch_composer))):
+        if closed or needs or stopped or (not quiet and looks > 1 and (unclear or not working)):
             break
-        deadline = min(timeout, unsure_until) if unsure_until is not None else timeout
-        remaining = deadline - (time.monotonic() - started)
-        if remaining <= 0:
-            if finish and report_unread([], cue):
-                return
-            unknown = "; status unknown: " + ", ".join("@" + n for n in unclear) if unclear else ""
-            if deadline < timeout:
-                print(f"cannot verify the operator composer{unsure_detail}: it stayed unrecognized for {fallback}s.")
-                timeout = deadline
-            if watch_composer:
-                still = "; still working: " + ", ".join("@" + n for n in working) if working else ""
-                print(f"timeout after {timeout:.9g}s{still}{unknown}. {LIVE}")
-                sys.exit(4)
+        if time.monotonic() >= deadline:
             activity = "still working: " + ", ".join("@" + n for n in working) if working else "nobody is working"
-            print(f"timeout after {timeout:.9g}s; {activity}{unknown}")
+            unknown = "; status unknown: " + ", ".join("@" + n for n in unclear) if unclear else ""
+            print(f"timeout after {args.timeout:g}s; {activity}{unknown}")
             sys.exit(4)
         worked.update(working)
-        time.sleep(min(interval, remaining) if watch_composer else interval)
-    if finish:
-        report_unread([], cue)
+        time.sleep(args.interval)
     for n in closed:
         print(f"@{n}'s pane was closed, so it is no longer running. `factory.py up {n}` gives it a new pane.")
     for n in needs:
@@ -2031,8 +1649,6 @@ def wait_for_events(args, cfg, route, operator, *, finish=None):
     for n in stopped:
         print(f"@{n} stopped ({state[n]}). If it sent no report, read its pane:"
               f" herdr agent read {n} --source recent-unwrapped --lines 80")
-    if watch_composer and any(n not in closed and state[n] != "gone" for n in state):
-        print("Members are live: after you act on this, run factory.py wait again; do not end your turn.")
     if not (closed or needs or unclear or stopped):
         hint = ". End your turn; run factory.py wait again after you assign work." if wait == "foreground" else ""
         print(f"nobody is working: {', '.join('@' + n + ' ' + s for n, s in state.items())}{hint}")
@@ -2082,9 +1698,8 @@ def cmd_say(args):
     route = message_route(cfg) if operator in names else None
     refused, unconfirmed = [], False
     for name in dict.fromkeys(names):
-        advisory = None
         if name == operator and route == "inbox":
-            outcome, detail, advisory = queue_message(cfg, sender, text, team=team if member else None)
+            outcome, detail = queue_message(cfg, sender, text)
         elif name == operator and route != "typed":
             outcome, detail = "refused", "operator messages are unavailable. Check factory.py status and rerun factory.py up."
         elif (name != operator and name not in cfg.members) or not team.live(name):
@@ -2094,10 +1709,6 @@ def cmd_say(args):
             outcome = "submitted" if detail is None else "refused" if delivery_refused(detail) else "unconfirmed"
         if outcome == "queued":
             print(f"queued message {detail} for @{name}")
-            if advisory:
-                print(f"Operator wake unavailable or unconfirmed ({advisory})."
-                      " The operator can read the unread batch with factory.py wait.",
-                      file=sys.stderr)
         elif outcome == "submitted":
             print(f"submitted your message to @{name}")
         elif outcome == "refused":
@@ -2180,14 +1791,10 @@ def main(argv=None):
     common(st)
 
     wt = sub.add_parser("wait", help="return for unread inbox messages or a blocked, gone or closed member; "
-                                     "an operator's Codex/pi inbox watch also returns for queued owner input")
+                                     "outside a quiet watch also when a member stops or nobody is working")
     wt.add_argument("names", nargs="*", help="watch only these members (default: every member)")
-    wt.add_argument("--background-task", action="store_true",
-                    help="declare a native background launch (required for Claude Code, omp and OpenCode operators)")
-    wt.add_argument("--timeout", type=float, help="seconds before giving up (exit 4). Operator Codex/pi inbox waits "
-                    "default to no deadline and 2147183 seconds respectively. Native omp background waits default to 240, "
-                    "other foreground inbox waits to 60, and all others to 1800")
-    wt.add_argument("--interval", type=float, default=5, help="seconds between looks (up to 2 in operator Codex/pi inbox waits)")
+    wt.add_argument("--timeout", type=float, help="seconds before giving up (exit 4; default: foreground inbox 60, otherwise 1800)")
+    wt.add_argument("--interval", type=float, default=5, help="seconds between looks")
     wt.add_argument("--seen", type=int, help="acknowledge inbox messages through this id, then wait. "
                                             "Reread them with factory.py inbox")
     common(wt)
