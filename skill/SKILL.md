@@ -12,13 +12,13 @@ You are the operator (`@operator`): form the team, assign tasks, decide architec
 
 Paths below are relative to this skill. `factory.py` means `python3 <skill>/scripts/factory.py`. A project has two files at its root. `FACTORY.md` is the brief every member reads: the project, where tasks are tracked, the workflow. It is committed and shared by everyone on the repo. `factory.toml` is your own formation: `[operator]` is you (`name`, default `operator`, is your @name, pane label and herdr agent name), then the members with their harnesses and models. It is not committed; `factory.toml.sample` is the project's suggestion, which `factory.py init` copies. One team runs per herdr session.
 
-The session receiving the request is the operator. Run `up` from its pane. Record any known operator harness, model and thinking level for the roster. The live operator harness determines the wait style. Roster choices apply to members. Hand off to another operator session only on the user's explicit request.
+The session receiving the request is the operator. Run `up` from its pane. Record any known operator harness, model and thinking level for the roster. Claude Code, OpenCode and local Codex have operator wake paths. pi, omp and agy remain member-only. Roster choices apply to members. Hand off to another operator session only on the user's explicit request.
 
 After compaction, re-read the active command's reference, `references/leading.md`, `FACTORY.md` and the tracker. Preserve task owners, acceptance criteria, branches, verdicts and next steps there, not only in chat.
 
 Use `factory.py say` to message teammates, never a harness's own messaging (e.g. Claude Code's `SendMessage`). Members send private drafts with `--file`, including reports to the operator. For several recipients, address each with `@name` in one draft and send it once.
 
-Start one `wait` in the mode `status` names. In background mode, start it as a background task and end your turn. When it returns, read the full output and act on or record messages before acknowledging them with the next watcher. Run `wait` directly, outside any loop or helper that restarts it or handles messages. Use `inbox` to reread acknowledged messages. See [references/leading.md](references/leading.md#receive-and-inspect).
+Read pending reports with `wait --timeout 0` on activation and on a Codex reminder. In Claude Code and OpenCode, start one native background `wait` and end your turn. Handle its full result before replacing it. Acknowledge only messages you acted on or recorded. Use `inbox` to reread acknowledged messages. See [references/leading.md](references/leading.md#receive-and-inspect).
 
 ## Before launch
 
@@ -47,7 +47,7 @@ factory.py up                       # every member in factory.toml
 factory.py up reviewer pm           # selected members
 ```
 
-`up` checks every member it will start or restart and checks for name conflicts before changing anything in herdr. Reading the team can record observed sessions in the local cache. If checks fail, report the problem/fix and resolve it; do not substitute models, harnesses or effort levels without the user's authorization. Unknown Claude models warn instead of failing preflight; Claude rejects invalid IDs at launch.
+`up` checks the live operator harness, every member it will start or restart, and name conflicts before changing anything in herdr. Reading the team can record observed sessions in the local cache. If checks fail, report the problem/fix and resolve it; do not substitute models, harnesses or effort levels without the user's authorization. Unknown Claude models warn instead of failing preflight; Claude rejects invalid IDs at launch.
 
 On success, the script labels the operator tab `factory operator`, creates a balanced `factory team` tab, prepares worktrees, starts members and sends their briefs. Re-running `up` leaves live members alone and resumes matching sessions for stopped members. Use `--fresh` for new sessions and `--restart` to relaunch running members too.
 
