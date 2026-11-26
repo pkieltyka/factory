@@ -8,6 +8,8 @@ harnesses and models; it is not committed (factory.toml.sample is, as the projec
 rest: a member's pane is labeled with its @name and its agent carries that name. Harnesses are described in
 harnesses.toml. `factory.py --help` lists the commands.
 """
+from __future__ import annotations
+
 import argparse
 import collections
 import datetime
@@ -18,12 +20,14 @@ import json
 import os
 import pathlib
 import re
+import select
 import shlex
 import shutil
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import tomllib
 
@@ -60,6 +64,203 @@ class Problem(Exception):
     def __init__(self, what, fix):
         super().__init__(what)
         self.what, self.fix = what, fix
+
+
+# ================================================================ hc transport
+
+class HcError(Exception):
+    """An error reply from hc."""
+
+    def __init__(self, kind, message, hint=""):
+        super().__init__(f"{kind}: {message}" if kind else message)
+        self.kind, self.message, self.hint = kind, message, hint
+
+
+class HcDown(Exception):
+    """No usable answer from hc. A sent request may already have taken effect."""
+
+    def __init__(self, sent, detail, timeout=False):
+        super().__init__(detail)
+        self.sent, self.detail, self.timeout = sent, detail, timeout
+
+
+class Hc:
+    def __init__(self, bin: str | None = None, timeout: float | None = 30, expect_core: str | None = None):
+        self.bin, self.timeout, self.expect_core = bin, timeout, expect_core
+        self.version: tuple[int, ...] | None = None
+        self.core: str | None = None
+        self.children: set[subprocess.Popen] = set()
+        self._lock = threading.Lock()
+        self._closed = False
+
+    def kill_children(self) -> None:
+        with self._lock:
+            self._closed = True
+            for process in self.children:
+                process.kill()
+
+    def call(self, method, params=None, timeout=...) -> dict:
+        timeout = self.timeout if timeout is ... else timeout
+        deadline = None if timeout is None else time.monotonic() + timeout
+        process = None
+        complete = sent = False
+        buffer = bytearray()
+        try:
+            stderr = tempfile.TemporaryFile()
+        except OSError as error:
+            raise HcDown(False, str(error)) from error
+
+        def wait_for(fd, writing=False):
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                raise TimeoutError("timed out")
+            readers, writers, _ = select.select([] if writing else [fd], [fd] if writing else [], [], remaining)
+            if not (writers if writing else readers):
+                raise TimeoutError("timed out")
+
+        def write_line(ident, name, fields):
+            nonlocal sent
+            wire = json.dumps({"jsonrpc": "2.0", "id": ident, "method": name,
+                               "params": {} if fields is None else fields}).encode() + b"\n"
+            fd = process.stdin.fileno()
+            offset = 0
+            while offset < len(wire):
+                wait_for(fd, writing=True)
+                try:
+                    count = os.write(fd, memoryview(wire)[offset:])
+                except BlockingIOError:
+                    continue
+                if count <= 0:
+                    raise OSError("hc connect stdin made no progress")
+                if ident == 1:
+                    sent = True
+                offset += count
+
+        def read_reply(ident, description):
+            fd = process.stdout.fileno()
+            end = buffer.find(b"\n")
+            while end < 0:
+                wait_for(fd)
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    raise OSError("hc connect closed its output")
+                buffer.extend(chunk)
+                end = buffer.find(b"\n")
+            line = bytes(buffer[:end])
+            del buffer[:end + 1]
+            try:
+                reply = json.loads(line)
+            except ValueError as error:
+                raise ValueError(f"unexpected {description} reply: {error}") from error
+            if (not isinstance(reply, dict) or reply.get("jsonrpc") != "2.0"
+                    or type(reply.get("id")) is not int or reply["id"] != ident):
+                raise ValueError(f"unexpected {description} reply: invalid JSON-RPC envelope")
+            return reply
+
+        with stderr:
+            try:
+                with self._lock:
+                    if self._closed:
+                        raise HcDown(False, "hc client closed")
+                    process = subprocess.Popen([HC if self.bin is None else self.bin, "connect"],
+                                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr, bufsize=0)
+                    self.children.add(process)
+                os.set_blocking(process.stdin.fileno(), False)
+                write_line(0, "hello", {"generation": 1, "framed": False})
+                hello = read_reply(0, "hello")
+                info = hello.get("result")
+                if not isinstance(info, dict) or "error" in hello:
+                    raise ValueError("unexpected hello reply: missing result")
+                version, core = info.get("version"), info.get("core")
+                if (type(info.get("generation")) is not int or info["generation"] != 1
+                        or info.get("framed") is not False or not isinstance(version, str)
+                        or not re.fullmatch(r"[0-9]+(?:\.[0-9]+)+", version)
+                        or not isinstance(core, dict) or not isinstance(core.get("id"), str) or not core["id"]):
+                    raise ValueError("unexpected hello reply: invalid generation, framing, version or core")
+                parsed_version = tuple(map(int, version.split(".")))
+                if parsed_version < HC_MIN:
+                    raise HcDown(False, f"hc {'.'.join(map(str, HC_MIN))} or newer is required (found {version})")
+                if self.expect_core is not None and core["id"] != self.expect_core:
+                    raise HcDown(False, f"this is another hc core ({core['id']}) than the team's ({self.expect_core})")
+                self.version, self.core = parsed_version, core["id"]
+                write_line(1, method, params)
+                reply = read_reply(1, "request")
+                if "error" in reply:
+                    error = reply["error"]
+                    data = error.get("data", {}) if isinstance(error, dict) else None
+                    if ("result" in reply or not isinstance(data, dict) or not isinstance(error.get("message"), str)
+                            or any(not isinstance(data.get(key, ""), str) for key in ("kind", "hint"))):
+                        raise ValueError("unexpected reply: malformed error")
+                    raise HcError(data.get("kind", ""), error["message"], data.get("hint", ""))
+                if not isinstance(reply.get("result"), dict):
+                    raise ValueError("unexpected reply: missing result object")
+                complete = True
+                return reply["result"]
+            except (OSError, ValueError) as error:
+                if process is not None:
+                    process.kill()
+                    process.wait()
+                size = stderr.seek(0, os.SEEK_END)
+                stderr.seek(max(0, size - 2000))
+                tail = stderr.read().decode(errors="replace").strip()
+                detail = "hc not found" if process is None and isinstance(error, FileNotFoundError) else str(error)
+                if tail:
+                    detail = f"{detail}: {tail}"
+                raise HcDown(sent, detail, timeout=isinstance(error, TimeoutError)) from error
+            finally:
+                if process is not None:
+                    try:
+                        process.stdin.close()
+                        if complete:
+                            try:
+                                process.wait(timeout=2)
+                            except subprocess.TimeoutExpired:
+                                process.kill()
+                        else:
+                            process.kill()
+                        process.wait()
+                    finally:
+                        process.stdout.close()
+                        with self._lock:
+                            self.children.remove(process)
+
+    def list(self, team: str) -> list[dict]:
+        return self.call("terminal.list", {"all": True, "labels": {"factory.team": team}})["terminals"]
+
+    def get(self, term: str) -> dict:
+        return self.call("terminal.get", {"terminal": term})
+
+    def run(self, argv: list[str], cwd: str, env: dict, labels: dict) -> dict:
+        return self.call("terminal.run", {"argv": argv, "cwd": cwd, "env": env, "labels": labels,
+                                          "no_parent": True, "no_notify": True})
+
+    def send(self, term: str, text: str) -> dict:
+        return self.call("terminal.send", {"terminal": term, "text": text}, timeout=None)
+
+    def keys(self, term: str, keys: list[str]) -> dict:
+        return self.call("terminal.keys", {"terminal": term, "keys": keys})
+
+    def read(self, term: str) -> str:
+        return self.call("terminal.read", {"terminal": term, "lines": 0})["text"]
+
+    def label(self, term: str, labels: dict) -> dict:
+        return self.call("terminal.label", {"terminal": term, "labels": labels})
+
+    def keep_off(self, term: str) -> None:
+        self.call("terminal.keep", {"terminal": term, "keep": False})
+
+    def kill(self, term: str) -> dict:
+        return self.call("terminal.kill", {"terminal": term})
+
+    def rm(self, term: str) -> None:
+        self.call("terminal.rm", {"terminal": term})
+
+    def doc_get(self) -> tuple[dict | None, int]:
+        result = self.call("doc.get", {"name": "herdr-app"})
+        return result["value"], result["version"]
+
+    def doc_set(self, value: dict | None, version: int) -> int:
+        return self.call("doc.set", {"name": "herdr-app", "value": value, "version": version})["version"]
 
 
 # ================================================================ files

@@ -18,12 +18,15 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
+import time
 import tomllib
 import types
 import unittest
 from urllib.parse import unquote, urlsplit
-from unittest.mock import patch
+from unittest.mock import call, patch
 
+import fake_hc
 import live
 
 SCRIPT = pathlib.Path(__file__).resolve().parent.parent / "skill/scripts/factory.py"
@@ -113,6 +116,272 @@ class HcContract(unittest.TestCase):
         self.assertEqual(self.check_result("terminal.list", result), [])
         self.assertEqual(self.check_result("terminal.list", {**result, "machines": []}), [])
         self.assertTrue(self.check_result("terminal.list", {**result, "machines": [False]}))
+
+
+class FakeHc:
+    def __enter__(self):
+        self.stack = contextlib.ExitStack()
+        self.directory = self.stack.enter_context(tempfile.TemporaryDirectory(prefix="fake-hc-"))
+        self.stack.enter_context(patch.dict(os.environ, {"FAKE_HC_DIR": self.directory}, clear=False))
+        self.stack.enter_context(patch.object(factory, "HC", str(pathlib.Path(fake_hc.__file__))))
+        return self
+
+    def __exit__(self, *error):
+        self.stack.close()
+
+    def state(self):
+        return fake_hc.state_at(self.directory)
+
+    def received(self):
+        with self.state() as state:
+            return state["received"]
+
+    def calls(self, method):
+        with self.state() as state:
+            return [request for request in state["calls"] if request["method"] == method]
+
+    def rule(self, phase, **options):
+        with self.state() as state:
+            state["rules"][phase] = options
+
+    def add(self, labels, status="idle", **fields):
+        with self.state() as state:
+            address = f"t{state['next']}"
+            state["next"] += 1
+            record = fake_hc.example("terminal.get.live")
+            record.update(address=address, labels=labels, turn=0,
+                          status={"state": status, "app": "fake"} if status else None, reported=status is not None)
+            record.update(fields)
+            state["terminals"][address] = record
+            return address
+
+    def on_send(self, term, **options):
+        with self.state() as state:
+            state["rules"].setdefault("send", {})[term] = options
+
+    def sent(self, term):
+        with self.state() as state:
+            return state["sent"].get(term, [])
+
+
+class HcClientTests(unittest.TestCase):
+    def setUp(self):
+        self.fake = self.enterContext(FakeHc())
+        self.hc = factory.Hc(timeout=2)
+
+    def check_failure(self, *, sent, timeout=False, method="terminal.list", params=None, client=None):
+        client = client or self.hc
+        with self.assertRaises(factory.HcDown) as raised:
+            client.call(method, params)
+        self.assertEqual((raised.exception.sent, raised.exception.timeout), (sent, timeout))
+        self.assertFalse(client.children)
+        return raised.exception
+
+    def test_call_returns_result(self):
+        self.assertEqual(self.hc.list("team"), [])
+        self.assertEqual(self.hc.version, (0, 1, 20))
+        self.assertEqual(self.hc.core, "fakecore00000000")
+        self.assertFalse(self.hc.children)
+
+    def test_call_maps_error_kind(self):
+        with self.assertRaises(factory.HcError) as raised:
+            self.hc.get("t999")
+        error = raised.exception
+        self.assertEqual(error.kind, "not_found")
+        self.assertIn("t999", error.message)
+        self.assertTrue(error.hint)
+        self.assertFalse(self.hc.children)
+
+    def test_old_hc_refused_before_request(self):
+        with patch.dict(os.environ, {"FAKE_HC_VERSION": "0.1.19"}):
+            self.check_failure(sent=False)
+        self.assertEqual([r["method"] for r in self.fake.received()], ["hello"])
+
+    def test_wrong_core_refused_before_request(self):
+        self.check_failure(sent=False, client=factory.Hc(expect_core="wrong-core"))
+        self.assertEqual([r["method"] for r in self.fake.received()], ["hello"])
+
+    def test_missing_binary(self):
+        error = self.check_failure(sent=False, client=factory.Hc(bin=str(pathlib.Path(self.fake.directory) / "missing")))
+        self.assertEqual(error.detail, "hc not found")
+
+    def test_hello_timeout_is_unsent(self):
+        self.fake.rule("hello", stall=True)
+        self.check_failure(sent=False, timeout=True, client=factory.Hc(timeout=0.3))
+
+    def test_hello_eof_is_unsent(self):
+        self.fake.rule("hello", eof=True)
+        self.check_failure(sent=False)
+
+    def test_malformed_hello_is_unsent(self):
+        info = HC_FIXTURES["replies"]["hello"]["result"]
+        hello = {"jsonrpc": "2.0", "id": 0, "result": info}
+        for rule in (
+            {"wire": "not JSON\n"}, {"reply": []}, {"reply": {**hello, "id": 1}},
+            {"reply": {**hello, "error": {}}}, {"reply": {**hello, "result": {**info, "framed": True}}},
+            {"reply": {**hello, "result": {**info, "generation": 2}}},
+            {"reply": {**hello, "result": {k: v for k, v in info.items() if k not in ("generation", "version")}}},
+            {"reply": {**hello, "result": {**info, "version": 20}}},
+            {"reply": {**hello, "result": {**info, "core": {}}}},
+        ):
+            with self.subTest(rule=rule):
+                prior = len(self.fake.received())
+                self.fake.rule("hello", **rule)
+                self.check_failure(sent=False)
+                self.assertEqual([r["method"] for r in self.fake.received()[prior:]], ["hello"])
+
+    def test_request_write_failures_use_actual_byte_count(self):
+        raw_write = os.write
+        for partial in (False, True):
+            with self.subTest(partial=partial):
+                writes = 0
+
+                def fail_request(fd, data):
+                    nonlocal writes
+                    if b'"method": "hello"' in data.tobytes():
+                        return raw_write(fd, data)
+                    writes += 1
+                    if partial and writes == 1:
+                        return raw_write(fd, data[:5])
+                    raise BrokenPipeError("injected")
+
+                with patch.object(factory.os, "write", side_effect=fail_request):
+                    self.check_failure(sent=partial)
+                self.assertEqual(writes, 2 if partial else 1)
+
+    def test_blocked_write_hits_the_deadline(self):
+        self.fake.rule("hello", stop_reading=True)
+        self.check_failure(sent=True, timeout=True, params={"large": "x" * (200 * 1024)},
+                           client=factory.Hc(timeout=0.6))
+
+    def test_stderr_flood_does_not_block(self):
+        term = self.fake.add({}, "idle")
+        self.fake.rule("reply", stderr=1024 * 1024)
+        self.assertTrue(self.hc.send(term, "hello")["started"])
+        self.fake.rule("reply", stderr=1024 * 1024, wire="wrong JSON\n")
+        detail = self.check_failure(sent=True).detail
+        self.assertTrue(detail.endswith("stderr-tail"))
+        self.assertLess(len(detail), 2200)
+
+    def test_reply_timeout_is_sent_and_kills_connect(self):
+        self.fake.rule("reply", stall=True)
+        process = subprocess.Popen
+        children = []
+
+        def start(*args, **kwargs):
+            child = process(*args, **kwargs)
+            children.append(child)
+            return child
+
+        with patch.object(factory.subprocess, "Popen", side_effect=start):
+            self.check_failure(sent=True, timeout=True, client=factory.Hc(timeout=0.3))
+        self.assertEqual(len(children), 1)
+        self.assertIsNotNone(children[0].returncode)
+
+    def test_reply_eof_is_sent(self):
+        self.fake.rule("reply", eof=True)
+        self.check_failure(sent=True)
+
+    def test_malformed_reply_is_sent(self):
+        envelope = {"jsonrpc": "2.0", "id": 1}
+        for rule in (
+            {"wire": "not JSON\n"}, {"reply": {**envelope, "id": 0, "result": {}}},
+            {"reply": envelope}, {"reply": {**envelope, "error": []}},
+            {"reply": {**envelope, "error": {"data": "wrong", "message": "oops"}}},
+        ):
+            with self.subTest(rule=rule):
+                self.fake.rule("reply", **rule)
+                self.check_failure(sent=True)
+
+    def test_fragmented_and_coalesced_replies(self):
+        self.fake.rule("hello", fragment=True)
+        self.fake.rule("reply", after='{"unused":true}\n')
+        self.assertEqual(self.hc.list("team"), [])
+
+    def test_one_deadline_covers_hello_and_reply(self):
+        self.fake.rule("hello", delay=0.35)
+        self.fake.rule("reply", delay=0.45)
+        self.check_failure(sent=True, timeout=True, client=factory.Hc(timeout=0.68))
+
+    def test_kill_children_ends_held_send(self):
+        term = self.fake.add({})
+        self.fake.on_send(term, hold=True)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(self.hc.send, term, "held")
+            try:
+                deadline = time.monotonic() + 3
+                while not self.fake.calls("terminal.send"):
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(0.01)
+            finally:
+                self.hc.kill_children()
+            with self.assertRaises(factory.HcDown) as raised:
+                future.result(timeout=3)
+        self.assertTrue(raised.exception.sent)
+        self.assertFalse(raised.exception.timeout)
+        self.assertFalse(self.fake.sent(term))
+        self.assertFalse(self.hc.children)
+
+    def test_no_call_after_kill_children(self):
+        self.hc.kill_children()
+        self.check_failure(sent=False)
+        self.assertEqual(self.fake.received(), [])
+
+    def test_kill_children_sees_a_child_being_started(self):
+        starting, release = threading.Event(), threading.Event()
+        popen = subprocess.Popen
+
+        def start(*args, **kwargs):
+            child = popen(*args, **kwargs)
+            starting.set()
+            if not release.wait(3):
+                child.kill()
+                child.wait()
+                raise RuntimeError("test did not release child")
+            return child
+
+        self.fake.rule("hello", stall=True)
+        with patch.object(factory.subprocess, "Popen", side_effect=start), ThreadPoolExecutor(2) as pool:
+            call_future = pool.submit(self.hc.list, "team")
+            self.assertTrue(starting.wait(3))
+            kill_future = pool.submit(self.hc.kill_children)
+            release.set()
+            kill_future.result(timeout=3)
+            with self.assertRaises(factory.HcDown) as raised:
+                call_future.result(timeout=3)
+        self.assertFalse(raised.exception.sent)
+        self.assertFalse(raised.exception.timeout)
+        self.assertFalse(self.hc.children)
+
+    def test_wrapper_requests(self):
+        with patch.object(self.hc, "call", return_value={"terminals": [], "text": "", "value": None, "version": 0}) as rpc:
+            self.hc.list("team")
+            self.hc.get("t1")
+            self.hc.run(["python"], "/tmp", {"X": "Y"}, {"team": "one"})
+            self.hc.send("t1", "hello")
+            self.hc.keys("t1", ["enter"])
+            self.hc.read("t1")
+            self.hc.label("t1", {"x": "y"})
+            self.hc.keep_off("t1")
+            self.hc.kill("t1")
+            self.hc.rm("t1")
+            self.hc.doc_get()
+            self.hc.doc_set({}, 7)
+        self.assertEqual(rpc.call_args_list, [
+            call("terminal.list", {"all": True, "labels": {"factory.team": "team"}}),
+            call("terminal.get", {"terminal": "t1"}),
+            call("terminal.run", {"argv": ["python"], "cwd": "/tmp", "env": {"X": "Y"},
+                                  "labels": {"team": "one"}, "no_parent": True, "no_notify": True}),
+            call("terminal.send", {"terminal": "t1", "text": "hello"}, timeout=None),
+            call("terminal.keys", {"terminal": "t1", "keys": ["enter"]}),
+            call("terminal.read", {"terminal": "t1", "lines": 0}),
+            call("terminal.label", {"terminal": "t1", "labels": {"x": "y"}}),
+            call("terminal.keep", {"terminal": "t1", "keep": False}),
+            call("terminal.kill", {"terminal": "t1"}),
+            call("terminal.rm", {"terminal": "t1"}),
+            call("doc.get", {"name": "herdr-app"}),
+            call("doc.set", {"name": "herdr-app", "value": {}, "version": 7}),
+        ])
 
 FAKE_HERDR = textwrap.dedent(r'''
     #!/usr/bin/env python3
