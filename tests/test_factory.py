@@ -8,6 +8,7 @@ import contextlib
 from concurrent.futures import ThreadPoolExecutor
 import datetime
 import errno
+import fcntl
 import hashlib
 import io
 import json
@@ -3728,6 +3729,578 @@ class DeliveryDecisionTests(unittest.TestCase):
         self.assertEqual(factory.head_of("lead-dev", self.box, True), (first, []))
         self.assertEqual(factory.head_of("lead-dev", self.box, False), (latest, [older]))
         self.assertEqual(factory.head_of("another", self.box, False), (None, []))
+
+
+class ManualClock:
+    def __init__(self):
+        self.now = 0
+
+    def monotonic(self):
+        return self.now
+
+    def time(self):
+        return 1_800_000_000 + self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+class TeamCase(HcBackend, unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        self.env = self.enterContext(Env(UI))
+        self.enterContext(patch.dict(os.environ, {"XDG_CACHE_HOME": self.env.env["XDG_CACHE_HOME"]}))
+        self.root = self.env.repo
+        self.cfg = factory.Config(self.root)
+        self.team = factory.team_key(self.root)
+        self.hc.list(self.team)  # learn the core ID before computing the state path
+        self.state_dir = factory.state_dir(self.root, self.hc.core)
+        factory.update_team(self.state_dir, root=str(self.root), team=self.team, core=self.hc.core, up=True)
+        self.log = factory.open_log(self.state_dir)
+        self.clock = ManualClock()
+        self.jobs, self.pane = [], []
+        self.keeper = factory.Keeper(self.state_dir, self.hc, self.clock, self.pane.append, self.jobs.append)
+
+    def terminal(self, name, *, kind="member", status="idle"):
+        labels = {"factory.team": self.team, "factory.kind": kind,
+                  "factory.member": name, "factory.dir": str(self.state_dir)}
+        if REAL_HC:
+            terminal, agent_log = self.launch("silent" if status is None else "reports", name=name)
+            self.hc.label(terminal, labels)
+            return terminal, agent_log
+        return self.fake.add(labels, status), None
+
+    def briefed(self, name, terminal):
+        ident = self.log.add("operator", [name], "brief completed", kind="brief")[0]
+        _, box = self.log.read_box()
+        self.log.out(box, ident, name, "sending", term=terminal)
+        self.log.out(box, ident, name, "delivered", term=terminal, started=True, turn=0)
+
+    def add(self, name, body="first", **extra):
+        return self.log.add("pm", [name], body, **extra)[0]
+
+    def outcome(self, ident, name="lead-dev"):
+        return self.log.read_box()[1].outcome(ident, name)
+
+    def run_jobs(self, *, reverse=False):
+        jobs, self.jobs[:] = list(self.jobs), []
+        for job in reversed(jobs) if reverse else jobs:
+            job()
+
+
+class KeeperTests(TeamCase):
+    def member(self, *, status="idle", briefed=True):
+        term, agent_log = self.terminal("lead-dev", status=status)
+        if briefed:
+            self.briefed("lead-dev", term)
+        return term, agent_log
+
+    def test_queued_jobs_keep_their_own_recipient_and_text(self):
+        lead, lead_log = self.member()
+        reviewer, reviewer_log = self.terminal("reviewer")
+        self.briefed("reviewer", reviewer)
+        a = self.add("lead-dev", "first")
+        b = self.add("reviewer", "second\n\n")
+        self.keeper.tick()
+        self.assertEqual(self.outcome(a)["o"], "sending")
+        self.assertEqual(self.outcome(b, "reviewer")["o"], "sending")
+        self.assertEqual(len(self.jobs), 2)
+        self.run_jobs(reverse=True)
+        self.keeper.tick()
+        for term, agent_log, text in ((lead, lead_log, "first\n"), (reviewer, reviewer_log, "second\n\n")):
+            self.until(lambda: self.inputs(term, agent_log) == ["[from @pm]\n" + text], "one exact input")
+        self.assertEqual(self.outcome(a)["o"], "delivered")
+        self.assertEqual(self.outcome(b, "reviewer")["o"], "delivered")
+        self.assertEqual(self.keeper.inflight, {})
+        self.assertEqual(len(self.pane), 2)
+        self.assertRegex(self.pane[0], rf"^\d\d:\d\d:\d\d #{b} @pm -> @reviewer delivered$")
+        self.assertNotIn("second", "\n".join(self.pane))
+
+    @fake_only
+    def test_held_head_does_not_delay_other_recipients_and_preserves_order(self):
+        term, _ = self.member(status="working")
+        operator, _ = self.terminal("operator", kind="operator")
+        first = self.add("lead-dev")
+        second = self.add("lead-dev", "second")
+        other = self.log.add("factory", ["operator"], "heads up", kind="note", meta={"what": "error"})[0]
+        self.keeper.tick()
+        held = self.jobs.pop(0)
+        self.run_jobs()
+        self.keeper.tick()
+        self.keeper.tick()
+        self.assertEqual(self.outcome(other, "operator")["o"], "delivered")
+        self.assertEqual(self.inputs(operator, None), ["[from factory]\nheads up\n"])
+        self.assertEqual(self.outcome(first)["o"], "sending")
+        self.assertEqual(self.outcome(second)["why"], "waiting")
+        self.assertEqual(sum("sending (held)" in line for line in self.pane), 1)
+        self.assertEqual(self.inputs(term, None), [])
+        held()
+        self.keeper.tick()
+        self.run_jobs()
+        self.keeper.tick()
+        self.assertEqual(self.inputs(term, None), ["[from @pm]\nfirst\n", "[from @pm]\nsecond\n"])
+
+    @fake_only
+    def test_blocked_queues_the_head_once_then_delivers(self):
+        term, _ = self.member(status="blocked")
+        first = self.add("lead-dev")
+        second = self.add("lead-dev", "second")
+        self.keeper.tick()
+        self.keeper.tick()
+        self.assertEqual(self.outcome(first)["why"], "blocked")
+        self.assertEqual(self.outcome(second)["why"], "waiting")
+        self.assertEqual(len(self.pane), 1)
+        self.fake.set_status(term, "idle")
+        self.keeper.tick()
+        self.run_jobs()
+        self.keeper.tick()
+        self.assertEqual(self.outcome(first)["o"], "delivered")
+        self.assertEqual(self.outcome(second)["o"], "sending")
+
+    @fake_only
+    def test_shell_is_gone_and_never_receives_input(self):
+        term, _ = self.member()
+        self.fake.set_status(term, None)
+        ident = self.add("lead-dev")
+        self.keeper.tick()
+        self.assertEqual(self.outcome(ident)["why"], "gone")
+        self.assertFalse(self.jobs)
+
+    @fake_only
+    def test_operator_null_holds_then_latches_until_marked_again(self):
+        operator, _ = self.terminal("operator", kind="operator", status=None)
+        first = self.add("operator")
+        second = self.add("operator", "second")
+        self.keeper.tick()
+        self.clock.sleep(factory.LATCH_AFTER - 1)
+        self.keeper.tick()
+        self.assertEqual(self.outcome(first, "operator")["why"], "waiting")
+        self.fake.set_status(operator, "working")
+        self.keeper.tick()
+        self.assertEqual(self.hc.get(operator)["labels"]["factory.kind"], "operator")
+        # Re-observe a new null episode while the first claim is outstanding.
+        self.fake.set_status(operator, None)
+        self.keeper.tick()
+        self.clock.sleep(factory.LATCH_AFTER)
+        self.jobs.clear()
+        self.keeper.results.put(("operator", first, operator, factory.HcError("finished", "gone")))
+        self.keeper.tick()
+        self.assertEqual(self.outcome(first, "operator")["why"], "gone")
+        self.assertEqual(self.outcome(second, "operator")["why"], "gone")
+        self.assertEqual(self.hc.get(operator)["labels"]["factory.kind"], "operator-lost")
+        self.fake.set_status(operator, "idle")
+        self.keeper = factory.Keeper(self.state_dir, self.hc, self.clock, self.pane.append, self.jobs.append)
+        self.keeper.tick()
+        self.assertFalse(self.jobs)
+        self.hc.label(operator, {"factory.kind": "operator"})
+        self.keeper.tick()
+        self.run_jobs()
+        self.keeper.tick()
+        self.run_jobs()
+        self.keeper.tick()
+        self.assertEqual(self.inputs(operator, None), ["[from @pm]\nfirst\n", "[from @pm]\nsecond\n"])
+
+    @fake_only
+    def test_newest_brief_goes_first_and_redelivery_releases_not_ready(self):
+        term, _ = self.member(status=None, briefed=False)
+        message = self.add("lead-dev")
+        superseded = self.add("lead-dev", "old brief", kind="brief")
+        brief = self.add("lead-dev", "new brief", kind="brief")
+        self.keeper.tick()
+        self.assertEqual(self.outcome(superseded)["why"], "superseded")
+        self.assertEqual(self.outcome(brief)["why"], "waiting")
+        self.assertFalse(self.jobs)
+        self.fake.set_status(term, "idle")
+        self.keeper.tick()
+        self.finish_job(term, brief, factory.HcDown(True, "lost reply"))
+        self.keeper.tick()
+        self.assertEqual(self.outcome(brief)["o"], "unconfirmed")
+        self.assertEqual(self.outcome(message)["why"], "not ready")
+        again = self.add("lead-dev", "try brief again", kind="brief")
+        self.keeper.tick()
+        self.run_jobs()
+        self.keeper.tick()
+        self.assertEqual(self.outcome(again)["o"], "delivered")
+        self.assertEqual(self.outcome(message)["o"], "sending")
+        self.run_jobs()
+        self.keeper.tick()
+        self.assertEqual(self.inputs(term, None), ["[from @pm]\ntry brief again\n", "[from @pm]\nfirst\n"])
+
+    def finish_job(self, term, ident, outcome, name="lead-dev"):
+        self.assertEqual(len(self.jobs), 1)
+        self.jobs.clear()
+        self.keeper.results.put((name, ident, term, outcome))
+
+    @fake_only
+    def test_pretyping_failure_retries_without_reordering(self):
+        term, _ = self.member()
+        first = self.add("lead-dev")
+        second = self.add("lead-dev", "later")
+        self.keeper.tick()
+        self.fake.set_status(term, "blocked")
+        self.run_jobs()  # hc refuses, although the earlier view was ready
+        self.keeper.tick()
+        self.assertEqual(self.outcome(first)["why"], "blocked")
+        self.assertEqual(self.outcome(second)["why"], "waiting")
+        self.fake.set_status(term, "idle")
+        self.keeper.tick()
+        self.finish_job(term, first, factory.HcDown(False, "no bytes written"))
+        self.keeper.tick()
+        self.assertEqual(self.outcome(first)["o"], "sending")
+        self.run_jobs()
+        self.keeper.tick()
+        self.run_jobs()
+        self.keeper.tick()
+        self.assertEqual(self.inputs(term, None), ["[from @pm]\nfirst\n", "[from @pm]\nlater\n"])
+
+    @fake_only
+    def test_note_result_blocked_is_dropped(self):
+        operator, _ = self.terminal("operator", kind="operator")
+        ident = self.log.add("factory", ["operator"], "quiet", kind="note", meta={"what": "quiet"})[0]
+        self.keeper.tick()
+        self.fake.set_status(operator, "blocked")
+        self.run_jobs()
+        self.keeper.tick()
+        self.assertEqual(self.outcome(ident, "operator")["why"], "operator could not take it")
+        self.assertFalse(self.inputs(operator, None))
+
+    @fake_only
+    def test_malformed_send_result_is_unconfirmed_and_frees_the_recipient(self):
+        term, _ = self.member()
+        results = ({}, {"turn": "1"}, {"turn": True}, {"turn": 1, "started": "yes"},
+                   RuntimeError(), factory.HcDown(True, "lost reply"), {"turn": 2})
+        for result in results:
+            with self.subTest(result=result):
+                ident = self.add("lead-dev")
+                self.keeper.tick()
+                with patch.object(self.hc, "send", side_effect=[result]):
+                    self.run_jobs()
+                self.keeper.tick()
+                self.assertNotIn("lead-dev", self.keeper.inflight)
+                expected = "delivered" if result == {"turn": 2} else "unconfirmed"
+                self.assertEqual(self.outcome(ident)["o"], expected)
+                if expected == "delivered":
+                    self.assertIsNone(self.outcome(ident)["started"])
+
+    @fake_only
+    def test_refusal_before_stop_evidence_requeues_and_the_sweep_drops(self):
+        term, _ = self.member()
+        ident = self.add("lead-dev")
+        self.keeper.tick()
+        self.fake.finish(term)
+        self.run_jobs()
+        self.keeper.tick()
+        self.assertEqual(self.outcome(ident)["why"], "gone")
+        factory.mark_stopped(self.state_dir, [term], self.keeper.box)
+        self.hc.rm(term)
+        self.assertEqual(self.log.drop_queued(self.keeper.box, ["lead-dev"]), 1)
+        self.assertEqual(self.outcome(ident)["o"], "dropped")
+
+    @fake_only
+    def test_refusal_after_stop_evidence_is_dropped_directly(self):
+        for result in (factory.HcError("finished", "gone"), factory.HcError("not_found", "gone"),
+                       factory.HcError("blocked", "permission"), factory.HcDown(False, "unsent")):
+            with self.subTest(result=result):
+                term, _ = self.member()
+                ident = self.add("lead-dev")
+                self.keeper.tick()
+                self.fake.finish(term)
+                factory.mark_stopped(self.state_dir, [term], self.keeper.box)
+                self.hc.rm(term)
+                self.assertEqual(self.log.drop_queued(self.keeper.box, ["lead-dev"]), 0)
+                replacement, _ = self.member()
+                self.finish_job(term, ident, result)
+                self.keeper.tick()
+                self.assertEqual(self.outcome(ident)["why"], "stopped by down")
+                self.assertFalse(self.inputs(replacement, None))
+                self.assertFalse(self.jobs)
+                self.fake.remove(replacement)
+
+    @fake_only
+    def test_replaced_terminal_without_stop_evidence_receives_the_message_after_brief(self):
+        term, _ = self.member()
+        ident = self.add("lead-dev")
+        self.keeper.tick()
+        self.fake.remove(term)
+        replacement, _ = self.member(status=None, briefed=False)
+        self.run_jobs()
+        with patch.object(self.keeper.log, "locked", wraps=self.keeper.log.locked) as lock:
+            self.keeper._drain_results()
+            lock.assert_called_once_with(exclusive=True)
+        self.assertEqual(self.outcome(ident)["why"], "gone")
+        self.keeper.tick()
+        self.assertFalse(self.jobs)
+        self.briefed("lead-dev", replacement)
+        self.fake.set_status(replacement, "idle")
+        self.keeper.tick()
+        self.run_jobs()
+        self.keeper.tick()
+        self.assertEqual(self.inputs(replacement, None), ["[from @pm]\nfirst\n"])
+
+    @fake_only
+    def test_receipt_and_uncertain_results_ignore_stop_evidence(self):
+        term, _ = self.member()
+        for result, expected in (({"turn": 10, "started": True}, "delivered"),
+                                 (factory.HcDown(True, "lost"), "unconfirmed")):
+            ident = self.add("lead-dev")
+            self.keeper.tick()
+            factory.mark_stopped(self.state_dir, [term], self.keeper.box)
+            self.finish_job(term, ident, result)
+            self.keeper.tick()
+            self.assertEqual(self.outcome(ident)["o"], expected)
+        factory.mark_stopped(self.state_dir, ["t99"], self.keeper.box)
+        self.assertEqual(factory.read_team(self.state_dir)["stopped"], ["t99"])
+
+    @fake_only
+    def test_missing_or_unreadable_metadata_withholds_settlement(self):
+        for missing in (False, True):
+            with self.subTest(missing=missing):
+                term, _ = self.member()
+                ident = self.add("lead-dev")
+                self.keeper.tick()
+                self.fake.finish(term)
+                factory.mark_stopped(self.state_dir, [term], self.keeper.box)
+                self.hc.rm(term)
+                self.log.drop_queued(self.keeper.box, ["lead-dev"])
+                replacement, _ = self.member()
+                later = self.add("lead-dev", "later")
+                path = self.state_dir / "team.json"
+                data = path.read_bytes()
+                if missing:
+                    path.unlink()
+                else:
+                    path.write_text("{")
+                self.finish_job(term, ident, factory.HcError("finished", "gone"))
+                self.keeper.tick()
+                self.keeper.tick()
+                self.assertEqual(self.keeper.inflight, {"lead-dev": ident})
+                self.assertEqual(len(self.keeper.unsettled), 1)
+                self.assertEqual(self.outcome(ident)["o"], "sending")
+                self.assertEqual(self.outcome(later)["why"], "waiting")
+                self.assertFalse(self.keeper.stop)
+                self.assertFalse(self.jobs)
+                path.write_bytes(data)
+                self.keeper.tick()
+                self.run_jobs()
+                self.keeper.tick()
+                self.assertEqual(self.outcome(ident)["o"], "dropped")
+                self.assertEqual(self.outcome(later)["o"], "delivered")
+                self.assertEqual(self.inputs(replacement, None), ["[from @pm]\nlater\n"])
+                self.fake.remove(replacement)
+
+    @fake_only
+    def test_withheld_result_becomes_unconfirmed_on_restart(self):
+        term, _ = self.member()
+        ident = self.add("lead-dev")
+        self.keeper.tick()
+        path = self.state_dir / "team.json"
+        data = path.read_bytes()
+        path.unlink()
+        self.finish_job(term, ident, factory.HcError("finished", "gone"))
+        self.keeper.tick()
+        self.assertTrue(self.keeper.unsettled)
+        path.write_bytes(data)
+        restart = factory.Keeper(self.state_dir, self.hc, self.clock, self.pane.append, self.jobs.append)
+        self.assertTrue(restart._load())
+        restart._recover("keeper restarted during the send")
+        restart.tick()
+        self.assertEqual(self.outcome(ident)["o"], "unconfirmed")
+        self.assertFalse(self.jobs)
+        self.assertFalse(self.inputs(term, None))
+
+    @fake_only
+    def test_wire_text_is_read_after_the_claim(self):
+        term, _ = self.member()
+        ident = self.add("lead-dev")
+        claim = self.keeper.log.out
+
+        def change_before_claim(box, msgid, *args, **kwargs):
+            if msgid == ident and args[1] == "sending":
+                before = self.log.path.stat()
+                self.log.path.write_bytes(self.log.path.read_bytes().replace(b'"first"', b'"fixed"'))
+                os.utime(self.log.path, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000))
+            return claim(box, msgid, *args, **kwargs)
+
+        with patch.object(self.keeper.log, "out", side_effect=change_before_claim):
+            self.keeper.tick()
+        self.run_jobs()
+        self.keeper.tick()
+        self.assertEqual(self.inputs(term, None), ["[from @pm]\nfixed\n"])
+
+    @fake_only
+    def test_failed_sending_record_recovers_without_restart(self):
+        term, _ = self.member()
+        first = self.add("lead-dev")
+        second = self.add("lead-dev", "later")
+        append = self.keeper.log._append
+
+        def visible_but_unsynced(data):
+            _, end = append(data)
+            return "visible", end
+
+        with patch.object(self.keeper.log, "_append", side_effect=visible_but_unsynced):
+            self.keeper.tick()
+        self.assertTrue(self.keeper.damaged)
+        self.assertEqual(self.outcome(first)["o"], "sending")
+        self.assertEqual(self.outcome(second)["why"], "waiting")
+        self.assertFalse(self.jobs)
+        self.clock.sleep(59)
+        self.keeper.tick()
+        self.assertFalse(self.jobs)
+        self.clock.sleep(1)
+        self.keeper.tick()
+        self.assertEqual(self.outcome(first)["o"], "unconfirmed")
+        self.assertEqual(self.outcome(second)["o"], "sending")
+        self.run_jobs()
+        self.keeper.tick()
+        self.assertEqual(self.inputs(term, None), ["[from @pm]\nlater\n"])
+
+    @fake_only
+    def test_managed_file_is_removed_after_its_last_delivery(self):
+        lead, _ = self.member()
+        reviewer, _ = self.terminal("reviewer")
+        self.briefed("reviewer", reviewer)
+        path = self.state_dir / "messages" / "pm" / "done.md"
+        path.parent.mkdir(parents=True)
+        path.write_text("exact")
+        ident = self.log.add("pm", ["lead-dev", "reviewer"], "exact", file=str(path))[0]
+        self.keeper.tick()
+        held = self.jobs.pop()
+        self.run_jobs()
+        self.keeper.tick()
+        self.assertTrue(path.exists())
+        self.assertEqual(self.outcome(ident)["o"], "delivered")
+        held()
+        self.keeper.tick()
+        self.assertFalse(path.exists())
+        self.assertEqual(self.inputs(lead, None), self.inputs(reviewer, None))
+
+    @fake_only
+    def test_bad_factory_toml_keeps_last_config(self):
+        term, _ = self.member()
+        self.keeper.tick()
+        (self.root / factory.CONF).write_text("[invalid")
+        ident = self.add("lead-dev")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.keeper.tick()
+        self.run_jobs()
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.keeper.tick()
+        self.assertEqual(self.outcome(ident)["o"], "delivered")
+        self.assertEqual(self.inputs(term, None), ["[from @pm]\nfirst\n"])
+        self.assertEqual(sum(line.startswith("factory.toml:") for line in self.pane), 1)
+
+    @fake_only
+    def test_keeper_touches_beat_during_hold_and_unknown_team(self):
+        self.member()
+        ident = self.add("lead-dev")
+        beat = self.state_dir / "keeper.beat"
+        path = self.state_dir / "team.json"
+        data = path.read_bytes()
+        with beat.open("wb") as stream:
+            self.keeper._beat_fd = stream.fileno()
+            self.keeper.tick()
+            self.assertEqual(self.outcome(ident)["o"], "sending")
+            path.write_text("{")
+            for stamp in (1, 2):
+                os.utime(beat, (stamp, stamp))
+                self.keeper.tick()
+                self.assertGreater(beat.stat().st_mtime, stamp)
+                self.assertFalse(self.keeper.stop)
+        self.keeper._beat_fd = None
+        self.assertEqual(sum(line.startswith("team.json:") for line in self.pane), 1)
+        path.write_bytes(data)
+        self.run_jobs()
+        self.keeper.tick()
+        self.assertEqual(self.outcome(ident)["o"], "delivered")
+
+    @fake_only
+    def test_second_keeper_exits_without_taking_over(self):
+        keeper_term, _ = self.terminal("keeper", kind="keeper")
+        (self.state_dir / "keeper.beat").write_text("original")
+        with (self.state_dir / "keeper.lock").open("wb") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            with patch.dict(os.environ, {"HC_TERMINAL_ID": keeper_term}):
+                self.assertEqual(self.keeper.run(), 0)
+        self.assertEqual(self.pane, ["keeper already running"])
+        self.assertEqual((self.state_dir / "keeper.beat").read_text(), "original")
+        self.assertFalse(self.hc._closed)
+
+    @fake_only
+    def test_startup_damage_keeps_the_beat_and_recovers_after_repair(self):
+        keeper_term, _ = self.terminal("keeper", kind="keeper")
+        self.member()
+        ident = self.add("lead-dev")
+        healthy = self.log.path.read_bytes()
+        self.log.path.write_bytes(b"{}\n" + healthy)
+        tick = self.keeper.tick
+
+        def repair_then_continue():
+            self.assertTrue(self.keeper.damaged)
+            self.assertFalse(self.jobs)
+            self.assertEqual((self.state_dir / "keeper.beat").read_text().split()[2], keeper_term)
+            self.log.path.write_bytes(healthy)
+            self.clock.sleep(60)
+            tick()
+            self.run_jobs()
+            tick()
+            self.keeper.stop = "test completed"
+
+        with (patch.dict(os.environ, {"HC_TERMINAL_ID": keeper_term}),
+              patch.object(self.keeper, "tick", side_effect=repair_then_continue),
+              patch.object(self.keeper, "_recover", wraps=self.keeper._recover) as recovery):
+            self.assertEqual(self.keeper.run(), 0)
+        recovery.assert_called_once_with("keeper could not record the send")
+        self.assertEqual(self.outcome(ident)["o"], "delivered")
+        self.assertTrue(self.hc._closed)
+
+    @fake_only
+    def test_stop_prevents_sends_and_run_always_kills_children(self):
+        self.member()
+        ident = self.add("lead-dev")
+        self.keeper.stop = "signal"
+        self.keeper.tick()
+        self.assertEqual(self.outcome(ident)["why"], "waiting")
+        self.assertFalse(self.jobs)
+        self.keeper.stop = None
+        keeper_term, _ = self.terminal("keeper", kind="keeper")
+        with (patch.dict(os.environ, {"HC_TERMINAL_ID": keeper_term}),
+              patch.object(self.keeper, "tick", side_effect=RuntimeError("tick failed"))):
+            self.assertEqual(self.keeper.run(), 0)
+        self.assertTrue(self.hc._closed)
+        self.assertEqual(self.pane[-1], "keeper stopping: tick failed")
+
+    @fake_only
+    def test_keeper_lock_and_beat_do_not_follow_links(self):
+        keeper_term, _ = self.terminal("keeper", kind="keeper")
+        outside = self.root / "outside"
+        outside.write_text("keep")
+        for filename in ("keeper.lock", "keeper.beat"):
+            with self.subTest(filename=filename):
+                path = self.state_dir / filename
+                path.symlink_to(outside)
+                keeper = factory.Keeper(self.state_dir, factory.Hc(), emit=self.pane.append)
+                with patch.dict(os.environ, {"HC_TERMINAL_ID": keeper_term}):
+                    self.assertEqual(keeper.run(), 0)
+                self.assertTrue(path.is_symlink())
+                self.assertIn(filename, self.pane[-1])
+                self.assertEqual(outside.read_text(), "keep")
+                path.unlink()
+
+    @fake_only
+    def test_stopped_team_keeps_running_for_reachable_operators_pending_messages(self):
+        term, _ = self.terminal("operator", kind="operator", status="blocked")
+        ident = self.add("operator")
+        factory.update_team(self.state_dir, up=False)
+        self.keeper.tick()
+        self.assertIsNone(self.keeper.stop)
+        self.assertEqual(self.outcome(ident, "operator")["why"], "blocked")
+        self.fake.set_status(term, "idle")
+        self.keeper.tick()
+        self.run_jobs()
+        self.keeper.tick()
+        self.assertEqual(self.outcome(ident, "operator")["o"], "delivered")
+        self.assertEqual(self.keeper.stop, "team is down")
 
 
 class TeamLookupTests(unittest.TestCase):
