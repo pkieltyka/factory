@@ -1689,6 +1689,54 @@ def pending_lines(state, operator, now=None):
     return lines
 
 
+# ================================================================ keeper delivery
+
+def head_of(name, box, ready):
+    """The next message for a recipient and any older startup briefs it supersedes."""
+    pending = [msg for msg, _ in box.pending(name)]
+    if not ready:
+        briefs = [msg for msg in pending if msg["kind"] == "brief"]
+        if briefs:
+            return briefs[-1], briefs[:-1]
+    return (pending[0] if pending else None), []
+
+
+def _quiet_or_ready_note(msg):
+    return msg["kind"] == "note" and (msg.get("meta") or {}).get("what") in ("quiet", "ready")
+
+
+def decide(name, msg, view, box, cfg, now, op_null_since, still_true=True):
+    """Choose the first matching delivery action from keeper.md's decision table."""
+    if name == cfg.operator["name"]:
+        if _quiet_or_ready_note(msg) and not still_true:
+            return "drop", "no longer true"
+        terminal = view.operator
+        if terminal is None:
+            return "queue", "gone"
+        status = terminal.get("status")
+        if status is None:
+            if op_null_since is not None and now - op_null_since >= LATCH_AFTER:
+                return "latch",
+            return "hold",
+        if status["state"] == "blocked":
+            return "queue", "blocked"
+        return "send", terminal["address"]
+
+    state = view.state(name)
+    if state == "not started":
+        return "drop", "stopped by down"
+    if state == "gone":
+        return "queue", "gone"
+    if state == "starting":
+        return "hold",
+    terminal = view.terminal(name)
+    if msg["kind"] != "brief" and terminal["address"] not in box.briefed():
+        return "queue", "not ready"
+    if state == "blocked":
+        return "queue", "blocked"
+    return "send", terminal["address"]
+
+
 def cmd_inbox(args):
     """Print committed messages addressed to the selected recipient."""
     if args.count < 1:

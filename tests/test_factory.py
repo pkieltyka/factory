@@ -3657,6 +3657,79 @@ class TeamStateTests(unittest.TestCase):
         self.assertEqual(list(partial.msgs), [1])
 
 
+class DeliveryDecisionTests(unittest.TestCase):
+    def setUp(self):
+        self.cfg = types.SimpleNamespace(operator={"name": "operator"})
+        self.box = factory.Box("log.jsonl")
+
+    @staticmethod
+    def terminal(name, status, *, kind="member", reported=None, state="live"):
+        return {"address": f"t-{name}", "created_ms": 1, "state": state,
+                "reported": status is not None if reported is None else reported,
+                "status": {"state": status} if status is not None else None,
+                "labels": {"factory.kind": kind, "factory.member": name}}
+
+    def message(self, ident, kind="say", **extra):
+        msg = {"t": "msg", "id": ident, "from": "operator", "to": ["lead-dev"], "text": str(ident),
+               "kind": kind, "at": "2026-11-26T17:00:00Z", **extra}
+        self.box.apply([msg, {"t": "ok", "id": ident}])
+        return msg
+
+    def briefed(self):
+        self.message(1, "brief")
+        receipt = {"t": "out", "id": 1, "to": "lead-dev", "term": "t-lead-dev", "at": "2026-11-26T17:00:00Z"}
+        self.box.apply([{**receipt, "o": "sending"}, {**receipt, "o": "delivered", "started": True, "turn": 1}])
+
+    def test_operator_rows(self):
+        for row, state, since, expected in (
+            ("O1", "absent", None, ("queue", "gone")),
+            ("O2", None, 6, ("hold",)),
+            ("O2 first observation", None, None, ("hold",)),
+            ("O3", None, 5, ("latch",)),
+            ("O4", "blocked", None, ("queue", "blocked")),
+            ("O5", "working", None, ("send", "t-operator")),
+        ):
+            with self.subTest(row=row):
+                records = [] if state == "absent" else [self.terminal("operator", state, kind="operator")]
+                decision = factory.decide("operator", {"kind": "say"}, factory.View(records),
+                                          self.box, self.cfg, 10, since)
+                self.assertEqual(decision, expected)
+
+    def test_stale_note_takes_precedence_over_an_absent_operator(self):
+        note = {"kind": "note", "meta": {"what": "quiet"}}
+        self.assertEqual(factory.decide("operator", note, factory.View([]), self.box, self.cfg, 10, None,
+                                        still_true=False), ("drop", "no longer true"))
+
+    def test_member_rows(self):
+        for row, terminal, kind, expected in (
+            ("M1", None, "say", ("drop", "stopped by down")),
+            ("M2", self.terminal("lead-dev", None, reported=True), "say", ("queue", "gone")),
+            ("M2 finished", self.terminal("lead-dev", None, state="finished"), "say", ("queue", "gone")),
+            ("M3", self.terminal("lead-dev", None), "brief", ("hold",)),
+            ("M4", self.terminal("lead-dev", "blocked"), "say", ("queue", "not ready")),
+            ("M5", self.terminal("lead-dev", "blocked"), "brief", ("queue", "blocked")),
+            ("M6", self.terminal("lead-dev", "working"), "brief", ("send", "t-lead-dev")),
+        ):
+            with self.subTest(row=row):
+                view = factory.View([] if terminal is None else [terminal])
+                self.assertEqual(factory.decide("lead-dev", {"kind": kind}, view, self.box, self.cfg, 0, None),
+                                 expected)
+        self.briefed()
+        view = factory.View([self.terminal("lead-dev", "working")])
+        self.assertEqual(factory.decide("lead-dev", {"kind": "say"}, view, self.box, self.cfg, 0, None),
+                         ("send", "t-lead-dev"))
+
+    def test_head_prefers_newest_startup_brief_then_preserves_order(self):
+        first = self.message(1)
+        self.assertEqual(factory.head_of("lead-dev", self.box, False), (first, []))
+        older = self.message(2, "brief")
+        latest = self.message(3, "brief")
+        self.message(4)
+        self.assertEqual(factory.head_of("lead-dev", self.box, True), (first, []))
+        self.assertEqual(factory.head_of("lead-dev", self.box, False), (latest, [older]))
+        self.assertEqual(factory.head_of("another", self.box, False), (None, []))
+
+
 class TeamLookupTests(unittest.TestCase):
     def setUp(self):
         self.env = self.enterContext(Env(UI))
