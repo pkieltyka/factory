@@ -14,6 +14,7 @@ import argparse
 import collections
 import contextlib
 import datetime
+import errno
 import fcntl
 import functools
 import getpass
@@ -35,6 +36,7 @@ import tempfile
 import threading
 import time
 import tomllib
+import uuid
 
 SCRIPT = pathlib.Path(__file__).resolve()
 SKILL = SCRIPT.parent.parent
@@ -2607,10 +2609,10 @@ def model_claude(checker, model, harness):
     return bare, t["thinking"]
 
 
-def argv_claude(m, prompt_file, resume):
+def argv_claude(m, prompt_file, sess):
     argv = ["--model", m["model"], "--effort", m["thinking"], "--append-system-prompt-file", str(prompt_file),
             "--name", m["name"], "--settings", str(prompt_file.with_suffix(".settings.json"))]
-    return argv + (["--resume", session_id(resume)] if resume else []), {}
+    return argv + (sess["args"] if sess else []), {}
 
 
 # ---- codex
@@ -2633,7 +2635,7 @@ def model_codex(checker, model, harness):
     return bare, models[bare]
 
 
-def argv_codex(m, prompt_file, resume):
+def argv_codex(m, prompt_file, sess):
     # Codex has no way to read developer instructions from a file, and the full text would not fit the line
     # macOS lets herdr type into a shell. So the system level carries one line that names the file, and the
     # full text arrives in the member's first message.
@@ -2646,7 +2648,7 @@ def argv_codex(m, prompt_file, resume):
             "-c", f"developer_instructions={json.dumps(pointer)}"]
     if m["permissions"] == "guarded":
         argv += ["--add-dir", str(m["inbox_dir"])]
-    return (["resume", session_id(resume)] if resume else []) + argv, {}
+    return (sess["args"] if sess else []) + argv, {}   # resume <id> goes before the options
 
 
 # ---- pi and omp (omp keeps pi's flags and session format)
@@ -2658,11 +2660,11 @@ def model_pi(checker, model, harness):
     return resolve_listed(model, listed, harness), TABLE[harness]["thinking"]
 
 
-def argv_pi(m, prompt_file, resume):
+def argv_pi(m, prompt_file, sess):
     argv = ["--model", m["model"], "--thinking", m["thinking"], "--append-system-prompt", str(prompt_file)]
     if m["harness"] == "pi":
-        return argv + ["--name", m["name"]] + (["--session", resume["value"]] if resume else []), {}
-    return argv + ([f"--resume={resume['value']}"] if resume else []), {}
+        argv += ["--name", m["name"]]
+    return argv + (sess["args"] if sess else []), {}
 
 
 # ---- opencode (v2+)
@@ -2671,11 +2673,11 @@ def model_opencode(checker, model, harness):
     return resolve_listed(model, listed, harness), None  # thinking is a per-model variant; OpenCode reports a bad one at start
 
 
-def argv_opencode(m, prompt_file, resume):
+def argv_opencode(m, prompt_file, sess):
     # The interface herdr can watch has no model flag, so the model comes from inline config in the pane's
     # environment. --standalone: OpenCode's shared background server ignores a client's own config.
     model = m["model"] + (f"#{m['thinking']}" if m["thinking"] != "default" else "")
-    argv = ["--standalone"] + (["--session", session_id(resume)] if resume else [])
+    argv = ["--standalone"] + (sess["args"] if sess else [])
     return argv, {"OPENCODE_CONFIG_CONTENT": json.dumps({"model": model})}
 
 
@@ -2706,11 +2708,11 @@ def model_agy(checker, model, harness):
     return model, levels
 
 
-def argv_agy(m, prompt_file, resume):
+def argv_agy(m, prompt_file, sess):
     model = m["model"]
     if m["thinking"] != "default" and not agy_effort(model):
         model += "-" + m["thinking"]
-    return ["--model", model] + (["--conversation", session_id(resume)] if resume else []), {}
+    return ["--model", model] + (sess["args"] if sess else []), {}
 
 
 Harness = collections.namedtuple("Harness", "model argv")
@@ -2724,11 +2726,194 @@ CODE = {
 }
 
 
-def launch_argv(m, prompt_file, resume=None):
-    """-> (native argv after `--`, pane env): the harness's own arguments, then the member's permission level
-    and any extra `args` from factory.toml."""
-    argv, env = CODE[m["harness"]].argv(m, prompt_file, resume)
+def launch_argv(m, prompt_file, sess=None):
+    """-> (native argv, env): the harness's own arguments with the session plan's, then the member's permission
+    level and any extra `args` from factory.toml."""
+    argv, env = CODE[m["harness"]].argv(m, prompt_file, sess)
     return argv + TABLE[m["harness"]]["permissions"][m["permissions"]] + m["args"], env
+
+
+# ================================================================ sessions (launch_layout.md §3)
+
+SESSIONS = "sessions.jsonl"
+SESSION_VALUE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")   # one argv item, never read as an option
+SESSION_HOWS = ("env", "id", "dir", "new")
+RESUME_ARGS = {"claude": lambda v: ["--resume", v], "codex": lambda v: ["resume", v],
+               "agy": lambda v: ["--conversation", v], "opencode": lambda v: ["--session", v],
+               "pi": lambda v: ["--session", v], "omp": lambda v: [f"--resume={v}"]}
+FRESH_ARGS = {"claude": lambda v: ["--session-id", v], "opencode": lambda v: ["--session", v]}
+
+
+def _session_entry(line):
+    """A sessions.jsonl entry, or None for a damaged line."""
+    try:
+        e = json.loads(line, parse_constant=_reject_constant)
+    except ValueError:
+        return None
+    if not isinstance(e, dict) or e.get("how") not in SESSION_HOWS \
+            or not all(isinstance(e.get(k), str) for k in ("member", "harness", "term", "at")) \
+            or not (e.get("model") is None or isinstance(e.get("model"), str)):
+        return None
+    value = e.get("value")
+    if e["how"] == "new":
+        return e if value is None else None
+    if not isinstance(value, str):
+        return None
+    good = os.path.isabs(value) if e["how"] == "dir" else SESSION_VALUE.fullmatch(value)
+    return e if good else None
+
+
+def _read_sessions(fd):
+    """(newest entry per member, damaged lines skipped, file exists, ends with a newline), relative to fd."""
+    try:
+        f = private_open(SESSIONS, os.O_RDONLY, fix_mode=False, dir_fd=fd)
+    except FileNotFoundError:
+        return {}, 0, False, True
+    with os.fdopen(f, "rb") as handle:
+        data = handle.read()
+    newest, skipped = {}, 0
+    for line in data.split(b"\n"):
+        if line.strip():
+            e = _session_entry(line)
+            if e is None:
+                skipped += 1
+            else:
+                newest[e["member"]] = e
+    return newest, skipped, True, data.endswith(b"\n") or not data
+
+
+def _sessions(state, decide=None):
+    """The one reader and writer of sessions.jsonl, under the team lock: shared to read; exclusive to read, let
+    decide(newest) return an entry or None, and append it in one write followed by fsync. A torn last line (a writer
+    killed mid-write) gets its newline first. -> (newest entry per member, damaged lines skipped)."""
+    with Log(state)._locked(exclusive=decide is not None) as fd:
+        if fd is None:
+            return {}, 0
+        newest, skipped, existed, whole = _read_sessions(fd)
+        entry = decide(newest) if decide else None
+        if entry is None:
+            return newest, skipped
+        line = (b"" if whole else b"\n") + json.dumps(entry, separators=(",", ":")).encode() + b"\n"
+        out = private_open(SESSIONS, os.O_WRONLY | os.O_APPEND | os.O_CREAT, dir_fd=fd)
+        try:
+            if os.write(out, line) != len(line):
+                raise OSError(errno.EIO, f"short write to {pathlib.Path(state) / SESSIONS}")
+            os.fsync(out)
+        finally:
+            os.close(out)
+        if not existed:
+            os.fsync(fd)   # the new file's directory entry
+        return {**newest, entry["member"]: entry}, skipped
+
+
+def saved_sessions(state):
+    """(newest entry per member, how many damaged lines were skipped)."""
+    return _sessions(state)
+
+
+def sessions_writable(state):
+    """down's check before it stops anyone: None, or why sessions.jsonl cannot be appended to and synced."""
+    try:
+        with Log(state)._locked(exclusive=True) as fd:
+            out = private_open(SESSIONS, os.O_WRONLY | os.O_APPEND | os.O_CREAT, dir_fd=fd)
+            try:
+                os.fsync(out)
+            finally:
+                os.close(out)
+    except (OSError, LogDamage) as error:
+        return str(error)
+    return None
+
+
+def _member_model(m):
+    return agy_choice(m)[0] if m["harness"] == "agy" else m.get("model")
+
+
+def record_session(cfg, state, member, term, environ=os.environ):
+    """Called by say for a member: save the harness's session_env value when it should. -> a warning or None."""
+    m = cfg.members[member]
+    harness, t = m["harness"], TABLE[m["harness"]]
+    value = environ.get(t["session_env"]) if t.get("session_env") else None
+    if not value or not SESSION_VALUE.fullmatch(value):
+        return None
+    follow = t.get("session_follow", True)
+
+    def decide(newest):
+        e = newest.get(member)
+        if e is not None and e["term"] == term:
+            if not follow and e["how"] == "env":
+                return None    # once per launch: later captures from this terminal are ignored
+            if follow and e["harness"] == harness and e["value"] == value:
+                return None
+        return {"member": member, "harness": harness, "model": _member_model(m), "term": term, "how": "env",
+                "value": value, "at": utc_now()}
+    try:
+        _sessions(state, decide)
+    except (OSError, LogDamage) as error:
+        return f"warning: could not record your session: {error}"
+    return None
+
+
+def launch_entry(state, m, term, how, value):
+    """Called by up once m's brief is delivered: the launch's fallback entry. Never replaces an entry say already
+    made for this terminal."""
+    def decide(newest):
+        e = newest.get(m["name"])
+        if e is not None and e["term"] == term:
+            return None
+        return {"member": m["name"], "harness": m["harness"], "model": m.get("model"), "term": term, "how": how,
+                "value": value, "at": utc_now()}
+    _sessions(state, decide)
+
+
+def session_folder(state, m):
+    return pathlib.Path(state) / "sessions" / f"{m['name']}-{m['harness']}"
+
+
+def _provider(model):
+    return model.split("/", 1)[0] if model and "/" in model else None
+
+
+def compatible(entry, m):
+    """Whether m may resume entry's conversation: same harness, a value, and a model resume_model allows (a model
+    with no provider prefix does not tell, and is allowed)."""
+    if entry is None or entry["harness"] != m["harness"] or entry["value"] is None:
+        return False
+    if TABLE[m["harness"]].get("resume_model", "any") == "provider":
+        a, b = _provider(entry.get("model")), _provider(m.get("model"))
+        return a is None or b is None or a == b
+    return True
+
+
+def session_plan(m, state, entry, fresh):
+    """{"args", "resume", "assigned", "notice"}: the session arguments for m's launch from its newest entry. A member
+    that ran before with no entry at all gets its notice from the caller, which knows its finished record."""
+    harness, t = m["harness"], TABLE[m["harness"]]
+    sess = {"args": [], "resume": False, "assigned": None, "notice": None}
+    if t.get("session") == "dir":
+        folder = session_folder(state, m)
+        sess["args"] = ["--session-dir", str(folder)] if harness == "pi" else [f"--session-dir={folder}"]
+    if not fresh and compatible(entry, m):
+        sess["resume"] = True
+        sess["args"] += ["--continue"] if entry["how"] == "dir" else RESUME_ARGS[harness](entry["value"])
+        return sess
+    if entry is not None and not fresh:
+        unrecorded = entry["value"] is None or entry["harness"] == harness and entry.get("model") == m.get("model")
+        sess["notice"] = (f"@{m['name']} starts in a new conversation: none was recorded for it" if unrecorded
+                          else f"@{m['name']} starts fresh: its saved conversation is for {entry['harness']}"
+                               f" {entry.get('model')}")
+    if t.get("session") == "id":
+        sess["assigned"] = str(uuid.uuid4())
+        sess["args"] += FRESH_ARGS[harness](sess["assigned"])
+    return sess
+
+
+def v1_session(m, ref):
+    """v1's launch: its herdr session ref as a session plan, until 5a's up replaces it."""
+    if not ref:
+        return None
+    value = ref["value"] if m["harness"] in ("pi", "omp") else session_id(ref)
+    return {"args": RESUME_ARGS[m["harness"]](value), "resume": True, "assigned": None, "notice": None}
 
 
 # ================================================================ briefs
@@ -3005,7 +3190,7 @@ def launch(cfg, team, m, operator, timeout, resume=None):
         # Keep the typed launch command below macOS's 1024-byte line limit.
         prompt_file.with_suffix(".settings.json").write_text(
             claude_settings(m["permissions"], m["draft_dir"]))
-    argv, env = launch_argv(m, prompt_file, resume)
+    argv, env = launch_argv(m, prompt_file, v1_session(m, resume))
     err = ensure_worktree(cfg, m) if m["branch"] else None
     if err:
         return err

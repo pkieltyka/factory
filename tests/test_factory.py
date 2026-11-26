@@ -1547,7 +1547,8 @@ class UpTests(unittest.TestCase):
             for name in cfg.members:
                 m = {**factory.plan(cfg, name), "permissions": "full", "branch": "ada/" + name}
                 m["model"] = "openrouter/" + m["model"] if m["harness"] == "pi" else m["model"]
-                argv, _ = factory.launch_argv(m, pathlib.Path("/Users/someone/.cache/factory-skill") / cfg.cache.name / cfg.session_dir.name / f"{name}.md", resume)
+                prompt = pathlib.Path("/Users/someone/.cache/factory-skill") / cfg.cache.name / cfg.session_dir.name
+                argv, _ = factory.launch_argv(m, prompt / f"{name}.md", factory.v1_session(m, resume))
                 self.assertLess(len(shlex.join([m["harness"], *argv]).encode("utf-8")), 900, name)
 
     def test_failed_check_launches_nothing_and_explains_the_fix(self):
@@ -5355,6 +5356,169 @@ class InboxReaderTests(unittest.TestCase):
             self.assertEqual(len(factory.inbox_rows(self.log, "operator")), 1)
         after = {p.name: (p.read_bytes(), p.stat().st_mode, p.stat().st_mtime_ns) for p in self.log.state.iterdir()}
         self.assertEqual(after, before)
+
+
+class SessionTests(unittest.TestCase):
+    """sessions.jsonl and session_plan (launch_layout.md §3)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.state = pathlib.Path(self.tmp.name) / "factory-skill" / "team" / "core"
+        self.cfg = types.SimpleNamespace(members={
+            "claude-dev": {"harness": "claude", "model": "claude-opus-5-5"},
+            "codex-dev": {"harness": "codex", "model": "gpt-6.2-sol"},
+            "pi-dev": {"harness": "pi", "model": "openai/gpt-6-astra"},
+            "agy-dev": {"harness": "agy"}})
+
+    def m(self, name, **over):
+        return {"name": name, **self.cfg.members[name], **over}
+
+    def lines(self):
+        return [json.loads(line) for line in (self.state / factory.SESSIONS).read_bytes().splitlines()]
+
+    def record(self, member, term, value, var=None):
+        var = var or factory.TABLE[self.cfg.members[member]["harness"]]["session_env"]
+        return factory.record_session(self.cfg, self.state, member, term, {var: value})
+
+    def test_a_follow_harness_records_each_new_value_and_terminal_once(self):
+        with patch.dict(factory.TABLE["claude"], session_follow=True):
+            for term, value in (("t1", "aaa"), ("t1", "aaa"), ("t1", "bbb"), ("t2", "bbb")):
+                self.assertIsNone(self.record("claude-dev", term, value))
+        self.assertEqual([(e["term"], e["value"], e["how"]) for e in self.lines()],
+                         [("t1", "aaa", "env"), ("t1", "bbb", "env"), ("t2", "bbb", "env")])
+        newest, skipped = factory.saved_sessions(self.state)
+        self.assertEqual((newest["claude-dev"]["value"], skipped), ("bbb", 0))
+        self.assertEqual(stat.S_IMODE(os.stat(self.state / factory.SESSIONS).st_mode), 0o600)
+
+    def test_without_follow_the_first_capture_of_a_launch_wins_in_either_order(self):
+        self.assertFalse(factory.TABLE["codex"].get("session_follow", True))
+        m = self.m("codex-dev")
+        factory.launch_entry(self.state, m, "t1", "new", None)       # up's fallback first
+        self.record("codex-dev", "t1", "thread-a")                   # then the ready line: replaces it
+        self.record("codex-dev", "t1", "thread-b")                   # a sub-agent's later value: ignored
+        self.assertEqual(factory.saved_sessions(self.state)[0]["codex-dev"]["value"], "thread-a")
+        self.record("codex-dev", "t2", "thread-c")                   # the ready line first this time
+        factory.launch_entry(self.state, m, "t2", "new", None)       # up's fallback never replaces it
+        self.assertEqual([(e["term"], e["how"], e["value"]) for e in self.lines()],
+                         [("t1", "new", None), ("t1", "env", "thread-a"), ("t2", "env", "thread-c")])
+
+    def test_a_fresh_launch_ends_the_previous_conversation(self):
+        m = self.m("codex-dev")
+        self.record("codex-dev", "t1", "thread-a")
+        factory.launch_entry(self.state, m, "t2", "new", None)       # up --fresh, brief delivered, no say yet
+        entry = factory.saved_sessions(self.state)[0]["codex-dev"]
+        sess = factory.session_plan(m, self.state, entry, fresh=False)
+        self.assertEqual((sess["args"], sess["resume"]), ([], False))
+        self.assertIn("starts in a new conversation: none was recorded", sess["notice"])
+
+    def test_values_that_could_be_options_or_too_long_are_not_recorded(self):
+        for value in ("-rf", "", "a" * 129, "a b", "x;y", None):
+            self.assertIsNone(self.record("codex-dev", "t1", value))
+        self.assertFalse((self.state / factory.SESSIONS).exists())
+        self.assertIsNone(self.record("codex-dev", "t1", "A1._:-" + "z" * 122))
+        self.assertEqual(len(self.lines()), 1)
+
+    def test_a_harness_without_a_variable_records_nothing(self):
+        cfg = types.SimpleNamespace(members={"omp-dev": {"harness": "omp", "model": "openai/gpt-6-astra"}})
+        self.assertIsNone(factory.record_session(cfg, self.state, "omp-dev", "t1", {"PI_SESSION_ID": "x"}))
+        self.assertFalse(self.state.exists())
+
+    def test_damaged_lines_are_skipped_and_counted_and_a_torn_tail_is_completed(self):
+        self.record("codex-dev", "t1", "thread-a")
+        with open(self.state / factory.SESSIONS, "ab") as f:
+            f.write(b'not json\n{"member": "codex-dev", "how": "env", "value": "-x", "harness": "codex",'
+                    b' "term": "t9", "at": "x"}\n{"member": "codex-dev", "harn')
+        newest, skipped = factory.saved_sessions(self.state)
+        self.assertEqual((newest["codex-dev"]["value"], skipped), ("thread-a", 3))
+        self.record("codex-dev", "t2", "thread-b")
+        data = (self.state / factory.SESSIONS).read_bytes()
+        self.assertTrue(data.endswith(b'"harn\n' + data.splitlines()[-1] + b"\n"))
+        newest, skipped = factory.saved_sessions(self.state)
+        self.assertEqual((newest["codex-dev"]["value"], skipped), ("thread-b", 3))
+
+    def test_concurrent_writers_each_append_one_whole_line(self):
+        def worker(i):
+            factory.record_session(self.cfg, self.state, "codex-dev", f"t{i}", {"CODEX_THREAD_ID": f"thread-{i}"})
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(16)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(sorted(e["value"] for e in self.lines()), sorted(f"thread-{i}" for i in range(16)))
+
+    def test_teams_do_not_share_sessions(self):
+        other = self.state.parent.parent / "other-team" / "core"
+        self.record("codex-dev", "t1", "thread-a")
+        self.assertEqual(factory.saved_sessions(other), ({}, 0))
+        self.assertFalse(other.exists())                              # a reader creates nothing
+
+    def test_a_failed_write_is_a_warning_and_says_why(self):
+        with patch.object(factory.os, "fsync", side_effect=OSError(5, "Input/output error")):
+            warning = self.record("codex-dev", "t1", "thread-a")
+        self.assertRegex(warning, "^warning: could not record your session: .*Input/output error")
+
+    def test_down_checks_sessions_can_be_saved(self):
+        self.assertIsNone(factory.sessions_writable(self.state))
+        self.assertTrue((self.state / factory.SESSIONS).exists())
+        with patch.object(factory.os, "fsync", side_effect=OSError(28, "No space left on device")):
+            self.assertIn("No space left", factory.sessions_writable(self.state))
+
+    def test_session_plan_resumes_only_a_compatible_entry(self):
+        entry = {"member": "claude-dev", "harness": "claude", "model": "claude-opus-5-5", "term": "t1",
+                 "how": "env", "value": "abc", "at": "x"}
+        m = self.m("claude-dev")
+        self.assertEqual(factory.session_plan(m, self.state, entry, fresh=False),
+                         {"args": ["--resume", "abc"], "resume": True, "assigned": None, "notice": None})
+        self.assertEqual(factory.session_plan(m, self.state, entry, fresh=True)["args"], [])
+        moved = factory.session_plan({**m, "harness": "codex"}, self.state, entry, fresh=False)
+        self.assertEqual((moved["resume"], moved["notice"]),
+                         (False, "@claude-dev starts fresh: its saved conversation is for claude claude-opus-5-5"))
+        self.assertTrue(factory.session_plan({**m, "model": "claude-sonnet-5-5"}, self.state, entry, False)["resume"])
+
+    def test_provider_harnesses_resume_only_within_a_provider(self):
+        m = self.m("pi-dev")
+        entry = {"member": "pi-dev", "harness": "pi", "model": "openai/gpt-6-luna", "term": "t1", "how": "env",
+                 "value": "abc", "at": "x"}
+        self.assertEqual(factory.session_plan(m, self.state, entry, False)["args"], ["--session", "abc"])
+        other = factory.session_plan({**m, "model": "z-ai/glm-5.3"}, self.state, entry, False)
+        self.assertEqual((other["resume"], other["args"]), (False, []))
+        self.assertIn("is for pi openai/gpt-6-luna", other["notice"])
+
+    def test_assigned_ids_and_session_folders(self):
+        with patch.dict(factory.TABLE["claude"], session="id"):
+            sess = factory.session_plan(self.m("claude-dev"), self.state, None, fresh=False)
+        self.assertEqual(sess["args"], ["--session-id", sess["assigned"]])
+        self.assertEqual(str(uuid.UUID(sess["assigned"])), sess["assigned"])
+        folder = self.state / "sessions" / "pi-dev-pi"
+        with patch.dict(factory.TABLE["pi"], session="dir"):
+            fresh = factory.session_plan(self.m("pi-dev"), self.state, None, fresh=False)
+            entry = {"member": "pi-dev", "harness": "pi", "model": "openai/gpt-6-astra", "term": "t1", "how": "dir",
+                     "value": str(folder), "at": "x"}
+            again = factory.session_plan(self.m("pi-dev"), self.state, entry, fresh=False)
+        self.assertEqual(fresh["args"], ["--session-dir", str(folder)])
+        self.assertEqual(again["args"], ["--session-dir", str(folder), "--continue"])
+        with patch.dict(factory.TABLE["omp"], session="dir"):
+            m = {"name": "omp-dev", "harness": "omp", "model": "openai/gpt-6-astra"}
+            self.assertEqual(factory.session_plan(m, self.state, None, False)["args"],
+                             [f"--session-dir={self.state / 'sessions' / 'omp-dev-omp'}"])
+
+    def test_launch_arguments_stay_separate_items(self):
+        prompt = pathlib.Path("/tmp/state dir/it's.md")
+        for harness, model, expect in (
+                ("claude", "claude-opus-5-5", ["--resume", "id 1"]),
+                ("codex", "gpt-6.2-sol", ["resume", "id 1"]),
+                ("agy", "gemini-4-neon", ["--conversation", "id 1"]),
+                ("opencode", "openrouter/z-ai/glm-5.3", ["--session", "id 1"]),
+                ("pi", "openai/gpt-6-astra", ["--session", "id 1"])):
+            m = {"name": "x", "role": "lead-dev", "harness": harness, "model": model, "thinking": "high",
+                 "permissions": "full", "args": ["--flag", "two words"], "dir": "/w d", "inbox_dir": "/s"}
+            argv, _ = factory.launch_argv(m, prompt, {"args": expect, "resume": True})
+            at = argv.index(expect[0])
+            self.assertEqual(argv[at:at + 2], expect, harness)
+            self.assertEqual(argv[-2:], ["--flag", "two words"], harness)
+            if harness == "codex":
+                self.assertEqual(at, 0)                                  # resume <id> before the options
 
 
 class LiveToolTests(unittest.TestCase):
