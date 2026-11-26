@@ -80,7 +80,7 @@ One monotonic deadline covers both writes and both reads. With `timeout=None` (u
 | Request reply | EOF, deadline or malformed reply | `HcDown(sent=True)` |
 | Request reply | Valid JSON-RPC error | `HcError(kind, message, hint)` |
 
-The hello reply must have a matching JSON-RPC envelope, an object result, generation 1, `framed: false`, and a non-empty core ID matching `expect_core` when set. Compare the version's leading dot-separated integers against `HC_MIN`, allowing a suffix starting with `-` or `+`. The request reply must have a matching envelope and an object result or error. An absent or null error hint becomes an empty string.
+The hello reply must have a matching JSON-RPC envelope, an object result, generation 1, `framed: false`, and a non-empty core ID matching `expect_core` when set. Compare the version's leading dot-separated integers against `HC_MIN`, allowing a suffix starting with `-` or `+`. The request reply must have a matching envelope and an object result or error. An error requires an integer code and a string message. An absent or null error hint becomes an empty string.
 
 Reads poll stdout and use `os.read` in a per-call buffer. Writes poll non-blocking stdin and use `os.write`, counting the first positive request write even if the rest fails. stderr goes to a temporary spool to avoid blocking on a full pipe. The last 2,000 bytes are available for transport errors.
 

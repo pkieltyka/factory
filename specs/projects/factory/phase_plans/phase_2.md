@@ -92,7 +92,7 @@ The two lines are fixed: `hello` is `{"jsonrpc":"2.0","id":0,"method":"hello","p
 | write request, after a positive write | deadline | `HcDown(sent=True, timeout=True)` |
 | read reply | deadline | `HcDown(sent=True, timeout=True)` |
 | read reply | EOF | `HcDown(sent=True, <stderr>)` |
-| parse reply | not JSON; not an object; `id` not 1; neither `result` nor `error`; an `error` that is not an object, or whose `data` is present and not an object | `HcDown(sent=True, "unexpected reply: …")` |
+| parse reply | invalid envelope, neither `result` nor `error`, or malformed error. An error requires an integer code and string message. Its data, when present, must be an object. | `HcDown(sent=True, "unexpected reply: …")` |
 | reply | `error` object | `HcError(data.kind or "", message, data.hint or "")` |
 
 `timeout=True` only for the five deadline rows; EOF is never a timeout.
@@ -200,6 +200,7 @@ Named so a reviewer can tick them off. "both" means fake and real mode.
 - fake mode: `test_recorded_replies_conform` (every reply and error in the fixtures against the extract); `test_fake_replies_conform` (drives every fake method, success and each error kind); `test_validator_rejects` (a missing required field, an unknown field, a wrong type, `null` in a non-nullable field, `bool` for `integer`, a non-string label value, a `records` value that is not a `Status`); `test_any_accepts_null`.
 - real only: `test_real_replies_conform` (the same drive against the real core).
 - both, the mirrored behaviours: `test_send_types_into_statusless_terminal` (`started` is null); `test_send_to_blocked_is_refused`; `test_turn_goes_up_on_leaving_working`; `test_kill_then_rm` and `test_rm_live_is_refused`; `test_label_on_finished_record_and_empty_removes`; `test_doc_set_stale_version_conflicts`.
+- Both backends run `test_error_envelopes_conform` to validate raw replies for every recorded error kind. `test_malformed_error_code_is_not_authoritative` checks the transport with missing, string, boolean and fractional codes.
 
 **`FakeAgentTests`** (real only): one test per script of testing.md §3, plus `test_fake_line_switches_script` and `test_log_has_every_input`.
 

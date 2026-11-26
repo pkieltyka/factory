@@ -110,6 +110,9 @@ class HcAssertions:
             fn(*args)
         self.assertEqual(raised.exception.kind, kind)
 
+    def assert_error_payload(self, kind, error):
+        self.assertEqual(conforms(error, {"ref": "Error"}, RPC_ERROR_TYPES), [])
+        self.assertEqual(error["data"]["kind"], kind)
 
 
 class HcContract(HcAssertions, unittest.TestCase):
@@ -119,8 +122,7 @@ class HcContract(HcAssertions, unittest.TestCase):
                 self.assertEqual(self.check_result(example["method"], example["result"]), [])
         for kind, example in HC_FIXTURES["errors"].items():
             with self.subTest(kind=kind):
-                self.assertEqual(conforms(example["error"], {"ref": "Error"}, RPC_ERROR_TYPES), [])
-                self.assertEqual(example["error"]["data"]["kind"], kind)
+                self.assert_error_payload(kind, example["error"])
 
     def test_validator_rejects(self):
         hello = HC_FIXTURES["replies"]["hello"]["result"]
@@ -545,6 +547,13 @@ class HcClientTests(unittest.TestCase):
                 self.fake.rule("reply", **rule)
                 self.check_failure(sent=True)
 
+    def test_malformed_error_code_is_not_authoritative(self):
+        error = {"message": "oops", "data": {"kind": "not_found"}}
+        for fields in ({}, {"code": "invalid"}, {"code": True}, {"code": 1.5}):
+            with self.subTest(fields=fields):
+                self.fake.rule("reply", reply={"jsonrpc": "2.0", "id": 1, "error": {**error, **fields}})
+                self.check_failure(sent=True, method="terminal.get", params={"terminal": "t999"})
+
     def test_fragmented_and_coalesced_replies(self):
         self.fake.rule("hello", fragment=True)
         self.fake.rule("reply", after='{"unused":true}\n')
@@ -839,6 +848,39 @@ class HcBackendTests(HcBackend, HcAssertions, unittest.TestCase):
         self.addCleanup(self.hc.doc_set, previous, written)
         self.assert_hc_error("conflict", self.hc.doc_set, {"spaces": []}, version)
         self.assertEqual(self.hc.doc_get(), ({"spaces": []}, written))
+
+    def test_error_envelopes_conform(self):
+        active, _ = self.launch()
+        blocked, _ = self.launch("dialog", name="blocked", FAKE_DIALOG_STATE="blocked")
+        self.state(blocked, "blocked")
+        finished, _ = self.launch(name="finished")
+        self.hc.kill(finished)
+        if not REAL_HC:
+            self.fake.on_run("missing", error="spawn_failed")
+        previous, version = self.hc.doc_get()
+        written = self.hc.doc_set({"spaces": []}, version)
+        self.addCleanup(self.hc.doc_set, previous, written)
+        cases = (
+            ("not_found", "terminal.send", {"terminal": "t999", "text": "x"}),
+            ("finished", "terminal.send", {"terminal": finished, "text": "x"}),
+            ("blocked", "terminal.send", {"terminal": blocked, "text": "x"}),
+            ("invalid_params", "terminal.send", {"terminal": active}),
+            ("status_mismatch", "terminal.send", {"terminal": active, "text": "x", "if": "working"}),
+            ("spawn_failed", "terminal.run", {"argv": ["/nonexistent/factory-agent"],
+                                             "labels": {"factory.member": "missing"}}),
+            ("live", "terminal.rm", {"terminal": active}),
+            ("conflict", "doc.set", {"name": "herdr-app", "value": {}, "version": version}),
+        )
+        self.assertEqual({kind for kind, _, _ in cases}, set(HC_FIXTURES["errors"]))
+        with patch.object(live, "HC", self.hc.bin or factory.HC):
+            for kind, method, params in cases:
+                with self.subTest(kind=kind), contextlib.closing(live.Conn(os.environ, self.hc.core)) as conn:
+                    conn.request(method, params)
+                    reply = conn.message()
+                    self.assertEqual(set(reply), {"id", "jsonrpc", "error"})
+                    self.assertIs(type(reply["id"]), int)
+                    self.assertEqual((reply["id"], reply["jsonrpc"]), (1, "2.0"))
+                    self.assert_error_payload(kind, reply["error"])
 
     @real_only
     def test_version_and_core_refusals_do_not_dispatch(self):

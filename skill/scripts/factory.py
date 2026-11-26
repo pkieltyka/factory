@@ -194,7 +194,8 @@ class Hc:
                 if "error" in reply:
                     error = reply["error"]
                     data = error.get("data", {}) if isinstance(error, dict) else None
-                    if ("result" in reply or not isinstance(data, dict) or not isinstance(error.get("message"), str)
+                    if ("result" in reply or not isinstance(data, dict)
+                            or type(error.get("code")) is not int or not isinstance(error.get("message"), str)
                             or not isinstance(data.get("kind", ""), str)
                             or (data.get("hint") is not None and not isinstance(data["hint"], str))):
                         raise ValueError("unexpected reply: malformed error")
