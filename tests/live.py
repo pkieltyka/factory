@@ -781,30 +781,37 @@ def scrubber(core):
     subs = [(str(core.dir), "/tmp/hc-fixture"), (core.id, "0" * 32), (home, "/home/<user>"),
             (sys.executable, "/usr/bin/python3")]
     host, user = socket.gethostname(), getpass.getuser()
-    user = user if len(user) > 2 else ""
     nix = re.compile(r"/nix/store/[a-z0-9]{32}-[^/\s\"]+")
-    names = [(n, f"<{p}>") for n, p in ((host, "host"), (user, "user")) if n]
+    names = [(n, f"<{p}>") for n, p in ((host, "host"), (user, "user")) if len(n) > 2]
 
     def word(name):
-        return re.compile(rf"(?<![\w.-]){re.escape(name)}(?![\w.-])")
+        return re.compile(rf"(?<![\w.<-]){re.escape(name)}(?![\w.>-])")
+
+    def identity_placeholder(value, key, parent):
+        if (parent, key) == ("core", "name") and isinstance(value, str):
+            return "<host>"
+        if parent == "login_session" and key in ("id", "user"):
+            if type(value) is int:
+                return 1
+            if isinstance(value, str):
+                return "<user>"
+        return None
 
     def scrub(value, key=None, parent=None):
-        # Host and user names are replaced only where hc puts them: core.name, login_session.user, and paths.
         if isinstance(value, dict):
             return {k: scrub(v, k, key) for k, v in value.items()}
         if isinstance(value, list):
             return [scrub(v, key, parent) for v in value]
+        placeholder = identity_placeholder(value, key, parent)
+        if placeholder is not None:
+            return placeholder
         if isinstance(value, str):
-            if (parent, key) == ("core", "name") and host and value == host:
-                return "<host>"
-            if (parent, key) == ("login_session", "user") and user and value == user:
-                return "<user>"
             for old, new in subs:
                 value = value.replace(old, new)
             value = nix.sub("/nix/store/HASH-pkg", value)
             if "/" in value:
-                for name, placeholder in names:
-                    value = word(name).sub(placeholder, value)
+                for name, mask in names:
+                    value = word(name).sub(mask, value)
             return value
         if isinstance(value, bool) or value is None:
             return value
@@ -820,12 +827,13 @@ def scrubber(core):
             return [x for k, v in value.items() for x in leaks(v, k, key)]
         if isinstance(value, list):
             return [x for v in value for x in leaks(v, key, parent)]
+        placeholder = identity_placeholder(value, key, parent)
+        if placeholder is not None:
+            return [f"{parent}.{key}"] if value != placeholder else []
         if not isinstance(value, str):
             return []
         found = [n for n in (home, str(core.dir), core.id) if n in value]
         found += ["/nix/store hash"] if nix.search(value) else []
-        found += [host] if (parent, key) == ("core", "name") and host and value == host else []
-        found += [user] if (parent, key) == ("login_session", "user") and user and value == user else []
         if "/" in value:
             bare = value.replace("<host>", "").replace("<user>", "")
             found += [n for n, _ in names if word(n).search(bare)]

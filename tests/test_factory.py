@@ -24,6 +24,8 @@ import unittest
 from urllib.parse import unquote, urlsplit
 from unittest.mock import patch
 
+import live
+
 SCRIPT = pathlib.Path(__file__).resolve().parent.parent / "skill/scripts/factory.py"
 spec = importlib.util.spec_from_file_location("factory", SCRIPT)
 factory = importlib.util.module_from_spec(spec)
@@ -2570,6 +2572,48 @@ class DownTests(unittest.TestCase):
                 self.assertEqual(factory.past_sessions(cfg)["lead-dev"], {"member": "lead-dev", **current})
             e.run("up", "lead-dev")
             self.assertEqual(native(e.starts()["lead-dev"])[:2], ["resume", "same"])
+
+
+class LiveToolTests(unittest.TestCase):
+    @staticmethod
+    def scrubber(host="local-host", user="local-user"):
+        core = types.SimpleNamespace(dir="/tmp/factory-scratch-core", id="local-core-id")
+        with patch("socket.gethostname", return_value=host), patch("getpass.getuser", return_value=user):
+            return live.scrubber(core)
+
+    def test_identity_fields_redacted_by_position(self):
+        scrub = self.scrubber()
+        for value in ("ci", "x", "another-user", 1000):
+            with self.subTest(value=value):
+                raw = {"core": {"name": str(value)}, "login_session": {"user": value, "id": 42, "gui": None}}
+                expected_user = 1 if isinstance(value, int) else "<user>"
+                self.assertEqual(scrub(raw), {"core": {"name": "<host>"},
+                                              "login_session": {"user": expected_user, "id": 1, "gui": None}})
+
+    def test_leaks_flags_any_unredacted_identity_field(self):
+        scrub = self.scrubber()
+        self.assertEqual(set(scrub.leaks({"core": {"name": "ci"}, "login_session": {"user": "x", "id": 8}})),
+                         {"core.name", "login_session.user", "login_session.id"})
+
+    def test_placeholders_are_not_leaks(self):
+        scrub = self.scrubber(host="host", user="user")
+        raw = {"core": {"name": "host"}, "login_session": {"user": 1000, "id": 2}, "cwd": "/home/user/host"}
+        masked = scrub(raw)
+        self.assertEqual(masked["cwd"], "/home/<user>/<host>")
+        self.assertEqual(scrub(masked), masked)
+        self.assertFalse(scrub.leaks(masked))
+
+    def test_short_names_left_alone_inside_paths(self):
+        scrub = self.scrubber(host="ci", user="ci")
+        self.assertEqual(scrub("/srv/ci/build"), "/srv/ci/build")
+        self.assertFalse(scrub.leaks("/srv/ci/build"))
+
+    def test_protocol_words_that_look_like_names_survive(self):
+        scrub = self.scrubber(host="idle", user="live")
+        payload = {"state": "live", "reason": "idle", "status": {"state": "idle"},
+                   "foreground": {"name": "idle"}, "labels": {"name": "live"}}
+        self.assertEqual(scrub(payload), payload)
+        self.assertFalse(scrub.leaks(payload))
 
 
 class ConstantsTests(unittest.TestCase):
