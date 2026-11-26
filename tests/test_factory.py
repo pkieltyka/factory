@@ -6,6 +6,7 @@ flags factory.py passes."""
 import importlib.util
 import contextlib
 from concurrent.futures import ThreadPoolExecutor
+import errno
 import hashlib
 import io
 import json
@@ -3592,7 +3593,7 @@ class LogTests(unittest.TestCase):
 
     def write_raw(self, *records):
         """Append records as they are, bypassing Log (to build histories, valid or damaged)."""
-        if not self.log.lock_path.exists():
+        if not self.log.path.exists():
             self.log.add("lead-dev", ["operator"], "seed")
         with self.log.path.open("ab") as f:
             for rec in records:
@@ -3678,7 +3679,8 @@ class LogTests(unittest.TestCase):
     def test_files_are_private(self):
         self.log.add("lead-dev", ["operator"], "x")
         self.assertEqual(stat.S_IMODE(self.state.stat().st_mode), 0o700)
-        for name in ("log.jsonl", "lock", "log.check"):
+        self.assertEqual(sorted(p.name for p in self.state.iterdir()), ["log.check", "log.jsonl"])   # no lock file
+        for name in ("log.jsonl", "log.check"):
             with self.subTest(name=name):
                 self.assertEqual(stat.S_IMODE((self.state / name).stat().st_mode), 0o600)
 
@@ -3713,23 +3715,6 @@ class LogTests(unittest.TestCase):
         os.chmod(self.log.path, 0o640)
         self.log.read()
         self.assertEqual(stat.S_IMODE(self.log.path.stat().st_mode), 0o640)
-
-    def test_missing_lock_with_a_log_is_retried_then_diagnosed(self):
-        self.log.add("lead-dev", ["operator"], "x")
-        real_open = factory.private_open
-        misses = []
-
-        def first_miss(path, flags, fix_mode=True, dir_fd=None):
-            if path == "lock" and not misses:
-                misses.append(path)  # a reader that looked before the writer made the lock
-                raise FileNotFoundError(path)
-            return real_open(path, flags, fix_mode, dir_fd)
-        with patch.object(factory, "private_open", first_miss):
-            self.assertEqual(len(self.log.read()[0]), 2)
-        self.assertEqual(len(misses), 1)
-        self.log.lock_path.unlink()
-        with self.assertRaisesRegex(factory.LogDamage, "lock file is missing"):
-            self.log.read()
 
     def test_checkpoint_without_log_is_damage(self):
         self.log.add("lead-dev", ["operator"], "x")
@@ -3769,7 +3754,6 @@ class LogTests(unittest.TestCase):
     def test_orphan_checkpoint_is_damage_for_readers(self):
         self.log.add("lead-dev", ["operator"], "x")
         self.log.path.unlink()
-        self.log.lock_path.unlink()
         with self.assertRaisesRegex(factory.LogDamage, "log.check remains"):
             self.log.read()
 
@@ -3785,33 +3769,6 @@ class LogTests(unittest.TestCase):
         self.assertTrue(self.log.out(box, 1, "operator", "sending", term="t1"))   # out rebuilds it from the file
         self.assertEqual(box.outcome(1, "operator")["o"], "sending")
 
-    def test_a_writer_refuses_a_missing_lock_once_the_log_exists(self):
-        self.log.add("lead-dev", ["operator"], "x")
-        held = os.open(self.log.lock_path, os.O_RDWR)    # another writer still holds the original lock
-        try:
-            self.log.lock_path.unlink()
-            before = self.log.path.read_bytes()
-            with self.assertRaisesRegex(factory.LogDamage, "lock file is missing"):
-                self.log.add("pm", ["operator"], "y")
-            self.assertEqual(self.log.path.read_bytes(), before)
-            self.assertFalse(self.log.lock_path.exists())
-        finally:
-            os.close(held)
-
-    def test_a_writer_racing_the_first_writer_looks_again(self):
-        """A sees no lock; B creates lock and log and commits 1; A must find B's lock, not report damage."""
-        real_open, paused = factory.private_open, []
-
-        def racing(path, flags, fix_mode=True, dir_fd=None):
-            if path == "lock" and flags == os.O_RDWR and not paused:
-                paused.append(path)
-                self.assertEqual(factory.Log(self.state).add("pm", ["operator"], "B, the first writer")[0], 1)
-                raise FileNotFoundError(path)               # what A saw before B ran
-            return real_open(path, flags, fix_mode, dir_fd)
-        with patch.object(factory, "private_open", racing):
-            self.assertEqual(self.log.add("lead-dev", ["operator"], "A")[0], 2)
-        self.assertEqual([r["id"] for r in self.log.read()[0] if r["t"] == "msg"], [1, 2])
-
     def test_a_malformed_lineage_is_a_miss(self):
         self.log.add("pm", ["operator"], "one")
         raw = self.log.check_path.read_text()
@@ -3820,62 +3777,93 @@ class LogTests(unittest.TestCase):
         self.assertEqual(self.log.add("pm", ["operator"], "two")[0], 2)    # one full validation, then a new proof
         self.assertRegex(json.loads(self.log.check_path.read_text())["lineage"], r"^[0-9a-f]{16}$")
 
-    def test_a_replacement_lock_never_authorizes_a_write(self):
-        """A sees an empty state; before A creates the lock, B creates it, writes, and keeps holding it while the
-        lock's name is removed. A's new lock must not authorize A, nor the next writer C."""
-        real_open, held, started = factory.private_open, [], []
-
-        def racing(path, flags, fix_mode=True, dir_fd=None):
-            if path == "lock" and flags & os.O_CREAT and not started:   # A, after it saw no lock, log or checkpoint
-                started.append(path)
-                factory.Log(self.state).add("pm", ["operator"], "B")              # lock Y, log, checkpoint
-                fd = os.open(self.log.lock_path, os.O_RDWR)
-                factory.fcntl.flock(fd, factory.fcntl.LOCK_EX)                    # B still holds Y...
-                held.append(fd)
-                self.log.lock_path.unlink()                                        # ...whose name is removed
-            return real_open(path, flags, fix_mode, dir_fd)
+    def test_the_state_directory_is_the_lock(self):
+        """Writers flock the state directory: another descriptor of it cannot take the lock meanwhile."""
+        self.log.add("lead-dev", ["operator"], "x")
+        other = os.open(self.state, os.O_RDONLY | os.O_DIRECTORY)
         try:
-            with patch.object(factory, "private_open", racing), \
-                    self.assertRaisesRegex(factory.LogDamage, "lock this writer had to create"):
-                self.log.add("lead-dev", ["operator"], "A")
-            before = self.log.path.read_bytes()
-            self.assertEqual([json.loads(line)["t"] for line in before.splitlines()], ["msg", "ok"])   # only B's
-            self.assertFalse(self.log.lock_path.exists())                          # A removed its replacement
-            with self.assertRaisesRegex(factory.LogDamage, "lock file is missing"):
-                factory.Log(self.state).add("reviewer", ["operator"], "C")         # the next writer refuses too
-            self.assertEqual(self.log.path.read_bytes(), before)
+            with self.log._locked(exclusive=True):
+                with self.assertRaises(BlockingIOError):
+                    factory.fcntl.flock(other, factory.fcntl.LOCK_EX | factory.fcntl.LOCK_NB)
+                with self.assertRaises(BlockingIOError):
+                    factory.fcntl.flock(other, factory.fcntl.LOCK_SH | factory.fcntl.LOCK_NB)
+            factory.fcntl.flock(other, factory.fcntl.LOCK_SH | factory.fcntl.LOCK_NB)   # readers share
+            with self.log._locked(exclusive=False):
+                pass
+            factory.fcntl.flock(other, factory.fcntl.LOCK_UN)
         finally:
-            for fd in held:
-                os.close(fd)
+            os.close(other)
 
-    def test_a_writer_holding_another_lock_than_the_log_was_written_under_refuses(self):
-        self.log.add("pm", ["operator"], "one")
-        original = os.open(self.log.lock_path, os.O_RDWR)
-        try:
-            factory.fcntl.flock(original, factory.fcntl.LOCK_EX)
-            self.log.lock_path.unlink()
-            fd = os.open(self.log.lock_path, os.O_CREAT | os.O_RDWR, 0o600)       # someone recreated the name
-            os.close(fd)
-            before = self.log.path.read_bytes()
-            with self.assertRaisesRegex(factory.LogDamage, "not the one the log was last written under"):
-                self.log.add("pm", ["operator"], "two")
-            self.assertEqual(self.log.path.read_bytes(), before)
-        finally:
-            os.close(original)
+    def test_a_held_lock_blocks_writers_with_or_without_a_checkpoint(self):
+        self.log.add("lead-dev", ["operator"], "x")
+        for checkpoint in (True, False):
+            with self.subTest(checkpoint=checkpoint):
+                if not checkpoint:
+                    self.log.check_path.unlink(missing_ok=True)
+                held = os.open(self.state, os.O_RDONLY | os.O_DIRECTORY)
+                factory.fcntl.flock(held, factory.fcntl.LOCK_EX)          # another writer, mid-operation
+                before = self.log.path.read_bytes()
+                results = []
+                writer = threading.Thread(target=lambda: results.append(factory.Log(self.state).add("pm", ["x"], "y")))
+                writer.start()
+                writer.join(0.5)
+                self.assertTrue(writer.is_alive())                       # blocked, not appending beside it
+                self.assertEqual(self.log.path.read_bytes(), before)
+                os.close(held)                                           # the other writer is done
+                writer.join(10)
+                self.assertEqual(len(results), 1)
 
-    def test_first_writers_sharing_a_new_lock_both_commit(self):
-        """A creates the lock; B opens that same lock and commits before A locks it: A then commits 2."""
-        real_open, done = factory.private_open, []
+    def test_concurrent_first_writers_without_a_checkpoint_all_commit(self):
+        """Fresh store, checkpoints unavailable, writers racing from the start: every id once, nothing lost."""
+        barrier, errors = threading.Barrier(4), []
 
-        def racing(path, flags, fix_mode=True, dir_fd=None):
-            fd = real_open(path, flags, fix_mode, dir_fd)
-            if path == "lock" and flags & os.O_CREAT and not done:
-                done.append(path)
-                self.assertEqual(factory.Log(self.state).add("pm", ["operator"], "B")[0], 1)
-            return fd
-        with patch.object(factory, "private_open", racing):
-            self.assertEqual(self.log.add("lead-dev", ["operator"], "A")[0], 2)
-        self.assertEqual([r["id"] for r in self.log.read()[0] if r["t"] == "msg"], [1, 2])
+        def writer(n):
+            log = factory.Log(self.state)
+            barrier.wait()
+            try:
+                for k in range(10):
+                    log.add(f"w{n}", ["operator"], str(k))
+            except Exception as error:    # collected, so a failure names itself
+                errors.append(error)
+        with patch.object(factory.Log, "_write_checkpoint", lambda log, last: None):
+            threads = [threading.Thread(target=writer, args=(n,)) for n in range(4)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(60)
+        self.assertEqual(errors, [])
+        self.assertFalse(self.log.check_path.exists())
+        records, _ = self.log.read()
+        self.assertEqual([r["id"] for r in records if r["t"] == "msg"], list(range(1, 41)))
+
+    def test_a_filesystem_that_cannot_lock_a_directory_is_named(self):
+        for code in (errno.EBADF, errno.ENOLCK):
+            with self.subTest(code=code), \
+                    patch.object(factory.fcntl, "flock", side_effect=OSError(code, os.strerror(code))), \
+                    self.assertRaisesRegex(OSError, "cannot lock the state directory.*XDG_CACHE_HOME") as raised:
+                self.log.add("pm", ["operator"], "x")
+            self.assertEqual(raised.exception.errno, code)
+
+    def test_a_new_store_is_durable_before_its_first_commit(self):
+        """The directory chain is synced by the writer that creates the log, whoever made the directories;
+        if that fails nothing is stored, and a retry commits id 1 normally."""
+        self.state.mkdir(parents=True, mode=0o700)            # made by a writer that died right after mkdir
+        real_fsync, synced = os.fsync, []
+
+        def failing(fd):
+            synced.append(os.fstat(fd).st_ino)
+            if len(synced) == 1:
+                raise OSError(5, "Input/output error")
+            return real_fsync(fd)
+        with patch.object(factory.os, "fsync", failing), self.assertRaisesRegex(factory.NotStored, "durable"):
+            self.log.add("pm", ["operator"], "x")
+        self.assertFalse(self.log.path.exists())
+        self.assertEqual(synced[0], os.stat(self.state.parent).st_ino)       # the parent's entry first
+        synced.clear()
+        with patch.object(factory.os, "fsync", lambda fd: (synced.append(os.fstat(fd).st_ino), real_fsync(fd))[1]):
+            self.assertEqual(self.log.add("pm", ["operator"], "x"), (1, self.log.path.stat().st_size, None))
+        self.assertIn(os.stat(self.state.parent).st_ino, synced)
+        self.assertIn(os.stat(self.base).st_ino, synced)
 
     def test_an_edited_checkpoint_is_a_miss_not_a_wrong_id(self):
         self.log.add("pm", ["operator"], "one")
@@ -4390,21 +4378,6 @@ class LogFaultTests(unittest.TestCase):
         self.assertEqual(len(results[0][0]), 4)
         self.assertEqual(self.log.add("pm", ["operator"], "third")[0], 3)
         self.assertEqual(list(pathlib.Path.cwd().glob("log.jsonl")), [])
-
-    def test_a_reader_racing_the_first_writer_looks_again(self):
-        """Lock missing, then the writer creates lock, log and checkpoint: the reader retries, not 'orphan'."""
-        fresh = factory.Log(self.base / "team" / "fresh")
-        real_open, calls = factory.private_open, []
-
-        def racing(path, flags, fix_mode=True, dir_fd=None):
-            if path == "lock" and not calls:
-                calls.append(path)
-                factory.Log(fresh.state).add("pm", ["operator"], "the first writer")
-                raise FileNotFoundError(path)
-            return real_open(path, flags, fix_mode, dir_fd)
-        fresh.state.mkdir(mode=0o700)
-        with patch.object(factory, "private_open", racing):
-            self.assertEqual(len(fresh.read()[0]), 2)
 
     # processes
 

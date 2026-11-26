@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import collections
 import contextlib
+import errno
 import datetime
 import fcntl
 import getpass
@@ -679,7 +680,7 @@ def _parse(data, first_line):
 
 def _checkpoint_digest(check):
     """A digest of log.check's fields, so an accidental edit of one of them is a miss, not a wrong id."""
-    fields = ":".join(str(check.get(k)) for k in ("ino", "size", "mtime_ns", "last", "lineage", "lock"))
+    fields = ":".join(str(check[k]) for k in ("ino", "size", "mtime_ns", "last", "lineage"))
     return hashlib.sha256(fields.encode()).hexdigest()
 
 
@@ -856,12 +857,11 @@ class Log:
     Every operation holds a no-follow descriptor of the state directory and opens its files relative to it,
     so no component (the directory, lock, log, checkpoint) is ever followed through a symbolic link."""
 
-    LOG, LOCK, CHECK = "log.jsonl", "lock", "log.check"
+    LOG, CHECK = "log.jsonl", "log.check"
 
     def __init__(self, state):
         self.state = pathlib.Path(_absolute(state))   # lexical: a symbolic link in the cache base is kept
         self.path = self.state / self.LOG
-        self.lock_path = self.state / self.LOCK
         self.check_path = self.state / self.CHECK
         self._local = threading.local()     # the open state directory and lineage belong to one operation
 
@@ -908,85 +908,27 @@ class Log:
 
     @contextlib.contextmanager
     def _locked(self, exclusive):
-        """The team lock. Writers create the private directory and the lock (before any log); readers create nothing."""
+        """The team lock is the state directory itself, flocked through the same no-follow descriptor every operation
+        uses: it cannot be removed or replaced while it holds the log, so no two writers can append to one log under
+        different locks. Writers create the private directory; readers create nothing."""
         directory = self._open_state(create=exclusive)
         if directory is None:
             yield None
             return
         self._dir = directory
         try:
-            fd, created = self._open_lock_for_writing() if exclusive else (self._open_lock_for_reading(), False)
-            if fd is None:
-                yield None
-                return
             try:
-                fcntl.flock(fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
-                self._check_lock(fd, created, exclusive)
-                yield fd
-            finally:
-                os.close(fd)
+                fcntl.flock(directory, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+            except OSError as error:
+                if error.errno in (errno.EBADF, errno.ENOLCK, errno.EOPNOTSUPP):
+                    raise OSError(error.errno, f"cannot lock the state directory {self.state}: {error.strerror}."
+                                               " If it is on a filesystem that cannot lock a directory (NFS, for"
+                                               " one), set XDG_CACHE_HOME to a local path.") from error
+                raise
+            yield directory
         finally:
             self._dir = None
             os.close(directory)
-
-    def _open_lock_for_writing(self):
-        """(lock fd, whether this call created it). The lock is created only for a state with no log and no
-        checkpoint yet. Recreating a lock that was removed while a log exists would let a writer still holding the
-        old one commit beside us: that is damage."""
-        try:
-            return self._open(self.LOCK, os.O_RDWR), False
-        except FileNotFoundError:
-            if not (self._lexists(self.LOG) or self._lexists(self.CHECK)):
-                try:
-                    return self._open(self.LOCK, os.O_CREAT | os.O_EXCL | os.O_RDWR), True
-                except FileExistsError:
-                    pass      # another first writer made it just now: use theirs
-        try:   # a first writer may have created the lock, then the log, since we looked: look again, never create
-            return self._open(self.LOCK, os.O_RDWR), False
-        except FileNotFoundError:
-            raise LogDamage(self.path, None, "the log exists but its lock file is missing") from None
-
-    def _check_lock(self, fd, created, exclusive):
-        """After locking: the lock path must still name the file we hold. A writer must hold the lock its log was
-        last written under (log.check records it), and a lock this writer created may stand beside an existing log
-        only if the checkpoint says that log was written under this same lock; such a lock is removed again, so the
-        next writer also finds the store damaged instead of trusting it."""
-        held = os.fstat(fd)
-        try:
-            named = os.stat(self.LOCK, dir_fd=self._dir, follow_symlinks=False)
-        except FileNotFoundError:
-            named = None
-        if named is None or (named.st_dev, named.st_ino) != (held.st_dev, held.st_ino):
-            raise LogDamage(self.path, None, "the lock file was removed or replaced while in use")
-        self._local.lock = held.st_ino
-        if not exclusive:
-            return
-        existing = self._lexists(self.LOG) or self._lexists(self.CHECK)
-        check = self._checkpoint(self._stat()) if existing else None
-        if created and existing and (check is None or check.get("lock") != held.st_ino):
-            try:
-                os.unlink(self.LOCK, dir_fd=self._dir)   # it names our inode (checked above): never trust it
-            except OSError:
-                pass
-            raise LogDamage(self.path, None, "a log appeared beside a lock this writer had to create: another"
-                                             " writer may still hold a removed lock")
-        if check is not None and check.get("lock") not in (None, held.st_ino):
-            raise LogDamage(self.path, None, "the lock is not the one the log was last written under")
-
-    def _open_lock_for_reading(self):
-        for attempt in (1, 2):
-            try:
-                return self._open(self.LOCK, os.O_RDONLY, fix_mode=False)
-            except FileNotFoundError:
-                log, check = self._lexists(self.LOG), self._lexists(self.CHECK)
-                if not (log or check):
-                    return None          # nothing written yet: the empty log
-                if attempt == 2:
-                    raise LogDamage(self.path, None, "the log exists but its lock file is missing" if log
-                                    else "log.jsonl is missing but log.check remains") from None
-                # A writer creates the lock before the log and the checkpoint: one of them appearing while the
-                # lock looked missing means a writer was starting. Look again.
-        return None
 
     def _snapshot(self, offset):
         """(records, end, box) from offset, with the lock held. At offset 0 the records are also replayed into a
@@ -1087,7 +1029,7 @@ class Log:
             if info is None:
                 return
             check = {"ino": info.st_ino, "size": info.st_size, "mtime_ns": info.st_mtime_ns,
-                     "last": last, "lineage": self._local.lineage, "lock": self._local.lock}
+                     "last": last, "lineage": self._local.lineage}
             data = json.dumps({**check, "digest": _checkpoint_digest(check)}).encode()
             fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=self._dir)
             created = True
@@ -1168,6 +1110,30 @@ class Log:
     def _sync_directory(self):
         os.fsync(self._dir)
 
+    def _sync_ancestors(self):
+        """Before the log is first created: make the state directory's entry, and each parent's up to the
+        filesystem's root, durable, whoever created them (a creator may have died right after mkdir)."""
+        device = os.fstat(self._dir).st_dev
+        path = self.state
+        while path.parent != path:
+            parent = path.parent
+            fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                if os.fstat(fd).st_dev != device:
+                    return            # another filesystem: the entry we depend on is in the directory below
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            path = parent
+
+    def _first_log(self):
+        """Called before an append when there is no log yet: sync the directory chain, or store nothing."""
+        if self._stat() is None:
+            try:
+                self._sync_ancestors()
+            except OSError as error:
+                raise NotStored(False, f"cannot make {self.state} durable: {error}") from error
+
     @staticmethod
     def _line(rec):
         return (json.dumps(rec, ensure_ascii=False, allow_nan=False, separators=(",", ":")) + "\n").encode("utf-8")
@@ -1189,6 +1155,7 @@ class Log:
             raise ValueError(f"message is not JSON-serializable: {error}") from error
         with self._locked(exclusive=True):
             ident = self._prefix() + 1
+            self._first_log()
             rec["id"] = ident
             try:
                 if self._append(self._line(rec))[0] == "visible":
