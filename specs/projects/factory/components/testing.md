@@ -1,0 +1,161 @@
+---
+status: complete
+---
+
+# Component: Testing
+
+## Purpose and scope
+
+How every behaviour in the functional spec is proven: automated tests that run in CI against a fake `hc`, the same tests against a real isolated core, the live qualification of each harness (§10), and the end-to-end autonomy runs. It names the test doubles and their interfaces; the test cases themselves are listed in each component's test plan.
+
+## 1. Files
+
+| File | Role |
+|---|---|
+| `tests/test_factory.py` | All automated tests, standard `unittest`, run with `python3 tests/test_factory.py` (v1's entry point and CI step) |
+| `tests/fake_hc.py` | The fake `hc`, about 300 lines |
+| `tests/fake_agent.py` | A program that reports OSC 7501 and plays a scripted agent |
+| `tests/live.py` | Driver for per-harness qualification and the end-to-end runs; never run by CI |
+| `tests/gate1-setup.sh` | v1's cold-recovery fixture, kept (§9.5) |
+| `tests/hc_fixtures.json` | Replies recorded from `hc 0.1.20`, for the contract tests |
+
+## 2. Fake `hc`
+
+An executable Python script; tests set `HC_BIN` to it. It implements `--version` (prints `hc <FAKE_HC_VERSION or 0.1.20>`) and `connect`: read JSON lines on stdin, answer each on stdout, exit at EOF. State is `$FAKE_HC_DIR/state.json`, read and written under `flock`, so the many `connect` processes of one test share it.
+
+```json
+{"core": "fakecore00000000", "next": 1,
+ "terminals": {"t1": {"address": "t1", "state": "live", "status": null, "turn": 0, "labels": {}, "argv": [], "cwd": "", "env": {},
+                      "created_ms": 0, "status_ms": null, "finished_ms": null, "reason": null, "exit_code": null, "screen": ""}},
+ "docs": {"herdr-app": {"value": null, "version": 0}},
+ "calls": [{"method": "terminal.send", "params": {}}],
+ "rules": {"send": {"t1": {"hold": true}}, "run": {}, "doc_conflicts": 0}}
+```
+
+Methods: `hello`, `terminal.run`, `.list` (`all`, `labels`), `.get`, `.send`, `.keys`, `.read`, `.label`, `.keep`, `.kill`, `.rm`, `doc.get`, `doc.set`. It answers `hello` before it reads the next line and records every line it receives, so a test can prove that a refused call never reached it. Anything else answers `invalid_params`, which fails the test that caused it. Results carry exactly the keys recorded in `hc_fixtures.json`; errors use `hc`'s shape and kinds.
+
+Behaviour that mirrors `hc` (each has a contract test, §4):
+- `terminal.send`: `not_found`, `finished`, `blocked`; otherwise it records the text and returns `{"started": …, "status": …, "turn": …}`. It types into a terminal with null status and returns `started: null` (V7).
+- `turn` goes up when a status leaves `working`; `status_ms` changes with the status.
+- `terminal.kill` gives `reason: "killed"`; `rm` refuses a live terminal with `live`; labels can be set on finished records; `""` removes a label.
+- `doc.set` with a stale version answers `conflict`.
+
+Test-side helper in `test_factory.py`:
+
+```python
+class FakeHc:
+    def __init__(self, directory): ...
+    def add(self, labels: dict, status: str | None = "idle", **fields) -> str     # a terminal that exists before the test acts
+    def set_status(self, term, state, kind=None, msg=None) -> None                # keeps turn and status_ms consistent
+    def finish(self, term, reason="exited", exit_code=0) -> None
+    def remove(self, term) -> None
+    def screen(self, term, text) -> None
+    def on_run(self, member, status=None, screen="", then=None) -> None           # status a newly run member reports, and after how many polls
+    def on_send(self, term, error=None, hold=False, die=False, started=True) -> None
+    def reply_in_chunks(self, sizes: list[int], delay: float) -> None             # split the next reply across writes
+    def hello(self, version="0.1.20", core=None) -> None                          # what the next hello answers
+    def received(self) -> list[dict]                                              # every request line, hello included
+    def release(self, term) -> None                                               # let a held send return
+    def doc_conflicts(self, n) -> None                                            # the next n doc.set calls answer conflict
+    def calls(self, method) -> list[dict]
+    def sent(self, term) -> list[str]                                             # texts typed into a terminal
+    def stop(self) -> None                                                        # connect fails: HcDown
+```
+
+`hold` makes the `connect` process poll the state file until `release`: this models a `draft_wait` hold. `die` makes it exit after reading the request, without a reply: `HcDown(sent=True)`.
+
+### Fault and crash injection
+
+- **Disk faults** in the log tests are made by patching `os.write`, `os.fsync` and `os.ftruncate` on the `factory` module's `os` binding for one call each, singly and together ([message_log.md](message_log.md)).
+- **A writer killed mid-append** is a child process that the test stops with SIGKILL at a named point (an environment variable makes `Log._append` pause there).
+- **A keeper killed between two steps** is modelled by raising from a patched method after the step under test (for example right after `log.out(…, "delivered")`), discarding that `Keeper`, and building a new one on the same state directory and fake `hc`. The crash-recovery tests in [keeper.md](keeper.md) all use this.
+
+## 3. Fake agent
+
+`tests/fake_agent.py [script]`, used wherever a real terminal is needed: the real-`hc` test mode, and dry runs of `live.py`. It puts the terminal in raw mode, enables bracketed paste, and writes `ESC ] 7501 ; state=<word>:app=fake ESC \` (verified against `hc 0.1.20`). Every submitted input is appended to `$FAKE_LOG` with a timestamp.
+
+| Script | Behaviour |
+|---|---|
+| `reports` (default) | `idle`; on each message: `working` for `FAKE_WORK` seconds, runs `factory.py say <FAKE_REPLY_TO> --file …` with the message's first line, then `idle` |
+| `forgets` | As `reports` without the `say` |
+| `works_forever` | `working` after the first message, never leaves it |
+| `blocks` | `blocked` (kind `permission`) after the first message, until it receives `enter` |
+| `crashes` | Exits with code 1 during its first turn |
+| `silent` | Never reports a status |
+| `dialog` | Prints `FAKE_DIALOG` text and reports `FAKE_DIALOG_STATE` (`blocked`, `idle` or none) until it receives the configured keys, then `idle` |
+
+A line in a message of the form `FAKE: <script>` switches the script, so one test can change an agent's behaviour by sending it a message.
+
+## 4. Test modes and isolation
+
+- **Fake mode (default, CI).** `HC_BIN=tests/fake_hc.py`; harness names on `PATH` are v1's fake executables that record their argv; tests that exercise `say` as a member set that harness's `session_env` variable in the command's environment. No terminal exists; nothing can reach a real `hc`.
+- **Real mode (`FACTORY_TEST_HC=real`, local).** Tests marked `@real_hc` run against a private core. `setUpModule` creates a temp directory and sets `HOME`, `XDG_RUNTIME_DIR`, `XDG_STATE_HOME`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME` inside it, `HC_SESSION=factory-test-<pid>`, `HC_SETTLE_MS=0`, and removes `HC_SOCKET` and `HC_TERMINAL_ID`; `tearDownModule` runs `hc server stop` and deletes the directory. Before the first call it asserts that `XDG_RUNTIME_DIR` is under the temp directory and refuses to run otherwise, so the owner's sessions cannot be touched (§13). Harness names on `PATH` point at `fake_agent.py`. This is the setup the architect's verification used.
+- **Contract tests (`HcContract`, replaces v1's `HerdrContract`).** In fake mode: every reply of the fake has exactly the keys of the recorded reply in `hc_fixtures.json`. In real mode: the same assertions against the real core, plus each mirrored behaviour of §2. A new `hc` version is adopted by re-recording the fixtures in real mode and fixing what the contract tests then fail.
+
+### Time
+
+No test sleeps for a deadline. `Keeper` and `await_ready` take a `clock` object; tests pass
+
+```python
+class ManualClock:
+    now = 1_000_000.0
+    def time(self): return self.now
+    def monotonic(self): return self.now
+    def sleep(self, s): self.now += s
+```
+
+and `say`'s wait loop reads the module's own `time` binding, which tests replace on the `factory` module only (v1's lesson: patching `time.sleep` globally also changes subprocess polling). Keeper tests call `tick()` directly and advance the clock between calls.
+
+## 5. What happens to v1's test classes
+
+| v1 class | v2 |
+|---|---|
+| `UpTests`, `UpRecoveryTests`, `DownTests` | Rewritten as `LaunchTests`, `SessionTests`, `DownTests` ([launch_layout.md](launch_layout.md)) |
+| `WorktreeTests`, `ConfigTests`, `ListingTests` | Kept; `ConfigTests` gains the three keys |
+| `InboxTests` | Becomes `LogTests` ([message_log.md](message_log.md)); acknowledgement tests are deleted |
+| `StockTransportTests`, `WaitTests` | Deleted with the code |
+| `CacheNameTests` | Becomes `StateDirTests`: team key, core suffix, privacy of the directory |
+| `DocumentationTests`, `RecipeTests`, `InstalledCopyTests`, `GateFixtureTests` | Kept ([cli_skill.md](cli_skill.md)) |
+| `HerdrContract` | `HcContract` |
+| `LiveFlags` | Kept, opt-in (`FACTORY_LIVE=1`): each installed harness still accepts the flags Factory passes, now including the session flags |
+| new | `HcClientTests`, `KeeperTests`, `LayoutTests`, `CliTests`, `AutonomyTests` |
+
+`AutonomyTests` are the `test_stall_<row>` tests of [keeper.md](keeper.md), the never-loops test, `test_status_leaves_stopped_team_stopped` and the ready check's A → none → A test: the automated half of §10's autonomy tests.
+
+Size: v1's test file is 3,130 lines. Expect about 3,500 for v2, plus the fake `hc` and the fake agent.
+
+Coverage rule: every row of every decision table in the component docs (delivery, send results, refusals, readiness, layout placement) has a test named in that doc's test plan; a reviewer checks a change against the table it touches.
+
+## 6. Live qualification (`tests/live.py`)
+
+`python3 tests/live.py qualify <harness> [--role operator|member] [--case N]`
+
+- Starts its own core, isolated on every axis that selects one: a unique `HC_SESSION=factory-qa-<pid>`, an explicit `HC_SOCKET=<private temp dir>/hc.sock` (it outranks an inherited `HC_SOCKET` and a `socket` set in `hc`'s config) and a private `XDG_RUNTIME_DIR`. `HOME` and `XDG_CONFIG_HOME` stay real, because the harness needs its credentials and settings. The owner can watch with the same three variables and `rodeo`.
+- Reads the new core's ID from `hello` once and builds every later client as `Hc(expect_core=<that id>)`: a send, interrupt, kill or teardown that would reach any other core fails before the request is written. Teardown runs `hc server stop` only after `server.status` shows that ID.
+- Sets the draft hold for cases 3 and 10 with `HC_DRAFT_MS` on that core if LC-10 confirms it; otherwise those cases run with the configured `draft_wait`. The owner's `hc` config is never edited.
+- Builds a scratch repository in a temp directory with a two-member formation in which the harness under test is the operator, the member, or both.
+- Types the owner's keystrokes through a framed `terminal.attach` client (`Kind::Data`, which `hc` counts as human input: hc-capabilities §10.1). This small client lives only in `live.py`.
+- Runs the ten cases of §10 in order, each with a unique token in its message and a check that the recipient acted on it (a file it was asked to write, or a reply quoting the token), and writes one row per case to `docs/qualification/<harness>.md`: result, observed behaviour (for case 4: queued or steered), harness version, `hc` version, Factory `VERSION`.
+- Runs the live checks (LC-1 to LC-4, LC-6 to LC-8, LC-10 to LC-12) as named subcommands (`live.py check lc3`), each printing the fact and writing it to `docs/qualification/hc-checks.md`.
+
+A harness is supported when all ten rows pass in both roles (§10). A case 4 result of "lost or garbled" is the trigger to build delivery between turns ([keeper.md](keeper.md) §9) for that harness; the case is then run again. Case 6 checks, per harness, that the ready line recorded the conversation ID, that `down` then `up` reopens that conversation (the member is asked for a token from before), and that a conversation switched inside the harness is the one resumed after the member's next `say`.
+
+## 7. End-to-end autonomy runs
+
+`python3 tests/live.py e2e --tracker file|github --operator <harness>`
+
+1. `file`: a throwaway repository with a local bare remote, `FACTORY.md` from the template with the `TODO.md` tracker holding three small ready items, a `ready_check` that greps `TODO.md`, a local test script standing in for CI and a locally merged branch for the pull request. `github`: the private `pkieltyka/factory-test` repository with its board, pull requests and CI.
+2. Starts the operator in a terminal of the QA core with one prompt (`/factory up`, then work through the ready items), a developer and a reviewer. No input after that.
+3. Faults: once the first item is assigned, `hc interrupt` on the developer (its turn ends without a report); during the second item, `hc kill` on the developer.
+4. Pass: all three items integrated with the checks green and the tracker updated inside the time budget (60 minutes for `file`); the log has no `unconfirmed` pair; it contains a quiet note followed by the operator's message to the developer, and an exit note followed by `up` of that member.
+5. Second run, empty tracker: exactly one quiet note, then 15 minutes with no further `msg` record from `factory`; then a ready item is added and the next ready check produces one `ready work` note and the item is taken.
+
+Results go to `docs/qualification/e2e-<date>.md` with the versions tested.
+
+## 8. CI
+
+`.github/workflows/test.yml` is unchanged: `python3 tests/test_factory.py` in fake mode on every push and pull request. Real mode is added there only if LC-9 shows a pinned `hc` release installs on the runner; until then real mode and `live.py` are run locally by the developer and the reviewer, and the reviewer's verdict says which were run.
+
+## Dependencies
+
+Depends on: `hc` 0.1.20 for real mode; the six harnesses for qualification. Used by: every component's test plan.

@@ -1,19 +1,20 @@
 ---
-status: draft
+status: complete
 ---
 
 # Component: Message log
 
 ## Purpose and scope
 
-Durable storage for every message and every per-recipient outcome (§8.5–8.7): the append-only file, its lock, the in-memory index built from it, and the handling of message files. It does not type, decide deliverability, or talk to `hc`.
+Durable storage for every message and every per-recipient outcome (§8.5–8.7): the append-only file, its lock, the commit rule, the in-memory index built from it, and the handling of message files. The index is also where everything the keeper must not forget across a crash is derived from: which terminals have a delivered brief, which notes were already sent, and the last quiet and ready-work notes. It does not type, decide deliverability, or talk to `hc`.
 
 ## Storage format
 
-`<state>/log.jsonl`, UTF-8, one JSON object per line, appended only. Two record types.
+`<state>/log.jsonl`, UTF-8, one JSON object per line, appended only. Three record types.
 
 ```json
 {"t":"msg","id":42,"at":"2026-11-26T17:00:00Z","from":"lead-dev","to":["operator","reviewer"],"kind":"say","text":"status: done …","file":"/…/messages/lead-dev/operator-done-1.md"}
+{"t":"ok","id":42}
 {"t":"out","id":42,"to":"operator","o":"sending","at":"2026-11-26T17:00:01Z","term":"t12"}
 {"t":"out","id":42,"to":"operator","o":"delivered","at":"2026-11-26T17:00:01Z","term":"t12","started":true,"turn":7}
 {"t":"out","id":42,"to":"reviewer","o":"queued","why":"blocked","at":"2026-11-26T17:00:01Z"}
@@ -28,33 +29,31 @@ Durable storage for every message and every per-recipient outcome (§8.5–8.7):
 | `kind` | str | `say`, `brief` or `note` |
 | `text` | str | Exactly as written by the sender; never changed |
 | `file` | str or absent | Absolute path given with `--file` |
-| `what`, `about` | str or absent | Notes only: `what` is `blocked`, `error`, `exit`, `quiet` or `ready`; `about` is the member a member note concerns |
+| `meta` | object or absent | Notes only; see [keeper.md](keeper.md) §5–6. `what` is `blocked:<kind>`, `error`, `exit`, `quiet` or `ready`; `about`, `term` and `since` (the state's `status_ms`) identify a member note; `turns` is a quiet note's snapshot; `digest` a ready note's |
+
+`ok` is the **commit record**: `{"t":"ok","id":N}`, written directly after message N by the same writer in the same lock section. A message exists for delivery, for `inbox` and for every derived fact only once its `ok` record is in the log. A `msg` without one is an *uncommitted entry*: its id is used up, it is never delivered, and `status` counts such entries.
 
 | `out` field | Type | Meaning |
 |---|---|---|
-| `id`, `to` | int, str | The message and one of its recipients |
+| `id`, `to` | int, str | A committed message and one of its recipients |
 | `o` | str | `sending`, `delivered`, `queued`, `unconfirmed` or `dropped` |
-| `why` | str or absent | `queued`: `waiting`, `blocked`, `busy`, `not ready` or `gone`. `unconfirmed` and `dropped`: a short reason |
+| `why` | str or absent | `queued`: `waiting`, `blocked`, `not ready` or `gone`. `unconfirmed` and `dropped`: a short reason |
 | `term` | str or absent | Terminal ID the send went to |
 | `started`, `turn` | bool or null, int | `delivered` only, from `hc`'s result |
 
-The current outcome of (message, recipient) is its last `out` record. With none it is `queued`, reason `waiting`: a `msg` record alone queues the message for all its recipients. `delivered`, `unconfirmed` and `dropped` are final. `refused` and `not stored` are never written: nothing was stored.
-
-Allowed transitions, enforced by the writers, not by the reader:
+The current outcome of (message, recipient) is its last `out` record; with none it is `queued`, reason `waiting`. `delivered`, `unconfirmed` and `dropped` are final. `refused` and `not stored` are never written. The reason `busy` (§8.3) is reserved and not written by v2.0 ([keeper.md](keeper.md) §9).
 
 ```
 queued ──▶ sending ──▶ delivered
    ▲          ├──────▶ unconfirmed
-   │          ├──────▶ dropped        (down stopped the recipient, nothing typed; or a quiet/ready note hc refused)
-   └──────────┘                       (hc refused before typing: back to queued with hc's reason)
-queued ──▶ dropped                    (down; or a brief superseded by a newer brief)
+   │          ├──────▶ dropped        (down stopped the recipient and nothing was typed)
+   └──────────┘                       (hc refused before typing: back to queued with the reason)
+queued ──▶ dropped                    (down; a superseded brief; a quiet or ready note that is no longer true)
 ```
 
-## Locking and the commit rule
+## Locking
 
-`<state>/lock` is the `flock` target for both `log.jsonl` and `team.json`. Readers take `LOCK_SH`, writers `LOCK_EX`. The lock is held only around file operations, never across an `hc` call or a sleep (v1's rule).
-
-**A record is committed when its writer releases the lock.** Because every reader reads under the lock, no reader ever sees a record that is later rolled back.
+`<state>/lock` is the `flock` target for `log.jsonl`, `log.check`, `team.json` and `sessions.jsonl`. Readers take `LOCK_SH`, writers `LOCK_EX`. It is held only around file operations, never across an `hc` call or a sleep (v1's rule). The lock gives mutual exclusion only. It is not the commit rule: a writer can die, or fail twice, while holding it, and the log must still say only true things. The commit record is what makes that so.
 
 ## Public interface
 
@@ -64,85 +63,132 @@ class LogDamage(Exception):
     # str(): "message log needs repair: <path>, line <n>: <reason>. Nothing was written. Repair or move the file, then run factory.py up."
 
 class NotStored(Exception):
-    partial: bool     # True: the rollback failed and the log may hold a partial line
+    partial: bool     # True: an incomplete line may remain; readers will report damage
     detail: str
 
 class Log:
     def __init__(self, state: pathlib.Path): ...
     def read(self, offset: int = 0) -> tuple[list[dict], int]
-        # LOCK_SH. Records from byte offset to the end, and the new offset. Raises LogDamage.
+        # LOCK_SH. Records from byte offset to the end and the new offset. offset == 0: full validation. Raises LogDamage.
     def add(self, sender: str, to: list[str], text: str, kind: str = "say",
-            file: str | None = None, what: str | None = None, about: str | None = None) -> tuple[int, int]
-        # LOCK_EX. Checks the tail, allocates the id, appends one msg record. Returns (id, offset just before the record).
-        # Raises LogDamage (nothing written) or NotStored.
+            file: str | None = None, meta: dict | None = None) -> tuple[int, int, str | None]
+        # LOCK_EX. Validates the prefix, allocates the id, appends msg then ok. Returns (id, offset after the ok record, warning or None).
+        # Raises LogDamage (nothing written) or NotStored (the message will never be delivered).
     def out(self, box: "Box", id: int, to: str, o: str, **extra) -> bool
-        # LOCK_EX. Reads and applies records after box.offset, then appends the out record only if the
-        # current outcome is not final and (for o == "sending") is "queued". Returns whether it wrote.
-        # Raises LogDamage, NotStored.
+        # LOCK_EX. Validates the prefix, applies records after box.offset, then appends the out record only if the pair's
+        # current outcome is not final and (for o == "sending") is "queued". Returns whether it wrote. Raises LogDamage, NotStored.
 
 class Box:
-    """In-memory index of the log."""
+    """In-memory index of the committed log."""
     offset: int
-    msgs: dict[int, dict]                       # id -> msg record; text is dropped once every recipient is final
-    def apply(self, records: list[dict]) -> None
-    def outcome(self, id: int, to: str) -> dict # the last out record, or {"o": "queued", "why": "waiting"}
+    msgs: dict[int, dict]                         # committed messages; text is dropped once every recipient is final
+    uncommitted: int                              # msg records with no ok
+    def apply(self, records: list[dict]) -> None  # raises LogDamage on a broken reference when the box started at offset 0
+    def outcome(self, id: int, to: str) -> dict   # the last out record, or {"o": "queued", "why": "waiting"}
     def pending(self, to: str | None = None) -> list[tuple[dict, str]]   # (msg, recipient) pairs not final, by id
-    def last_to(self, name: str) -> dict | None     # newest msg delivered to name
-    def last_from(self, name: str) -> dict | None   # newest msg sent by name
+    def last_to(self, name: str, sender: str | None = None) -> dict | None   # newest message delivered to name
+    def last_from(self, name: str) -> dict | None                            # newest message sent by name
+    # derived facts (§ "Derived facts")
+    def briefed(self) -> set[str]                 # terminal IDs with a delivered brief
+    def last_note(self, term: str) -> dict | None # meta of the newest member note about that terminal
+    def quiet_note(self) -> dict | None           # newest quiet note whose outcome is not dropped
+    def ready_note(self) -> dict | None           # newest ready-work note whose outcome is not dropped
 ```
 
 ## Algorithms
 
-### Reading and validating
+### Validation
 
-`parse(raw: bytes, first_line: int, strict: bool) -> list[dict]`:
+`parse(raw: bytes, first_line: int, state) -> list[dict]`, where `state` carries the highest `msg` id and the previous record across calls:
 
 1. Empty is valid. Otherwise `raw` must end with `\n`, else `LogDamage(line = count + 1, "incomplete line")`.
-2. Each line must decode as a JSON object with `t` of `msg` or `out`.
-3. `msg`: `id` is an int greater than the previous `msg` id in this parse; `at`, `from`, `text` are strings; `to` is a non-empty list of strings; `kind` is one of the three.
-4. `out`: `id` is an int of at least 1; `to` is a string; `o` is one of the five. With `strict`, `id` must not exceed the highest `msg` id seen.
-5. Any violation raises `LogDamage` with the 1-based line number and what was expected.
+2. Each line must decode as a JSON object with `t` of `msg`, `ok` or `out`.
+3. `msg`: `id` is an int greater than the highest `msg` id so far; `at`, `from`, `text` are strings; `to` is a non-empty list of distinct strings; `kind` is one of the three.
+4. `ok`: the record directly before it is a `msg` with the same `id`.
+5. `out`: `id` is an int; `to` is a string; `o` is one of the five.
+6. Any violation raises `LogDamage` with the 1-based line number and what was expected.
 
-`read(0)` parses the whole file with `strict=True`. `read(offset > 0)` parses from that offset with `strict=False` (earlier messages are outside the slice); the offset is always one this process got from a previous `read` or `add`, so it sits on a line boundary. If the file is now shorter than `offset`, that is damage ("log was truncated").
+References are checked by `Box.apply` for a box that started at offset 0: an `out` must name a committed message and one of its recipients, else `LogDamage` ("outcome for unknown message", "outcome for a non-recipient"). A box started at a later offset (the wait loop of `say`) ignores records for ids it does not hold.
 
-### Checking the tail before an append
+### Proving the prefix before extending it
 
-`add` and `out` do not read the whole file. They read the last 256 KiB (the whole file when smaller), drop everything up to and including the first `\n` when the window starts mid-file, and `parse` the rest with `strict=False`. That catches the damage a crash can cause, a cut-off last entry, at a cost that does not grow with the log. The next id is the highest `msg` id in the window plus one; if the window holds no `msg` record and does not start at byte 0, the window doubles and the step repeats. Full validation runs in the keeper at start, and in `status`, `inbox` and `up`.
+Every writer validates everything already in the log before it appends (§8.6). Reading the whole file on every `say` would grow with the log, so writers keep a checkpoint, `<state>/log.check`:
 
-### Append protocol
+```json
+{"ino": 1234567, "size": 81234, "mtime_ns": 1795713707392000000, "last": 42}
+```
 
-Inside `LOCK_EX`, with `before` = the file's size:
+`_prefix() -> int` (the highest `msg` id), called inside `LOCK_EX`:
 
-1. Build the payload: `json.dumps(record, ensure_ascii=False) + "\n"`, encoded as UTF-8.
-2. `fd = private_open(path, O_WRONLY | O_CREAT | O_APPEND)`. A failure here raises `NotStored(partial=False)`: nothing was written.
-3. Write until the payload is done; a write that makes no progress is an `OSError`.
-4. `os.fsync(fd)`, then fsync the directory (v1's `sync_directory`).
-5. If step 3 or 4 fails: `os.ftruncate(fd, before)` and `os.fsync(fd)`. If both succeed, raise `NotStored(partial=False)`; the log is exactly as before, and whatever a failed fsync left visible is gone. If the truncate fails, raise `NotStored(partial=True)`; later readers will report the damage.
+1. `st = os.stat(log)`. If `log.check` parses and its `ino`, `size` and `mtime_ns` all equal `st`'s: the file is the one a previous writer validated and extended; return `last`.
+2. Otherwise read and `parse` the whole file and build a throwaway `Box` from offset 0 (which also checks references). Damage raises `LogDamage` and nothing is written. Success: return the highest id.
 
-This distinguishes the three cases §8.6 names: nothing stored (step 2), a partial write (step 3) and an uncertain sync (step 4), and "checks what became visible" by removing it under the lock. A message reported as `not stored` therefore can never be delivered.
+After every successful append the writer rewrites `log.check` from a fresh `os.stat` (write a temp file, `os.replace`; no fsync, since losing it only costs one full validation). Any change to the log that did not go through a writer, including one byte in an early line, changes `mtime_ns` or `size` and forces step 2. A missing log with no checkpoint is the empty log, id 0.
+
+### Append and commit
+
+`_append(line: bytes) -> str` appends one record inside `LOCK_EX` and returns `"synced"` or `"visible"`, or raises:
+
+1. `before = size of the file`. `fd = private_open(path, O_WRONLY | O_CREAT | O_APPEND)`; failure raises `NotStored(partial=False)`.
+2. Write until done; a write that makes no progress is an `OSError`.
+3. `os.fsync(fd)`, then fsync the directory. Success: return `"synced"`.
+4. On a failure in step 2 or 3: try `os.ftruncate(fd, before)` and `os.fsync(fd)`, ignoring their errors. Then **look at what is actually in the file**: read from `before` to the end, still under the lock. The result depends only on that, never on which call failed:
+
+| Bytes after `before` | Result |
+|---|---|
+| none | `NotStored(partial=False)`: the log is as before |
+| exactly the line | return `"visible"`: the record is whole and every reader will see it; only its survival of a power loss is unknown |
+| anything else | `NotStored(partial=True)`: readers will report damage |
+
+`add`:
+
+1. `last = _prefix()`; `id = last + 1`.
+2. `_append(msg line)`. On `NotStored`: re-raise. On `"visible"`: stop and raise `NotStored(partial=False, "the disk reported an error; the entry was left uncommitted")`. The `msg` stays without an `ok`, so it is inert.
+3. `_append(ok line)`. On `NotStored`: re-raise; the `msg` stays uncommitted and inert (with `partial`, readers report damage). On `"visible"`: the message **is** committed, because the keeper will read the `ok` and deliver it; return with the warning `stored and will be delivered, but the disk reported an error: it may not survive a power loss. Do not resend.`
+4. Rewrite `log.check`; return `(id, offset, warning)`.
+
+What this guarantees, including when a write, a sync and a rollback fail together, and when the writer is killed at any point: **a message is delivered if and only if its complete `ok` record is in the log, and `say` reports it stored if and only if that record is there when `say` releases the lock.** Two gaps cannot be closed: a writer killed after writing `ok` and before printing (delivered, sender saw no result), and a power loss after a `"visible"` `ok` (the sender was warned).
+
+Sentence proposed for spec §8.6: "If the disk reports an error after an entry is completely written and the entry cannot be removed, the message counts as stored and is delivered; `say` warns that it may not survive a power loss and must not be resent."
+
+`out` uses `_prefix()`, then `read(box.offset)` and `apply`, then the check on the pair's current outcome, then `_append`:
+
+- For `o == "sending"` only `"synced"` counts. A send is handed to `hc` only after its `sending` record is durable: otherwise a power loss could erase the claim while `msg` and `ok` survive, and the next keeper would type the message a second time. On `"visible"` `out` raises `NotStored(partial=False, "the sending record is not durable")` and the caller must not send ([keeper.md](keeper.md) §3).
+- For every other outcome `"visible"` counts as written: those records only ever stop a send, so losing one to a power loss cannot cause a duplicate.
 
 ### What each writer appends
 
 | Writer | Records | Notes |
 |---|---|---|
-| `say`, `up` (briefs, join news), `brief --send` | `msg` | One `msg` per `say`. Briefs are one `msg` per member, since each member's text differs |
-| keeper | `msg` of kind `note`; every `out` except the next row | See [keeper.md](keeper.md) |
+| `say`, `up` (briefs, join news), `brief --send` | `msg` + `ok` | One message per `say`. Briefs are one message per member, since each member's text differs |
+| keeper | `msg` + `ok` for notes; every `out` except the next row | [keeper.md](keeper.md) |
 | `down` | `out` `dropped` for every pair that is `queued` to a member it stops | One `LOCK_EX` section: full read, build a `Box`, append. A pair that is `sending` is left to the keeper |
+
+### Derived facts
+
+Computed by `Box` from committed records only, so a crash between two steps of the keeper cannot leave them wrong:
+
+| Fact | Definition |
+|---|---|
+| `briefed()` | `term` of every `delivered` outcome of a `brief` message. A member terminal is **ready** when its address is in this set |
+| `last_note(term)` | The `meta` of the newest note whose `meta.term` is that terminal. A member note is sent only when the state the keeper observes differs from it in `what` or in `since` ([keeper.md](keeper.md) §5) |
+| `quiet_note()` | The newest note with `meta.what == "quiet"` whose outcome for the operator is not `dropped` |
+| `ready_note()` | The newest note with `meta.what == "ready"` whose outcome for the operator is not `dropped` |
 
 ### `say`: waiting for outcomes
 
-After `add` returns `(id, offset)`, `say` calls `read(offset)` every 0.2 s and applies the records to a `Box`, until every recipient's outcome is final or is `queued` with a reason other than `waiting`, or `SAY_WAIT` seconds pass. A recipient still `sending` or `queued (waiting)` at the deadline is printed as such.
+After `add` returns `(id, offset, _)`, `say` calls `read(offset)` every 0.2 s and applies the records to a box that holds only its own message, until every recipient's outcome is final or is `queued` with a reason other than `waiting`, or `SAY_WAIT` seconds pass. A recipient still `sending` or `queued (waiting)` at the deadline is printed as such.
 
 ### Message files (§8.7)
 
-A file is **managed** when its parent directory is exactly `<state>/messages/<sender>`, its name matches `[A-Za-z0-9-]+\.[A-Za-z0-9]+`, and none of `<state>`, `messages`, the sender's directory is a symbolic link (v1's rule). `say` refuses a file in the sender's directory with any other name ("use letters, digits and dashes, plus a plain extension").
+A file is **managed** when its parent directory is exactly `<state>/messages/<sender>`, its name matches `[A-Za-z0-9-]+\.[A-Za-z0-9]+`, and none of `<state>`, `messages`, the sender's directory is a symbolic link (v1's rule). `say` refuses a file in the sender's directory with any other name.
 
 - The keeper unlinks a managed file when the last recipient of its message becomes `delivered`. A failed unlink is one pane line; the message is still delivered.
-- `up`, when no member was running before it, lists leftovers: for each regular file in `messages/*/`, find the newest `msg` whose `file` is that path. Delivered to everyone: unlink, print nothing. Otherwise print `leftover message file for @<sender> (<n> min old): <path>: message <id>: @a delivered, @b unconfirmed`, or `: never logged`, followed once by "Check before resending or discarding."
+- `up`, when no member was running before it, lists leftovers: for each regular file in `messages/*/`, find the newest committed message whose `file` is that path. Delivered to everyone: unlink, print nothing. Otherwise print `leftover message file for @<sender> (<n> min old): <path>: message <id>: @a delivered, @b unconfirmed`, or `: never stored`, followed once by "Check before resending or discarding."
 
 ### `inbox` output
 
-`inbox [N] [--for NAME]` reads the whole log and prints the last N `msg` records whose `to` contains the name, oldest first:
+`inbox [N] [--for NAME]` reads the whole log and prints the last N committed messages whose `to` contains the name, oldest first:
 
 ```
 [Message 42 from @lead-dev at 2026-11-26T17:00:00Z: delivered]
@@ -159,21 +205,42 @@ Depends on: the state directory and `private_open`. Used by: `say`, `up`, `down`
 
 No `hc` needed. Most are v1's `InboxTests` re-aimed at the new format.
 
-- `test_first_id_is_one_and_ids_increase`, `test_ids_survive_keeper_and_team_restart`.
-- `test_concurrent_adds_get_distinct_ids`: 8 processes, 25 adds each; 200 distinct increasing ids, no torn lines.
+Ids and content
+- `test_first_id_is_one_and_ids_increase`, `test_ids_survive_keeper_and_team_restart`, `test_uncommitted_entry_uses_up_its_id`.
+- `test_concurrent_adds_get_distinct_ids`: 8 processes, 25 adds each; 200 distinct increasing ids, each followed by its `ok`.
 - `test_text_is_stored_byte_for_byte`: multi-line text with quotes, tabs, non-ASCII, a trailing `@name`, no final newline.
-- `test_files_are_private`: `log.jsonl` and `lock` are 0600, the directory 0700; a symbolic link in place of `log.jsonl` is refused.
-- `test_incomplete_last_line_is_damage`, `test_invalid_json_is_damage`, `test_ids_out_of_order_is_damage`, `test_out_for_unknown_message_is_damage`: each names the line; `add` after each writes nothing.
+- `test_files_are_private`: `log.jsonl`, `log.check` and `lock` are 0600, the directory 0700; a symbolic link in place of `log.jsonl` is refused.
+
+Validation
+- `test_incomplete_last_line_is_damage`, `test_invalid_json_is_damage`, `test_ids_out_of_order_is_damage`, `test_ok_without_its_msg_is_damage`: each names the line; `add` after each writes nothing.
+- `test_out_for_unknown_message_is_damage`, `test_out_for_non_recipient_is_damage`, `test_out_for_uncommitted_message_is_damage`.
+- `test_early_corruption_blocks_append`: a 2 MB log; flip one byte in line 3 (so mtime changes); `add` raises `LogDamage` naming line 3 and the file is unchanged.
+- `test_checkpoint_skips_full_read`: with a matching `log.check`, `add` reads no log bytes (patch `os.read`); with a missing, stale or unparsable one it validates everything and rewrites it.
 - `test_truncated_log_is_damage`: a reader holding an offset past the end reports it.
-- `test_failed_open_is_not_stored_clean`: nothing written, `partial` false.
-- `test_short_write_is_rolled_back`: patch `os.write` to fail mid-payload; file size is unchanged, `NotStored(partial=False)`, the next `add` succeeds and reuses no reported id.
-- `test_failed_fsync_is_rolled_back`: the complete line is removed; a concurrent reader never saw it.
-- `test_failed_rollback_reports_partial`: patch `os.ftruncate` to fail; `NotStored(partial=True)`, and the next reader raises `LogDamage`.
-- `test_tail_check_matches_full_read`: a 2 MB log; `add` reads only the window (patch `os.read` sizes) and allocates the right id; a window holding only `out` records widens.
+
+Commit, with faults injected by patching `os.write`, `os.fsync` and `os.ftruncate`
+- `test_failed_open_is_not_stored_clean`.
+- `test_short_write_is_rolled_back`: file size unchanged; the next `add` succeeds.
+- `test_failed_fsync_is_rolled_back`: the complete line is removed.
+- `test_msg_sync_and_rollback_both_fail`: `NotStored`; the `msg` line is in the file with no `ok`; a fresh `Box` holds no such message; `pending()` is empty; `uncommitted == 1`.
+- `test_ok_sync_and_rollback_both_fail`: `add` returns the id with the warning; the message is in `pending()`.
+- `test_truncate_succeeds_but_its_sync_fails`: the line is gone from the file, so the result is `NotStored(partial=False)` for `msg` and for `ok` alike, never a warning.
+- `test_result_follows_file_content_not_the_failing_call`: for each combination of failing calls, the outcome matches the table above.
+- `test_sending_requires_synced_record`: with the sync of a `sending` record failing and its rollback failing, `out` raises and writes no further record; with the same faults on a `delivered` record, `out` returns True.
+- `test_partial_write_and_failed_rollback_is_damage`: `NotStored(partial=True)`; the next reader raises `LogDamage`.
+- `test_writer_killed_between_msg_and_ok`: a child process is killed (SIGKILL) after the `msg` append; the parent's box holds no such message and the next `add` gets the next id.
+- `test_writer_killed_holding_lock_leaves_valid_log`.
+
+Outcomes and derived facts
 - `test_default_outcome_is_queued_waiting`, `test_last_out_wins`, `test_final_outcomes`.
-- `test_out_refuses_final_and_double_sending`: `out(…, "sending")` on a pair already `sending`, `delivered` or `dropped` returns False and writes nothing, including when the other record was appended by another process after the box's offset.
-- `test_down_drops_only_queued`: `queued` pairs become `dropped`; a `sending` pair is untouched.
-- `test_say_wait_stops_when_settled` and `test_say_wait_reports_sending_at_deadline` (clock patched).
-- `test_managed_file_rules`: own directory and good name is managed; another member's directory, an outside path, a bad name and a symlinked directory are not.
-- `test_leftovers_listed_and_delivered_removed`: three files: delivered to all (removed silently), partly delivered (listed with outcomes), never logged (listed).
-- `test_inbox_filters_and_shows_outcome`, `test_inbox_for_name`, `test_inbox_works_without_hc`.
+- `test_out_refuses_final_and_double_sending`, including when the other record was appended by another process after the box's offset.
+- `test_down_drops_only_queued`.
+- `test_briefed_from_delivered_briefs_only`: an `unconfirmed` or `dropped` brief does not count; the terminal ID is the one in the `delivered` record.
+- `test_last_note_is_newest_per_terminal`.
+- `test_quiet_and_ready_note_ignore_dropped`.
+- `test_text_dropped_when_final_but_references_still_checked`.
+
+Commands
+- `test_say_wait_stops_when_settled`, `test_say_wait_reports_sending_at_deadline` (clock patched).
+- `test_managed_file_rules`; `test_leftovers_listed_and_delivered_removed`.
+- `test_inbox_filters_and_shows_outcome`, `test_inbox_for_name`, `test_inbox_works_without_hc`, `test_inbox_hides_uncommitted`.

@@ -1,5 +1,5 @@
 ---
-status: draft
+status: complete
 ---
 
 # Architecture: Factory v2
@@ -20,20 +20,23 @@ Facts marked **verified** were run by the architect on an isolated `hc 0.1.20` c
 ## 1. Decisions
 
 1. **One file, one process model.** Everything is `skill/scripts/factory.py`, Python 3.11+ standard library. Commands are short-lived processes. The only long-lived process is `factory.py keeper`, one per team, running in its own `hc` terminal.
-2. **Talk to `hc` through `hc connect`.** Factory spawns `hc connect` and speaks newline-delimited JSON-RPC on its stdin and stdout (verified). It never resolves a socket path itself, so it follows `HC_SESSION`, `HC_SOCKET` and `hc`'s config exactly as `hc` does, and the test double is one small script.
-3. **Poll, do not subscribe.** The keeper reads the team with one label-filtered `terminal.list` per tick (0–1 ms, verified). No event stream, no missed-event handling.
-4. **`hc`'s terminal records are the membership database.** Per-terminal facts are labels on the terminal (member name, ready, last state, what was noted). They live and die with the terminal record, survive a core restart (verified) and need no file or lock. A member is `not started` when it has no record, `gone` when its newest record is finished.
-5. **One append-only log for messages and outcomes**, written under one file lock that is never held across an `hc` call. A record is committed when the appender releases the lock; a failed append is rolled back by truncating to the previous length. No commit markers are needed.
+2. **Talk to `hc` through `hc connect`.** Factory spawns `hc connect` and speaks newline-delimited JSON-RPC on its stdin and stdout (verified). It never resolves a socket path itself, so it follows `HC_SESSION`, `HC_SOCKET` and `hc`'s config exactly as `hc` does. The request is written only after `hello` has been read and the version and core checked.
+3. **Poll once a second, do not subscribe.** The keeper reads the team with one label-filtered `terminal.list` per tick (0–1 ms, verified). What a poll cannot see is in [keeper.md](components/keeper.md) §10 (owner decision 8).
+4. **`hc`'s terminal records are the membership database.** Which terminal is which member is a label on the terminal. A member is `not started` when it has no record and `gone` when its newest record is finished. Records and labels survive a core restart (verified).
+5. **One append-only log is the only durable memory of what happened.** Messages, their commit records and per-recipient outcomes are appended under one file lock that is never held across an `hc` call. A message exists once its commit record is written, whatever fails or dies around it. Every fact the keeper must not forget across a crash (which terminals are briefed, which notes were sent) is derived from the log, never kept in a flag beside it.
 6. **Only the keeper types.** `say`, `up` and `brief --send` append to the log and wait for the outcome records the keeper writes. Briefs are messages of kind `brief`.
-7. **A small `team.json`** holds the few team-level facts with no terminal to carry them (root, layout ids, quiet and ready-check bookkeeping). Losing it costs a repeated note or a second team tab, never a message.
-8. **Sessions are assigned, not discovered, wherever the harness allows** (a Factory-chosen ID or a per-member session directory). Discovery by scanning harness files is the fallback for Codex and agy only.
+7. **Nothing changes before preflight passes**, and `up` and `down` hold one team lock for their whole run, so two launches cannot claim the same member.
+8. **A small `team.json`** holds the few team-level facts with no terminal or log record to carry them (root, layout ids, the ready check's "cleared" mark). Losing it costs a second team tab or one repeated ready-work note, never a message.
+9. **A member's conversation is learned from the member itself.** Each harness exports its current conversation ID to the commands it runs (Claude Code, Codex and agy, confirmed live), so every `say` a member runs records it, and a switch made inside the harness is followed from the next `say`. Launch flags that fix the conversation are used where they exist (Claude Code and OpenCode an ID, pi and omp a per-member directory). No harness file is scanned and no screen is read for this.
 
 Rejected:
 - *Direct Unix socket.* Works (verified), but Factory would have to reimplement `hc`'s path rules (`HC_SOCKET`, config `socket`, `XDG_RUNTIME_DIR`, length limits).
 - *The `hc` CLI per call.* No CLI for `doc.get`/`doc.set`, no `--env` on `hc run`, and the CLI adds its own `caller`, which tags messages.
-- *`events.subscribe`.* Needs a stream reader, heartbeats and `missed` recovery; the shortest deadline the keeper has is about a second.
-- *A second mutable store for membership* (a roster file). It can disagree with `hc` after a crash; labels cannot.
-- *Commit-marker records in the log.* Rollback under the lock gives the same guarantee with one record per message.
+- *A roster file for membership.* It can disagree with `hc` after a crash; labels cannot.
+- *Labels or `team.json` flags for "ready" and "already noted".* A crash between the log append and the flag leaves them wrong (review round 1). The log already holds both facts.
+- *Rollback under the lock as the only commit rule.* It fails when a sync error and a failed truncate coincide, or the writer dies holding the lock (review round 1). The commit record costs one small append per message.
+- *Checking only the log's tail before an append.* It would extend a log whose earlier part is damaged. A stat-based checkpoint proves the prefix unchanged at the same cost.
+- *Finding the current conversation by scanning transcripts or session stores.* Six fragile readers of other programs' private files. The harness's own environment variable gives the same fact for free.
 - *A separate `keeper.py`.* Decided by the owner: one file.
 
 ## 2. Processes and data flow
@@ -68,14 +71,17 @@ state  = <cache base>/factory-skill/<team>/<core.id[:8]>/   # mode 0700; cache b
 | File | Content | Written by |
 |---|---|---|
 | `team.json` | See §3.3 | `up`, `down`, keeper; atomic replace under `lock` |
-| `lock` | Empty; `flock` target for `log.jsonl` and `team.json` | — |
-| `log.jsonl` | Messages and outcomes | `say`, `up`, `brief`, `down`, keeper |
-| `sessions.jsonl` | Saved native sessions, append-only, v1 format plus `model` and `how` | `up`, `down` |
+| `lock` | Empty; `flock` target for `log.jsonl`, `log.check`, `team.json` and `sessions.jsonl` | — |
+| `log.jsonl` | Messages, commit records and outcomes | `say`, `up`, `brief`, `down`, keeper |
+| `log.check` | Checkpoint proving the log unchanged since the last validated append | every log writer |
+| `up.lock` | `flock` held by `up` and `down` for their whole run | — |
+| `keeper.start` | `flock` serializing keeper starts | — |
+| `sessions.jsonl` | Saved native sessions, append-only, one entry per line, under `lock` | `say` (members), `up` |
 | `keeper.lock` | `flock` held for the keeper's lifetime | keeper |
 | `keeper.beat` | One line `<pid> <version> <terminal>`; its mtime is the heartbeat | keeper |
 | `<member>.md`, `<member>.settings.json` | Standing instructions and Claude Code settings, rewritten at every launch | `up` |
 | `messages/<member>/` | That member's message files (§8.7) | the member; removed by the keeper |
-| `sessions/<member>/` | Session directory for pi and omp members | the harness |
+| `sessions/<member>-<harness>/` | Session directory for pi and omp members | the harness |
 
 All files are created with v1's `private_open` (`O_NOFOLLOW`, mode 0600, regular file only); directories are 0700 and never symbolic links.
 
@@ -87,27 +93,24 @@ All files are created with v1's `private_open` (`O_NOFOLLOW`, mode 0600, regular
 | `factory.kind` | every team terminal | `operator`, `operator-lost`, `member` or `keeper` |
 | `factory.member` | operator, members | the @name without `@` |
 | `factory.dir` | every team terminal | absolute state directory |
-| `factory.ready` | members | `1` once a brief was `delivered` to this terminal |
-| `factory.last` | members | last state word the keeper observed (`working`, `idle`, …) |
-| `factory.noted` | members | what the operator was last told: `blocked:<kind>`, `error`, `exit`, or absent |
+| `factory.last` | members | last state word the keeper observed (`working`, `idle`, …); shown by `status` and exit notes, nothing depends on it |
 | `factory.down` | members | `1`, set by `down` just before it ends the terminal |
 | `factory.version` | keeper | the keeper's `VERSION` |
 | `name` | members, keeper, operator | `@<member>` or `keeper` (rodeo's sidebar name) |
-| `herdr.space`, `herdr.tab`, `herdr.seen` | members, keeper | layout ids; `herdr.seen=0` once at start, never written again |
+| `herdr.space`, `herdr.tab`, `herdr.seen` | members, keeper | layout ids and `herdr.seen=0`, written once, only after the pane is in the layout doc; `herdr.seen` is never written again |
 
-Factory never sets an `hc` terminal name (§6.1) and always addresses a terminal by its ID after reading its labels.
+Factory never sets an `hc` terminal name (§6.1) and always addresses a terminal by its ID after reading its labels. Whether a member is ready, and what the operator has been told about it, are not labels: they are read from the log ([message_log.md](components/message_log.md), "Derived facts").
 
 ### 3.3 `team.json`
 
 ```json
 {"v": 1, "root": "/abs/checkout", "team": "factory-ab12cd34", "core": "2b0e89bc…",
  "up": true,
- "layout": {"space": "sp…", "tab": "tb…"},
- "quiet": {"noted": false, "note_id": null, "turns": {"lead-dev": 7}},
- "ready": {"last": null}}
+ "layout": {"space": "sp…", "tab": "tb…", "made_space": false},
+ "ready_clear": 0}
 ```
 
-`up` is true from the first successful `up` until `down` stops the last member. A missing or unreadable `team.json` is rebuilt by `up` from the checkout and the team's terminals; other commands print "run factory.py up" and exit 2.
+`up` is true from the first `up` that passes preflight until `down` stops the last member. `ready_clear` is the highest message id at the last ready check that found no work. A missing or unreadable `team.json` is rebuilt by `up` from the checkout and the team's terminals; other commands print "run factory.py up" and exit 2.
 
 ### 3.4 Member and operator state
 
@@ -126,32 +129,32 @@ class View:
 | `state(name)` | Condition |
 |---|---|
 | `not started` | no terminal record carries this member |
-| `gone` | no live terminal; a finished record exists (it exited or was lost without `down`) |
-| `starting` | live, `status` is null (not reporting yet, or Codex's silent trust dialog) |
+| `gone` | no live terminal and a finished record exists (it exited or was lost without `down`); or a live terminal with a null status that has reported before (a shell was left in its place) |
+| `starting` | live, `status` is null and it has never reported (not up yet, or Codex's silent trust dialog) |
 | `idle`, `working`, `done`, `blocked`, `error` | live; the word is `status.state` unchanged |
 
-The operator is **reachable** when `view.operator` exists and its `status` is not null. The latch of §7.4 is the label: whoever queues a message for the operator as `gone` while its terminal is live without a status sets `factory.kind=operator-lost`; only `up` sets `operator` again.
+The operator is **reachable** when `view.operator` exists and its `status` is not null. The latch of §7.4 is the label: when a message is pending for the operator and its terminal has had no status for `LATCH_AFTER` seconds, the keeper sets `factory.kind=operator-lost` and queues the message as `gone`; only `up` sets `operator` again. A shorter gap (a harness resetting) latches nothing.
 
 ## 4. Module layout of `factory.py`
 
-Sections in file order, with a line budget. v1 is 1,786 lines; the budget is the target, see §8 for the risk.
+Sections in file order, with a size estimate. v1 is 1,786 lines. The owner's target for v2 is about 2,200 lines: a target, not a cap. Clear error handling and the recovery paths below are not to be compressed to meet it.
 
 | Section | Main units | From v1 | Lines |
 |---|---|---|---|
 | Constants, `Problem`, files | `find_root`, `refuse_dangling_links`, `VERSION` | kept | 60 |
-| Config | `Config`, `parse_role`, `plan` | kept; three new optional keys | 130 |
+| Config | `Config`, `parse_role`, `plan` | kept; three new optional keys | 135 |
 | Availability checks | `run_probe`, `listed_models`, `resolve_listed`, `Checker`, `check_all`, `checked` | kept | 190 |
-| hc client | `Hc`, `HcError`, `team_view`, `View` | new | 110 |
-| Message log | `Log`, `Box`, `LogDamage`, `NotStored` | replaces `Inbox` | 150 |
-| Harness adapters | `CODE`, `launch_argv`, `claude_settings`, session functions | kept; sessions new | 220 |
+| hc client | `Hc`, `HcError`, `HcDown`, `team_view`, `View` | new | 140 |
+| Message log | `Log`, `Box`, `LogDamage`, `NotStored` | replaces `Inbox` | 230 |
+| Harness adapters | `CODE`, `launch_argv`, `claude_settings`, session functions | kept; sessions new | 240 |
 | Briefs | `member_prompt`, `render_team_brief`, `message_for` | kept | 80 |
-| Layout | `edit_layout`, `add_pane`, `remove_pane`, `swap_terminal` | new | 110 |
-| Launch | `ensure_worktree`, `start_member`, `await_ready`, `ensure_keeper` | rewritten | 130 |
-| Keeper | `Keeper` | new | 240 |
-| Commands | `cmd_init` … `cmd_keeper`, `main` | rewritten except `init`, `harnesses`, `check` | 370 |
-| | | **Total** | **1,790** |
+| Layout | `edit_layout`, `resolve_tab`, `add_panes`, `remove_panes`, `swap_terminal` | new | 120 |
+| Launch | `check_operator`, `mark_operator`, `start_member`, `await_ready` | rewritten | 150 |
+| Keeper | `Keeper`, `decide`, `head_of`, `quiet_now`, `ensure_keeper` | new | 400 |
+| Commands | `cmd_init` … `cmd_keeper`, `resolve_team`, `main` | rewritten except `init`, `harnesses`, `check` | 450 |
+| | | **Total** | **about 2,200** |
 
-Removed from v1: `Inbox`, `cmd_wait`, `operator_wait`, `queue_message`, `herdr()`, integration checks, `Team`, `place`, `launch`'s typed start, `deliver`, `prompt_error`, `report_launch_drift`, `harness_argv`, `print_retry`, `cmd_prompt`, `session_key`.
+Removed from v1: `Inbox`, `cmd_wait`, `operator_wait`, `queue_message`, `herdr()`, integration checks, `Team`, `place`, `launch`'s typed start, `deliver`, `prompt_error`, `report_launch_drift`, `harness_argv`, `print_retry`, `cmd_prompt`, `session_key`, `session_id`, `remember_sessions`' herdr reads.
 
 ## 5. Shared constants
 
@@ -159,7 +162,8 @@ Removed from v1: `Inbox`, `cmd_wait`, `operator_wait`, `queue_message`, `herdr()
 HC = os.environ.get("HC_BIN", "hc")
 HC_MIN = (0, 1, 20)
 VERSION = hashlib.sha1(pathlib.Path(__file__).read_bytes()).hexdigest()[:12]   # the build actually loaded
-TICK_BUSY, TICK_IDLE = 1.0, 5.0      # keeper sleep, seconds: something pending or in flight / nothing
+TICK = 1.0                           # keeper period, seconds
+LATCH_AFTER = 5                      # operator with no status this long, and a message pending: unreachable until up
 BEAT_STALE = 30                      # heartbeat older than this: the keeper is hung
 SAY_WAIT = 10                        # say waits this long for outcomes
 LAUNCH_TIMEOUT = 60                  # per member, from terminal.run to ready
@@ -173,18 +177,21 @@ CAS_TRIES = 8                        # layout doc compare-and-set attempts
 
 | Failure | Where | Result |
 |---|---|---|
-| `hc` missing, older than 0.1.20, or `hc connect` cannot reach a core | any team command | Exit 2: "hc 0.1.20 or newer is required (found X)" or "cannot reach hc: <stderr>". Offline commands never call `hc`. |
+| `hc` missing, older than 0.1.20, another core than the team's, or `hc connect` cannot reach a core | any team command | Exit 2 with the reason; decided from `hello`, before any request is written. Offline commands never call `hc`. |
 | `HC_TERMINAL_ID` unset | `up` | Exit 2: "run the operator inside an hc terminal (rodeo or the Herdr app)" |
 | Caller's terminal has no team labels | `say` | Exit 2: "run up first" |
-| Preflight fails | `up` | Exit 2, nothing changed (v1 `checked`) |
+| The operator check or preflight fails, or another `up`/`down` holds the team lock | `up` | Exit 2; no label, terminal, layout, `team.json` or log change was made |
 | A member does not start or gets no brief | `up` | Exit 3 naming it; other members proceed |
 | Log damaged | `say`, `brief --send`, keeper, `inbox`, `status` | Diagnosis with path, line and reason; nothing written. `say`/`inbox` exit 2. `status` prints members' states, then the diagnosis. The keeper prints it once per minute and delivers nothing. |
-| Append fails | `say` | `not stored`, exit 2; rolled back, or the damage path above if rollback fails |
+| Append fails | `say` | `not stored`, exit 2. The message has no commit record and is never delivered, whatever else failed |
+| A resumed member exits at start | `up` | One fresh restart with a warning |
+| A `sending` record cannot be synced | keeper | Nothing is sent; the keeper stops delivering and says so until the log can be written |
 | `hc` error on send | keeper | Mapped to an outcome ([hc_client.md](components/hc_client.md) §4) |
 | Connection lost during a send | keeper | `unconfirmed` |
-| Layout write keeps conflicting | `up`, `down` | After `CAS_TRIES`: warn "layout not updated"; the terminal still runs and clients adopt it by its `herdr.*` labels |
+| Layout write keeps conflicting | `up`, `down` | After `CAS_TRIES`: warn; the terminals run without panes and without `herdr.*` labels, and the next `up` places them |
 | `team.json` unreadable | all but `up` | Exit 2: "run factory.py up" |
-| Session cannot be written at `down` | `down` | That member is left running; exit 1 |
+| Session cannot be written | `say`, `up` | A warning; the next `say` tries again |
+| `sessions.jsonl` cannot be appended to | `down` | Nobody is stopped; exit 1 |
 
 Every error message names the member or file and says what to run next. Nothing is retried blindly: a call that may have typed is never repeated.
 
@@ -197,17 +204,19 @@ Each step is mergeable alone and ends with its tests green ([testing.md](compone
 3. Keeper delivery only (no notes, no quiet rule); `say`.
 4. Launch, readiness, labels, sessions; `up` without layout; `down`; `status`.
 5. Layout doc; keeper pane.
-6. Keeper notes, team-quiet rule, ready check, liveness and version handling.
+6. Keeper notes, team-quiet rule, ready check, liveness, re-exec on a new version, crash-recovery tests.
 7. `brief`, recovery of `not ready`, leftover message files, adoption by a new operator.
 8. Skill text, templates, docs; remove v1 code and tests that no longer apply.
-9. Live checks LC-1 to LC-9, then per-harness qualification (§10) and the end-to-end runs.
+9. The live checks of §10, then per-harness qualification (§10) and the end-to-end runs.
 
 ## 8. Risks and gaps
 
-- **Size.** The budget lands at v1's size with nothing to spare; the keeper and the sessions code are the likeliest to overrun. If the total passes 1,900 lines, cut before merging: `cmd_harnesses`' per-model detail and the worktree `generic` user note are the cheapest.
-- **Log growth.** The log is never compacted in v2.0. At about 0.5 MB a busy day, a full read (keeper start, `status`, `inbox`, `up`) stays under 100 ms for months. `status` warns above 64 MiB. `say` reads only the tail, so its cost does not grow.
-- **A missed short state.** Polling can miss a block that begins and clears inside one tick (1–5 s). The `turn` counter still shows that work happened, which is all the quiet rule needs.
-- **Session capture** is unverified for five of six harnesses (LC-3 to LC-7). Each has a fallback that degrades to "starts fresh, with a warning".
+- **Size.** About 2,200 lines against v1's 1,786. The keeper (about 400) and the commands (about 450) carry most of the growth; the reviewers' independent estimates were 2,050 to 2,250.
+- **Log growth.** The log is never compacted in v2.0. At about 0.5 MB a busy day, a full read (keeper start, `status`, `inbox`, `up`) stays under 100 ms for months. `status` warns above 64 MiB. A writer does not read the log at all when the checkpoint matches, so the cost of `say` does not grow.
+- **A state shorter than a second.** Decided by the owner: the keeper polls and sends notes only for states it observes. A block or error that begins and clears inside one tick produces no note; the `turn` counter still shows that work happened, which is all the quiet rule needs. The spec's §8.4 should say so (§11).
+- **Clients and `keep`.** A client may turn `keep` on for a pane it shows; `hc` then leaves a shell when the harness dies. The keeper turns `keep` off when it sees it, a live terminal that stopped reporting counts as `gone`, and nothing is ever typed into a terminal with no status. LC-8 measures how often clients do this.
+- **Environment.** A member gets `PATH` from the process that ran `up` and everything else from the `hc` core's login environment. An API key exported only in the operator's shell does not reach members; the docs say so and `up`'s failure line shows the harness's own error.
+- **Resume.** The environment variables are confirmed for three harnesses; the launch flags, the by-ID resume arguments and the sub-agent case are not all exercised yet (LC-3, LC-4, LC-6, LC-11, LC-12). Each fails safe: a resume that does not work is retried fresh once, with a warning. A Codex or agy member that never ran `say` has no recorded conversation and starts fresh.
 - **Layout doc shape** is taken from rodeo's source through the research, not from a client rendering a Factory-written doc (LC-8).
 
 ## 9. Verified on `hc 0.1.20` (isolated core, 26 November 2026)
@@ -217,12 +226,12 @@ Each step is mergeable alone and ends with its tests green ([testing.md](compone
 | V1 | `hc connect` accepts `hello` then any number of requests, one JSON per line; a round trip is about 1 ms | Transport |
 | V2 | `terminal.list{all, labels}` filters by every given label; finished records keep their labels | `team_view` |
 | V3 | Finished records and their labels survive `hc server stop` and the next start; reason is `server_stop` | `gone` after an `hc` restart; labels as store |
-| V4 | `terminal.label` works on a finished terminal; `key: ""` removes a label | `factory.noted=exit` |
+| V4 | `terminal.label` works on a finished terminal; `key: ""` removes a label | `factory.down`, `operator-lost` |
 | V5 | `terminal.send` to an idle agent that starts at once returns in 0.2 s; to one that never starts, in 5.2 s with `started: false` | `SAY_WAIT = 10` |
 | V6 | Three concurrent sends to one terminal are serialized by `hc`, none interleaved | One in-flight send per recipient is Factory's own ordering rule, not a safety need |
 | V7 | `terminal.send` types into a terminal with no status (`started: null`) | Factory must check status itself (§8.2) |
 | V8 | Errors arrive as `{"code": -32000, "message": …, "data": {"kind": …, "hint": …}}` with kinds `blocked`, `status_mismatch`, `not_found`, `finished`, `live`, `conflict` | Error mapping |
-| V9 | `if: "working"` on an idle terminal fails with `status_mismatch`, "nothing was typed" | `busy` delivery |
+| V9 | `if: "working"` on an idle terminal fails with `status_mismatch`, "nothing was typed" | Reserved delivery between turns ([keeper.md](components/keeper.md) §9) |
 | V10 | `terminal.kill` returns the finished record (`reason: "killed"`); `terminal.rm` then removes it; `rm` on a live one fails with `live` | `down` |
 | V11 | `core.id` is the same before and after a core restart | State directory key |
 | V12 | Every terminal's environment has `HC_TERMINAL_ID`, `HC_SESSION` and `HC_TERMINAL_SOCKET`; `env` in `terminal.run` adds to the core's environment | Caller identity; Claude Code's socket allowance |
@@ -236,19 +245,29 @@ Each step is mergeable alone and ends with its tests green ([testing.md](compone
 |---|---|---|---|
 | LC-1 | Does an in-flight `terminal.send` still type if its `hc connect` client dies during `draft_wait`? | keeper restart test (§10.10) | Either answer is safe: the message is `unconfirmed`. Record the answer in the docs. |
 | LC-2 | Codex: does `-c 'projects."<dir>".trust_level="trusted"'` suppress the trust dialog without writing `config.toml`? | launch | Answer the dialog with `enter`, as v1 |
-| LC-3 | Claude Code: does `--resume <uuid>` keep the same session ID, and does `--session-id` accept a fresh UUID with `--append-system-prompt-file`? | sessions | Scan `~/.claude/projects/<slug>/` for the newest transcript that contains the member's instructions path |
-| LC-4 | OpenCode: which ID format does `--session <id>` accept for a session that does not exist yet? | sessions | `opencode session list` after the brief, newest in the member's directory |
-| LC-5 | Codex: is the developer-instructions pointer (which contains the member's instructions path) stored in each rollout file, including a thread started with `/new`? | sessions | Match on the first message only; a switched thread is then not tracked |
-| LC-6 | pi and omp: does `--session-dir <dir> --continue` resume the newest session in that directory, and start a new one without `--continue`? | sessions | pi: `--session-id <uuid>`; omp: `--resume=<path of newest file>` |
-| LC-7 | agy: where are conversation IDs stored, and can one be found for a running member? Can the trust dialog be avoided with `--settings`? | sessions, launch | No capture: `up` starts agy fresh with a warning; the dialog is left to the owner (§6.3) |
-| LC-8 | Do rodeo and the Herdr app render the tab and panes Factory writes, keep a block's `size.weight`, and leave unknown terminals alone? | layout | Drop the keeper's `size`; let clients adopt by label |
+| LC-3 | Claude Code: is `--session-id <uuid>` accepted together with `--append-system-prompt-file` and `--settings`, and does `--resume <id>` reopen that conversation? | sessions | Drop the flag; the ID recorded by `say` is enough |
+| LC-4 | OpenCode: which ID format does `--session <id>` accept for a session that does not exist yet? | sessions | Its variable if LC-11 finds one; else OpenCode starts fresh with a notice |
+| LC-6 | pi and omp: does `--session-dir <dir> --continue` resume the newest conversation in that directory, and start a new one without `--continue`? | sessions | pi: record `PI_SESSION_ID` and resume with `--session <id>`; omp: fresh with a notice |
+| LC-7 | agy: does `--settings '{"trustedWorkspaces": ["<dir>"]}'` suppress the trust dialog for that session without writing the global list? | launch | The dialog is left to the owner (§6.3) |
+| LC-11 | OpenCode: is there a variable like the others in its tool environment? | sessions | Its launch flag only (`--session`) |
+| LC-12 | Claude Code, Codex, agy: does a `say` run by a sub-agent or sub-thread carry the parent conversation's ID in the variable? | sessions | `session_follow = false` for that harness: record once per launch, from the ready line |
+| LC-8 | Do rodeo and the Herdr app render the tab and panes Factory writes (a `row` root always), keep a block's `size.weight`, leave unlabelled terminals alone, and do they turn `keep` on for terminals placed in the doc? | layout | Drop the keeper's `size`; the keeper already turns `keep` off |
 | LC-9 | Can GitHub Actions install a pinned `hc` release? | CI | Fake `hc` only in CI (already the plan) |
+| LC-10 | Does the core honour `HC_DRAFT_MS` (named in `hc --skill` as the test fallback for `draft_wait`)? | live cases 3 and 10 | Run those cases with the configured `draft_wait` (60 s by default): slower, same proof |
 
-## 11. Decisions needed from the owner
+## 11. Owner decisions
 
-1. **Keeper after a skill update.** The spec says it "exits, and the next command starts the new version". With an idle team no command comes, so the quiet rule and notes are off until someone runs one. I recommend the keeper re-executes itself (`os.execv`) once its sends finish: same terminal, same pane, no gap. The design below follows the spec; the change is five lines in [keeper.md](components/keeper.md) §8.
-2. **"`down` reads each member's session again" (§9.4)** is possible only where the harness exposes its current conversation. With assigned IDs (Claude Code, OpenCode) a conversation the member switched to inside the harness (`/clear`, `/resume`) is not seen; `down` saves the one it launched. I propose to accept this and print it per harness in the qualification record, unless LC-3 to LC-5 show a cheap way.
-3. **A seventh status word.** A live member that reports no status yet has no word in §5.2's list. I use `starting`.
-4. **Three optional `factory.toml` keys** (`quiet_grace`, `ready_check`, `ready_check_every`). v1 rejects unknown top-level keys, so v1 needs a one-line back-port to accept and ignore them (§4).
-5. **Message size limit** of 64 KiB, refused with "write it to a file and send the path". The spec sets none.
-6. **`down` with no session to save.** I read §9.4's "left running" as a storage failure only. A member whose harness gives no session ID (agy today) is stopped, and `down` says "up will start it fresh", as v1 did.
+Decided on 26 November 2026, and built into this design:
+
+| # | Decision |
+|---|---|
+| 1 | After a skill update the keeper finishes its sends and re-executes itself in place (`os.execv`) |
+| 2 | A member's conversation is learned from its harness's environment variable, recorded by each `say` it runs; launch flags are kept where they help; a member with no recorded conversation starts fresh with a notice (spec §9.4, already updated) |
+| 3 | A seventh status word, `starting`, for a live member that has not reported yet |
+| 4 | Three optional `factory.toml` keys (`quiet_grace`, `ready_check`, `ready_check_every`), with a v1 back-port that accepts and ignores them |
+| 5 | Message text is limited to 64 KiB |
+| 6 | `down` stops a member that has no recorded conversation and `up` says it starts fresh; `down` stops nobody when sessions cannot be written |
+| 7 | About 2,200 lines is a target, not a cap; delivery only between turns (`busy`) is not built until a harness fails §10.4 |
+| 8 | The keeper polls and sends notes only for states it observes; no event stream |
+
+Nothing is open. One sentence is proposed for spec §8.6 ([message_log.md](components/message_log.md), "Append and commit"): a message whose commit record is completely written counts as stored even if the disk then reports an error, and `say` warns.
