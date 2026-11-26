@@ -3866,6 +3866,65 @@ class LogTests(unittest.TestCase):
         self.assertIn(os.stat(self.state.parent).st_ino, synced)
         self.assertIn(os.stat(self.base).st_ino, synced)
 
+    def test_components_below_the_cache_base_are_never_followed(self):
+        """The owner's cache base may be a symbolic link; factory-skill/<team>/<core> below it never are."""
+        real_base = self.base / "real-cache"
+        real_base.mkdir()
+        (self.base / "cache").symlink_to(real_base)
+        state = self.base / "cache" / "factory-skill" / "team" / "core"
+        log = factory.Log(state, base=self.base / "cache")
+        self.assertEqual(log.add("pm", ["operator"], "x")[0], 1)
+        self.assertTrue((real_base / "factory-skill" / "team" / "core" / "log.jsonl").exists())
+        for name, link in (("factory-skill", self.base / "cache" / "factory-skill"),
+                           ("team", self.base / "cache" / "factory-skill" / "team")):
+            with self.subTest(component=name):
+                elsewhere = self.base / f"elsewhere-{name}"
+                shutil.move(str(link), elsewhere)
+                link.symlink_to(elsewhere)
+                before = sorted(str(p) for p in elsewhere.rglob("*"))
+                for attempt in (lambda: log.add("pm", ["operator"], "y"), log.read):
+                    with self.assertRaisesRegex(OSError, "symbolic link"):
+                        attempt()
+                self.assertEqual(sorted(str(p) for p in elsewhere.rglob("*")), before)
+                link.unlink()
+                shutil.move(str(elsewhere), link)
+        with self.assertRaises(ValueError):
+            factory.Log(self.base / "other" / "core", base=self.base / "cache")
+
+    def test_a_state_directory_moved_while_locking_is_damage(self):
+        self.log.add("pm", ["operator"], "x")
+        moved = self.base / "moved"
+        real_flock = factory.fcntl.flock
+
+        def move_then_lock(fd, op):
+            if op == factory.fcntl.LOCK_EX and not moved.exists():
+                self.state.rename(moved)                  # renamed with its log, a new one in its place
+                self.state.mkdir(mode=0o700)
+            return real_flock(fd, op)
+        with patch.object(factory.fcntl, "flock", move_then_lock), \
+                self.assertRaisesRegex(factory.LogDamage, "moved or replaced"):
+            self.log.add("pm", ["operator"], "y")
+        self.assertEqual(len((moved / "log.jsonl").read_bytes().splitlines()), 2)
+        self.assertEqual(list(self.state.iterdir()), [])
+
+    def test_a_state_directory_moved_during_the_write_is_reported(self):
+        self.log.add("pm", ["operator"], "x")
+        moved = self.base / "moved"
+        real = factory.Log._append
+
+        def move_after_msg(log, line):
+            result = real(log, line)
+            if b'"t":"msg"' in line and not moved.exists():
+                self.state.rename(moved)
+                self.state.mkdir(mode=0o700)
+            return result
+        with patch.object(factory.Log, "_append", move_after_msg), \
+                self.assertRaisesRegex(OSError, "moved during the write; message 2 is in the moved directory"):
+            self.log.add("pm", ["operator"], "y")
+        committed = [json.loads(line)["id"] for line in (moved / "log.jsonl").read_bytes().splitlines()
+                     if json.loads(line)["t"] == "ok"]
+        self.assertEqual(committed, [1, 2])                         # committed, in the moved directory
+
     def test_an_edited_checkpoint_is_a_miss_not_a_wrong_id(self):
         self.log.add("pm", ["operator"], "one")
         self.log.add("pm", ["operator"], "two")

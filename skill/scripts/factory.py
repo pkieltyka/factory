@@ -858,8 +858,16 @@ class Log:
 
     LOG, CHECK = "log.jsonl", "log.check"
 
-    def __init__(self, state):
+    def __init__(self, state, base=None):
+        """state: the team's state directory. base: the owner's cache base above it, which may be a symbolic link;
+        every component from base down to state is Factory's and is never followed through a link. Without base
+        only the state directory itself is."""
         self.state = pathlib.Path(_absolute(state))   # lexical: a symbolic link in the cache base is kept
+        self._base = _absolute(base) if base is not None else str(self.state.parent)
+        relative = os.path.relpath(self.state, self._base)
+        if relative == "." or relative.startswith("..") or os.path.isabs(relative):
+            raise ValueError(f"{self.state} is not below {self._base}")
+        self._parts = relative.split(os.sep)
         self.path = self.state / self.LOG
         self.check_path = self.state / self.CHECK
         self._local = threading.local()     # the open state directory and lineage belong to one operation
@@ -885,31 +893,63 @@ class Log:
             return False
 
     def _open_state(self, create):
-        """A no-follow descriptor of the state directory, or None for a reader when it does not exist."""
+        """A no-follow descriptor of the state directory, or None for a reader when it does not exist. The cache
+        base may be the owner's symbolic link; every component below it is opened (or created) one at a time
+        relative to its parent's descriptor, never through a symbolic link."""
+        base, parts = self._base, self._parts
         if create:
-            self.state.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            try:
-                os.mkdir(self.state, 0o700)
-            except FileExistsError:
-                pass
+            pathlib.Path(base).mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
-            fd = os.open(self.state, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY)
         except FileNotFoundError:
             if create:
                 raise
             return None
+        path = base
+        try:
+            for part in parts:
+                path = os.path.join(path, part)
+                try:
+                    child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                except FileNotFoundError:
+                    if not create:
+                        os.close(fd)
+                        return None
+                    try:
+                        os.mkdir(part, 0o700, dir_fd=fd)
+                    except FileExistsError:
+                        pass
+                    child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                os.close(fd)
+                fd = child
         except OSError as error:
-            raise OSError(f"cannot open the state directory {self.state} (a symbolic link or not a directory?):"
-                          f" {error}") from error
+            os.close(fd)
+            raise OSError(f"cannot open {path} (a symbolic link or not a directory?): {error}") from error
         if create and stat.S_IMODE(os.fstat(fd).st_mode) != 0o700:
             os.fchmod(fd, 0o700)
         return fd
 
+    def _in_place(self):
+        """Whether the state path still names the directory this operation holds."""
+        try:
+            named = os.stat(self.state, follow_symlinks=False)
+        except OSError:
+            return False
+        held = os.fstat(self._dir)
+        return (named.st_dev, named.st_ino) == (held.st_dev, held.st_ino)
+
+    def _check_moved(self, what):
+        """After an append: if the state directory was moved or replaced meanwhile, the record is in the moved one."""
+        if not self._in_place():
+            raise OSError(f"the state directory {self.state} was moved during the write; {what} is in the moved"
+                          " directory, check before resending")
+
     @contextlib.contextmanager
     def _locked(self, exclusive):
         """The team lock is the state directory itself, flocked through the same no-follow descriptor every operation
-        uses: it cannot be removed or replaced while it holds the log, so no two writers can append to one log under
-        different locks. Writers create the private directory; readers create nothing."""
+        uses, so no two writers can append to one log under different locks. A writer then checks that the state path
+        still names that directory: one moved or replaced meanwhile is damage, with nothing written. Writers create
+        the private directory; readers create nothing."""
         directory = self._open_state(create=exclusive)
         if directory is None:
             yield None
@@ -924,6 +964,8 @@ class Log:
                 raise OSError(error.errno, f"cannot lock the state directory {self.state}: {error.strerror}."
                                            " If it is on a filesystem that cannot lock a directory (NFS, for"
                                            " one), set XDG_CACHE_HOME to a local path.") from error
+            if exclusive and not self._in_place():
+                raise LogDamage(self.path, None, "the state directory was moved or replaced while opening it")
             yield directory
         finally:
             self._dir = None
@@ -1166,6 +1208,7 @@ class Log:
                 status, end = self._append(self._line({"t": "ok", "id": ident}))
             except _Unreadable as unreadable:
                 raise OSError(f"message {ident} in {self.path}: {UNKNOWN}") from unreadable.error
+            self._check_moved(f"message {ident}")
             self._write_checkpoint(ident)
             return ident, end, None if status == "synced" else STORED_WARNING
 
@@ -1222,6 +1265,7 @@ class Log:
             raise OSError(f"outcome {o} for @{to} of message {ident} in {self.path}: {UNKNOWN}") from unreadable.error
         if status == "visible" and o == "sending":
             raise NotStored(False, "the sending record is not durable: do not send")
+        self._check_moved(f"the {o} record for @{to} of message {ident}")
         box.apply([rec])
         box.offset, box._lineage = end, self._local.lineage
         self._write_checkpoint(box.highest)

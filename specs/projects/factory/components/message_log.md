@@ -71,7 +71,8 @@ class NotStored(Exception):
     detail: str
 
 class Log:
-    def __init__(self, state: pathlib.Path): ...
+    def __init__(self, state: pathlib.Path, base: pathlib.Path | None = None): ...
+        # base: the owner's cache base above state; everything from base down is opened without following links
     def read(self, offset: int = 0) -> tuple[list[dict], int]
         # LOCK_SH. Records from byte offset to the end and the new offset. offset == 0: full validation. Raises LogDamage.
     def add(self, sender: str, to: list[str], text: str, kind: str = "say",
@@ -150,7 +151,7 @@ After every successful append the writer rewrites `log.check` from a fresh `os.s
 
 `lineage` names an unbroken run of writers' appends. A writer that proves the file through a matching checkpoint continues its lineage; one that had to validate in full starts a new one. `out` reads only the tail of a caller's `Box` when the box's last proven view belongs to the current lineage, and rebuilds any other box from the whole file: a matching checkpoint written after someone else's full validation proves nothing about an older view.
 
-Every operation holds a no-follow descriptor of the state directory and opens, stats, replaces and syncs its files relative to it, so no component is followed through a symbolic link and the directory cannot be swapped mid-operation. Only writers create the directory and its files; readers create, chmod and rewrite nothing. The writer that creates `log.jsonl` first syncs the state directory's entry and each parent's up to the filesystem's root, whoever made the directories (a creator may have died right after `mkdir`); if that fails, nothing is stored.
+`Log(state, base)` opens the owner's cache base (which may be a symbolic link) and then each component below it, `factory-skill/<team>/<core>`, one at a time relative to its parent's descriptor with `O_NOFOLLOW`, creating it for a writer; every operation then opens, stats, replaces and syncs its files relative to the state directory's descriptor, so no Factory component is followed through a symbolic link. A writer checks, after locking and again after each append, that the state path still names the directory it holds: a mismatch before the append is `LogDamage` with nothing written; after it, an `OSError` says the record is in the moved directory and to check before resending. The state directory must not be moved or replaced while Factory runs; a move between those checks is not prevented. Only writers create the directory and its files; readers create, chmod and rewrite nothing. The writer that creates `log.jsonl` first syncs the state directory's entry and each parent's up to the filesystem's root, whoever made the directories (a creator may have died right after `mkdir`); if that fails, nothing is stored.
 
 ### Append and commit
 
