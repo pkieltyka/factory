@@ -29,6 +29,7 @@ The team works through the board on its own. The owner sets direction; the team 
 | 7. Merge | The operator | Confirms the reviewer approved the head commit and CI is green, squash-merges, and tells @pm, who closes the ticket. |
 | 8. Next | The operator | Takes the next ticket in Todo without asking. |
 
+- **Pairing on every ticket.** One lead dev is the main writer; the other lead devs follow along closely: they review each commit as it lands on the ticket branch, run its tests, and send the writer suggestions. The architect who planned the ticket and the other architects review the plan before building starts (the plan is final only after their review) and give the final design review of the finished work against the plan before @reviewer's verdict.
 - The operator assigns each step with acceptance criteria. When the team has a @pm, it records owner, criteria, branch or commit, verdict and next step on the issue, and only @pm updates the tracker; otherwise the operator does.
 - Consult an architect before changing a shared interface, the brief or formation format, or the shape of SKILL.md and references/. Its plans are advice; the operator decides.
 - Developers with a worktree work on its branch (`<user>/<member>`); the others share the main checkout, where only one task writes at a time. Members do not commit in the main checkout.
