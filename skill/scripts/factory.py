@@ -13,7 +13,6 @@ from __future__ import annotations
 import argparse
 import collections
 import contextlib
-import errno
 import datetime
 import fcntl
 import getpass
