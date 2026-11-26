@@ -1,4 +1,4 @@
-"""Tests for factory.py with a fake `herdr` and fake harness binaries; nothing real is launched.
+"""Tests for factory.py with fake herdr and harnesses, plus an optional private hc core.
 
 Two test classes touch real tools and skip when they cannot: HerdrContract reads the installed herdr's API
 schema, and LiveFlags (FACTORY_LIVE=1, outside any sandbox) greps each installed harness's --help for the
@@ -23,11 +23,15 @@ import time
 import tomllib
 import types
 import unittest
+import uuid
 from urllib.parse import unquote, urlsplit
 from unittest.mock import call, patch
 
-import fake_hc
-import live
+if __package__:
+    from . import fake_hc, live
+else:
+    import fake_hc
+    import live
 
 SCRIPT = pathlib.Path(__file__).resolve().parent.parent / "skill/scripts/factory.py"
 spec = importlib.util.spec_from_file_location("factory", SCRIPT)
@@ -39,6 +43,23 @@ TEMPLATE = ("+++\n" + (factory.SKILL / "templates/factory.toml").read_text().str
             + (factory.SKILL / "templates/FACTORY.md").read_text())
 GIT = shutil.which("git")
 HC_FIXTURES = json.loads(pathlib.Path(__file__).with_name("hc_fixtures.json").read_text())
+REAL_HC = os.environ.get("FACTORY_TEST_HC") == "real"
+fake_only = unittest.skipIf(REAL_HC, "scripts the fake hc")
+real_only = unittest.skipUnless(REAL_HC, "requires a real hc PTY")
+REAL_CORE = None
+REAL_CASES = set()
+
+
+def setUpModule():
+    global REAL_CORE
+    if REAL_HC:
+        REAL_CORE = live.Core("unit", extra_env={"HC_SETTLE_MS": "0"})
+
+
+def tearDownModule():
+    if REAL_CORE is not None:
+        REAL_CORE.stop()
+        print(f"Ran {len(REAL_CASES)} hc tests against the real core", file=sys.stderr)
 
 
 def conforms(value, spec, named_types, path="$"):
@@ -73,12 +94,25 @@ RPC_ERROR_TYPES = {
 }
 
 
-class HcContract(unittest.TestCase):
+class HcAssertions:
     @staticmethod
     def check_result(method, value):
         schema = HC_FIXTURES["schema"]
         return conforms(value, {"ref": schema["results"][method]}, schema["types"])
 
+    def checked_call(self, hc, method, params):
+        result = hc.call(method, params)
+        self.assertEqual(self.check_result(method, result), [])
+        return result
+
+    def assert_hc_error(self, kind, fn, *args):
+        with self.assertRaises(factory.HcError) as raised:
+            fn(*args)
+        self.assertEqual(raised.exception.kind, kind)
+
+
+
+class HcContract(HcAssertions, unittest.TestCase):
     def test_recorded_replies_conform(self):
         for name, example in HC_FIXTURES["replies"].items():
             with self.subTest(name=name):
@@ -117,6 +151,7 @@ class HcContract(unittest.TestCase):
         self.assertEqual(self.check_result("terminal.list", {**result, "machines": []}), [])
         self.assertTrue(self.check_result("terminal.list", {**result, "machines": [False]}))
 
+    @fake_only
     def test_fake_replies_conform(self):
         with FakeHc() as fake:
             hc = factory.Hc()
@@ -150,17 +185,6 @@ class HcContract(unittest.TestCase):
             self.checked_call(hc, "doc.set", layout)
             self.assert_hc_error("conflict", hc.call, "doc.set", layout)
 
-    def checked_call(self, hc, method, params):
-        result = hc.call(method, params)
-        self.assertEqual(self.check_result(method, result), [])
-        return result
-
-    def assert_hc_error(self, kind, fn, *args):
-        with self.assertRaises(factory.HcError) as raised:
-            fn(*args)
-        self.assertEqual(raised.exception.kind, kind)
-
-
 class FakeHc:
     def __enter__(self):
         self.stack = contextlib.ExitStack()
@@ -192,7 +216,8 @@ class FakeHc:
             address = f"t{state['next']}"
             state["next"] += 1
             record = fake_hc.example("terminal.get.live")
-            record.update(address=address, labels=labels, turn=0,
+            record.update(address=address, labels=labels, turn=0, screen="", created_ms=fake_hc.timestamp(),
+                          status_ms=fake_hc.timestamp() if status else None,
                           status={"state": status, "app": "fake"} if status else None, reported=status is not None)
             record.update(fields)
             state["terminals"][address] = record
@@ -251,6 +276,7 @@ class FakeHc:
             return state["sent"].get(term, [])
 
 
+@fake_only
 class FakeHcTests(unittest.TestCase):
     def setUp(self):
         self.fake = self.enterContext(FakeHc())
@@ -316,6 +342,7 @@ class FakeHcTests(unittest.TestCase):
         self.assertFalse(raised.exception.sent)
 
 
+@fake_only
 class HcClientTests(unittest.TestCase):
     def setUp(self):
         self.fake = self.enterContext(FakeHc())
@@ -361,6 +388,27 @@ class HcClientTests(unittest.TestCase):
         self.fake.rule("hello", stall=True)
         self.check_failure(sent=False, timeout=True, client=factory.Hc(timeout=0.3))
 
+    def test_send_handshake_is_bounded(self):
+        self.fake.rule("hello", stall=True)
+        client = factory.Hc(timeout=0.3)
+        with self.assertRaises(factory.HcDown) as raised:
+            client.send("t1", "hello")
+        self.assertEqual((raised.exception.sent, raised.exception.timeout), (False, True))
+        self.assertFalse(client.children)
+
+    def test_send_reply_outlives_setup_timeout(self):
+        self.fake.rule("reply", delay=0.6)
+        term = self.fake.add({})
+        self.assertTrue(factory.Hc(timeout=0.3).send(term, "hello")["started"])
+
+    def test_nullable_error_hint_is_optional(self):
+        self.fake.rule("reply", reply={"jsonrpc": "2.0", "id": 1, "error": {
+            "code": -32000, "message": "oops", "data": {"kind": "blocked", "hint": None},
+        }})
+        with self.assertRaises(factory.HcError) as raised:
+            self.hc.get("t1")
+        self.assertEqual((raised.exception.kind, raised.exception.hint), ("blocked", ""))
+
     def test_hello_eof_is_unsent(self):
         self.fake.rule("hello", eof=True)
         self.check_failure(sent=False)
@@ -405,6 +453,22 @@ class HcClientTests(unittest.TestCase):
         self.fake.rule("hello", stop_reading=True)
         self.check_failure(sent=True, timeout=True, params={"large": "x" * (200 * 1024)},
                            client=factory.Hc(timeout=0.6))
+
+    def test_request_deadline_before_any_byte_is_unsent_timeout(self):
+        select = factory.selectors.PollSelector.select
+        writes = 0
+
+        def wait(poller, timeout):
+            nonlocal writes
+            if any(key.events == factory.selectors.EVENT_WRITE for key in poller.get_map().values()):
+                writes += 1
+                if writes == 2:
+                    return []
+            return select(poller, timeout)
+
+        with patch.object(factory.selectors.PollSelector, "select", wait):
+            self.check_failure(sent=False, timeout=True)
+        self.assertEqual([r["method"] for r in self.fake.received()], ["hello"])
 
     def test_stderr_flood_does_not_block(self):
         term = self.fake.add({}, "idle")
@@ -479,6 +543,23 @@ class HcClientTests(unittest.TestCase):
         self.check_failure(sent=False)
         self.assertEqual(self.fake.received(), [])
 
+    def test_kill_during_hello_is_unsent(self):
+        self.fake.rule("hello", stall=True)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(self.hc.list, "team")
+            try:
+                deadline = time.monotonic() + 2
+                while not self.fake.received():
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(0.01)
+            finally:
+                self.hc.kill_children()
+            with self.assertRaises(factory.HcDown) as raised:
+                pending.result(timeout=3)
+        self.assertFalse(raised.exception.sent)
+        self.assertFalse(raised.exception.timeout)
+        self.assertFalse(self.hc.children)
+
     def test_kill_children_sees_a_child_being_started(self):
         starting, release = threading.Event(), threading.Event()
         popen = subprocess.Popen
@@ -536,6 +617,7 @@ class HcClientTests(unittest.TestCase):
         ])
 
 
+@fake_only
 class ViewTests(unittest.TestCase):
     def setUp(self):
         self.fake = self.enterContext(FakeHc())
@@ -595,6 +677,279 @@ class ViewTests(unittest.TestCase):
         self.assertEqual(view.keeper["address"], keeper)
         self.assertEqual(view.terminal("boss")["address"], active)
         self.assertFalse(view.strays)
+
+
+class HcBackend:
+    def setUp(self):
+        self.team = "t-" + uuid.uuid4().hex[:8]
+        if REAL_HC:
+            self.use_real_core(REAL_CORE)
+        else:
+            self.fake = self.enterContext(FakeHc())
+            self.hc = factory.Hc()
+
+    def use_real_core(self, core):
+        self.enterContext(patch.dict(os.environ, core.env, clear=True))
+        self.hc = factory.Hc(bin=live.HC, expect_core=core.id)
+        self.directory = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory(dir=core.dir)))
+        REAL_CASES.add(self.id())
+
+    def launch(self, script="reports", *, name="worker", **env):
+        labels = {"factory.team": self.team, "factory.kind": "member", "factory.member": name}
+        if not REAL_HC:
+            return self.fake.add(labels, None if script == "silent" else env.get("FAKE_DIALOG_STATE", "idle")), None
+        log = self.directory / f"{name}.jsonl"
+        agent = pathlib.Path(__file__).resolve().with_name("fake_agent.py")
+        term = self.hc.run([sys.executable, str(agent), script], str(self.directory),
+                           {"FAKE_LOG": str(log), **env}, labels)["address"]
+        self.addCleanup(self.remove, term)
+        self.until(lambda: "fake agent ready" in self.hc.read(term), "agent startup")
+        if script not in ("silent", "dialog"):
+            self.state(term, "idle")
+        return term, log
+
+    def remove(self, term):
+        try:
+            if self.hc.get(term)["state"] == "live":
+                self.hc.kill(term)
+            self.hc.rm(term)
+        except factory.HcError as error:
+            if error.kind != "not_found":
+                raise
+
+    def until(self, predicate, detail):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            result = predicate()
+            if result:
+                return result
+            time.sleep(0.025)
+        self.fail(f"timed out waiting for {detail}")
+
+    def state(self, term, expected):
+        def record_matching():
+            record = self.hc.get(term)
+            return record if (record["status"] or {}).get("state") == expected else None
+
+        return self.until(record_matching, f"{term} to report {expected}")
+
+    def inputs(self, term, log):
+        if not REAL_HC:
+            return self.fake.sent(term)
+        return [json.loads(line)["text"] for line in log.read_text().splitlines()] if log.exists() else []
+
+
+class HcBackendTests(HcBackend, HcAssertions, unittest.TestCase):
+    def test_call_returns_result(self):
+        self.assertEqual(self.hc.list(self.team), [])
+        self.assertGreaterEqual(self.hc.version, factory.HC_MIN)
+        self.assertEqual(self.hc.core, REAL_CORE.id if REAL_HC else "fakecore00000000")
+        self.assertFalse(self.hc.children)
+
+    def test_call_maps_error_kind(self):
+        with self.assertRaises(factory.HcError) as raised:
+            self.hc.get("t999")
+        self.assertEqual(raised.exception.kind, "not_found")
+        self.assertIn("t999", raised.exception.message)
+        self.assertTrue(raised.exception.hint)
+
+    def test_send_types_into_statusless_terminal(self):
+        term, log = self.launch("silent")
+        self.assertIsNone(self.hc.send(term, "hello")["started"])
+        self.until(lambda: self.inputs(term, log) == ["hello"], "statusless input")
+
+    def test_send_to_blocked_is_refused(self):
+        term, log = self.launch("dialog", FAKE_DIALOG_STATE="blocked")
+        self.state(term, "blocked")
+        self.assert_hc_error("blocked", self.hc.send, term, "refused")
+        self.assertEqual(self.inputs(term, log), [])
+
+    def test_turn_goes_up_on_leaving_working(self):
+        term, _ = self.launch("forgets", FAKE_WORK="0.8")
+        initial = self.state(term, "idle")["turn"]
+        if REAL_HC:
+            self.hc.send(term, "work")
+        else:
+            self.fake.set_status(term, "working")
+        self.assertEqual(self.state(term, "working")["turn"], initial)
+        if not REAL_HC:
+            self.fake.set_status(term, "idle")
+        self.assertEqual(self.state(term, "idle")["turn"], initial + 1)
+
+    def test_kill_then_rm(self):
+        term, _ = self.launch()
+        killed = self.hc.kill(term)
+        self.assertEqual((killed["state"], killed["reason"], killed["status"]), ("finished", "killed", None))
+        self.hc.rm(term)
+        self.assert_hc_error("not_found", self.hc.get, term)
+
+    def test_rm_live_is_refused(self):
+        term, _ = self.launch()
+        self.assert_hc_error("live", self.hc.rm, term)
+
+    def test_label_on_finished_record_and_empty_removes(self):
+        term, _ = self.launch()
+        self.hc.kill(term)
+        self.assertEqual(self.hc.label(term, {"test": "1"})["labels"]["test"], "1")
+        self.assertNotIn("test", self.hc.label(term, {"test": ""})["labels"])
+
+    def test_doc_set_stale_version_conflicts(self):
+        previous, version = self.hc.doc_get()
+        written = self.hc.doc_set({"spaces": []}, version)
+        self.addCleanup(self.hc.doc_set, previous, written)
+        self.assert_hc_error("conflict", self.hc.doc_set, {"spaces": []}, version)
+        self.assertEqual(self.hc.doc_get(), ({"spaces": []}, written))
+
+    @real_only
+    def test_version_and_core_refusals_do_not_dispatch(self):
+        args = ([sys.executable, "-c", "print('must not start')"], str(self.directory), {}, {"factory.team": self.team})
+        wrong_core = factory.Hc(bin=live.HC, expect_core="wrong-core")
+        with self.assertRaises(factory.HcDown) as raised:
+            wrong_core.run(*args)
+        self.assertFalse(raised.exception.sent)
+        with patch.object(factory, "HC_MIN", (99,)):
+            with self.assertRaises(factory.HcDown) as raised:
+                self.hc.run(*args)
+        self.assertFalse(raised.exception.sent)
+        self.assertEqual(self.hc.list(self.team), [])
+
+    @real_only
+    def test_wire_exceptions_still_hold(self):
+        result = self.checked_call(self.hc, "terminal.list", {"all": True})
+        self.assertNotIn("machines", result, "hc now includes machines: recheck the wire exception")
+
+    @real_only
+    def test_real_replies_conform(self):
+        hc = self.hc
+        self.assertEqual(self.check_result("hello", REAL_CORE.hello()), [])
+        self.checked_call(hc, "server.status", {})
+        plain = self.checked_call(hc, "terminal.run", {
+            "argv": [sys.executable, "-c", "import time; time.sleep(60)"],
+            "cwd": str(self.directory), "labels": {"factory.team": self.team}, "no_parent": True, "no_notify": True,
+        })["address"]
+        self.addCleanup(self.remove, plain)
+        self.checked_call(hc, "terminal.send", {"terminal": plain, "text": "hello"})
+        term, _ = self.launch()
+        target = {"terminal": term}
+        self.checked_call(hc, "terminal.list", {"all": True, "labels": {"factory.team": self.team}})
+        self.checked_call(hc, "terminal.get", target)
+        self.checked_call(hc, "terminal.send", {**target, "text": "hello"})
+        self.checked_call(hc, "terminal.keys", {**target, "keys": ["enter"]})
+        self.checked_call(hc, "terminal.read", {**target, "lines": 0})
+        self.checked_call(hc, "terminal.label", {**target, "labels": {"extra": "one"}})
+        self.checked_call(hc, "terminal.keep", {**target, "keep": False})
+        self.assert_hc_error("invalid_params", hc.call, "terminal.send", target)
+        self.state(term, "idle")
+        self.assert_hc_error("status_mismatch", hc.call, "terminal.send", {**target, "text": "x", "if": "working"})
+        self.checked_call(hc, "terminal.kill", target)
+        self.assert_hc_error("finished", hc.send, term, "x")
+        self.checked_call(hc, "terminal.rm", target)
+        self.assert_hc_error("spawn_failed", hc.run, ["/nonexistent/factory-agent"], str(self.directory), {}, {})
+        doc = self.checked_call(hc, "doc.get", {"name": "herdr-app"})
+        result = self.checked_call(hc, "doc.set", {"name": "herdr-app", **doc})
+        self.assertEqual(hc.doc_get()[0], doc["value"])
+        self.assertGreater(result["version"], doc["version"])
+
+    @real_only
+    def test_view_states_with_fake_agents(self):
+        self.launch("silent", name="silent")
+        self.launch(name="idle")
+        blocked, _ = self.launch("dialog", name="blocked")
+        self.state(blocked, "blocked")
+        finished, _ = self.launch(name="exited")
+        self.hc.kill(finished)
+        view = factory.team_view(self.hc, self.team)
+        self.assertEqual([view.state(name) for name in ("silent", "idle", "blocked", "exited")],
+                         ["starting", "idle", "blocked", "gone"])
+
+    @real_only
+    def test_view_gone_after_core_restart(self):
+        core = self.enterContext(live.Core("restart"))
+        self.use_real_core(core)
+        term, _ = self.launch()
+        reply = core.server_stop()
+        if reply is not None:
+            self.assertEqual(self.check_result("server.stop", reply["result"]), [])
+        self.until(lambda: core.listening() is False, "private core to stop")
+        core.start()
+        view = factory.team_view(self.hc, self.team)
+        self.assertEqual(view.state("worker"), "gone")
+        record = view.finished("worker")
+        self.assertEqual((record["address"], record["reason"], record["labels"]["factory.team"]),
+                         (term, "server_stop", self.team))
+
+
+@real_only
+class FakeAgentTests(HcBackend, unittest.TestCase):
+    def launch_with_reply(self, script):
+        reply = self.directory / "reply"
+        command = [sys.executable, "-c", "from pathlib import Path; import sys; "
+                   "Path(sys.argv[1]).write_text(sys.stdin.read())", str(reply)]
+        term, log = self.launch(script, FAKE_REPLY_CMD=json.dumps(command))
+        return term, log, reply
+
+    def test_reports(self):
+        term, _, reply = self.launch_with_reply("reports")
+        self.hc.send(term, "first\nsecond")
+        self.until(reply.exists, "reply command")
+        self.state(term, "idle")
+        self.assertEqual(reply.read_text(), "first\n")
+
+    def test_forgets(self):
+        term, _, reply = self.launch_with_reply("forgets")
+        initial = self.hc.get(term)["turn"]
+        self.hc.send(term, "forgettable")
+        self.until(lambda: self.hc.get(term)["turn"] > initial, "completed turn")
+        self.assertFalse(reply.exists())
+
+    def test_works_forever(self):
+        term, _ = self.launch("works_forever")
+        self.hc.send(term, "stay busy")
+        self.state(term, "working")
+        self.assertEqual(self.hc.get(term)["status"]["state"], "working")
+
+    def test_blocks(self):
+        term, _ = self.launch("blocks")
+        self.hc.send(term, "ask")
+        self.assertEqual(self.state(term, "blocked")["status"]["kind"], "permission")
+        self.hc.keys(term, ["enter"])
+        self.state(term, "idle")
+
+    def test_crashes(self):
+        term, _ = self.launch("crashes")
+        try:
+            self.hc.send(term, "crash")
+        except factory.HcError as error:
+            self.assertEqual(error.kind, "finished")
+        self.until(lambda: self.hc.get(term)["state"] == "finished", "process exit")
+        self.assertEqual(self.hc.get(term)["exit_code"], 1)
+
+    def test_silent(self):
+        term, log = self.launch("silent")
+        self.hc.send(term, "silent input")
+        self.until(lambda: self.inputs(term, log) == ["silent input"], "silent input")
+        self.assertFalse(self.hc.get(term)["reported"])
+
+    def test_dialog(self):
+        term, _ = self.launch("dialog", FAKE_DIALOG="Trust this folder?", FAKE_DIALOG_KEYS="y")
+        self.state(term, "blocked")
+        self.assertIn("Trust this folder?", self.hc.read(term))
+        self.hc.keys(term, ["y", "enter"])
+        self.state(term, "idle")
+
+    def test_fake_line_switches_script(self):
+        term, _ = self.launch()
+        self.hc.send(term, "first line\nFAKE: blocks")
+        self.state(term, "blocked")
+
+    def test_log_has_every_input(self):
+        term, log = self.launch("silent")
+        self.hc.send(term, "first\nsecond")
+        self.hc.keys(term, ["enter"])
+        self.hc.send(term, "third")
+        self.until(lambda: self.inputs(term, log) == ["first\nsecond", "", "third"], "all input")
+        self.assertTrue(all(entry["at"] > 0 for entry in map(json.loads, log.read_text().splitlines())))
+
 
 FAKE_HERDR = textwrap.dedent(r'''
     #!/usr/bin/env python3
@@ -3138,7 +3493,8 @@ class LiveToolTests(unittest.TestCase):
     @staticmethod
     def scrubber(host="local-host", user="local-user"):
         core = types.SimpleNamespace(dir="/tmp/factory-scratch-core", id="local-core-id")
-        with patch("socket.gethostname", return_value=host), patch("getpass.getuser", return_value=user):
+        with (patch("socket.gethostname", return_value=host), patch("getpass.getuser", return_value=user),
+              patch("os.path.expanduser", return_value=f"/home/{user}")):
             return live.scrubber(core)
 
     def test_identity_fields_redacted_by_position(self):

@@ -20,7 +20,7 @@ import json
 import os
 import pathlib
 import re
-import select
+import selectors
 import shlex
 import shutil
 import stat
@@ -101,7 +101,8 @@ class Hc:
 
     def call(self, method, params=None, timeout=...) -> dict:
         timeout = self.timeout if timeout is ... else timeout
-        deadline = None if timeout is None else time.monotonic() + timeout
+        setup_timeout = self.timeout if timeout is None else timeout
+        deadline = None if setup_timeout is None else time.monotonic() + setup_timeout
         process = None
         complete = sent = False
         buffer = bytearray()
@@ -114,9 +115,10 @@ class Hc:
             remaining = None if deadline is None else deadline - time.monotonic()
             if remaining is not None and remaining <= 0:
                 raise TimeoutError("timed out")
-            readers, writers, _ = select.select([] if writing else [fd], [fd] if writing else [], [], remaining)
-            if not (writers if writing else readers):
-                raise TimeoutError("timed out")
+            with selectors.PollSelector() as poll:
+                poll.register(fd, selectors.EVENT_WRITE if writing else selectors.EVENT_READ)
+                if not poll.select(remaining):
+                    raise TimeoutError("timed out")
 
         def write_line(ident, name, fields):
             nonlocal sent
@@ -173,10 +175,11 @@ class Hc:
                     raise ValueError("unexpected hello reply: missing result")
                 version, core = info.get("version"), info.get("core")
                 if (type(info.get("generation")) is not int or info["generation"] != 1
-                        or info.get("framed") is not False or not isinstance(version, str)
-                        or not re.fullmatch(r"[0-9]+(?:\.[0-9]+)+", version)
+                        or info.get("framed") is not False
                         or not isinstance(core, dict) or not isinstance(core.get("id"), str) or not core["id"]):
-                    raise ValueError("unexpected hello reply: invalid generation, framing, version or core")
+                    raise ValueError("unexpected hello reply: invalid generation, framing or core")
+                if not isinstance(version, str) or not re.fullmatch(r"[0-9]+(?:\.[0-9]+)+", version):
+                    raise ValueError(f"unrecognised hc version: {version!r}")
                 parsed_version = tuple(map(int, version.split(".")))
                 if parsed_version < HC_MIN:
                     raise HcDown(False, f"hc {'.'.join(map(str, HC_MIN))} or newer is required (found {version})")
@@ -184,14 +187,17 @@ class Hc:
                     raise HcDown(False, f"this is another hc core ({core['id']}) than the team's ({self.expect_core})")
                 self.version, self.core = parsed_version, core["id"]
                 write_line(1, method, params)
+                if timeout is None:
+                    deadline = None  # Draft holds apply only after the request was written.
                 reply = read_reply(1, "request")
                 if "error" in reply:
                     error = reply["error"]
                     data = error.get("data", {}) if isinstance(error, dict) else None
                     if ("result" in reply or not isinstance(data, dict) or not isinstance(error.get("message"), str)
-                            or any(not isinstance(data.get(key, ""), str) for key in ("kind", "hint"))):
+                            or not isinstance(data.get("kind", ""), str)
+                            or (data.get("hint") is not None and not isinstance(data["hint"], str))):
                         raise ValueError("unexpected reply: malformed error")
-                    raise HcError(data.get("kind", ""), error["message"], data.get("hint", ""))
+                    raise HcError(data.get("kind", ""), error["message"], data.get("hint") or "")
                 if not isinstance(reply.get("result"), dict):
                     raise ValueError("unexpected reply: missing result object")
                 complete = True
@@ -210,7 +216,10 @@ class Hc:
             finally:
                 if process is not None:
                     try:
-                        process.stdin.close()
+                        try:
+                            process.stdin.close()
+                        except OSError:
+                            pass
                         if complete:
                             try:
                                 process.wait(timeout=2)

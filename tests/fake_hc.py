@@ -77,7 +77,7 @@ def observe(state, record):
 
 
 def finish(record, reason, exit_code=None):
-    record.update(state="finished", reason=reason, finished_ms=timestamp(), exit_code=exit_code)
+    record.update(state="finished", reason=reason, finished_ms=timestamp(), exit_code=exit_code, status=None)
     return record
 
 

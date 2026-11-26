@@ -141,6 +141,8 @@ class Conn:
         if self.p.poll() is None:
             self.p.kill()
         self.p.wait()
+        self.p.stdin.close()
+        self.p.stdout.close()
 
     def close(self):
         try:
@@ -151,6 +153,8 @@ class Conn:
             self.p.wait(2)
         except subprocess.TimeoutExpired:
             self.kill()
+        finally:
+            self.p.stdout.close()
 
 
 class Core:
@@ -791,6 +795,7 @@ def scrubber(core):
         if (parent, key) == ("core", "name") and isinstance(value, str):
             return "<host>"
         if parent == "login_session" and key in ("id", "user"):
+            # In hc 0.1.20 these are the session number and UID, both uint32.
             if type(value) is int:
                 return 1
             if isinstance(value, str):
