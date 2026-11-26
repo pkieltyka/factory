@@ -3820,6 +3820,63 @@ class LogTests(unittest.TestCase):
         self.assertEqual(self.log.add("pm", ["operator"], "two")[0], 2)    # one full validation, then a new proof
         self.assertRegex(json.loads(self.log.check_path.read_text())["lineage"], r"^[0-9a-f]{16}$")
 
+    def test_a_replacement_lock_never_authorizes_a_write(self):
+        """A sees an empty state; before A creates the lock, B creates it, writes, and keeps holding it while the
+        lock's name is removed. A's new lock must not authorize A, nor the next writer C."""
+        real_open, held, started = factory.private_open, [], []
+
+        def racing(path, flags, fix_mode=True, dir_fd=None):
+            if path == "lock" and flags & os.O_CREAT and not started:   # A, after it saw no lock, log or checkpoint
+                started.append(path)
+                factory.Log(self.state).add("pm", ["operator"], "B")              # lock Y, log, checkpoint
+                fd = os.open(self.log.lock_path, os.O_RDWR)
+                factory.fcntl.flock(fd, factory.fcntl.LOCK_EX)                    # B still holds Y...
+                held.append(fd)
+                self.log.lock_path.unlink()                                        # ...whose name is removed
+            return real_open(path, flags, fix_mode, dir_fd)
+        try:
+            with patch.object(factory, "private_open", racing), \
+                    self.assertRaisesRegex(factory.LogDamage, "lock this writer had to create"):
+                self.log.add("lead-dev", ["operator"], "A")
+            before = self.log.path.read_bytes()
+            self.assertEqual([json.loads(line)["t"] for line in before.splitlines()], ["msg", "ok"])   # only B's
+            self.assertFalse(self.log.lock_path.exists())                          # A removed its replacement
+            with self.assertRaisesRegex(factory.LogDamage, "lock file is missing"):
+                factory.Log(self.state).add("reviewer", ["operator"], "C")         # the next writer refuses too
+            self.assertEqual(self.log.path.read_bytes(), before)
+        finally:
+            for fd in held:
+                os.close(fd)
+
+    def test_a_writer_holding_another_lock_than_the_log_was_written_under_refuses(self):
+        self.log.add("pm", ["operator"], "one")
+        original = os.open(self.log.lock_path, os.O_RDWR)
+        try:
+            factory.fcntl.flock(original, factory.fcntl.LOCK_EX)
+            self.log.lock_path.unlink()
+            fd = os.open(self.log.lock_path, os.O_CREAT | os.O_RDWR, 0o600)       # someone recreated the name
+            os.close(fd)
+            before = self.log.path.read_bytes()
+            with self.assertRaisesRegex(factory.LogDamage, "not the one the log was last written under"):
+                self.log.add("pm", ["operator"], "two")
+            self.assertEqual(self.log.path.read_bytes(), before)
+        finally:
+            os.close(original)
+
+    def test_first_writers_sharing_a_new_lock_both_commit(self):
+        """A creates the lock; B opens that same lock and commits before A locks it: A then commits 2."""
+        real_open, done = factory.private_open, []
+
+        def racing(path, flags, fix_mode=True, dir_fd=None):
+            fd = real_open(path, flags, fix_mode, dir_fd)
+            if path == "lock" and flags & os.O_CREAT and not done:
+                done.append(path)
+                self.assertEqual(factory.Log(self.state).add("pm", ["operator"], "B")[0], 1)
+            return fd
+        with patch.object(factory, "private_open", racing):
+            self.assertEqual(self.log.add("lead-dev", ["operator"], "A")[0], 2)
+        self.assertEqual([r["id"] for r in self.log.read()[0] if r["t"] == "msg"], [1, 2])
+
     def test_an_edited_checkpoint_is_a_miss_not_a_wrong_id(self):
         self.log.add("pm", ["operator"], "one")
         self.log.add("pm", ["operator"], "two")
@@ -3882,7 +3939,9 @@ class LogTests(unittest.TestCase):
                "kind": "say", "text": "x"}
         for field, value, reason in (
             ("t", "note", "expected t of"), ("id", True, "positive integer id"), ("id", 0, "positive integer id"),
-            ("at", "yesterday", "UTC at"), ("from", "", "sender"), ("to", [], "distinct recipients"),
+            ("at", "yesterday", "UTC at"), ("at", "2026-99-99T99:99:99Z", "UTC at"),
+            ("at", "2026-02-30T12:00:00Z", "UTC at"), ("at", "2026-11-26T24:00:00Z", "UTC at"),
+            ("from", "", "sender"), ("to", [], "distinct recipients"),
             ("to", ["pm"], "distinct recipients"), ("to", ["a", "a"], "distinct recipients"),
             ("kind", "wait", "kind say"), ("text", None, "expected text"), ("file", "rel.md", "absolute file"),
             ("meta", 3, "meta to be an object"),
@@ -3898,7 +3957,7 @@ class LogTests(unittest.TestCase):
             ({"o": "lost"}, "known outcome"), ({"why": "tired"}, "queue reason"), ({"to": ""}, "a recipient"),
             ({"o": "dropped", "why": " "}, "reason for dropped"), ({"o": "sending", "term": 7}, "terminal ID"),
             ({"o": "sending", "started": "yes"}, "started"), ({"o": "sending", "turn": True}, "turn"),
-            ({"at": None}, "UTC at"),
+            ({"at": None}, "UTC at"), ({"at": "2026-13-01T00:00:00Z"}, "UTC at"),
         ):
             with self.subTest(changes=changes):
                 self.setUp()

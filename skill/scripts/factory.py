@@ -591,6 +591,17 @@ class _Unreadable(Exception):
         self.error = error
 
 
+def _utc(value):
+    """Whether value is a real UTC time written as 2026-11-26T17:00:00Z."""
+    if not (isinstance(value, str) and UTC.fullmatch(value)):
+        return False
+    try:
+        datetime.datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return False
+    return True
+
+
 def _record_problem(rec):
     """Why a decoded line is not a valid record on its own, or None. Unknown extra keys are allowed."""
     if not isinstance(rec, dict):
@@ -603,7 +614,7 @@ def _record_problem(rec):
         return "expected a positive integer id"
     if kind == "msg":
         to = rec.get("to")
-        if not (isinstance(rec.get("at"), str) and UTC.fullmatch(rec["at"])):
+        if not _utc(rec.get("at")):
             return "expected a UTC at"
         if not (isinstance(rec.get("from"), str) and rec["from"]):
             return "expected a sender"
@@ -624,7 +635,7 @@ def _record_problem(rec):
             return "expected a recipient"
         if o not in OUTCOMES:
             return "expected a known outcome"
-        if not (isinstance(rec.get("at"), str) and UTC.fullmatch(rec["at"])):
+        if not _utc(rec.get("at")):
             return "expected a UTC at"
         if "why" in rec and not isinstance(why, str):
             return "expected why to be a string"
@@ -668,7 +679,7 @@ def _parse(data, first_line):
 
 def _checkpoint_digest(check):
     """A digest of log.check's fields, so an accidental edit of one of them is a miss, not a wrong id."""
-    fields = ":".join(str(check[k]) for k in ("ino", "size", "mtime_ns", "last", "lineage"))
+    fields = ":".join(str(check.get(k)) for k in ("ino", "size", "mtime_ns", "last", "lineage", "lock"))
     return hashlib.sha256(fields.encode()).hexdigest()
 
 
@@ -904,12 +915,13 @@ class Log:
             return
         self._dir = directory
         try:
-            fd = self._open_lock_for_writing() if exclusive else self._open_lock_for_reading()
+            fd, created = self._open_lock_for_writing() if exclusive else (self._open_lock_for_reading(), False)
             if fd is None:
                 yield None
                 return
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+                self._check_lock(fd, created, exclusive)
                 yield fd
             finally:
                 os.close(fd)
@@ -918,17 +930,48 @@ class Log:
             os.close(directory)
 
     def _open_lock_for_writing(self):
-        """The lock, created only for a state with no log and no checkpoint yet. Recreating a lock that was removed
-        while a log exists would let a writer still holding the old one commit beside us: that is damage."""
+        """(lock fd, whether this call created it). The lock is created only for a state with no log and no
+        checkpoint yet. Recreating a lock that was removed while a log exists would let a writer still holding the
+        old one commit beside us: that is damage."""
         try:
-            return self._open(self.LOCK, os.O_RDWR)
+            return self._open(self.LOCK, os.O_RDWR), False
         except FileNotFoundError:
             if not (self._lexists(self.LOG) or self._lexists(self.CHECK)):
-                return self._open(self.LOCK, os.O_CREAT | os.O_RDWR)
+                try:
+                    return self._open(self.LOCK, os.O_CREAT | os.O_EXCL | os.O_RDWR), True
+                except FileExistsError:
+                    pass      # another first writer made it just now: use theirs
         try:   # a first writer may have created the lock, then the log, since we looked: look again, never create
-            return self._open(self.LOCK, os.O_RDWR)
+            return self._open(self.LOCK, os.O_RDWR), False
         except FileNotFoundError:
             raise LogDamage(self.path, None, "the log exists but its lock file is missing") from None
+
+    def _check_lock(self, fd, created, exclusive):
+        """After locking: the lock path must still name the file we hold. A writer must hold the lock its log was
+        last written under (log.check records it), and a lock this writer created may stand beside an existing log
+        only if the checkpoint says that log was written under this same lock; such a lock is removed again, so the
+        next writer also finds the store damaged instead of trusting it."""
+        held = os.fstat(fd)
+        try:
+            named = os.stat(self.LOCK, dir_fd=self._dir, follow_symlinks=False)
+        except FileNotFoundError:
+            named = None
+        if named is None or (named.st_dev, named.st_ino) != (held.st_dev, held.st_ino):
+            raise LogDamage(self.path, None, "the lock file was removed or replaced while in use")
+        self._local.lock = held.st_ino
+        if not exclusive:
+            return
+        existing = self._lexists(self.LOG) or self._lexists(self.CHECK)
+        check = self._checkpoint(self._stat()) if existing else None
+        if created and existing and (check is None or check.get("lock") != held.st_ino):
+            try:
+                os.unlink(self.LOCK, dir_fd=self._dir)   # it names our inode (checked above): never trust it
+            except OSError:
+                pass
+            raise LogDamage(self.path, None, "a log appeared beside a lock this writer had to create: another"
+                                             " writer may still hold a removed lock")
+        if check is not None and check.get("lock") not in (None, held.st_ino):
+            raise LogDamage(self.path, None, "the lock is not the one the log was last written under")
 
     def _open_lock_for_reading(self):
         for attempt in (1, 2):
@@ -1044,7 +1087,7 @@ class Log:
             if info is None:
                 return
             check = {"ino": info.st_ino, "size": info.st_size, "mtime_ns": info.st_mtime_ns,
-                     "last": last, "lineage": self._local.lineage}
+                     "last": last, "lineage": self._local.lineage, "lock": self._local.lock}
             data = json.dumps({**check, "digest": _checkpoint_digest(check)}).encode()
             fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=self._dir)
             created = True
