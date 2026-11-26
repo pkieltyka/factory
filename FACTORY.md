@@ -2,29 +2,44 @@
 
 ## Project
 
-factory: an agent skill (`/factory`) that forms, launches and leads a software team of coding agents in herdr panes, across Claude Code, Codex, pi, omp and OpenCode. It is the base of a composable software-factory meta-harness on top of herdr, and the team iterates on the skill itself. Users are developers running agent teams; the agents that read SKILL.md, roles/, references/ and templates/ are users too, so those files are product, not docs.
+factory: an agent skill (`/factory`) that forms, launches and leads a software team of coding agents across Claude Code, Codex, pi, omp, OpenCode and agy, and the team iterates on the skill itself. Users are developers running agent teams; the agents that read SKILL.md, roles/, references/ and templates/ are users too, so those files are product, not docs.
 
-Stack: Python 3.11+ standard library (`skill/scripts/factory.py`, one file), herdr's CLI and socket, Git worktrees, `skill/harnesses.toml` for harness and model facts. Tests: `python3 tests/test_factory.py` (fake harnesses and herdr, real Git); live flag checks with `FACTORY_LIVE=1 python3 tests/test_factory.py LiveFlags`.
+This is v2, on `master`: it targets herdr-core (`hc`, 0.1.20 or newer) only. `hc` owns the terminals and reports each agent's own state through OSC 7501, and the layout lives in the `herdr-app` doc, so the team shows up in any client (rodeo, the Herdr desktop app). v1, for herdr 0.9.5, lives on the `v1` branch (tag `v1.0.0`) and gets fixes only. v2 is being specced and built under `specs/projects/factory/`; until it replaces it, the v1 tree on `master` is the reference, not the target.
 
-Principles: keep it small and simple. Prefer deleting words and code to adding them; every line an agent reads costs context. A change to behaviour updates the docs that describe it in the same change.
+Stack: Python 3.11+ standard library (`skill/scripts/factory.py`), `hc`'s CLI and JSON-RPC, Git worktrees, `skill/harnesses.toml` for harness and model facts. Tests: `python3 tests/test_factory.py`.
+
+Principles: keep it small and simple. Prefer deleting words and code to adding them; every line an agent reads costs context. A change to behaviour updates the docs that describe it in the same change. Never touch the owner's own `hc` sessions in tests or experiments: use an isolated `hc` session or socket.
 
 ## Tasks
 
-Tasks and bugs are GitHub Issues on `pkieltyka/factory`, managed with the `todos` CLI. Run `todos skill` once to read how it works, and always pass `--json`. Never run `todos rm`; close instead. An issue in the board's Todo column is ready: the operator may assign it without asking the owner; only the owner moves issues to Todo, never the team. Backlog is not ready.
+Tasks and bugs are GitHub Issues on `pkieltyka/factory`, managed with `todos`; the board is `pkieltyka/2` (columns Backlog, Todo, In progress, Done). Run from the checkout. Learn it once with `todos skill`; agent operations always pass `--json`. Only a person moves an issue into Todo: the operator may then assign it without asking the owner; it is not an assignment to a member. Assigned work moves to In progress. @pm owns tracker writes, or the operator when there is no @pm; members report discoveries to that owner, who records them in Backlog. Record owner, criteria, branch or commit, verdict and next step on the issue. Check with `todos doctor --json`; reconcile an uncertain write before retrying. Never run `todos rm`; close instead, after the merge is confirmed.
 
 ## Workflow
 
-1. The operator assigns tasks with acceptance criteria. When the team has a @pm, it records owner, criteria, commit, verdict and next step on the issue, and only @pm updates the tracker; otherwise the operator does.
-2. Consult @architect before changing a shared interface, the brief or formation format, or the shape of SKILL.md and references/. Its plans are advice; the operator decides.
-3. Developers implement, run the tests, then ask @reviewer with the issue, criteria and exact diff. They fix findings until approved; after three rounds on one issue the operator decides how to go on.
-4. Everyone works in the shared checkout. Members do not commit; the operator commits on the ticket branch, opens the pull request and squash-merges it once it is ready.
-5. One issue is in progress at a time, and in the shared checkout only one task writes at a time. Parallel writers need their own worktrees.
+The team works through the board on its own. The owner sets direction; the team carries each ready ticket from plan to merge, then takes the next, and stops only for the owner's decisions.
+
+| Step | Who | Output |
+|---|---|---|
+| 1. Direction | The owner, with the operator | Goals and priorities. Only the owner moves tickets into Todo (ready). |
+| 2. Tickets | @pm | Tickets with acceptance criteria from the direction and from discoveries; a current board. |
+| 3. Plan | An architect | A plan for the ticket against the specs and the code: interfaces, edge cases, tests, files. Another architect or a lead dev may challenge it; the operator settles disagreements. Small fixes skip this step. |
+| 4. Build | Lead devs, plus frontend-dev for UI work when the team has one | Code and tests on the ticket branch, following the plan. |
+| 5. Review | @reviewer | A verdict on the exact diff (see Review). Fixes until approved; after three rounds on one ticket the operator decides. |
+| 6. Pull request and CI | The developer who wrote it | Pushes, opens the pull request, watches CI and fixes failures. |
+| 7. Merge | The operator | Confirms the reviewer approved the head commit and CI is green, squash-merges, and tells @pm, who closes the ticket. |
+| 8. Next | The operator | Takes the next ticket in Todo without asking. |
+
+- The operator assigns each step with acceptance criteria. When the team has a @pm, it records owner, criteria, branch or commit, verdict and next step on the issue, and only @pm updates the tracker; otherwise the operator does.
+- Consult an architect before changing a shared interface, the brief or formation format, or the shape of SKILL.md and references/. Its plans are advice; the operator decides.
+- Developers with a worktree work on its branch (`<user>/<member>`); the others share the main checkout, where only one task writes at a time. Members do not commit in the main checkout.
+- One ticket is in progress at a time; its tasks may run in parallel when each writer has its own worktree.
+- Every member reports to whoever assigned its work when it finishes, is blocked, or needs a decision. A member that is rate-limited or stuck says so; the operator reassigns.
 
 ## Pull requests
 
 Work reaches `master` only through a pull request on GitHub. Ticket branches are `<user>/<ticket>`, for example `peter/16-pr-workflow`. The team merges only by squash merge.
 
-- The operator may push ticket branches and open or update pull requests.
+- The developer who wrote a ticket's change commits it on the ticket branch, pushes it, opens or updates the pull request and watches CI. The operator may also push ticket branches and open or update pull requests.
 - The operator may squash-merge a pull request once it is ready: the reviewer approved its head commit and every check passed. It does not wait for the owner.
 - CI: the `Tests` workflow runs on every push and pull request.
 - The issue links its pull request and closes only after the merge is confirmed.
@@ -32,7 +47,11 @@ Work reaches `master` only through a pull request on GitHub. Ticket branches are
 
 ## Review
 
-Reviews start in the fast lane. Deep lane: @reviewer runs `codegenie` (github.com/0xPolygon/codegenie) on committed changes: at the pull-request readiness step, on the pull request's head against its base: `codegenie review --no-progress --base <base sha> --head <head sha>`. Learn it with `codegenie --help`; check it works with `codegenie --help`. Limits: a run can take up to 30 minutes; never pass `--post-github-comments` or anything else that publishes. Its report is input: the reviewer verifies each finding and names what it reviewed.
+Reviews start in the fast lane. Deep lane: for any change beyond a small fix, @reviewer also runs Codex's built-in review (the engine behind Codex's interactive `/review`) from its shell: `codex review --base master` for a branch (run in its worktree), `codex review --uncommitted` for uncommitted work in the main checkout, or `codex review --commit <sha>` for one commit, with the issue and acceptance criteria as the prompt argument. Learn and check it with `codex review --help`. Its report is input, not the verdict: verify each finding, cover anything it skipped, and name the lane and what it reviewed. It publishes nothing.
+
+## Specs
+
+v2 is specced with the `spec` skill: `specs/projects/factory/` holds the project overview, functional spec, architecture and implementation plan, with research under `research/`. Artifacts carry `status: draft` or `complete` in their front matter; only the owner marks one complete. Read the completed ones before working on v2.
 
 ## Notes
 

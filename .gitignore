@@ -4,3 +4,4 @@ __pycache__/
 notes/private/
 .codegenie
 factory.toml
+.specs_skill_state/

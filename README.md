@@ -1,5 +1,19 @@
 # Factory
 
+> **v2 is in progress on `master`: Factory for herdr-core.** The release below, v1 for herdr 0.9.5, lives on the [`v1` branch](https://github.com/pkieltyka/factory/tree/v1) (tag `v1.0.0`). Install v1 from that branch until v2 ships.
+
+## What's new in v2
+
+v2 rebuilds Factory on **herdr-core** (`hc`): a server that owns persistent terminals, with clients on top of it, such as the [Herdr desktop app](https://github.com/herdrdev/herdr-core) (`herdr-app`) and [rodeo](https://github.com/lukeed/rodeo), a keyboard-first terminal UI. Factory talks to `hc` directly, so it doesn't care which client you use, and your team appears in all of them at once.
+
+- **Agents report their own state.** Claude Code, Codex, pi, omp, OpenCode and agy emit **OSC 7501**, and `hc` tracks each one as idle, working, done, blocked or error, with a turn counter. Factory reads that instead of watching screens, so herdr integrations and per-harness plugins are gone.
+- **Simpler, more reliable messaging.** Most of v1's trouble was getting a report to wake the operator and the right member at the right moment. On `hc`, delivery uses `hc send` (which waits for an unsent draft and refuses blocked agents) and `hc wait`, on top of a durable inbox.
+- **Leaner.** The same roles, formation, worktrees and `FACTORY.md` as v1, with less script: the workarounds for herdr 0.9.5 go away.
+
+The design is specced in [specs/projects/factory/](specs/projects/factory/). Everything below describes v1 until v2 replaces it.
+
+---
+
 **Factory is your minimal autonomous software engineering agent team, built for the tools you already use, and packaged as a simple skill.**
 
 It lets you build autonomous software engineering teams from the agents and models you already use: Claude Code, Codex, pi, omp, OpenCode and Antigravity (agy), across model families, on your own plans and subscriptions. Each member runs in its own native harness, in its own herdr pane, and the team talks it through: members message each other, share context and put their heads together on the work.
