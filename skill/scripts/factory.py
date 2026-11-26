@@ -2916,6 +2916,151 @@ def v1_session(m, ref):
     return {"args": RESUME_ARGS[m["harness"]](value), "resume": True, "assigned": None, "notice": None}
 
 
+# ================================================================ starting members (launch_layout.md §4)
+
+def team_key(root):
+    """The team's name in labels and the cache: v1's cache key. #168 owns it; this copy goes at the rebase."""
+    root = pathlib.Path(root)
+    return f"{root.name[:24]}-{hashlib.sha1(str(root).encode()).hexdigest()[:8]}"
+
+
+def private_dir(parent_fd, name, shown):
+    """name below parent_fd, created 0700 when missing, never through a symbolic link: its descriptor."""
+    try:
+        os.mkdir(name, 0o700, dir_fd=parent_fd)
+    except FileExistsError:
+        pass
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+    except OSError as error:
+        raise Problem(f"expected a private directory at {shown}, found a symbolic link or another file ({error})",
+                      f"Remove {shown} and run the command again.") from error
+    if stat.S_IMODE(os.fstat(fd).st_mode) != 0o700:
+        os.fchmod(fd, 0o700)
+    return fd
+
+
+def write_private(dir_fd, name, text):
+    fd = private_open(name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, dir_fd=dir_fd)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+
+
+def member_settings(level, message_dir):
+    """Claude Code's launch settings for a v2 member (§7): say and inbox run outside a sandbox the owner turned
+    on, and at full the hc socket is reachable inside it. The last key skips the first bypassPermissions warning.
+    It replaces v1's claude_settings when v1's launch goes."""
+    script = ["python3", str(SKILL / "scripts/factory.py")]
+    commands = [shlex.join([*script, "say"]) + " *", shlex.join([*script, "inbox"]) + " *"]
+    sandbox = {"excludedCommands": commands, "filesystem": {"allowWrite": [str(message_dir)]}}
+    if level == "full":
+        sock = os.environ.get("HC_TERMINAL_SOCKET")
+        sandbox["network"] = ({"allowUnixSockets": [sock]} if sys.platform == "darwin" and sock
+                              else {"allowAllUnixSockets": True})
+    permissions = {"allow": [f"Bash({c})" for c in commands] + [f"Write(/{message_dir}/**)"],
+                   "additionalDirectories": [str(message_dir)]}
+    return json.dumps({"promptSuggestionEnabled": False, "sandbox": sandbox, "skipDangerousModePermissionPrompt": True,
+                       "permissions": permissions}, separators=(",", ":"))
+
+
+def start_member(cfg, state, hc, m, operator, sess):
+    """Start m's harness, by itself, in a new terminal (its worktree exists). -> the terminal record; raises Problem."""
+    name, harness = m["name"], m["harness"]
+    state = pathlib.Path(state)
+    exe = shutil.which(harness)
+    if exe is None:
+        raise Problem(f"{harness} is not on PATH", TABLE[harness]["install"])
+    message_dir = state / "messages" / name
+    try:
+        root = Log(state)._open_state(create=True)
+    except OSError as error:
+        raise Problem(f"cannot open the state directory {state}: {error}", "Fix its permissions, then run up again.")
+    opened = [root]
+    try:
+        messages = private_dir(root, "messages", state / "messages")
+        opened.append(messages)
+        opened.append(private_dir(messages, name, message_dir))
+        if TABLE[harness].get("session") == "dir":
+            sessions = private_dir(root, "sessions", state / "sessions")
+            opened.append(sessions)
+            folder = session_folder(state, m)
+            opened.append(private_dir(sessions, folder.name, folder))
+        prompt_file = state / f"{name}.md"
+        # inbox_dir: guarded Codex's --add-dir <state>
+        m = {**m, "draft_dir": message_dir, "inbox_dir": state, "instructions": prompt_file}
+        try:
+            write_private(root, prompt_file.name, member_prompt(m, operator, cfg))   # rewritten at every launch
+            if harness == "claude":
+                write_private(root, f"{name}.settings.json", member_settings(m["permissions"], message_dir))
+        except OSError as error:
+            raise Problem(f"cannot write {prompt_file}: {error}", "Fix the state directory, then run up again.")
+    finally:
+        for fd in opened:
+            os.close(fd)
+    argv, env = launch_argv(m, prompt_file, sess)
+    labels = {"factory.team": team_key(cfg.root), "factory.kind": "member", "factory.member": name,
+              "factory.dir": str(state), "name": "@" + name}
+    try:
+        return hc.run([exe, *argv], cwd=m["dir"], env={"PATH": os.environ.get("PATH", ""), **env}, labels=labels)
+    except (HcError, HcDown) as error:
+        raise Problem(f"hc could not start @{name}: {error}", "Check that hc runs (hc status), then run up again.")
+
+
+def _last_line(hc, address):
+    try:
+        lines = [line.strip() for line in hc.read(address).splitlines() if line.strip()]
+    except (HcError, HcDown):
+        return ""
+    return lines[-1] if lines else ""
+
+
+def await_ready(hc, started, timeout=LAUNCH_TIMEOUT, clock=time):
+    """started: {member: (its terminal record, its harness's dialogs)}. Polls every member every 0.5 s until each
+    is settled or the deadline passes. -> {member: None when ready, else the reason it is not}."""
+    deadline = clock.monotonic() + timeout
+    outcome, answered, shown, words = {}, {name: set() for name in started}, {}, {}
+    while True:
+        for name, (record, dialogs) in started.items():
+            if name in outcome:
+                continue
+            address = record["address"]
+            try:
+                t = hc.get(address)
+                if t["state"] == "finished":
+                    last = _last_line(hc, address)
+                    outcome[name] = f"exited (code {t.get('exit_code')})" + (f": {last}" if last else "")
+                    continue
+                word = words[name] = (t.get("status") or {}).get("state")
+                if word == "working":
+                    continue
+                screen = "".join(hc.read(address).split())
+                asked = next(((text, keys) for text, keys in dialogs if "".join(text.split()) in screen), None)
+                shown[name] = asked and asked[0]
+                if asked:
+                    text, keys = asked
+                    if not keys:
+                        outcome[name] = ("waits on its trust dialog: accept it in its pane, then run:"
+                                         f" factory.py brief --send {name}")
+                    elif text not in answered[name]:
+                        hc.keys(address, keys)
+                        answered[name].add(text)
+                    continue
+                if word == "idle":
+                    outcome[name] = None
+            except (HcError, HcDown) as error:
+                outcome[name] = f"could not be watched: {error}"
+        if len(outcome) == len(started):
+            return outcome
+        if clock.monotonic() >= deadline:
+            for name in started:
+                if name not in outcome:
+                    text = shown.get(name)
+                    outcome[name] = (f'still asks "{text}" after the answer was sent' if text in answered[name]
+                                     else f"not ready after {timeout:g} s ({words.get(name) or 'no status'})")
+            return outcome
+        clock.sleep(0.5)
+
+
 # ================================================================ briefs
 
 def tag(name):
@@ -2947,7 +3092,7 @@ def member_prompt(m, operator, cfg):
                        "draft": shlex.quote(str(m["draft_dir"])) + "/FILENAME",
                        "say": shlex.join(["python3", str(SCRIPT), "say"]),
                        "brief": str(cfg.brief_file), "where": where, "rules": "\n".join(rules),
-                       "instructions": str(cfg.session_dir / f"{m['name']}.md"),
+                       "instructions": str(m.get("instructions") or cfg.session_dir / f"{m['name']}.md"),
                        "notes": str(SKILL / "references/notes.md")}.items():
         text = text.replace("{" + key + "}", value)
     return text.rstrip() + "\n"

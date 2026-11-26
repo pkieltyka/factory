@@ -5521,6 +5521,182 @@ class SessionTests(unittest.TestCase):
                 self.assertEqual(at, 0)                                  # resume <id> before the options
 
 
+class ScriptedHc:
+    """A stand-in for Hc in readiness tests: each terminal follows a script of (state, status word, screen) steps,
+    one per get(); keys are recorded and may move the script on."""
+
+    def __init__(self, scripts, on_keys=None):
+        self.scripts = {a: list(s) for a, s in scripts.items()}
+        self.at = {a: 0 for a in scripts}
+        self.on_keys = on_keys or {}
+        self.keys_sent = []
+
+    def step(self, address):
+        steps = self.scripts[address]
+        return steps[min(self.at[address], len(steps) - 1)]
+
+    def get(self, address):
+        state, word, _ = self.step(address)
+        self.at[address] += 1
+        if state == "error":
+            raise factory.HcError("not_found", f"no terminal {address}")
+        return {"address": address, "state": state, "exit_code": 2 if state == "finished" else None,
+                "status": {"state": word} if word else None}
+
+    def read(self, address):
+        return self.step(address)[2]
+
+    def keys(self, address, keys):
+        self.keys_sent.append((address, keys))
+        if address in self.on_keys:
+            self.scripts[address] = self.on_keys.pop(address)
+            self.at[address] = 0
+
+
+class FakeClock:
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+class ReadyTests(unittest.TestCase):
+    """await_ready (launch_layout.md §4), on scripted terminals and fake time."""
+
+    CLAUDE = factory.TABLE["claude"]["dialogs"]
+    TRUST = "Do you trust the contents of this project?"
+
+    def ready(self, scripts, dialogs=(), timeout=5, on_keys=None):
+        hc = ScriptedHc(scripts, on_keys)
+        started = {a: ({"address": a}, dialogs.get(a, []) if isinstance(dialogs, dict) else list(dialogs))
+                   for a in scripts}
+        return factory.await_ready(hc, started, timeout=timeout, clock=FakeClock()), hc
+
+    def test_idle_without_a_dialog_is_ready_and_nothing_else_is(self):
+        out, _ = self.ready({"a": [("live", "working", ""), ("live", "idle", "")],
+                             "b": [("live", "done", "")], "c": [("live", None, "")],
+                             "d": [("live", "working", "")], "e": [("live", "blocked", "")]})
+        self.assertEqual(out, {"a": None, "b": "not ready after 5 s (done)", "c": "not ready after 5 s (no status)",
+                               "d": "not ready after 5 s (working)", "e": "not ready after 5 s (blocked)"})
+
+    def test_a_dialog_is_answered_once_whatever_the_status(self):
+        screen = "Quick safety check\n  Yes, I trust\n  this folder\n  No, exit"      # wrapped by a narrow pane
+        for word in ("blocked", None, "idle"):
+            with self.subTest(status=word):
+                out, hc = self.ready({"a": [("live", word, screen)]}, self.CLAUDE,
+                                     on_keys={"a": [("live", word, screen), ("live", "idle", "")]})
+                self.assertEqual(out, {"a": None})
+                self.assertEqual(hc.keys_sent, [("a", ["down", "enter"])])
+
+    def test_a_dialog_still_shown_after_the_answer_is_named(self):
+        out, hc = self.ready({"a": [("live", "blocked", "Yes, I trust this folder")]}, self.CLAUDE)
+        self.assertEqual(out, {"a": 'still asks "Yes, I trust this folder" after the answer was sent'})
+        self.assertEqual(len(hc.keys_sent), 1)
+
+    def test_a_dialog_without_keys_is_left_to_the_owner(self):
+        out, hc = self.ready({"a": [("live", "blocked", self.TRUST)]}, [[self.TRUST, []]])
+        self.assertEqual(out, {"a": "waits on its trust dialog: accept it in its pane, then run:"
+                                    " factory.py brief --send a"})
+        self.assertEqual(hc.keys_sent, [])
+
+    def test_an_exit_reports_its_code_and_last_line_and_others_go_on(self):
+        out, _ = self.ready({"a": [("finished", None, "starting\nError: bad model\n\n")],
+                             "b": [("live", "working", "")] * 3 + [("live", "idle", "")]})
+        self.assertEqual(out, {"a": "exited (code 2): Error: bad model", "b": None})
+
+    def test_a_terminal_that_cannot_be_read_is_named(self):
+        out, _ = self.ready({"a": [("error", None, "")], "b": [("live", "idle", "")]})
+        self.assertEqual(out["b"], None)
+        self.assertRegex(out["a"], "^could not be watched: .*no terminal a")
+
+    def test_members_are_polled_together_against_one_deadline(self):
+        clock = FakeClock()
+        hc = ScriptedHc({"a": [("live", "working", "")] * 6 + [("live", "idle", "")],
+                         "b": [("live", "working", "")] * 8 + [("live", "idle", "")]})
+        out = factory.await_ready(hc, {"a": ({"address": "a"}, []), "b": ({"address": "b"}, [])}, timeout=60,
+                                  clock=clock)
+        self.assertEqual(out, {"a": None, "b": None})
+        self.assertEqual(clock.now, 4.0)
+
+
+class StartMemberTests(unittest.TestCase):
+    """start_member (launch_layout.md §4) against the fake hc."""
+
+    def setUp(self):
+        self.env = self.enterContext(Env())
+        self.cfg = factory.Config(self.env.repo)
+        self.fake = self.enterContext(FakeHc())
+        self.hc = factory.Hc()
+        self.state = self.env.root / "cache" / "factory-skill" / "team" / "core"
+        self.enterContext(patch.object(factory.shutil, "which", lambda name: f"/opt/bin/{name}"))
+        self.path = f"/opt/bin:{os.environ.get('PATH', '')}"      # the fake hc itself still has to start
+        self.enterContext(patch.dict(os.environ, {"PATH": self.path}))
+
+    def start(self, name, sess=None):
+        m = factory.plan(self.cfg, name)
+        return m, factory.start_member(self.cfg, self.state, self.hc, m, "operator", sess)
+
+    def test_the_harness_runs_by_itself_with_its_argv_cwd_env_and_labels(self):
+        name = next(n for n, m in self.cfg.members.items() if m["harness"] == "claude")
+        m, record = self.start(name, {"args": ["--resume", "abc"], "resume": True})
+        run = self.fake.calls("terminal.run")[-1]["params"]
+        prompt = self.state / f"{name}.md"
+        argv, env = factory.launch_argv({**m, "draft_dir": self.state / "messages" / name, "inbox_dir": self.state},
+                                        prompt, {"args": ["--resume", "abc"]})
+        self.assertEqual(run["argv"], ["/opt/bin/claude", *argv])
+        self.assertEqual((run["cwd"], run["env"]), (m["dir"], {"PATH": self.path, **env}))
+        self.assertEqual(run["labels"], {"factory.team": factory.team_key(self.cfg.root), "factory.kind": "member",
+                                         "factory.member": name, "factory.dir": str(self.state), "name": "@" + name})
+        self.assertTrue(run["no_parent"])
+        self.assertFalse(any(k.startswith("herdr.") for k in record["labels"]))
+
+    def test_files_are_private_and_rewritten_at_each_launch(self):
+        name = next(n for n, m in self.cfg.members.items() if m["harness"] == "claude")
+        self.start(name)
+        prompt, settings = self.state / f"{name}.md", self.state / f"{name}.settings.json"
+        self.assertIn(str(self.state / "messages" / name), prompt.read_text())
+        self.assertIn(str(prompt), prompt.read_text())
+        prompt.write_text("stale")
+        self.start(name)
+        self.assertNotEqual(prompt.read_text(), "stale")
+        for path, mode in ((prompt, 0o600), (settings, 0o600), (self.state / "messages", 0o700),
+                           (self.state / "messages" / name, 0o700)):
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), mode, path)
+        values = json.loads(settings.read_text())
+        say = shlex.join(["python3", str(factory.SKILL / "scripts/factory.py"), "say"]) + " *"
+        self.assertIn(say, values["sandbox"]["excludedCommands"])
+        self.assertIn(f"Bash({say})", values["permissions"]["allow"])
+        self.assertEqual(values["permissions"]["additionalDirectories"], [str(self.state / "messages" / name)])
+
+    def test_a_symbolic_link_for_a_message_folder_is_refused_before_anything_starts(self):
+        name = next(iter(self.cfg.members))
+        (self.state / "messages").mkdir(parents=True)
+        (self.state / "messages" / name).symlink_to(self.env.root)
+        with self.assertRaisesRegex(factory.Problem, "expected a private directory"):
+            self.start(name)
+        self.assertEqual(self.fake.calls("terminal.run"), [])
+
+    def test_session_folders_for_dir_harnesses(self):
+        name = next(n for n, m in self.cfg.members.items() if m["harness"] == "pi")
+        with patch.dict(factory.TABLE["pi"], session="dir"):
+            self.start(name)
+        folder = self.state / "sessions" / f"{name}-pi"
+        self.assertEqual(stat.S_IMODE(folder.stat().st_mode), 0o700)
+
+    def test_a_missing_binary_or_a_refused_run_is_a_problem(self):
+        name = next(iter(self.cfg.members))
+        with patch.object(factory.shutil, "which", lambda _: None), \
+                self.assertRaisesRegex(factory.Problem, "is not on PATH"):
+            self.start(name)
+        self.fake.on_run(name, error="spawn_failed")
+        with self.assertRaisesRegex(factory.Problem, "hc could not start"):
+            self.start(name)
+
+
 class LiveToolTests(unittest.TestCase):
     @staticmethod
     def scrubber(host="local-host", user="local-user"):
