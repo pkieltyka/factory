@@ -3561,14 +3561,51 @@ def cmd_harnesses(args):
             print(f"{'':10}agy offers: {', '.join(sorted(checker.probe('agy-models', agy_models)))}")
 
 
+def hc_check(environ=os.environ):
+    """check's offline lines about hc (hc_client.md): its version, and draft_wait from its config. -> (lines, failed).
+    A missing hc is reported and is not a failure; an hc too old or unreadable, or an unreadable config, is."""
+    try:
+        out = subprocess.run([HC, "--version"], capture_output=True, text=True, timeout=30, check=False)
+    except FileNotFoundError:
+        return [f"hc: not found ({HC}); install hc {'.'.join(map(str, HC_MIN))} or newer before up"], False
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return [f"hc: {HC} --version failed: {error}"], True
+    first = (out.stdout.strip().splitlines() or [""])[0] if out.returncode == 0 else ""
+    found = re.fullmatch(r"hc ([0-9]+(?:\.[0-9]+)+)(?:[-+ ].*)?", first)
+    if not found:
+        return [f"hc: unrecognised version from {HC} --version: {(first or out.stderr.strip())[:200]!r}"], True
+    version = tuple(map(int, found[1].split(".")))
+    if version < HC_MIN:
+        return [f"hc {found[1]} is too old: Factory needs {'.'.join(map(str, HC_MIN))} or newer"], True
+    config = pathlib.Path(environ.get("XDG_CONFIG_HOME") or pathlib.Path.home() / ".config") / "herdr-core/config.toml"
+    try:
+        wait = tomllib.loads(config.read_text()).get("draft_wait", 60)
+    except FileNotFoundError:
+        wait = 60
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        return [f"hc {found[1]}; cannot read {config}: {error}"], True
+    if type(wait) is not int:
+        return [f"hc {found[1]}; draft_wait in {config} must be a whole number of seconds, not {wait!r}"], True
+    wait = max(wait, 0)
+    lines = [f"hc {found[1]}, draft_wait {wait} s"]
+    if wait < 600:
+        lines.append(f"warning: raise draft_wait to 600 or more in {config} so a report never lands in text you"
+                     " are typing")
+    return lines, False
+
+
 def cmd_check(args):
     cfg = cfg_of(args)
     plans = selected(cfg, args.names)
     ready, problems = check_all(cfg, plans)
     ok = {p["name"]: p for p in ready}
     print_plan([ok.get(p["name"], p) for p in plans], ("Check", lambda p: "ok" if p["name"] in ok else "FAILED"))
+    lines, hc_failed = hc_check()
+    for line in lines:
+        print(line)
     if problems:
         report_problems(problems)
+    if problems or hc_failed:
         sys.exit(2)
 
 

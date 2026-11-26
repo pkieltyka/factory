@@ -5697,6 +5697,76 @@ class StartMemberTests(unittest.TestCase):
             self.start(name)
 
 
+class HcCheckTests(unittest.TestCase):
+    """check's offline hc line (hc_client.md, phase_5a.md §4.1)."""
+
+    def setUp(self):
+        self.dir = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.environ = {"XDG_CONFIG_HOME": str(self.dir / "config")}
+
+    def hc(self, output, code=0):
+        script = self.dir / "hc"
+        script.write_text(f"#!/bin/sh\nprintf '%s\\n' {shlex.quote(output)}\nexit {code}\n")
+        script.chmod(0o755)
+        self.enterContext(patch.object(factory, "HC", str(script)))
+
+    def config(self, text):
+        path = self.dir / "config" / "herdr-core" / "config.toml"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        return path
+
+    def test_draft_wait_values(self):
+        self.hc("hc 0.1.20")
+        path = self.dir / "config" / "herdr-core" / "config.toml"
+        warn = f"warning: raise draft_wait to 600 or more in {path} so a report never lands in text you are typing"
+        self.assertEqual(factory.hc_check(self.environ), (["hc 0.1.20, draft_wait 60 s", warn], False))
+        for text, shown, warned in (("other = 1\n", 60, True), ("draft_wait = 599\n", 599, True),
+                                    ("draft_wait = 600\n", 600, False), ("draft_wait = 900\n", 900, False),
+                                    ("draft_wait = -5\n", 0, True)):
+            self.config(text)
+            lines, failed = factory.hc_check(self.environ)
+            self.assertEqual((lines[0], len(lines) == 2, failed), (f"hc 0.1.20, draft_wait {shown} s", warned, False))
+
+    def test_a_missing_hc_is_reported_and_not_a_failure(self):
+        self.enterContext(patch.object(factory, "HC", str(self.dir / "no-such-hc")))
+        lines, failed = factory.hc_check(self.environ)
+        self.assertFalse(failed)
+        self.assertIn("hc: not found", lines[0])
+
+    def test_an_old_or_unrecognised_hc_or_a_bad_config_fails(self):
+        for output, code, expect in (("hc 0.1.19", 0, "too old"), ("herdr 0.9.5", 0, "unrecognised version"),
+                                     ("hc 0.1.20", 1, "unrecognised version")):
+            self.hc(output, code)
+            lines, failed = factory.hc_check(self.environ)
+            self.assertTrue(failed, output)
+            self.assertIn(expect, lines[0])
+        self.hc("hc 0.2.0-dev+abc")
+        self.assertFalse(factory.hc_check(self.environ)[1])
+        for text, expect in (("draft_wait = [", "cannot read"), ('draft_wait = "600"', "whole number"),
+                             ("draft_wait = true", "whole number")):
+            self.config(text)
+            lines, failed = factory.hc_check(self.environ)
+            self.assertTrue(failed, text)
+            self.assertIn(expect, lines[0])
+
+    def test_check_prints_the_line_and_its_exit_code(self):
+        with Env() as e:
+            fake = e.root / "bin" / "hc"
+            fake.write_text("#!/bin/sh\necho 'hc 0.1.20'\n")
+            fake.chmod(0o755)
+            p = e.run("check", HC_BIN=str(fake), XDG_CONFIG_HOME=str(e.root / "config"))
+            self.assertIn("hc 0.1.20, draft_wait 60 s", p.stdout)
+            self.assertEqual(p.returncode, 0)
+            p = e.run("check", check=False, HC_BIN=str(e.root / "missing"), XDG_CONFIG_HOME=str(e.root / "config"))
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertIn("hc: not found", p.stdout)
+            fake.write_text("#!/bin/sh\necho 'hc 0.1.2'\n")
+            p = e.run("check", check=False, HC_BIN=str(fake), XDG_CONFIG_HOME=str(e.root / "config"))
+            self.assertEqual(p.returncode, 2)
+            self.assertIn("too old", p.stdout)
+
+
 class LiveToolTests(unittest.TestCase):
     @staticmethod
     def scrubber(host="local-host", user="local-user"):
