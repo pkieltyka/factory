@@ -556,8 +556,8 @@ class Rodeo:
 def hc_env_names(core):
     """Names of the HC_* variables a terminal of this core gets."""
     out = core.dir / "env.txt"
-    names_only = f"env | sed -n 's/^\\(HC_[A-Za-z0-9_]*\\)=.*/\\1/p' > {out}"   # names only, never values
-    t = core.rpc("terminal.run", {"argv": ["sh", "-c", names_only], "cwd": str(core.dir)})
+    names_only = "env | sed -n 's/^\\(HC_[A-Za-z0-9_]*\\)=.*/\\1/p' > \"$1\""   # names only, never values
+    t = core.rpc("terminal.run", {"argv": ["sh", "-c", names_only, "sh", str(out)], "cwd": str(core.dir)})
     deadline = time.monotonic() + 10
     while core.rpc("terminal.get", {"terminal": t["address"]})["state"] == "live" and time.monotonic() < deadline:
         time.sleep(0.1)
