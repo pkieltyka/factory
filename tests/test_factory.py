@@ -3639,6 +3639,17 @@ class LogTests(unittest.TestCase):
         self.assertEqual((msgs[1]["kind"], msgs[1]["meta"]), ("note", {"what": "quiet"}))
         self.assertEqual(msgs[2]["file"], "/abs/messages/lead-dev/a-1.md")
 
+    def test_unserializable_or_nan_meta_touches_nothing(self):
+        for meta in ({"x": float("nan")}, {"x": object()}):
+            with self.subTest(meta=meta), self.assertRaises(ValueError):
+                self.log.add("factory", ["operator"], "note", kind="note", meta=meta)
+        self.assertFalse(self.state.exists())
+
+    def test_offset_must_be_a_non_negative_integer(self):
+        for offset in (-1, 1.5, True, "0"):
+            with self.subTest(offset=offset), self.assertRaises(ValueError):
+                self.log.read(offset)
+
     def test_invalid_arguments_raise_before_writing(self):
         for args, kwargs in (
             (("", ["operator"], "x"), {}),
@@ -3708,11 +3719,11 @@ class LogTests(unittest.TestCase):
         real_open = factory.private_open
         misses = []
 
-        def first_miss(path, flags, fix_mode=True):
-            if pathlib.Path(path) == self.log.lock_path and not misses:
+        def first_miss(path, flags, fix_mode=True, dir_fd=None):
+            if path == "lock" and not misses:
                 misses.append(path)  # a reader that looked before the writer made the lock
                 raise FileNotFoundError(path)
-            return real_open(path, flags, fix_mode)
+            return real_open(path, flags, fix_mode, dir_fd)
         with patch.object(factory, "private_open", first_miss):
             self.assertEqual(len(self.log.read()[0]), 2)
         self.assertEqual(len(misses), 1)
@@ -3726,6 +3737,52 @@ class LogTests(unittest.TestCase):
         for attempt in (self.log.read, lambda: self.log.add("lead-dev", ["operator"], "y")):
             with self.subTest(attempt=attempt), self.assertRaisesRegex(factory.LogDamage, "log.check remains"):
                 attempt()
+
+    def test_readers_refuse_a_symlinked_state_directory(self):
+        self.log.add("lead-dev", ["operator"], "x")
+        alias = self.base / "alias"
+        alias.symlink_to(self.state)
+        with self.assertRaisesRegex(OSError, "symbolic link"):
+            factory.Log(alias).read()
+
+    def test_started_must_be_a_bool_or_null(self):
+        for started in (1, 0, 1.0):
+            with self.subTest(started=started):
+                self.setUp()
+                self.write_raw({"t": "out", "id": 1, "to": "operator", "o": "sending", "at": "2026-11-26T17:00:01Z"},
+                               {"t": "out", "id": 1, "to": "operator", "o": "delivered", "at": "2026-11-26T17:00:02Z",
+                                "started": started})
+                self.assert_damage(4, "started")
+
+    def test_unsafe_checkpoint_is_an_error_not_a_cache_miss(self):
+        self.log.add("lead-dev", ["operator"], "x")
+        outside = self.base / "outside.check"
+        outside.write_text("{}")
+        self.log.check_path.unlink()
+        self.log.check_path.symlink_to(outside)
+        with self.assertRaises(OSError):
+            self.log.add("lead-dev", ["operator"], "y")
+        self.assertTrue(self.log.check_path.is_symlink())
+        self.assertEqual(outside.read_text(), "{}")
+
+    def test_orphan_checkpoint_is_damage_for_readers(self):
+        self.log.add("lead-dev", ["operator"], "x")
+        self.log.path.unlink()
+        self.log.lock_path.unlink()
+        with self.assertRaisesRegex(factory.LogDamage, "log.check remains"):
+            self.log.read()
+
+    def test_a_damaged_batch_leaves_the_box_unusable_until_rebuilt(self):
+        self.log.add("lead-dev", ["operator"], "x")
+        box = self.box()
+        sending = {"t": "out", "id": 1, "to": "operator", "o": "sending", "at": "2026-11-26T17:00:01Z"}
+        with self.assertRaises(factory.LogDamage):
+            box.apply([sending, sending])
+        for use in (lambda: box.outcome(1, "operator"), box.pending, lambda: box.apply([])):
+            with self.subTest(use=use), self.assertRaises(factory.LogDamage):
+                use()
+        self.assertTrue(self.log.out(box, 1, "operator", "sending", term="t1"))   # out rebuilds it from the file
+        self.assertEqual(box.outcome(1, "operator")["o"], "sending")
 
     # validation
 
@@ -3856,6 +3913,327 @@ class LogTests(unittest.TestCase):
         self.assertEqual(box.outcome(1, "operator"), {"o": "queued", "why": "waiting"})
         self.assertEqual([(m["id"], r) for m, r in box.pending()], [(1, "operator"), (1, "reviewer")])
         self.assertEqual([(m["id"], r) for m, r in box.pending("reviewer")], [(1, "reviewer")])
+
+
+LOG_CHILD = r'''
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("factory", sys.argv[1])
+factory = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(factory)
+log, mode = factory.Log(sys.argv[2]), sys.argv[3]
+if mode == "adds":
+    for n in range(int(sys.argv[4])):
+        log.add("w%s" % os.getpid(), ["operator"], "message %d" % n)
+    sys.exit(0)
+pause_after, real, calls = int(sys.argv[4]), factory.Log._append, [0]
+def paused(self, line):
+    result = real(self, line)
+    calls[0] += 1
+    if calls[0] == pause_after:
+        os.write(1, b"paused\n")
+        sys.stdin.read()          # the parent kills us here, holding the team lock
+    return result
+factory.Log._append = paused
+log.add("lead-dev", ["operator"], "killed writer")
+'''
+
+
+class LogFaultTests(unittest.TestCase):
+    """Append, commit and checkpoint under injected faults (phase_3.md §§3-4, §8 step 2)."""
+
+    def setUp(self):
+        self.base = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.state = self.base / "team" / "core"
+        self.log = factory.Log(self.state)
+        self.log.add("lead-dev", ["operator"], "seed")   # a valid checkpoint, so later adds read no log bytes
+        self.fsyncs = 0
+
+    def box(self):
+        records, end = self.log.read()
+        box = factory.Box(self.log.path)
+        box.apply(records)
+        box.offset = end
+        return box
+
+    def faults(self, writes=(), fsync_fail=(), truncate_fails=False, readback_fails=False):
+        """Patch the module's os calls for the log only. writes: per os.write call, an int (bytes to write),
+        "zero" or "fail"; later calls write fully. fsync_fail: which fsync calls (1-based) raise."""
+        real_write, real_fsync, real_truncate, real_open = os.write, os.fsync, os.ftruncate, factory.private_open
+        plan = list(writes)
+        stack = contextlib.ExitStack()
+
+        self.failed = False
+
+        def write(fd, data):
+            step = plan.pop(0) if plan else None
+            if step == "fail":
+                self.failed = True
+                raise OSError(28, "No space left on device")
+            if step == "zero":
+                return 0
+            return real_write(fd, bytes(data)[:step] if isinstance(step, int) else data)
+
+        def fsync(fd):
+            self.fsyncs += 1
+            if self.fsyncs in fsync_fail:
+                self.failed = True
+                raise OSError(5, "Input/output error")
+            return real_fsync(fd)
+
+        def ftruncate(fd, size):
+            if truncate_fails:
+                raise OSError(5, "Input/output error")
+            return real_truncate(fd, size)
+
+        def private_open(path, flags, fix_mode=True, dir_fd=None):
+            if readback_fails and self.failed and path == "log.jsonl" and flags == os.O_RDONLY:
+                raise OSError(5, "Input/output error")
+            return real_open(path, flags, fix_mode, dir_fd)
+        stack.enter_context(patch.object(factory.os, "write", write))
+        stack.enter_context(patch.object(factory.os, "fsync", fsync))
+        stack.enter_context(patch.object(factory.os, "ftruncate", ftruncate))
+        stack.enter_context(patch.object(factory, "private_open", private_open))
+        stack.enter_context(patch.object(factory.Log, "_sync_directory", lambda log: None))
+        return stack
+
+    def committed(self):
+        box = self.box()
+        return sorted(box.msgs), box.uncommitted
+
+    # the commit matrix
+
+    def test_failed_open_is_not_stored_clean(self):
+        before = self.log.path.read_bytes()
+        real_open = factory.private_open
+
+        def refuse(path, flags, fix_mode=True, dir_fd=None):
+            if path == "log.jsonl" and flags & os.O_WRONLY:
+                raise PermissionError(13, "Permission denied")
+            return real_open(path, flags, fix_mode, dir_fd)
+        with patch.object(factory, "private_open", refuse), self.assertRaises(factory.NotStored) as raised:
+            self.log.add("pm", ["operator"], "x")
+        self.assertFalse(raised.exception.partial)
+        self.assertEqual(self.log.path.read_bytes(), before)
+
+    def test_short_writes_complete_the_line(self):
+        with self.faults(writes=(3, 5, 1, 7)):
+            self.log.add("pm", ["operator"], "written in pieces")
+        self.assertEqual(self.committed(), ([1, 2], 0))
+
+    def test_no_progress_or_a_failed_write_rolls_back(self):
+        for writes in ((4, "zero"), (4, 2, "fail"), ("fail",)):
+            with self.subTest(writes=writes):
+                before = self.log.path.read_bytes()
+                with self.faults(writes=writes), self.assertRaises(factory.NotStored) as raised:
+                    self.log.add("pm", ["operator"], "x")
+                self.assertFalse(raised.exception.partial)
+                self.assertEqual(self.log.path.read_bytes(), before)
+        self.assertEqual(self.log.add("pm", ["operator"], "next")[0], 2)
+
+    def test_failed_sync_of_a_complete_line_is_rolled_back(self):
+        before = self.log.path.read_bytes()
+        with self.faults(fsync_fail=(1,)), self.assertRaises(factory.NotStored) as raised:
+            self.log.add("pm", ["operator"], "x")
+        self.assertFalse(raised.exception.partial)
+        self.assertEqual(self.log.path.read_bytes(), before)
+
+    def test_truncate_succeeds_but_its_sync_fails(self):
+        for failing in ((1, 2), (2, 3)):   # the msg append, then the ok append
+            with self.subTest(failing=failing):
+                self.setUp()
+                before = self.log.path.read_bytes()
+                with self.faults(fsync_fail=failing), self.assertRaises(factory.NotStored) as raised:
+                    self.log.add("pm", ["operator"], "x")
+                self.assertFalse(raised.exception.partial)
+                if failing == (1, 2):
+                    self.assertEqual(self.log.path.read_bytes(), before)
+                else:
+                    self.assertEqual(self.committed(), ([1], 1))   # the msg stays, inert
+
+    def test_msg_sync_and_rollback_both_fail(self):
+        with self.faults(fsync_fail=(1,), truncate_fails=True), self.assertRaises(factory.NotStored) as raised:
+            self.log.add("pm", ["operator"], "x")
+        self.assertFalse(raised.exception.partial)
+        self.assertIn("uncommitted", raised.exception.detail)
+        self.assertEqual(self.log.path.read_bytes().splitlines()[-1][:22], b'{"t":"msg","id":2,"at"')
+        box = self.box()
+        self.assertEqual((sorted(box.msgs), box.uncommitted, [m["id"] for m, _ in box.pending()]), ([1], 1, [1]))
+        self.assertEqual(self.log.add("pm", ["operator"], "next")[0], 3)
+
+    def test_ok_sync_and_rollback_both_fail_is_stored_with_a_warning(self):
+        with self.faults(fsync_fail=(2,), truncate_fails=True):
+            ident, end, warning = self.log.add("pm", ["operator"], "x")
+        self.assertEqual((ident, warning), (2, factory.STORED_WARNING))
+        self.assertEqual(end, self.log.path.stat().st_size)
+        self.assertEqual([(m["id"], r) for m, r in self.box().pending()], [(1, "operator"), (2, "operator")])
+
+    def test_partial_write_and_failed_rollback_is_damage(self):
+        with self.faults(writes=(10, "fail"), truncate_fails=True), self.assertRaises(factory.NotStored) as raised:
+            self.log.add("pm", ["operator"], "x")
+        self.assertTrue(raised.exception.partial)
+        with self.assertRaisesRegex(factory.LogDamage, "incomplete line"):
+            self.log.read()
+        with self.assertRaises(factory.LogDamage):
+            self.log.add("pm", ["operator"], "refused on a damaged log")
+
+    def test_partial_ok_and_failed_rollback_is_damage(self):
+        with self.faults(writes=("full", 4, "fail"), truncate_fails=True), \
+                self.assertRaises(factory.NotStored) as raised:
+            self.log.add("pm", ["operator"], "x")
+        self.assertTrue(raised.exception.partial)
+        with self.assertRaisesRegex(factory.LogDamage, "incomplete line"):
+            self.log.read()
+
+    def test_unreadable_msg_readback_is_not_stored_partial(self):
+        with self.faults(fsync_fail=(1,), truncate_fails=True, readback_fails=True), \
+                self.assertRaises(factory.NotStored) as raised:
+            self.log.add("pm", ["operator"], "x")
+        self.assertTrue(raised.exception.partial)
+        self.assertEqual(self.committed(), ([1], 1))
+
+    def test_unreadable_ok_readback_reports_unknown_and_recovers_once(self):
+        check = self.log.check_path.read_bytes()
+        with self.faults(fsync_fail=(2,), truncate_fails=True, readback_fails=True), \
+                self.assertRaises(OSError) as raised:
+            self.log.add("pm", ["operator"], "x")
+        self.assertNotIsInstance(raised.exception, factory.NotStored)
+        message = str(raised.exception)
+        self.assertIn("message 2", message)
+        self.assertIn(str(self.log.path), message)
+        self.assertIn(factory.UNKNOWN, message)
+        self.assertEqual(self.log.check_path.read_bytes(), check)
+        records, _ = self.log.read()
+        self.assertEqual([(r["t"], r["id"]) for r in records], [("msg", 1), ("ok", 1), ("msg", 2), ("ok", 2)])
+        self.assertEqual(self.committed(), ([1, 2], 0))
+        self.assertEqual(self.log.add("pm", ["operator"], "next")[0], 3)
+
+    def test_failed_checkpoint_publication_keeps_the_commit(self):
+        denied = OSError(13, "Permission denied")
+        with patch.object(factory.os, "replace", side_effect=denied), \
+                patch.object(factory.os, "unlink", side_effect=denied):   # its cleanup fails too
+            ident, _, warning = self.log.add("pm", ["operator"], "x")
+        self.assertEqual((ident, warning), (2, None))
+        self.assertEqual(self.committed(), ([1, 2], 0))
+        for leftover in self.state.glob("log.check.*.tmp"):
+            leftover.unlink()
+        with patch.object(factory.Log, "_snapshot", autospec=True, side_effect=factory.Log._snapshot) as snapshot:
+            self.assertEqual(factory.Log(self.state).add("pm", ["operator"], "y")[0], 3)
+        self.assertTrue(any(c.args[1:] == (0,) for c in snapshot.call_args_list))
+
+    # outcomes under faults
+
+    def test_sending_needs_a_synced_record_but_receipts_do_not(self):
+        box = self.box()
+        self.log.add("pm", ["operator"], "second")
+        with self.faults(fsync_fail=(1,), truncate_fails=True), self.assertRaises(factory.NotStored) as raised:
+            self.log.out(box, 1, "operator", "sending", term="t1")
+        self.assertIn("not durable", raised.exception.detail)
+        offset = box.offset
+        self.assertEqual(self.box().outcome(1, "operator")["o"], "sending")   # the record is there
+        self.assertFalse(self.log.out(box, 1, "operator", "sending", term="t1"))   # the next refresh sees it
+        self.assertGreater(box.offset, offset)
+        self.assertTrue(self.log.out(box, 2, "operator", "sending", term="t1"))
+        with self.faults(fsync_fail=(1,), truncate_fails=True):
+            self.assertTrue(self.log.out(box, 2, "operator", "delivered", term="t1", started=True, turn=3))
+        self.assertEqual(self.box().outcome(2, "operator")["o"], "delivered")
+
+    def test_unreadable_outcome_readback_raises(self):
+        box = self.box()
+        with self.faults(fsync_fail=(1,), truncate_fails=True, readback_fails=True), \
+                self.assertRaisesRegex(OSError, "outcome sending for @operator of message 1.*do not resend"):
+            self.log.out(box, 1, "operator", "sending", term="t1")
+
+    # the checkpoint
+
+    def test_matching_checkpoint_reads_no_log_bytes(self):
+        with patch.object(factory.Log, "_snapshot", side_effect=AssertionError("full read")):
+            self.assertEqual(self.log.add("pm", ["operator"], "x")[0], 2)
+
+    def test_stale_or_broken_checkpoint_costs_one_full_validation(self):
+        def stale_size():
+            with self.log.path.open("ab") as f:
+                f.write(b'{"t":"out","id":1,"to":"operator","o":"queued","why":"blocked","at":"2026-11-26T17:00:01Z"}\n')
+
+        def stale_mtime():
+            info = self.log.path.stat()
+            os.utime(self.log.path, ns=(info.st_atime_ns, info.st_mtime_ns + 1_000_000))
+
+        def new_inode():
+            copy = self.state / "copy.jsonl"
+            shutil.copyfile(self.log.path, copy)
+            os.chmod(copy, 0o600)
+            os.utime(copy, ns=(self.log.path.stat().st_atime_ns, self.log.path.stat().st_mtime_ns))
+            copy.replace(self.log.path)
+        for name, change in (("missing", lambda: self.log.check_path.unlink()),
+                             ("garbage", lambda: self.log.check_path.write_text("{not json")),
+                             ("negative", lambda: self.log.check_path.write_text(
+                                 json.dumps({"ino": 1, "size": -1, "mtime_ns": 0, "last": 1}))),
+                             ("size", stale_size), ("mtime", stale_mtime), ("inode", new_inode)):
+            with self.subTest(name=name):
+                change()
+                with patch.object(factory.Log, "_snapshot", autospec=True,
+                                  side_effect=factory.Log._snapshot) as snapshot:
+                    self.log.add("pm", ["operator"], name)
+                self.assertTrue(any(c.args[1:] == (0,) for c in snapshot.call_args_list))
+                check = json.loads(self.log.check_path.read_text())
+                info = self.log.path.stat()
+                self.assertEqual((check["ino"], check["size"], check["mtime_ns"]),
+                                 (info.st_ino, info.st_size, info.st_mtime_ns))
+
+    def test_one_byte_edit_early_in_a_large_log_blocks_appends(self):
+        line = {"t": "msg", "id": 0, "at": "2026-11-26T17:00:00Z", "from": "pm", "to": ["operator"],
+                "kind": "say", "text": "x" * 400}
+        with self.log.path.open("ab") as f:
+            for ident in range(2, 6002):
+                f.write((json.dumps({**line, "id": ident}) + "\n").encode())
+                f.write(b'{"t":"ok","id":%d}\n' % ident)
+        self.log.add("pm", ["operator"], "proves the big log")   # a full validation, then a checkpoint
+        self.assertGreater(self.log.path.stat().st_size, 2 * 1024 * 1024)
+        info = self.log.path.stat()
+        with open(self.log.path, "r+b") as f:
+            first, second = self.log.path.read_bytes().splitlines(keepends=True)[:2]
+            f.seek(len(first) + len(second) + 5)
+            f.write(b"\xff")
+        os.utime(self.log.path, ns=(info.st_atime_ns, info.st_mtime_ns + 1))
+        before = self.log.path.read_bytes()
+        with self.assertRaises(factory.LogDamage) as raised:
+            self.log.add("pm", ["operator"], "refused")
+        self.assertEqual(raised.exception.line, 3)
+        self.assertEqual(self.log.path.read_bytes(), before)
+
+    # processes
+
+    def child(self, *args):
+        return subprocess.Popen([sys.executable, "-c", LOG_CHILD, str(SCRIPT), str(self.state), *args],
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+
+    def test_concurrent_writers_get_distinct_ids(self):
+        children = [self.child("adds", "25") for _ in range(8)]
+        for child in children:
+            self.assertEqual(child.wait(timeout=120), 0)
+        records, _ = self.log.read()
+        msgs = [r["id"] for r in records if r["t"] == "msg"]
+        self.assertEqual(msgs, list(range(1, 202)))
+        for a, b in zip(records[::2], records[1::2]):
+            self.assertEqual((a["t"], b["t"], a["id"]), ("msg", "ok", b["id"]))
+
+    def killed(self, pause_after):
+        child = self.child("pause", str(pause_after))
+        self.assertEqual(child.stdout.readline(), b"paused\n")
+        child.kill()
+        child.wait(timeout=10)
+        child.stdout.close()
+        child.stdin.close()
+
+    def test_writer_killed_between_msg_and_ok(self):
+        self.killed(1)
+        self.assertEqual(self.committed(), ([1], 1))
+        self.assertEqual(factory.Log(self.state).add("pm", ["operator"], "after")[0], 3)
+
+    def test_writer_killed_after_its_ok(self):
+        self.killed(2)
+        self.assertEqual(self.committed(), ([1, 2], 0))
+        self.assertEqual(self.log.add("pm", ["operator"], "after")[0], 3)
 
 
 class LiveToolTests(unittest.TestCase):
