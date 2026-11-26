@@ -1555,6 +1555,171 @@ def update_team(state, reset=False, **changes):
         return team
 
 
+def _offline_state(cfg):
+    """Find the checkout's newest log, or its newest metadata-only state."""
+    base = pathlib.Path(_absolute(cache_base()))
+    parent = base / "factory-skill" / team_key(cfg.root)
+    candidates = []
+    try:
+        directory = Log(parent, base=base).open_dir(create=False)
+        if directory is None:
+            return None
+        try:
+            with os.scandir(directory) as entries:
+                names = [entry.name for entry in entries if entry.is_dir(follow_symlinks=False)]
+            for name in names:
+                state = parent / name
+                try:
+                    child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+                except (FileNotFoundError, NotADirectoryError):
+                    continue
+                try:
+                    for priority, filename in enumerate((Log.LOG, "team.json")):
+                        try:
+                            info = os.stat(filename, dir_fd=child, follow_symlinks=False)
+                        except FileNotFoundError:
+                            continue
+                        if not stat.S_ISREG(info.st_mode):
+                            raise Problem(f"not a regular file: {state / filename}", "run factory.py up")
+                        candidates.append((priority, -info.st_mtime_ns, state))
+                        break
+                finally:
+                    os.close(child)
+        finally:
+            os.close(directory)
+    except OSError as error:
+        raise Problem(f"cannot inspect {parent}: {error}", "run factory.py up") from error
+    if not candidates:
+        return None
+    state = min(candidates)[2]
+    if len(candidates) > 1:
+        print(f"using {state}", file=sys.stderr)
+    return state
+
+
+def state_for(cfg, hc):
+    if hc is None:
+        return _offline_state(cfg)
+    key = team_key(cfg.root)
+    records = hc.list(key)
+    view = View(records)
+    for record in (view.operator, view.keeper, *records):
+        label = record and record.get("labels", {}).get("factory.dir")
+        if label:
+            state = open_log(label).state
+            if state.parent.name != key or state.name != hc.core[:8]:
+                raise Problem(f"{state} does not match this checkout and hc core", "run factory.py up")
+            return state
+    return state_dir(cfg.root, hc.core)
+
+
+def resolve_team(args, hc):
+    """Return the formation, its state path and the caller's terminal when known."""
+    caller = None
+    terminal = os.environ.get("HC_TERMINAL_ID")
+    if hc is not None and terminal:
+        try:
+            caller = hc.get(terminal)
+        except HcError as error:
+            if error.kind != "not_found":
+                raise
+        labels = caller.get("labels", {}) if caller else {}
+        key, label = labels.get("factory.team"), labels.get("factory.dir")
+        if key and label:
+            if not isinstance(key, str) or not isinstance(label, str):
+                raise Problem("this pane has invalid Factory labels", "run factory.py up")
+            state = open_log(label).state
+            team = read_team(state)
+            if not team:
+                raise Problem(f"no team.json in {state}", "run factory.py up")
+            if (team["team"] != key or state.parent.name != key or state.name != team["core"][:8]
+                    or not os.path.isabs(team["root"])):
+                raise Problem(f"this pane's labels do not match {state}/team.json", "run factory.py up")
+            if team["core"] != hc.core:
+                raise Problem("this pane's hc is another core than the team's", "run factory.py up")
+            hc.expect_core = team["core"]
+            try:
+                cfg = Config(team["root"])
+            except SystemExit as error:
+                raise Problem(str(error), "run factory.py up") from error
+            if team_key(cfg.root) != key:
+                raise Problem(f"this pane's checkout does not match {state}/team.json", "run factory.py up")
+            return cfg, state, caller
+    cfg = Config(getattr(args, "cwd", None) or os.getcwd())
+    return cfg, state_for(cfg, hc), caller
+
+
+def find_team(args):
+    hc = Hc() if os.environ.get("HC_TERMINAL_ID") else None
+    try:
+        return resolve_team(args, hc)
+    except HcDown:
+        return resolve_team(args, None)
+
+
+def pending_lines(state, operator, now=None):
+    if state is None:
+        return ["pending: none"]
+    try:
+        _, box = open_log(state).read_box()
+    except LogDamage as error:
+        return [str(error)]
+    except (Problem, OSError) as error:
+        return [f"message log unavailable: {error}"]
+    pairs = collections.defaultdict(list)
+    for msg, name in box.pending():
+        pairs[name].append(msg)
+    now = time.time() if now is None else now
+    parts = []
+    for name, messages in pairs.items():
+        oldest = messages[0]
+        seconds = max(0, int(now - datetime.datetime.fromisoformat(oldest["at"]).timestamp()))
+        minutes, seconds = divmod(seconds, 60)
+        hours, minutes = divmod(minutes, 60)
+        age = f"{hours}h{minutes}m" if hours else f"{minutes}m" if minutes else f"{seconds}s"
+        outcome = box.outcome(oldest["id"], name)
+        reason = outcome["why"] if outcome["o"] == "queued" else outcome["o"]
+        parts.append(f"@{name} {len(messages)} (oldest {age}, {reason})")
+    lines = ["pending: " + ("; ".join(parts) if parts else "none")]
+    if operator in pairs:
+        lines.append(f"read them with: factory.py inbox --for {operator}")
+    if box.uncommitted:
+        noun = "entry" if box.uncommitted == 1 else "entries"
+        lines.append(f"log: {box.uncommitted} uncommitted {noun} (never delivered)")
+    return lines
+
+
+def cmd_inbox(args):
+    """Print committed messages addressed to the selected recipient."""
+    if args.count < 1:
+        print("give a positive number of messages", file=sys.stderr)
+        sys.exit(2)
+    try:
+        cfg, state, caller = find_team(args)
+        if state is None:
+            raise Problem(f"no team state for {cfg.root}", "run factory.py up")
+        labels = caller.get("labels", {}) if caller else {}
+        if args.for_name is not None:
+            name = args.for_name.lstrip("@")
+        else:
+            member = labels.get("factory.member") if labels.get("factory.team") and labels.get("factory.dir") else None
+            name = member or cfg.operator["name"]
+        rows = inbox_rows(open_log(state), name, args.count)
+    except Problem as error:
+        print(f"{error.what}. {error.fix}", file=sys.stderr)
+        sys.exit(2)
+    except (LogDamage, HcError, OSError, ValueError) as error:
+        print(str(error), file=sys.stderr)
+        sys.exit(2)
+    if not rows:
+        print(f"no messages for @{name}")
+    for msg, outcome in rows:
+        sender = "factory" if msg["kind"] == "note" else f"@{msg['from']}"
+        print(f"[Message {msg['id']} from {sender} at {msg['at']}: {outcome_word(outcome)}]")
+        for line in msg["text"].splitlines():
+            print(f"    {line}")
+
+
 class InboxDamage(ValueError):
     def __init__(self, path, line, reason):
         super().__init__(f"inbox needs repair: {path}, line {line}: {reason}. Operator messages are unavailable."
@@ -1687,7 +1852,7 @@ def print_messages(rows):
         print("\n".join("    " + line for line in row["text"].splitlines()))
 
 
-def cmd_inbox(args):
+def _cmd_inbox_v1(args):
     require_herdr()
     if args.count < 1:
         raise SystemExit("give a positive number of acknowledged messages")
@@ -3073,7 +3238,7 @@ def main(argv=None):
     if args.cmd == "say":
         args.message = None if args.file else (args.to.pop() if len(args.to) > 1 else None)
     {"init": cmd_init, "harnesses": cmd_harnesses, "check": cmd_check, "up": cmd_up, "down": cmd_down,
-     "status": cmd_status, "wait": cmd_wait, "inbox": cmd_inbox, "brief": cmd_brief, "say": cmd_say,
+     "status": cmd_status, "wait": cmd_wait, "inbox": _cmd_inbox_v1, "brief": cmd_brief, "say": cmd_say,
      "prompt": cmd_prompt}[args.cmd](args)
 
 

@@ -6,6 +6,7 @@ flags factory.py passes."""
 import importlib.util
 import contextlib
 from concurrent.futures import ThreadPoolExecutor
+import datetime
 import errno
 import hashlib
 import io
@@ -3654,6 +3655,156 @@ class TeamStateTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "partial box"):
             absent.refresh(partial)
         self.assertEqual(list(partial.msgs), [1])
+
+
+class TeamLookupTests(unittest.TestCase):
+    def setUp(self):
+        self.env = self.enterContext(Env(UI))
+        self.enterContext(patch.dict(os.environ, self.env.env, clear=True))
+        self.root = self.env.repo
+        self.cfg = factory.Config(self.root)
+        self.key = factory.team_key(self.root)
+        self.core = "fakecore00000000"
+        self.args = types.SimpleNamespace(cwd=str(self.root / "sub"))
+
+    def make_state(self, core=None):
+        core = self.core if core is None else core
+        state = factory.state_dir(self.root, core)
+        factory.update_team(state, root=str(self.root), team=self.key, core=core, up=True)
+        return state
+
+    def labels(self, state, member="lead-dev"):
+        return {"factory.team": self.key, "factory.dir": str(state),
+                "factory.kind": "member", "factory.member": member}
+
+    def inbox(self, count=10, for_name=None):
+        out, err = io.StringIO(), io.StringIO()
+        args = types.SimpleNamespace(cwd=self.args.cwd, count=count, for_name=for_name)
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = 0
+            try:
+                factory.cmd_inbox(args)
+            except SystemExit as error:
+                code = error.code
+        return code, out.getvalue(), err.getvalue()
+
+    def test_two_cache_homes_share_one_log(self):
+        state = self.make_state()
+        with FakeHc() as fake:
+            term = fake.add(self.labels(state))
+            with patch.dict(os.environ, {"HC_TERMINAL_ID": term, "XDG_CACHE_HOME": str(self.env.root / "elsewhere")}):
+                hc = factory.Hc()
+                cfg, resolved, caller = factory.resolve_team(types.SimpleNamespace(cwd="/unrelated"), hc)
+                self.assertEqual((cfg.root, resolved, caller["address"]), (self.root, state, term))
+                self.assertEqual(hc.expect_core, self.core)
+                factory.open_log(resolved).add("operator", ["lead-dev"], "shared text")
+        self.assertFalse((self.env.root / "elsewhere").exists())
+        self.assertEqual(factory.inbox_rows(factory.open_log(state), "lead-dev")[0][0]["text"], "shared text")
+
+    def test_labelled_state_with_wrong_shape_or_team_is_refused_without_a_write(self):
+        state = self.make_state()
+        with FakeHc() as fake:
+            for labels in (self.labels(state.parent), {**self.labels(state), "factory.team": "other"}):
+                term = fake.add(labels)
+                with (self.subTest(labels=labels), patch.dict(os.environ, {"HC_TERMINAL_ID": term}),
+                      self.assertRaises(factory.Problem)):
+                    factory.resolve_team(self.args, factory.Hc())
+        self.assertFalse((state / "log.jsonl").exists())
+
+    def test_state_for_live_team_prefers_the_labelled_operator(self):
+        state = self.make_state()
+        with FakeHc() as fake:
+            other = self.env.root / "other-cache" / "factory-skill" / self.key / state.name
+            fake.add(self.labels(other), created_ms=2)
+            fake.add({**self.labels(state, "operator"), "factory.kind": "operator"}, created_ms=1)
+            with patch.dict(os.environ, {"XDG_CACHE_HOME": str(self.env.root / "elsewhere")}):
+                self.assertEqual(factory.state_for(self.cfg, factory.Hc()), state)
+
+    def test_inbox_default_name_is_the_callers(self):
+        state = self.make_state()
+        log = factory.open_log(state)
+        log.add("operator", ["lead-dev"], "member only")
+        log.add("lead-dev", ["operator"], "operator only")
+        with FakeHc() as fake:
+            term = fake.add(self.labels(state))
+            with patch.dict(os.environ, {"HC_TERMINAL_ID": term}):
+                code, output, err = self.inbox()
+                self.assertEqual((code, err), (0, ""))
+                self.assertIn("member only", output)
+                self.assertNotIn("operator only", output)
+                fake.stop()
+                code, output, err = self.inbox()
+                self.assertEqual((code, err), (0, ""))
+                self.assertIn("operator only", output)
+
+    def test_offline_selection(self):
+        older = self.make_state("11111111old")
+        newer = self.make_state("22222222new")
+        metadata = self.make_state("33333333meta")
+        (older.parent / "alias").symlink_to(metadata, target_is_directory=True)
+        for second, candidate in enumerate((older, newer, metadata), 1):
+            os.utime(candidate / "team.json", (second, second))
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(factory.state_for(self.cfg, None), metadata)
+        self.assertEqual(err.getvalue(), f"using {metadata}\n")
+        for state in (older, newer):
+            factory.open_log(state).add("lead-dev", ["operator"], state.name)
+        os.utime(older / "log.jsonl", (5, 5))
+        os.utime(newer / "log.jsonl", (6, 6))
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(factory.state_for(self.cfg, None), newer)
+            os.utime(newer / "log.jsonl", (5, 5))
+            self.assertEqual(factory.state_for(self.cfg, None), older)
+        (metadata / "log.jsonl").symlink_to(older / "log.jsonl")
+        code, output, err = self.inbox()
+        self.assertEqual((code, output), (2, ""))
+        self.assertIn(str(metadata / "log.jsonl"), err)
+
+    def test_inbox_without_team_state_exits_2(self):
+        with patch.object(factory, "Hc", side_effect=AssertionError("offline inbox called hc")):
+            code, output, err = self.inbox()
+            self.assertEqual((code, output), (2, ""))
+            self.assertIn("no team state", err)
+            self.make_state()
+            self.assertEqual(self.inbox(), (0, "no messages for @operator\n", ""))
+
+    def test_inbox_filters_and_shows_outcome(self):
+        log = factory.open_log(self.make_state())
+        log.add("operator", ["lead-dev"], "line one\nline two")
+        log.add("factory", ["operator"], "note", kind="note")
+        log.out(factory.Box(log.path), 1, "lead-dev", "queued", why="blocked")
+        original = log.path.read_bytes()
+        code, output, err = self.inbox(count=1, for_name="@lead-dev")
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("Message 1 from @operator", output)
+        self.assertIn(": queued (blocked)]\n    line one\n    line two\n", output)
+        self.assertNotIn("note", output)
+        self.assertIn("Message 2 from factory", self.inbox()[1])
+        self.assertEqual(log.path.read_bytes(), original)
+        self.assertEqual(self.inbox(count=0)[0], 2)
+
+    def test_pending_lines(self):
+        state = self.make_state()
+        log = factory.open_log(state)
+        self.assertEqual(factory.pending_lines(None, "operator"), ["pending: none"])
+        self.assertEqual(factory.pending_lines(state, "operator"), ["pending: none"])
+        with patch.object(factory, "utc_now", return_value="2026-11-26T17:00:00Z"):
+            log.add("pm", ["operator", "lead-dev"], "oldest")
+            log.add("pm", ["operator"], "next")
+        log.out(factory.Box(log.path), 1, "operator", "queued", why="blocked")
+        now = datetime.datetime.fromisoformat("2026-11-26T17:03:00Z").timestamp()
+        self.assertEqual(factory.pending_lines(state, "operator", now), [
+            "pending: @operator 2 (oldest 3m, blocked); @lead-dev 1 (oldest 3m, waiting)",
+            "read them with: factory.py inbox --for operator",
+        ])
+        self.assertEqual(len(factory.pending_lines(state, "reviewer", now)), 1)
+        with log.path.open("ab") as stream:
+            stream.write(b'{"t":"msg","id":3,"at":"2026-11-26T17:00:00Z","from":"pm","to":["operator"],'
+                         b'"kind":"say","text":"no ok"}\n')
+        self.assertIn("log: 1 uncommitted entry (never delivered)", factory.pending_lines(state, "operator", now))
+        with log.path.open("ab") as stream:
+            stream.write(b"torn")
+        self.assertIn("message log needs repair", factory.pending_lines(state, "operator", now)[0])
 
 
 class LogTests(unittest.TestCase):
