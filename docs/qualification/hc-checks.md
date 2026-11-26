@@ -4,7 +4,7 @@ Verified facts about `hc` and `rodeo`, collected on isolated private cores (neve
 
 ## Environment (Phase 1, 2026-11-26)
 
-- Local: `hc 0.1.20` (Nix build), `rodeo 0.2.1`, branch `peter/165-early-live-checks` (head `c07870f`).
+- Local: `hc 0.1.20` (Nix build), `rodeo 0.2.1`, branch `peter/165-early-live-checks` (head `c245ca6`).
 - CI: GitHub Actions `ubuntu-latest`, pinned `hc 0.1.20` release tarball (`https://releases.herdr.dev/core/0.1.20/herdr-core-linux-x86_64.tar.gz`, `sha256: ac6b86890c451a37584620aaa438b71bc0d0bd430a2e7c1d7e095f052c414e74`).
 
 ---
@@ -18,9 +18,9 @@ Verified facts about `hc` and `rodeo`, collected on isolated private cores (neve
   - **Control (client stays alive):** typed **`12.0 s`** after last key (`11.7 s` after send); reply `{"started": false, "status": "idle", "turn": 0}` at `16.9 s` (typing + 5 s `started` window); terminal remained `live`.
   - **`SIGKILL` of `hc connect` at `6 s`:** confirmed held at kill, **never typed** (watched past `draft_wait`); terminal stayed `live`.
   - **`SIGKILL` at `6 s`, then person presses Enter `0.3 s` later (`6.3 s` after send):** **never typed**; clearing the draft did not revive the cancelled send.
-  - **Clean EOF at `6 s` (stdin closed, `hc connect` left alive):** process still running `5 s` later and **typed at `12.0 s`** after last key (`11.7 s` after send, when the hold ended). Closing stdin alone does not cancel; dropping the connection does.
+  - **Clean EOF at `6 s` (stdin closed, `hc connect` left alive):** process still running `5 s` later and **typed at `12.0 s`** after last key (`11.7 s` after send, when the hold ended; check reports `inconclusive` rather than "did not type" if an alive EOF client produces nothing by deadline). Closing stdin alone does not cancel; dropping the connection does.
   - **Follow-up send after every variant:** a fresh `terminal.send` afterwards typed immediately (`0.0 s`) in all four variants; where the first token was typed (`control`, `eof`), it arrived before the follow-up token and nothing was typed twice.
-  - **Variant C (no draft, 20 trials, `SIGKILL` 9–264 ms after observed paste):** **0 of 20 trials left an unsubmitted paste** (20/20 pasted and submitted, 0 not pasted). This is an observation after an observed paste, not a guarantee if the client dies before the full paste arrives.
+  - **Variant C (no draft, 20 trials, `SIGKILL` 18–294 ms after observed paste):** **0 of 20 trials left an unsubmitted paste** (20/20 pasted and submitted, 0 not pasted). This is an observation after an observed paste, not a guarantee if the client dies before the full paste arrives.
 - **Verdict:** **Answered (safe).**
 - **Consequence:** `keeper.md` §8's `kill_children()` (`SIGKILL`) cancels sends held on `draft_wait`, and 0 of 20 trials left an unsubmitted paste when killed after an observed paste. `hc_client.md`: closing stdin alone does not cancel a held send (so a keeper killed by `SIGKILL`/OOM without running `kill_children()` leaves held sends alive until their hold ends). Interrupted pairs still become `unconfirmed` on keeper restart.
 
@@ -36,7 +36,7 @@ Verified facts about `hc` and `rodeo`, collected on isolated private cores (neve
   - `python3 tests/live.py fixtures` ran a private core with PTY, OSC 7501, and `hc connect` cleanly; key-shape diff against `tests/hc_fixtures.json` printed `differ: none` (scalars collapsed, so key shape only).
   - Observed build-dependent field: `server.status.installed_by` is `null` on the release build and `"nix"` on the Nix build.
 - **Verdict:** **Pass.**
-- **Consequence:** Phase 2 can add a real-`hc` CI job pinned to `hc 0.1.20` + SHA-256 alongside fake mode (`components/testing.md` §8). Phase 2 contract tests (`HcContract`) check matching keys and JSON types, allowing `null` only where `hc 0.1.20` schema declares a field nullable (so `null` in a required field like `hello.version` fails; see `components/testing.md` §4). Temporary CI job was reverted in `151bd43` for Phase 1.
+- **Consequence:** Phase 2 can add a real-`hc` CI job pinned to `hc 0.1.20` + SHA-256 alongside fake mode (`components/testing.md` §8). Phase 2 contract tests (`HcContract`) check every required `hc 0.1.20` schema key, check optional keys (such as `Terminal.foreground`) when present, reject unknown keys, and check schema JSON types allowing `null` only on schema-declared nullable fields (`components/testing.md` §4); `tests/hc_fixtures.json` supplies real recorded examples rather than a rigid exact key set. Temporary CI job was reverted in `151bd43` for Phase 1.
 
 ---
 
@@ -63,7 +63,7 @@ Verified facts about `hc` and `rodeo`, collected on isolated private cores (neve
   - Driver terminal env carries `HC_SCOPE`, `HC_SESSION`, `HC_SOCKET`, `HC_TERMINAL_ID`, `HC_TERMINAL_SOCKET`.
   - **Nesting bypass:** both `env -u HC_TERMINAL_ID -u HC_TERMINAL_SOCKET -u HC_SCOPE rodeo` and `experimental.allow_nested = true` (with only `HC_SESSION`/`HC_SOCKET` overridden, nothing unset) rendered `"team"`, `"@op"`, and `"@dev"` within 15 s via `terminal.read` on the driver core. Only `HC_TERMINAL_ID` triggers rodeo's nesting check.
   - **Focus switching:** focus starts on the first block (`@op`); separate `terminal.keys` calls 0.2 s apart (`ctrl+b`, then `l` for right / `h` for left) switch focus deterministically between `@op` and `@dev`.
-  - **Cleared-draft baseline & human-input `draft_wait` proof:** with focus on `@op` and no draft, a QA `terminal.send` typed immediately (**`0.0 s`**). With `"draft"` typed through rodeo, a QA `terminal.send` stayed held past the **`6 s`** check point (`max(baseline + 3, 6)`); after rodeo received `enter`, the token typed **`0.17 s`** after Enter (**`6.21 s`** after send; reply at `5.37 s` after Enter), within the pass rule (`<= 2 s` after Enter and before `draft_wait`, `released_by_enter: true`), the concatenated PTY stream contained `"draft\r"` followed by the token, and the token appeared on rodeo's rendered screen.
+  - **Cleared-draft baseline & human-input `draft_wait` proof:** with focus on `@op` and no draft, a QA `terminal.send` typed immediately (**`0.0 s`**). With `"draft"` typed through rodeo, a QA `terminal.send` stayed held past the **`6 s`** check point (`max(baseline + 3, 6)`); after rodeo received `enter`, the token typed **`0.17 s`** after Enter (**`6.21 s`** after send; reply at `5.37 s` after Enter), within the pass rule (`<= 2 s` after Enter and before `draft_wait` measured from the last draft key, `released_by_enter: true`), the concatenated PTY stream contained `"draft\r"` followed by the token, and the token appeared on rodeo's rendered screen.
   - **Negative control (`LC13_DRAFT_WAIT=0`):** returned **`fail`** as intended — not held at `6 s`, typed **`2.47 s`** after send (`hc`'s regular quiet pause after recent keys, `released_by_enter: false`), proving the `6 s` check distinguishes a real `draft_wait` hold from quiet pause.
   - **Partial LC-8 observation:** `keep` stayed **`false`** on both doc-placed terminals (`@op`, `@dev`) after rodeo rendered the doc.
 - **Verdict:** **Pass.**
@@ -78,4 +78,4 @@ Verified facts about `hc` and `rodeo`, collected on isolated private cores (neve
 - **Coverage:**
   - Replies: `hello`, `server.status`, `server.stop`, `terminal.run` (`agent`, `plain`), `terminal.get` (`live`, `finished`, `after_restart` with `reason: "server_stop"` and labels kept), `terminal.list` (`all`, `live`, `after_restart`), `terminal.send` (`agent`, `plain` with `started: null`), `terminal.keys`, `terminal.read`, `terminal.label` (`set`, `remove`, `finished`), `terminal.keep` (`on`, `off`), `terminal.kill`, `terminal.rm`, `doc.get` (`empty`, `present`), `doc.set`.
   - Errors: `blocked`, `conflict`, `finished`, `invalid_params`, `live`, `not_found`, `spawn_failed`, `status_mismatch`.
-- **Redaction & validation:** Core IDs, hostnames, usernames, home/temp paths, `/nix/store` hashes, PIDs, and timestamps scrubbed to same-type placeholders (`terminal.run` records the actual scrubbed request); exact key sets preserved; recorder refuses to write if any case produces the wrong outcome or an error kind is missing; verified `differ: none` against the Linux `hc 0.1.20` release build in CI.
+- **Redaction & validation:** Core IDs, hostnames, usernames, home/temp paths, `/nix/store` hashes, PIDs, and timestamps scrubbed to same-type placeholders (`terminal.run` records the actual scrubbed request); recorder validates post-restart state (`finished`, `server_stop`, labels kept) and refuses to write if any case produces the wrong outcome or an error kind is missing; verified `differ: none` against the Linux `hc 0.1.20` release build in CI.
