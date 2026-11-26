@@ -4,7 +4,7 @@ Verified facts about `hc` and `rodeo`, collected on isolated private cores (neve
 
 ## Environment (Phase 1, 2026-11-26)
 
-- Local: `hc 0.1.20` (Nix build), `rodeo 0.2.1`, branch `peter/165-early-live-checks` (head `dfa7331`).
+- Local: `hc 0.1.20` (Nix build), `rodeo 0.2.1`, branch `peter/165-early-live-checks` (head `c07870f`).
 - CI: GitHub Actions `ubuntu-latest`, pinned `hc 0.1.20` release tarball (`https://releases.herdr.dev/core/0.1.20/herdr-core-linux-x86_64.tar.gz`, `sha256: ac6b86890c451a37584620aaa438b71bc0d0bd430a2e7c1d7e095f052c414e74`).
 
 ---
@@ -12,14 +12,15 @@ Verified facts about `hc` and `rodeo`, collected on isolated private cores (neve
 ## LC-1: In-flight `terminal.send` when its `hc connect` client dies
 
 - **Command:** `python3 tests/live.py check lc1`
-- **Setup:** Private `hc 0.1.20` core (`draft_wait = 3`, `HC_SETTLE_MS` unset); OSC 7501 `idle` probe; unsent draft typed through framed `terminal.attach` (`Kind::Data`); `terminal.send` held on `draft_wait`, then client terminated 0.8 s after request.
+- **Setup:** Private `hc 0.1.20` core (`draft_wait = 12`, `HC_SETTLE_MS` unset); OSC 7501 `idle` probe; unsent draft typed through framed `terminal.attach` (`Kind::Data`); `terminal.send` confirmed held past `6 s` (`max(baseline + 3, 6)`, separating the draft hold from `hc`'s ~2.5–3 s quiet pause) before ending the client.
 - **Observed:**
-  - **Control (client stays alive):** typed 3.0 s after last key (2.7 s after send); reply `{"started": false, "status": "idle", "turn": 0}` at 7.9 s (typing + 5 s `started` window); terminal remained `live`.
-  - **`SIGKILL` of `hc connect`:** **never typed** (watched `draft_wait + 3` s); terminal stayed `live`.
-  - **`SIGKILL`, then person presses Enter 0.3 s later (1.1 s after send):** **never typed**; clearing the draft did not revive the cancelled send.
-  - **Clean EOF (stdin closed, `hc connect` left alive):** process still running 5 s later and **typed at 3.0 s** (same as control). Closing stdin alone does not cancel; dropping the connection does.
+  - **Baseline (no draft):** typed immediately (`0.0 s` after send).
+  - **Control (client stays alive):** typed **`12.0 s`** after last key (`11.7 s` after send); reply `{"started": false, "status": "idle", "turn": 0}` at `16.9 s` (typing + 5 s `started` window); terminal remained `live`.
+  - **`SIGKILL` of `hc connect` at `6 s`:** confirmed held at kill, **never typed** (watched past `draft_wait`); terminal stayed `live`.
+  - **`SIGKILL` at `6 s`, then person presses Enter `0.3 s` later (`6.3 s` after send):** **never typed**; clearing the draft did not revive the cancelled send.
+  - **Clean EOF at `6 s` (stdin closed, `hc connect` left alive):** process still running `5 s` later and **typed at `12.0 s`** after last key (`11.7 s` after send, when the hold ended). Closing stdin alone does not cancel; dropping the connection does.
   - **Follow-up send after every variant:** a fresh `terminal.send` afterwards typed immediately (`0.0 s`) in all four variants; where the first token was typed (`control`, `eof`), it arrived before the follow-up token and nothing was typed twice.
-  - **Variant C (no draft, 20 trials, `SIGKILL` 2–279 ms after observed paste):** **0 of 20 trials left an unsubmitted paste** (20/20 pasted and submitted, 0 not pasted). This is an observation after an observed paste, not a guarantee if the client dies before the full paste arrives.
+  - **Variant C (no draft, 20 trials, `SIGKILL` 9–264 ms after observed paste):** **0 of 20 trials left an unsubmitted paste** (20/20 pasted and submitted, 0 not pasted). This is an observation after an observed paste, not a guarantee if the client dies before the full paste arrives.
 - **Verdict:** **Answered (safe).**
 - **Consequence:** `keeper.md` §8's `kill_children()` (`SIGKILL`) cancels sends held on `draft_wait`, and 0 of 20 trials left an unsubmitted paste when killed after an observed paste. `hc_client.md`: closing stdin alone does not cancel a held send (so a keeper killed by `SIGKILL`/OOM without running `kill_children()` leaves held sends alive until their hold ends). Interrupted pairs still become `unconfirmed` on keeper restart.
 
@@ -62,8 +63,8 @@ Verified facts about `hc` and `rodeo`, collected on isolated private cores (neve
   - Driver terminal env carries `HC_SCOPE`, `HC_SESSION`, `HC_SOCKET`, `HC_TERMINAL_ID`, `HC_TERMINAL_SOCKET`.
   - **Nesting bypass:** both `env -u HC_TERMINAL_ID -u HC_TERMINAL_SOCKET -u HC_SCOPE rodeo` and `experimental.allow_nested = true` (with only `HC_SESSION`/`HC_SOCKET` overridden, nothing unset) rendered `"team"`, `"@op"`, and `"@dev"` within 15 s via `terminal.read` on the driver core. Only `HC_TERMINAL_ID` triggers rodeo's nesting check.
   - **Focus switching:** focus starts on the first block (`@op`); separate `terminal.keys` calls 0.2 s apart (`ctrl+b`, then `l` for right / `h` for left) switch focus deterministically between `@op` and `@dev`.
-  - **Cleared-draft baseline & human-input `draft_wait` proof:** with focus on `@op` and no draft, a QA `terminal.send` typed immediately (**`0.0 s`**). With `"draft"` typed through rodeo, a QA `terminal.send` stayed held past the **`6 s`** check point (`max(baseline + 3, 6)`); after rodeo received `enter`, the token typed **`0.17 s`** after Enter (**`6.21 s`** after send; reply at `5.37 s` after Enter), the concatenated PTY stream contained `"draft\r"` followed by the token, and the token appeared on rodeo's rendered screen.
-  - **Negative control (`LC13_DRAFT_WAIT=0`):** returned **`fail`** as intended — not held at `6 s`, typed **`2.47 s`** after send (`hc`'s regular quiet pause after recent keys), proving the `6 s` check distinguishes a real `draft_wait` hold from quiet pause.
+  - **Cleared-draft baseline & human-input `draft_wait` proof:** with focus on `@op` and no draft, a QA `terminal.send` typed immediately (**`0.0 s`**). With `"draft"` typed through rodeo, a QA `terminal.send` stayed held past the **`6 s`** check point (`max(baseline + 3, 6)`); after rodeo received `enter`, the token typed **`0.17 s`** after Enter (**`6.21 s`** after send; reply at `5.37 s` after Enter), within the pass rule (`<= 2 s` after Enter and before `draft_wait`, `released_by_enter: true`), the concatenated PTY stream contained `"draft\r"` followed by the token, and the token appeared on rodeo's rendered screen.
+  - **Negative control (`LC13_DRAFT_WAIT=0`):** returned **`fail`** as intended — not held at `6 s`, typed **`2.47 s`** after send (`hc`'s regular quiet pause after recent keys, `released_by_enter: false`), proving the `6 s` check distinguishes a real `draft_wait` hold from quiet pause.
   - **Partial LC-8 observation:** `keep` stayed **`false`** on both doc-placed terminals (`@op`, `@dev`) after rodeo rendered the doc.
 - **Verdict:** **Pass.**
 - **Consequence:** Keep the `Rodeo` driver class in `components/testing.md` §6 using `env -u HC_TERMINAL_ID` (or `experimental.allow_nested = true`), doc written before launch, and `ctrl+b` + `h`/`l` (0.2 s apart) for pane focus.
@@ -77,4 +78,4 @@ Verified facts about `hc` and `rodeo`, collected on isolated private cores (neve
 - **Coverage:**
   - Replies: `hello`, `server.status`, `server.stop`, `terminal.run` (`agent`, `plain`), `terminal.get` (`live`, `finished`, `after_restart` with `reason: "server_stop"` and labels kept), `terminal.list` (`all`, `live`, `after_restart`), `terminal.send` (`agent`, `plain` with `started: null`), `terminal.keys`, `terminal.read`, `terminal.label` (`set`, `remove`, `finished`), `terminal.keep` (`on`, `off`), `terminal.kill`, `terminal.rm`, `doc.get` (`empty`, `present`), `doc.set`.
   - Errors: `blocked`, `conflict`, `finished`, `invalid_params`, `live`, `not_found`, `spawn_failed`, `status_mismatch`.
-- **Redaction:** Core IDs, hostnames, usernames, home/temp paths, `/nix/store` hashes, PIDs, and timestamps scrubbed to same-type placeholders; exact key sets preserved; verified `differ: none` against the Linux `hc 0.1.20` release build in CI.
+- **Redaction & validation:** Core IDs, hostnames, usernames, home/temp paths, `/nix/store` hashes, PIDs, and timestamps scrubbed to same-type placeholders (`terminal.run` records the actual scrubbed request); exact key sets preserved; recorder refuses to write if any case produces the wrong outcome or an error kind is missing; verified `differ: none` against the Linux `hc 0.1.20` release build in CI.
