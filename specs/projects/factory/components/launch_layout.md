@@ -70,7 +70,7 @@ def session_plan(m: dict, state, entry: dict | None, fresh: bool) -> dict
 
 `sessions.jsonl`, one JSON object per line: `{"member", "harness", "model", "term", "how", "value", "at"}`. `term` is the member's terminal ID at the time; `how` is `env` (recorded by `say`), `id` or `dir` (set at launch), or `new` with `value: null` (a launch whose conversation is not known yet). **The newest entry for a member is the truth.**
 
-Every member's `say` writes here, so there are many concurrent writers. All reading and writing goes through one function that takes `LOCK_EX` on `<state>/lock`, reads the file, decides, and appends in a single `os.write` followed by `fsync`. A torn last line (a writer killed mid-write) is handled inside the same lock: the new line starts after a `\n`. A line that is not JSON is skipped and counted, and `up` prints `skipped <n> damaged entries in <path>` (§9.4).
+Every member's `say` writes here, so there are many concurrent writers. All reading and writing goes through one function that takes `LOCK_EX` on the team lock (the state directory, message_log.md §Locking), reads the file, decides, and appends in a single `os.write` followed by `fsync`. A torn last line (a writer killed mid-write) is handled inside the same lock: the new line starts after a `\n`. A line that is not JSON is skipped and counted, and `up` prints `skipped <n> damaged entries in <path>` (§9.4).
 
 ### Recording, in `say`
 
@@ -195,7 +195,7 @@ One to three members sit side by side; four to nine fill three columns; the keep
 
 ## 6. `up` and `down` sequences
 
-`up [names] [--fresh]`. Steps 1–5 change nothing in `hc`, in the layout or in the team's files, so a refusal or a failed preflight leaves everything as it was (§5.2). The only thing written before step 6 is the private state directory with its empty lock file.
+`up [names] [--fresh]`. Steps 1–5 change nothing in `hc`, in the layout or in the team's files, so a refusal or a failed preflight leaves everything as it was (§5.2). The only thing written before step 6 is the private state directory, which is also the team lock.
 
 1. `Config`; the selected plans.
 2. `hc` answers and is new enough; `HC_TERMINAL_ID` is set.

@@ -23,7 +23,7 @@ Facts marked **verified** were run by the architect on an isolated `hc 0.1.20` c
 2. **Talk to `hc` through `hc connect`.** Factory spawns `hc connect` and speaks newline-delimited JSON-RPC on its stdin and stdout (verified). It never resolves a socket path itself, so it follows `HC_SESSION`, `HC_SOCKET` and `hc`'s config exactly as `hc` does. The request is written only after `hello` has been read and the version and core checked.
 3. **Poll once a second, do not subscribe.** The keeper reads the team with one label-filtered `terminal.list` per tick (0–1 ms, verified). What a poll cannot see is in [keeper.md](components/keeper.md) §10 (owner decision 8).
 4. **`hc`'s terminal records are the membership database.** Which terminal is which member is a label on the terminal. A member is `not started` when it has no record and `gone` when its newest record is finished. Records and labels survive a core restart (verified).
-5. **One append-only log is the only durable memory of what happened.** Messages, their commit records and per-recipient outcomes are appended under one file lock that is never held across an `hc` call. A message exists once its commit record is written, whatever fails or dies around it. Every fact the keeper must not forget across a crash (which terminals are briefed, which notes were sent) is derived from the log, never kept in a flag beside it.
+5. **One append-only log is the only durable memory of what happened.** Messages, their commit records and per-recipient outcomes are appended under one lock, the state directory itself, never held across an `hc` call. A message exists once its commit record is written, whatever fails or dies around it. Every fact the keeper must not forget across a crash (which terminals are briefed, which notes were sent) is derived from the log, never kept in a flag beside it.
 6. **Only the keeper types.** `say`, `up` and `brief --send` append to the log and wait for the outcome records the keeper writes. Briefs are messages of kind `brief`.
 7. **Nothing changes before preflight passes**, and `up` and `down` hold one team lock for their whole run, so two launches cannot claim the same member.
 8. **A small `team.json`** holds the few team-level facts with no terminal or log record to carry them (root, layout ids, the ready check's "cleared" mark). Losing it costs a second team tab or one repeated ready-work note, never a message.
@@ -46,7 +46,7 @@ owner ── types ──▶ operator pane (hc terminal, kind=operator)
                       │ factory.py up / say / status / down
                       ▼
    ┌──────────────── state dir (per team) ────────────────┐
-   │ log.jsonl  team.json  sessions.jsonl  lock           │
+   │ log.jsonl  log.check  team.json  sessions.jsonl      │
    │ keeper.lock  keeper.beat  messages/<member>/         │
    └───────▲──────────────────────────▲───────────────────┘
            │ append msg, read outcomes │ read msgs, append outcomes
@@ -70,13 +70,13 @@ state  = <cache base>/factory-skill/<team>/<core.id[:8]>/   # mode 0700; cache b
 
 | File | Content | Written by |
 |---|---|---|
-| `team.json` | See §3.3 | `up`, `down`, keeper; atomic replace under `lock` |
-| `lock` | Empty; `flock` target for `log.jsonl`, `log.check`, `team.json` and `sessions.jsonl` | — |
+| `team.json` | See §3.3 | `up`, `down`, keeper; atomic replace under the team lock |
+| (the state directory) | The team lock: `flock` on its no-follow descriptor for `log.jsonl`, `log.check`, `team.json` and `sessions.jsonl`; no lock file (message_log.md §Locking). It must be on a local filesystem; a failed lock names the path and the original error and suggests a local `XDG_CACHE_HOME` | — |
 | `log.jsonl` | Messages, commit records and outcomes | `say`, `up`, `brief`, `down`, keeper |
 | `log.check` | Checkpoint proving the log unchanged since the last validated append | every log writer |
 | `up.lock` | `flock` held by `up` and `down` for their whole run | — |
 | `keeper.start` | `flock` serializing keeper starts | — |
-| `sessions.jsonl` | Saved native sessions, append-only, one entry per line, under `lock` | `say` (members), `up` |
+| `sessions.jsonl` | Saved native sessions, append-only, one entry per line, under the team lock | `say` (members), `up` |
 | `keeper.lock` | `flock` held for the keeper's lifetime | keeper |
 | `keeper.beat` | One line `<pid> <version> <terminal>`; its mtime is the heartbeat | keeper |
 | `<member>.md`, `<member>.settings.json` | Standing instructions and Claude Code settings, rewritten at every launch | `up` |
