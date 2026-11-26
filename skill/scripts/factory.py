@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import contextlib
 import datetime
 import fcntl
 import getpass
@@ -22,6 +23,7 @@ import pathlib
 import re
 import selectors
 import shlex
+import secrets
 import shutil
 import stat
 import subprocess
@@ -532,6 +534,935 @@ def resolve_listed(model, listed, harness):
 
 
 
+# ================================================================ message log (v2; spec §8.5-8.7, message_log.md)
+
+LOG_KINDS = ("say", "brief", "note")
+OUTCOMES = ("sending", "delivered", "queued", "unconfirmed", "dropped")
+FINAL = ("delivered", "unconfirmed", "dropped")
+QUEUE_REASONS = ("waiting", "blocked", "not ready", "gone")
+READ_QUEUE_REASONS = QUEUE_REASONS + ("busy",)   # "busy" is reserved for the §8.3 fallback: read, never written
+MOVES = {"sending": ("queued",), "delivered": ("sending",), "unconfirmed": ("sending",),
+         "queued": ("queued", "sending"), "dropped": ("queued", "sending")}   # new outcome: allowed from these
+UTC = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
+STORED_WARNING = ("stored and will be delivered, but the disk reported an error: it may not survive a power loss."
+                  " Do not resend.")
+UNKNOWN = "storage outcome unknown; do not resend; check inbox after repair"
+
+
+def private_open(path, flags, fix_mode=True, dir_fd=None):
+    """Open a regular file without following a symbolic link; writers make it 0600."""
+    fd = os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=dir_fd)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(f"not a regular file: {path}")
+        if fix_mode:
+            os.fchmod(fd, 0o600)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def utc_now():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+class LogDamage(Exception):
+    def __init__(self, path, line, reason):
+        where = f", line {line}" if line else ""
+        super().__init__(f"message log needs repair: {path}{where}: {reason}. Nothing was written."
+                         " Repair or move the file, then run factory.py up.")
+        self.path, self.line, self.reason = path, line, reason
+
+
+class NotStored(Exception):
+    """The message or outcome was not stored. partial: an incomplete line may remain, which readers report."""
+
+    def __init__(self, partial, detail):
+        super().__init__(detail)
+        self.partial, self.detail = partial, detail
+
+
+class _Unreadable(Exception):
+    """The tail could not be read back after a failed append (internal)."""
+
+    def __init__(self, error):
+        super().__init__(str(error))
+        self.error = error
+
+
+def _utc(value):
+    """Whether value is a real UTC time written as 2026-11-26T17:00:00Z."""
+    if not (isinstance(value, str) and UTC.fullmatch(value)):
+        return False
+    try:
+        datetime.datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return False
+    return True
+
+
+def _record_problem(rec):
+    """Why a decoded line is not a valid record on its own, or None. Unknown extra keys are allowed."""
+    if not isinstance(rec, dict):
+        return "expected a JSON object"
+    kind = rec.get("t")
+    if kind not in ("msg", "ok", "out"):
+        return "expected t of msg, ok or out"
+    ident = rec.get("id")
+    if type(ident) is not int or ident < 1:
+        return "expected a positive integer id"
+    if kind == "msg":
+        to = rec.get("to")
+        if not _utc(rec.get("at")):
+            return "expected a UTC at"
+        if not (isinstance(rec.get("from"), str) and rec["from"]):
+            return "expected a sender"
+        if not (isinstance(to, list) and to and all(isinstance(n, str) and n for n in to)
+                and len(set(to)) == len(to) and rec["from"] not in to):
+            return "expected distinct recipients other than the sender"
+        if rec.get("kind") not in LOG_KINDS:
+            return "expected kind say, brief or note"
+        if not isinstance(rec.get("text"), str):
+            return "expected text"
+        if "file" in rec and not (isinstance(rec["file"], str) and os.path.isabs(rec["file"])):
+            return "expected an absolute file path"
+        if "meta" in rec and not isinstance(rec["meta"], dict):
+            return "expected meta to be an object"
+    elif kind == "out":
+        o, why = rec.get("o"), rec.get("why")
+        if not (isinstance(rec.get("to"), str) and rec["to"]):
+            return "expected a recipient"
+        if o not in OUTCOMES:
+            return "expected a known outcome"
+        if not _utc(rec.get("at")):
+            return "expected a UTC at"
+        if "why" in rec and not isinstance(why, str):
+            return "expected why to be a string"
+        if o == "queued" and why not in READ_QUEUE_REASONS:
+            return "expected a queue reason"
+        if o in ("unconfirmed", "dropped") and not (isinstance(why, str) and why.strip()):
+            return f"expected a reason for {o}"
+        if "term" in rec and not (isinstance(rec["term"], str) and rec["term"]):
+            return "expected term to be a terminal ID"
+        if "started" in rec and rec["started"] is not None and type(rec["started"]) is not bool:
+            return "expected started to be true, false or null"
+        if "turn" in rec and type(rec["turn"]) is not int:
+            return "expected turn to be an integer"
+        if o in ("sending", "delivered") and "term" not in rec:
+            return f"expected the terminal ID of {o}"
+        if o == "delivered" and not ("started" in rec and "turn" in rec):
+            return "expected started and turn on delivered"
+    return None
+
+
+def _parse(data, first_line):
+    """Records from whole lines of bytes; LogDamage with the 1-based line number on anything else."""
+    if not data:
+        return []
+    if not data.endswith(b"\n"):
+        raise _LineDamage(first_line + data.count(b"\n"), "incomplete line")
+    records = []
+    for n, raw in enumerate(data[:-1].split(b"\n"), first_line):
+        if not raw:
+            raise _LineDamage(n, "blank line")
+        try:
+            rec = json.loads(raw.decode("utf-8"), parse_constant=_reject_constant)
+        except (UnicodeError, ValueError) as error:
+            raise _LineDamage(n, f"not JSON: {error}") from error
+        problem = _record_problem(rec)
+        if problem:
+            raise _LineDamage(n, problem)
+        records.append(rec)
+    return records
+
+
+def _checkpoint_digest(check):
+    """A digest of log.check's fields, so an accidental edit of one of them is a miss, not a wrong id."""
+    fields = ":".join(str(check[k]) for k in ("ino", "size", "mtime_ns", "last", "lineage"))
+    return hashlib.sha256(fields.encode()).hexdigest()
+
+
+def _reject_constant(name):
+    raise ValueError(f"{name} is not standard JSON")
+
+
+def _absolute(path):
+    """Absolute and lexically normalized, with one leading slash ("//x" is "/x" here); nothing is resolved."""
+    path = os.path.abspath(os.fspath(path))
+    return "/" + path.lstrip("/") if path.startswith("//") else path
+
+
+class _LineDamage(Exception):
+    def __init__(self, line, reason):
+        super().__init__(reason)
+        self.line, self.reason = line, reason
+
+
+class Box:
+    """In-memory index of the committed log, replayed from Log.read."""
+
+    def __init__(self, path):
+        self.path = path
+        self._reset()
+
+    def _reset(self):
+        self.offset = 0
+        self.line = 0                       # lines applied so far (full boxes only)
+        self.msgs: dict[int, dict] = {}     # committed messages; text dropped once every recipient is final
+        self.outcomes: dict[tuple[int, str], dict] = {}
+        self.uncommitted = 0
+        self.highest = 0                    # highest msg id seen, committed or not
+        self._open = None                   # the msg record just read, waiting for its ok
+        self._only = None                   # for_message: the one id this partial view follows
+        self._lineage = None                # the checkpoint lineage this box's view was proven in, by Log.out
+        self._damage = None                 # set when an apply failed: the box is unusable until rebuilt
+
+    @classmethod
+    def for_message(cls, path, ident, recipients, offset):
+        """A partial, outcome-only view of one committed message, from the offset add returned."""
+        box = cls(path)
+        box.offset, box.line, box._only = offset, None, ident
+        box.msgs[ident] = {"t": "msg", "id": ident, "to": list(recipients)}
+        return box
+
+    def _damage_at(self, index, reason):
+        line = None if self.line is None else self.line + index + 1
+        where = "" if line else f" (after byte {self.offset})"
+        return LogDamage(self.path, line, reason + where)
+
+    def _usable(self):
+        if self._damage is not None:
+            raise self._damage
+
+    def apply(self, records):
+        self._usable()
+        for index, rec in enumerate(records):
+            problem = self._apply(rec)
+            if problem:
+                self._damage = self._damage_at(index, problem)   # never leave a half-applied box usable
+                raise self._damage
+        if self.line is not None:
+            self.line += len(records)
+
+    def _apply(self, rec):
+        kind, ident = rec["t"], rec["id"]
+        if self._only is not None:
+            if kind == "out" and ident == self._only:
+                return self._outcome(rec)
+            return None
+        opened, self._open = self._open, None
+        if kind == "msg":
+            if ident <= self.highest:
+                return f"message id {ident} is not above {self.highest}"
+            self.highest = ident
+            self.uncommitted += 1
+            self._open = rec
+            return None
+        if kind == "ok":
+            if opened is None or opened["id"] != ident:
+                return f"commit record for {ident} does not follow its message"
+            self.uncommitted -= 1
+            self.msgs[ident] = dict(opened)
+            return None
+        if ident not in self.msgs:
+            return f"outcome for unknown message {ident}"
+        return self._outcome(rec)
+
+    def _outcome(self, rec):
+        ident, to = rec["id"], rec["to"]
+        msg = self.msgs[ident]
+        if to not in msg["to"]:
+            return f"outcome for a non-recipient @{to} of message {ident}"
+        current = self.outcome(ident, to)
+        new = rec["o"]
+        if current["o"] in FINAL:
+            return f"outcome {new} after the final {current['o']} for @{to} of message {ident}"
+        if new == "queued" and current["o"] == "queued" and current.get("why") == rec.get("why"):
+            return None   # a redundant queued record with the same reason is harmless
+        if current["o"] not in MOVES[new]:
+            return f"illegal outcome {current['o']} -> {new} for @{to} of message {ident}"
+        self.outcomes[(ident, to)] = dict(rec)
+        if "text" in msg and all(self.outcome(ident, r)["o"] in FINAL for r in msg["to"]):
+            msg.pop("text")
+        return None
+
+    def outcome(self, ident, to):
+        self._usable()
+        rec = self.outcomes.get((ident, to))
+        return dict(rec) if rec else {"o": "queued", "why": "waiting"}
+
+    def pending(self, to=None):
+        self._usable()
+        return [(msg, r) for ident, msg in sorted(self.msgs.items()) for r in msg["to"]
+                if (to is None or r == to) and self.outcome(ident, r)["o"] not in FINAL]
+
+    # derived facts (message_log.md "Derived facts")
+
+    def last_to(self, name, sender=None):
+        """The newest committed message delivered to name (from sender, when given)."""
+        self._usable()
+        for ident in sorted(self.msgs, reverse=True):
+            msg = self.msgs[ident]
+            if (name in msg["to"] and (sender is None or msg.get("from") == sender)
+                    and self.outcome(ident, name)["o"] == "delivered"):
+                return msg
+        return None
+
+    def last_from(self, name):
+        """The newest committed message sent by name."""
+        self._usable()
+        for ident in sorted(self.msgs, reverse=True):
+            if self.msgs[ident].get("from") == name:
+                return self.msgs[ident]
+        return None
+
+    def briefed(self):
+        """Terminal IDs that a brief was delivered to: a member terminal is ready when it is in this set."""
+        self._usable()
+        return {rec["term"] for (ident, _), rec in self.outcomes.items()
+                if rec["o"] == "delivered" and "term" in rec and self.msgs[ident].get("kind") == "brief"}
+
+    def last_note(self, term):
+        """The meta of the newest committed member note about that terminal."""
+        self._usable()
+        for ident in sorted(self.msgs, reverse=True):
+            msg = self.msgs[ident]
+            if msg.get("kind") == "note" and (msg.get("meta") or {}).get("term") == term:
+                return msg["meta"]
+        return None
+
+    def _note(self, what):
+        self._usable()
+        for ident in sorted(self.msgs, reverse=True):
+            msg = self.msgs[ident]
+            if (msg.get("kind") == "note" and (msg.get("meta") or {}).get("what") == what
+                    and all(self.outcome(ident, r)["o"] != "dropped" for r in msg["to"])):
+                return msg
+        return None
+
+    def quiet_note(self):
+        """The newest quiet note that was not dropped."""
+        return self._note("quiet")
+
+    def ready_note(self):
+        """The newest ready-work note that was not dropped."""
+        return self._note("ready")
+
+
+class Log:
+    """The team's append-only message log in <state>/log.jsonl.
+
+    Every operation holds a no-follow descriptor of the state directory and opens its files relative to it,
+    so no component (the directory, lock, log, checkpoint) is ever followed through a symbolic link."""
+
+    LOG, CHECK = "log.jsonl", "log.check"
+
+    def __init__(self, state, base=None):
+        """state: the team's state directory. base: the owner's cache base above it, which may be a symbolic link;
+        every component from base down to state is Factory's and is never followed through a link. Without base
+        only the state directory itself is."""
+        self.state = pathlib.Path(_absolute(state))   # lexical: a symbolic link in the cache base is kept
+        self._base = _absolute(base) if base is not None else str(self.state.parent)
+        relative = os.path.relpath(self.state, self._base)
+        if relative == "." or relative.startswith("..") or os.path.isabs(relative):
+            raise ValueError(f"{self.state} is not below {self._base}")
+        self._parts = relative.split(os.sep)
+        self.path = self.state / self.LOG
+        self.check_path = self.state / self.CHECK
+        self._local = threading.local()     # the open state directory and lineage belong to one operation
+
+    @property
+    def _dir(self):
+        return getattr(self._local, "dir", None)
+
+    @_dir.setter
+    def _dir(self, fd):
+        self._local.dir = fd
+
+    # ---------------------------------------------------------------- locking and reading
+
+    def _open(self, name, flags, fix_mode=True):
+        return private_open(name, flags, fix_mode, dir_fd=self._dir)
+
+    def _lexists(self, name):
+        try:
+            os.stat(name, dir_fd=self._dir, follow_symlinks=False)
+            return True
+        except FileNotFoundError:
+            return False
+
+    def _open_state(self, create):
+        """A no-follow descriptor of the state directory, or None for a reader when it does not exist. The cache
+        base may be the owner's symbolic link; every component below it is opened (or created) one at a time
+        relative to its parent's descriptor, never through a symbolic link."""
+        base, parts = self._base, self._parts
+        if create:
+            pathlib.Path(base).mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY)
+        except FileNotFoundError:
+            if create:
+                raise
+            return None
+        path = base
+        try:
+            for part in parts:
+                path = os.path.join(path, part)
+                try:
+                    child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                except FileNotFoundError:
+                    if not create:
+                        os.close(fd)
+                        return None
+                    try:
+                        os.mkdir(part, 0o700, dir_fd=fd)
+                    except FileExistsError:
+                        pass
+                    child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                os.close(fd)
+                fd = child
+        except OSError as error:
+            os.close(fd)
+            raise OSError(f"cannot open {path} (a symbolic link or not a directory?): {error}") from error
+        if create and stat.S_IMODE(os.fstat(fd).st_mode) != 0o700:
+            os.fchmod(fd, 0o700)
+        return fd
+
+    def _in_place(self):
+        """Whether the state path still names the directory this operation holds."""
+        try:
+            named = os.stat(self.state, follow_symlinks=False)
+        except OSError:
+            return False
+        held = os.fstat(self._dir)
+        return (named.st_dev, named.st_ino) == (held.st_dev, held.st_ino)
+
+    def _check_moved(self, what):
+        """After an append: if the state directory was moved or replaced meanwhile, the record is in the moved one."""
+        if not self._in_place():
+            raise OSError(f"the state directory {self.state} was moved during the write; {what} is in the moved"
+                          " directory, check before resending")
+
+    @contextlib.contextmanager
+    def _locked(self, exclusive):
+        """The team lock is the state directory itself, flocked through the same no-follow descriptor every operation
+        uses, so no two writers can append to one log under different locks. A writer then checks that the state path
+        still names that directory: one moved or replaced meanwhile is damage, with nothing written. Writers create
+        the private directory; readers create nothing."""
+        directory = self._open_state(create=exclusive)
+        if directory is None:
+            yield None
+            return
+        self._dir = directory
+        try:
+            try:
+                fcntl.flock(directory, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+            except OSError as error:
+                if not exclusive:
+                    raise
+                raise OSError(error.errno, f"cannot lock the state directory {self.state}: {error.strerror}."
+                                           " If it is on a filesystem that cannot lock a directory (NFS, for"
+                                           " one), set XDG_CACHE_HOME to a local path.") from error
+            if exclusive and not self._in_place():
+                raise LogDamage(self.path, None, "the state directory was moved or replaced while opening it")
+            yield directory
+        finally:
+            self._dir = None
+            os.close(directory)
+
+    def _snapshot(self, offset):
+        """(records, end, box) from offset, with the lock held. At offset 0 the records are also replayed into a
+        full box, to check references and transitions before anything is returned; otherwise box is None."""
+        try:
+            fd = self._open(self.LOG, os.O_RDONLY, fix_mode=False)
+        except FileNotFoundError:
+            if offset:
+                raise LogDamage(self.path, None, f"the log was removed (reader was at byte {offset})")
+            if self._lexists(self.CHECK):
+                raise LogDamage(self.path, None, "log.jsonl is missing but log.check remains")
+            return [], 0, Box(self.path)
+        with os.fdopen(fd, "rb") as f:
+            size = os.fstat(f.fileno()).st_size
+            if offset > size:
+                raise LogDamage(self.path, None, f"the log was truncated (reader was at byte {offset}, size {size})")
+            if offset:
+                f.seek(offset - 1)
+                if f.read(1) != b"\n":
+                    raise LogDamage(self.path, None, f"byte {offset} is not at the start of a line")
+            data = f.read()
+            try:
+                records = _parse(data, 1)
+            except _LineDamage as damage:
+                line = damage.line
+                if offset:
+                    f.seek(0)
+                    line += f.read(offset).count(b"\n")
+                raise LogDamage(self.path, line, damage.reason) from None
+        end = offset + len(data)
+        box = None
+        if offset == 0:
+            box = Box(self.path)
+            box.apply(records)              # references and transitions, before anything is returned
+            box.offset = end
+        return records, end, box
+
+    def read_box(self):
+        """(records, box): one full, validated read and the box it built. Raises LogDamage."""
+        with self._locked(exclusive=False) as fd:
+            if fd is None:
+                return [], Box(self.path)
+            records, _, box = self._snapshot(0)
+            return records, box
+
+    def read(self, offset=0):
+        """(records, end) from byte offset; offset 0 validates the whole log. Raises LogDamage."""
+        if type(offset) is not int or offset < 0:
+            raise ValueError(f"offset must be a non-negative integer, not {offset!r}")
+        with self._locked(exclusive=False) as fd:
+            if fd is None:
+                if offset:
+                    raise LogDamage(self.path, None, f"the log was removed (reader was at byte {offset})")
+                return [], 0
+            return self._snapshot(offset)[:2]
+
+    # ---------------------------------------------------------------- the checkpoint
+
+    def _stat(self):
+        try:
+            info = os.stat(self.LOG, dir_fd=self._dir, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError(f"not a regular file: {self.path}")
+        return info
+
+    def _checkpoint(self, info):
+        """log.check when it proves this exact file was validated ({"last", "lineage"}), else None.
+        An unsafe log.check raises."""
+        try:
+            fd = self._open(self.CHECK, os.O_RDONLY, fix_mode=False)
+        except FileNotFoundError:
+            return None
+        with os.fdopen(fd, "rb") as f:
+            raw = f.read()
+        if info is None:
+            raise LogDamage(self.path, None, "log.jsonl is missing but log.check remains")
+        try:
+            check = json.loads(raw)
+        except ValueError:
+            return None
+        fields = ("ino", "size", "mtime_ns", "last")
+        if not (isinstance(check, dict) and all(type(check.get(k)) is int and check[k] >= 0 for k in fields)
+                and isinstance(check.get("lineage"), str) and re.fullmatch(r"[0-9a-f]{16}", check["lineage"])
+                and isinstance(check.get("digest"), str) and check["digest"] == _checkpoint_digest(check)):
+            return None       # unparsable, or edited by hand: one full validation instead
+        if (check["ino"], check["size"], check["mtime_ns"]) != (info.st_ino, info.st_size, info.st_mtime_ns):
+            return None
+        return check
+
+    def _write_checkpoint(self, last):
+        """Publish a fresh proof of validation; a failure only costs the next writer one full read.
+        lineage names an unbroken run of appends by writers since the last full validation."""
+        name, created = f"{self.CHECK}.{secrets.token_hex(8)}.tmp", False
+        try:
+            info = self._stat()
+            if info is None:
+                return
+            check = {"ino": info.st_ino, "size": info.st_size, "mtime_ns": info.st_mtime_ns,
+                     "last": last, "lineage": self._local.lineage}
+            data = json.dumps({**check, "digest": _checkpoint_digest(check)}).encode()
+            fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=self._dir)
+            created = True
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+            os.replace(name, self.CHECK, src_dir_fd=self._dir, dst_dir_fd=self._dir)
+            return
+        except OSError:
+            pass
+        if created:
+            try:
+                os.unlink(name, dir_fd=self._dir)
+            except OSError:
+                pass
+
+    def _full_box(self):
+        return self._snapshot(0)[2]
+
+    def _prove(self, info):
+        """The checkpoint if it proves the file, else None; records the lineage the next append continues."""
+        check = self._checkpoint(info)
+        self._local.lineage = check["lineage"] if check else secrets.token_hex(8)
+        return check
+
+    def _prefix(self):
+        """The highest message id, after proving everything already in the log is valid (lock held)."""
+        info = self._stat()
+        check = self._prove(info)
+        if check is not None:
+            return check["last"]
+        if info is None:
+            return 0
+        return self._full_box().highest
+
+    # ---------------------------------------------------------------- appending
+
+    def _append(self, line):
+        """Append one record: ("synced" or "visible", end offset); "visible" when it is whole but its sync failed.
+        Raises NotStored, or _Unreadable when the tail cannot be read back."""
+        try:
+            fd = self._open(self.LOG, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
+        except OSError as error:
+            raise NotStored(False, f"cannot open {self.path}: {error}") from error
+        try:
+            before = os.fstat(fd).st_size
+            try:
+                view, offset = memoryview(line), 0
+                while offset < len(line):
+                    count = os.write(fd, view[offset:])
+                    if count <= 0:
+                        raise OSError("write made no progress")
+                    offset += count
+                os.fsync(fd)
+                self._sync_directory()
+                return "synced", before + len(line)
+            except OSError as error:
+                failure = error
+                try:
+                    os.ftruncate(fd, before)
+                    os.fsync(fd)
+                except OSError:
+                    pass
+        finally:
+            os.close(fd)
+        try:
+            rfd = self._open(self.LOG, os.O_RDONLY, fix_mode=False)
+            with os.fdopen(rfd, "rb") as f:
+                f.seek(before)
+                tail = f.read()
+        except OSError as error:
+            raise _Unreadable(error) from failure
+        if not tail:
+            raise NotStored(False, f"the disk reported an error ({failure}); nothing was stored") from failure
+        if tail == line:
+            return "visible", before + len(line)
+        raise NotStored(True, f"the disk reported an error ({failure}); an incomplete entry may remain") from failure
+
+    def _sync_directory(self):
+        os.fsync(self._dir)
+
+    def _sync_ancestors(self):
+        """Before the log is first created: make the state directory's entry, and each parent's up to the
+        filesystem's root, durable, whoever created them (a creator may have died right after mkdir)."""
+        device = os.fstat(self._dir).st_dev
+        path = self.state
+        while path.parent != path:
+            parent = path.parent
+            fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                if os.fstat(fd).st_dev != device:
+                    return            # another filesystem: the entry we depend on is in the directory below
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            path = parent
+
+    def _first_log(self):
+        """Called before an append when there is no log yet: sync the directory chain, or store nothing."""
+        if self._stat() is None:
+            try:
+                self._sync_ancestors()
+            except OSError as error:
+                raise NotStored(False, f"cannot make {self.state} durable: {error}") from error
+
+    @staticmethod
+    def _line(rec):
+        return (json.dumps(rec, ensure_ascii=False, allow_nan=False, separators=(",", ":")) + "\n").encode("utf-8")
+
+    def add(self, sender, to, text, kind="say", file=None, meta=None):
+        """Store one message: (id, end offset, warning or None). Raises ValueError, LogDamage, NotStored, OSError."""
+        recipients = list(to) if isinstance(to, (list, tuple)) else to
+        rec = {"t": "msg", "id": 1, "at": utc_now(), "from": sender, "to": recipients, "kind": kind, "text": text}
+        if file is not None:
+            rec["file"] = file
+        if meta is not None:
+            rec["meta"] = meta
+        problem = _record_problem(rec)
+        if problem:
+            raise ValueError(problem)
+        try:
+            self._line(rec)   # serializable (no NaN, no foreign objects in meta) before anything is touched
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"message is not JSON-serializable: {error}") from error
+        with self._locked(exclusive=True):
+            ident = self._prefix() + 1
+            self._first_log()
+            rec["id"] = ident
+            try:
+                if self._append(self._line(rec))[0] == "visible":
+                    raise NotStored(False, "the disk reported an error; the entry was left uncommitted")
+            except _Unreadable as unreadable:
+                raise NotStored(True, f"the disk reported an error and {self.path} could not be read back;"
+                                      f" message {ident} was not committed") from unreadable.error
+            try:
+                status, end = self._append(self._line({"t": "ok", "id": ident}))
+            except _Unreadable as unreadable:
+                raise OSError(f"message {ident} in {self.path}: {UNKNOWN}") from unreadable.error
+            self._check_moved(f"message {ident}")
+            self._write_checkpoint(ident)
+            return ident, end, None if status == "synced" else STORED_WARNING
+
+    OUT_FIELDS = {"sending": {"term"}, "delivered": {"term", "started", "turn"}, "queued": {"why"},
+                  "unconfirmed": {"why", "term"}, "dropped": {"why", "term"}}
+
+    def _refresh(self, box):
+        """Bring box up to the current, validated file (lock held). Only a box whose view belongs to the
+        checkpoint's lineage (nothing but writers' appends since) refreshes its tail; any other is rebuilt."""
+        if box._only is not None:
+            raise ValueError("a partial box cannot authorize a write")   # before anything could widen it
+        info = self._stat()
+        check = self._prove(info)
+        if box._damage is None and check is not None and box._lineage == check["lineage"] \
+                and box.offset <= info.st_size:
+            records, end, _ = self._snapshot(box.offset)
+            box.apply(records)
+            box.offset = end
+            return
+        records, end, _ = self._snapshot(0)
+        box._reset()
+        box.apply(records)
+        box.offset, box._lineage = end, self._local.lineage   # the caller's own object, rebuilt in place
+
+    def _check_out(self, box, ident, to, o, extra):
+        if box._only is not None:
+            raise ValueError("a partial box cannot authorize a write")
+        if o not in OUTCOMES:
+            raise ValueError(f"unknown outcome {o!r}")
+        unexpected = set(extra) - self.OUT_FIELDS[o]
+        if unexpected:
+            raise ValueError(f"unexpected fields for {o}: {sorted(unexpected)}")
+        if o == "queued" and extra.get("why") not in QUEUE_REASONS:
+            raise ValueError(f"queued needs one of the reasons {QUEUE_REASONS}")
+        rec = {"t": "out", "id": ident, "to": to, "o": o, "at": utc_now(), **extra}
+        problem = _record_problem(rec)
+        if problem:
+            raise ValueError(problem)
+        return rec
+
+    def _out_locked(self, box, rec):
+        ident, to, o = rec["id"], rec["to"], rec["o"]
+        msg = box.msgs.get(ident)
+        if msg is None or to not in msg["to"]:
+            raise ValueError(f"@{to} is not a recipient of committed message {ident}")
+        current = box.outcome(ident, to)
+        if current["o"] in FINAL or current["o"] not in MOVES[o]:
+            return False
+        if o == "queued" and current["o"] == "queued" and current.get("why") == rec["why"]:
+            return False
+        try:
+            status, end = self._append(self._line(rec))
+        except _Unreadable as unreadable:
+            raise OSError(f"outcome {o} for @{to} of message {ident} in {self.path}: {UNKNOWN}") from unreadable.error
+        if status == "visible" and o == "sending":
+            raise NotStored(False, "the sending record is not durable: do not send")
+        self._check_moved(f"the {o} record for @{to} of message {ident}")
+        box.apply([rec])
+        box.offset, box._lineage = end, self._local.lineage
+        self._write_checkpoint(box.highest)
+        return True
+
+    def out(self, box, ident, to, o, **extra):
+        """Record one outcome if the pair's current outcome allows it; returns whether it wrote."""
+        rec = self._check_out(box, ident, to, o, extra)
+        with self._locked(exclusive=True):
+            self._refresh(box)
+            return self._out_locked(box, rec)
+
+    def drop_queued(self, box, names, why="stopped by down"):
+        """down's batch: drop every pair still queued to one of names, in one locked section; the count written."""
+        names = set(names)
+        if not (isinstance(why, str) and why.strip()):
+            raise ValueError("dropped needs a reason")
+        with self._locked(exclusive=True):
+            self._refresh(box)
+            written = 0
+            for msg, to in box.pending():
+                if to in names and box.outcome(msg["id"], to)["o"] == "queued":
+                    rec = self._check_out(box, msg["id"], to, "dropped", {"why": why})
+                    written += self._out_locked(box, rec)
+            return written
+
+    # ---------------------------------------------------------------- message files (§8.7)
+
+    def _sender_dir(self, sender):
+        """A no-follow descriptor of messages/<sender> inside the state directory (lock held), or None."""
+        try:
+            messages = os.open("messages", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=self._dir)
+        except (FileNotFoundError, NotADirectoryError):
+            return None
+        except OSError as error:
+            raise OSError(f"not a directory (or a symbolic link): {self.state / 'messages'}") from error
+        try:
+            return os.open(sender, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=messages)
+        except (FileNotFoundError, NotADirectoryError):
+            return None
+        except OSError as error:
+            raise OSError(f"not a directory (or a symbolic link): {self.state / 'messages' / sender}") from error
+        finally:
+            os.close(messages)
+
+    def _unlink_in(self, sender_fd, name, path):
+        """Remove one regular file by name relative to its sender directory: None, or a warning."""
+        try:
+            if not stat.S_ISREG(os.stat(name, dir_fd=sender_fd, follow_symlinks=False).st_mode):
+                return None
+            os.unlink(name, dir_fd=sender_fd)
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            return f"could not remove {path}: {error}"
+        return None
+
+    @staticmethod
+    def _newest_use(box, sender, path):
+        """The newest committed message from sender naming this file, by the lexical identity of the path."""
+        key = lexical_path(path)
+        for ident in sorted(box.msgs, reverse=True):
+            msg = box.msgs[ident]
+            if key and msg.get("from") == sender and "file" in msg and lexical_path(msg["file"]) == key:
+                return msg
+        return None
+
+    def remove_delivered_file(self, box, ident):
+        """After a delivered receipt: unlink the message's managed file once every recipient has it.
+        Returns a warning naming the path when the unlink failed, else None."""
+        with self._locked(exclusive=True):
+            self._refresh(box)
+            msg = box.msgs.get(ident)
+            if msg is None or "file" not in msg or self._newest_use(box, msg["from"], msg["file"]) is not msg:
+                return None
+            path = lexical_path(msg["file"])
+            if not all(box.outcome(ident, r)["o"] == "delivered" for r in msg["to"]):
+                return None
+            if not managed_file(self.state, msg["from"], path):
+                return None
+            sender_fd = self._sender_dir(msg["from"])
+            if sender_fd is None:
+                return None
+            try:
+                return self._unlink_in(sender_fd, os.path.basename(path), path)
+            finally:
+                os.close(sender_fd)
+
+    def leftovers(self, now=None):
+        """Message files left in messages/<sender>/: (rows still to check, warnings). Files whose newest message
+        was delivered to every recipient are removed silently. Symbolic links and non-regular entries are ignored."""
+        now = time.time() if now is None else now
+        rows, warnings = [], []
+        with self._locked(exclusive=True):
+            box = self._full_box()
+            try:
+                messages = os.open("messages", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=self._dir)
+            except (FileNotFoundError, NotADirectoryError):
+                return rows, warnings
+            try:
+                with os.scandir(messages) as entries:
+                    senders = sorted(e.name for e in entries if e.is_dir(follow_symlinks=False))
+            finally:
+                os.close(messages)
+            for sender in senders:
+                sender_fd = self._sender_dir(sender)
+                if sender_fd is None:
+                    continue
+                try:
+                    with os.scandir(sender_fd) as listing:
+                        entries = sorted(listing, key=lambda e: e.name)
+                    for entry in entries:
+                        path = str(self.state / "messages" / sender / entry.name)
+                        try:
+                            if not entry.is_file(follow_symlinks=False):
+                                continue
+                            mtime = entry.stat(follow_symlinks=False).st_mtime
+                        except FileNotFoundError:
+                            continue          # gone since the listing: nothing left to check
+                        except OSError as error:
+                            warnings.append(f"could not inspect {path}: {error}")
+                            continue
+                        msg = self._newest_use(box, sender, path)
+                        outcomes = {r: box.outcome(msg["id"], r) for r in msg["to"]} if msg else {}
+                        if (msg and MESSAGE_FILE.fullmatch(entry.name)
+                                and all(o["o"] == "delivered" for o in outcomes.values())):
+                            warning = self._unlink_in(sender_fd, entry.name, path)
+                            if warning:
+                                warnings.append(warning)
+                            continue
+                        rows.append({"sender": sender, "path": path, "age_s": max(0.0, now - mtime),
+                                     "id": msg["id"] if msg else None,
+                                     "outcomes": {r: outcome_word(o) for r, o in outcomes.items()}})
+                finally:
+                    os.close(sender_fd)
+        return rows, warnings
+
+
+def inbox_rows(log, name, count=10):
+    """The last count committed messages addressed to name, oldest first, each with that recipient's current
+    outcome: [(message, outcome)]. One validated snapshot; reads only (phase_3.md §7). Raises LogDamage."""
+    if type(count) is not int or count < 1:
+        raise ValueError(f"count must be a positive integer, not {count!r}")
+    if not (isinstance(name, str) and name):
+        raise ValueError("a recipient name is needed")
+    records, box = log.read_box()
+    originals = {r["id"]: r for r in records if r["t"] == "msg"}   # the box drops text once final; these keep it
+    chosen = [ident for ident in sorted(box.msgs) if name in box.msgs[ident]["to"]][-count:]
+    return [(originals[ident], box.outcome(ident, name)) for ident in chosen]
+
+
+MESSAGE_FILE = re.compile(r"[A-Za-z0-9-]+\.[A-Za-z0-9]+")
+
+
+def outcome_word(outcome):
+    return f"queued ({outcome['why']})" if outcome["o"] == "queued" else outcome["o"]
+
+
+def lexical_path(path):
+    """A path's lexical identity: absolute, with "." and repeated slashes removed; None for a relative path or one
+    with a ".." component. Nothing is resolved."""
+    path = os.fspath(path)
+    if not os.path.isabs(path) or ".." in path.split("/"):
+        return None
+    return _absolute(path)
+
+
+def managed_file(state, sender, path):
+    """Whether path is a message file Factory may remove: a regular file named like a-b-1.md directly in
+    <state>/messages/<sender>/, with no symbolic link from the state directory down. Lexical: nothing is resolved."""
+    path, state = lexical_path(path), _absolute(state)
+    if path is None or not MESSAGE_FILE.fullmatch(os.path.basename(path)):
+        return False
+    if os.path.dirname(path) != os.path.join(state, "messages", sender) or not sender or "/" in sender:
+        return False
+    try:
+        for component in (state, os.path.join(state, "messages"), os.path.dirname(path)):
+            if not stat.S_ISDIR(os.lstat(component).st_mode):
+                return False
+        return stat.S_ISREG(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+
+def format_leftovers(rows):
+    """up's cold-start lines for leftover message files, with the reminder once."""
+    lines = []
+    for row in rows:
+        where = (f"message {row['id']}: " + ", ".join(f"@{r} {o}" for r, o in row["outcomes"].items())
+                 if row["id"] is not None else "never stored")
+        lines.append(f"leftover message file for @{row['sender']} ({int(row['age_s'] // 60)} min old): "
+                     f"{row['path']}: {where}")
+    if lines:
+        lines.append("Check before resending or discarding.")
+    return lines
+
+
 class InboxDamage(ValueError):
     def __init__(self, path, line, reason):
         super().__init__(f"inbox needs repair: {path}, line {line}: {reason}. Operator messages are unavailable."
@@ -546,17 +1477,7 @@ class Inbox:
         self.state_path = self.path.with_suffix(".json")
         self.lock_path = self.path.with_suffix(".lock")
 
-    @staticmethod
-    def private_open(path, flags):
-        fd = os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
-        try:
-            if not stat.S_ISREG(os.fstat(fd).st_mode):
-                raise OSError(f"not a regular file: {path}")
-            os.fchmod(fd, 0o600)
-            return fd
-        except BaseException:
-            os.close(fd)
-            raise
+    private_open = staticmethod(private_open)
 
     def __enter__(self):
         for path in (self.directory.parent, self.directory):
