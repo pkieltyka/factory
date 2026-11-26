@@ -141,6 +141,8 @@ class Conn:
         if self.p.poll() is None:
             self.p.kill()
         self.p.wait()
+        self.p.stdin.close()
+        self.p.stdout.close()
 
     def close(self):
         try:
@@ -151,6 +153,8 @@ class Conn:
             self.p.wait(2)
         except subprocess.TimeoutExpired:
             self.kill()
+        finally:
+            self.p.stdout.close()
 
 
 class Core:
@@ -781,30 +785,38 @@ def scrubber(core):
     subs = [(str(core.dir), "/tmp/hc-fixture"), (core.id, "0" * 32), (home, "/home/<user>"),
             (sys.executable, "/usr/bin/python3")]
     host, user = socket.gethostname(), getpass.getuser()
-    user = user if len(user) > 2 else ""
     nix = re.compile(r"/nix/store/[a-z0-9]{32}-[^/\s\"]+")
-    names = [(n, f"<{p}>") for n, p in ((host, "host"), (user, "user")) if n]
+    names = [(n, f"<{p}>") for n, p in ((host, "host"), (user, "user")) if len(n) > 2]
 
     def word(name):
-        return re.compile(rf"(?<![\w.-]){re.escape(name)}(?![\w.-])")
+        return re.compile(rf"(?<![\w.<-]){re.escape(name)}(?![\w.>-])")
+
+    def identity_placeholder(value, key, parent):
+        if (parent, key) == ("core", "name") and isinstance(value, str):
+            return "<host>"
+        if parent == "login_session" and key in ("id", "user"):
+            # In hc 0.1.20 these are the session number and UID, both uint32.
+            if type(value) is int:
+                return 1
+            if isinstance(value, str):
+                return "<user>"
+        return None
 
     def scrub(value, key=None, parent=None):
-        # Host and user names are replaced only where hc puts them: core.name, login_session.user, and paths.
         if isinstance(value, dict):
             return {k: scrub(v, k, key) for k, v in value.items()}
         if isinstance(value, list):
             return [scrub(v, key, parent) for v in value]
+        placeholder = identity_placeholder(value, key, parent)
+        if placeholder is not None:
+            return placeholder
         if isinstance(value, str):
-            if (parent, key) == ("core", "name") and host and value == host:
-                return "<host>"
-            if (parent, key) == ("login_session", "user") and user and value == user:
-                return "<user>"
             for old, new in subs:
                 value = value.replace(old, new)
             value = nix.sub("/nix/store/HASH-pkg", value)
             if "/" in value:
-                for name, placeholder in names:
-                    value = word(name).sub(placeholder, value)
+                for name, mask in names:
+                    value = word(name).sub(mask, value)
             return value
         if isinstance(value, bool) or value is None:
             return value
@@ -820,12 +832,13 @@ def scrubber(core):
             return [x for k, v in value.items() for x in leaks(v, k, key)]
         if isinstance(value, list):
             return [x for v in value for x in leaks(v, key, parent)]
+        placeholder = identity_placeholder(value, key, parent)
+        if placeholder is not None:
+            return [f"{parent}.{key}"] if value != placeholder else []
         if not isinstance(value, str):
             return []
         found = [n for n in (home, str(core.dir), core.id) if n in value]
         found += ["/nix/store hash"] if nix.search(value) else []
-        found += [host] if (parent, key) == ("core", "name") and host and value == host else []
-        found += [user] if (parent, key) == ("login_session", "user") and user and value == user else []
         if "/" in value:
             bare = value.replace("<host>", "").replace("<user>", "")
             found += [n for n, _ in names if word(n).search(bare)]
@@ -836,6 +849,59 @@ def scrubber(core):
 
 ERROR_KINDS = {"blocked", "conflict", "finished", "invalid_params", "live", "not_found", "spawn_failed",
                "status_mismatch"}
+WIRE_EXCEPTIONS = (
+    {"version": "0.1.20", "type": "ListResult", "field": "machines",
+     "declared": {"required": True}, "observed": "omitted when there are no remote machines",
+     "applied": {"required": False}},
+)
+
+
+def schema_extract(replies, version, env):
+    """Keep the required keys and JSON types reachable from the recorded success replies."""
+    schema = json.loads(subprocess.check_output([HC, "schema"], env=env, timeout=15))
+    source = schema["components"]["schemas"]
+    methods = {entry["name"]: entry["result"]["schema"] for entry in schema["methods"]}
+    types = {}
+
+    def describe(field):
+        if field is True:
+            return {"type": "any"}
+        if "anyOf" in field:
+            choices = [choice for choice in field["anyOf"] if choice != {"type": "null"}]
+            if len(choices) == 1 and len(field["anyOf"]) == 2:
+                return {**describe(choices[0]), "nullable": True}
+            raise ValueError(f"unsupported schema union: {field}")
+        if "$ref" in field:
+            name = field["$ref"].rsplit("/", 1)[1]
+            if name not in types:
+                types[name] = {}  # WaitResult.children can lead back here.
+                required = set(source[name].get("required", []))
+                types[name].update({key: {**describe(prop), **({"required": True} if key in required else {})}
+                                    for key, prop in source[name]["properties"].items()})
+            return {"ref": name}
+        kind = field.get("type")
+        nullable = isinstance(kind, list) and "null" in kind
+        if nullable:
+            kind, = (entry for entry in kind if entry != "null")
+        if kind not in ("string", "integer", "number", "boolean", "array", "object"):
+            raise ValueError(f"unsupported schema field: {field}")
+        spec = {"type": kind}
+        if nullable:
+            spec["nullable"] = True
+        if kind == "array":
+            spec["items"] = describe(field["items"])
+        if kind == "object" and field.get("additionalProperties"):
+            spec["values"] = describe(field["additionalProperties"])
+        return spec
+
+    results = {method: describe(methods[method])["ref"] for method in sorted({r["method"] for r in replies.values()})}
+    exceptions = [rule for rule in WIRE_EXCEPTIONS if rule["version"] == version]
+    for rule in exceptions:
+        field = types[rule["type"]][rule["field"]]
+        if any(field.get(key) != value for key, value in rule["declared"].items()):
+            raise ValueError(f"remove obsolete wire exception: {rule['type']}.{rule['field']}")
+        field.update(rule["applied"])
+    return {"results": results, "types": types}, exceptions
 
 
 def fixtures(out):
@@ -915,6 +981,7 @@ def fixtures(out):
         rec("terminal.list.after_restart", "terminal.list", {"all": True, "labels": {"factory.team": "fix"}})
         scrub = scrubber(qa)
         version = replies["hello"]["result"]["version"]
+        schema, exceptions = schema_extract(replies, version, qa.env)
     missing = ERROR_KINDS - set(errors)
     if problems or missing:
         raise RuntimeError(f"fixtures not written: {problems + [f'{k}: not recorded' for k in sorted(missing)]}")
@@ -923,7 +990,7 @@ def fixtures(out):
         raise RuntimeError(f"fixtures still contain host details: {leaks}")
     data = {"hc_version": version, "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "note": "Recorded by tests/live.py fixtures from a private core; host details replaced by placeholders.",
-            "replies": scrub(replies), "errors": scrub(errors)}
+            "replies": scrub(replies), "errors": scrub(errors), "schema": schema, "wire_exceptions": exceptions}
     pathlib.Path(out).write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
     return {"check": "fixtures", "out": str(out), "hc": version, "replies": sorted(replies), "errors": sorted(errors)}
 

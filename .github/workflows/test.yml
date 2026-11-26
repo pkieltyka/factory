@@ -18,3 +18,27 @@ jobs:
           git config --global user.name "factory CI"
           git config --global user.email "ci@example.invalid"
           python3 tests/test_factory.py
+  test-real-hc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+      - name: Install hc 0.1.20
+        working-directory: ${{ runner.temp }}
+        run: |
+          mkdir -p hc-bin
+          curl -fsSLo herdr-core.tar.gz https://releases.herdr.dev/core/0.1.20/herdr-core-linux-x86_64.tar.gz
+          echo "ac6b86890c451a37584620aaa438b71bc0d0bd430a2e7c1d7e095f052c414e74  herdr-core.tar.gz" | sha256sum -c -
+          tar -xzf herdr-core.tar.gz -C hc-bin
+          ln -s herdr-core hc-bin/hc
+          echo "$PWD/hc-bin" >> "$GITHUB_PATH"
+      - name: Run tests against a private hc core
+        env:
+          FACTORY_TEST_HC: real
+        run: |
+          hc --version
+          git config --global user.name "factory CI"
+          git config --global user.email "ci@example.invalid"
+          python3 tests/test_factory.py

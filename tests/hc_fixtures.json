@@ -153,7 +153,7 @@
   },
   "hc_version": "0.1.20",
   "note": "Recorded by tests/live.py fixtures from a private core; host details replaced by placeholders.",
-  "recorded_at": "2026-11-26T19:59:57Z",
+  "recorded_at": "2026-11-26T20:23:05Z",
   "replies": {
     "doc.get.empty": {
       "method": "doc.get",
@@ -1320,5 +1320,676 @@
         "turn": 0
       }
     }
-  }
+  },
+  "schema": {
+    "results": {
+      "doc.get": "DocGetResult",
+      "doc.set": "DocSetResult",
+      "hello": "HelloResult",
+      "server.status": "StatusResult",
+      "server.stop": "StopResult",
+      "terminal.get": "Terminal",
+      "terminal.keep": "Terminal",
+      "terminal.keys": "KeysResult",
+      "terminal.kill": "Terminal",
+      "terminal.label": "Terminal",
+      "terminal.list": "ListResult",
+      "terminal.read": "ReadResult",
+      "terminal.rm": "RemoveResult",
+      "terminal.run": "RunResult",
+      "terminal.send": "SendResult"
+    },
+    "types": {
+      "CoreInfo": {
+        "id": {
+          "required": true,
+          "type": "string"
+        },
+        "name": {
+          "required": true,
+          "type": "string"
+        }
+      },
+      "DocGetResult": {
+        "value": {
+          "required": true,
+          "type": "any"
+        },
+        "version": {
+          "required": true,
+          "type": "integer"
+        }
+      },
+      "DocSetResult": {
+        "version": {
+          "required": true,
+          "type": "integer"
+        }
+      },
+      "FirstMessage": {
+        "reason": {
+          "nullable": true,
+          "type": "string"
+        },
+        "sent": {
+          "required": true,
+          "type": "boolean"
+        },
+        "started": {
+          "nullable": true,
+          "type": "boolean"
+        },
+        "turn": {
+          "nullable": true,
+          "type": "integer"
+        }
+      },
+      "Foreground": {
+        "argv": {
+          "items": {
+            "type": "string"
+          },
+          "required": true,
+          "type": "array"
+        },
+        "cwd": {
+          "required": true,
+          "type": "string"
+        },
+        "name": {
+          "required": true,
+          "type": "string"
+        },
+        "pid": {
+          "required": true,
+          "type": "integer"
+        }
+      },
+      "HelloResult": {
+        "core": {
+          "ref": "CoreInfo",
+          "required": true
+        },
+        "features": {
+          "items": {
+            "type": "string"
+          },
+          "required": true,
+          "type": "array"
+        },
+        "framed": {
+          "required": true,
+          "type": "boolean"
+        },
+        "generation": {
+          "required": true,
+          "type": "integer"
+        },
+        "login_session": {
+          "nullable": true,
+          "ref": "LoginSession"
+        },
+        "methods": {
+          "items": {
+            "type": "string"
+          },
+          "required": true,
+          "type": "array"
+        },
+        "version": {
+          "required": true,
+          "type": "string"
+        }
+      },
+      "HolderInfo": {
+        "current": {
+          "required": true,
+          "type": "boolean"
+        },
+        "instance": {
+          "required": true,
+          "type": "string"
+        },
+        "pid": {
+          "required": true,
+          "type": "integer"
+        },
+        "terminals": {
+          "required": true,
+          "type": "integer"
+        }
+      },
+      "KeysResult": {
+        "status": {
+          "nullable": true,
+          "type": "string"
+        },
+        "turn": {
+          "required": true,
+          "type": "integer"
+        }
+      },
+      "ListResult": {
+        "hidden_finished": {
+          "required": true,
+          "type": "integer"
+        },
+        "machines": {
+          "items": {
+            "ref": "MachineView"
+          },
+          "required": false,
+          "type": "array"
+        },
+        "terminals": {
+          "items": {
+            "ref": "Terminal"
+          },
+          "required": true,
+          "type": "array"
+        }
+      },
+      "LoginSession": {
+        "gui": {
+          "nullable": true,
+          "type": "boolean"
+        },
+        "id": {
+          "required": true,
+          "type": "integer"
+        },
+        "user": {
+          "required": true,
+          "type": "integer"
+        }
+      },
+      "MachineView": {
+        "host": {
+          "required": true,
+          "type": "string"
+        },
+        "id": {
+          "required": true,
+          "type": "string"
+        },
+        "name": {
+          "required": true,
+          "type": "string"
+        },
+        "session": {
+          "nullable": true,
+          "type": "string"
+        },
+        "since_ms": {
+          "nullable": true,
+          "type": "integer"
+        },
+        "state": {
+          "required": true,
+          "type": "string"
+        },
+        "target": {
+          "required": true,
+          "type": "string"
+        },
+        "temporary": {
+          "type": "boolean"
+        },
+        "version": {
+          "required": true,
+          "type": "string"
+        },
+        "via": {
+          "type": "boolean"
+        },
+        "why": {
+          "nullable": true,
+          "type": "string"
+        }
+      },
+      "ReadResult": {
+        "complete": {
+          "required": true,
+          "type": "boolean"
+        },
+        "how": {
+          "required": true,
+          "type": "string"
+        },
+        "text": {
+          "required": true,
+          "type": "string"
+        },
+        "why": {
+          "nullable": true,
+          "type": "string"
+        }
+      },
+      "RemoveResult": {
+        "removed": {
+          "required": true,
+          "type": "string"
+        }
+      },
+      "RunResult": {
+        "address": {
+          "required": true,
+          "type": "string"
+        },
+        "argv": {
+          "items": {
+            "type": "string"
+          },
+          "required": true,
+          "type": "array"
+        },
+        "cols": {
+          "required": true,
+          "type": "integer"
+        },
+        "created_ms": {
+          "required": true,
+          "type": "integer"
+        },
+        "cwd": {
+          "required": true,
+          "type": "string"
+        },
+        "die_with_parent": {
+          "type": "boolean"
+        },
+        "exit_code": {
+          "nullable": true,
+          "type": "integer"
+        },
+        "finished_ms": {
+          "nullable": true,
+          "type": "integer"
+        },
+        "first_message": {
+          "nullable": true,
+          "ref": "FirstMessage"
+        },
+        "foreground": {
+          "nullable": true,
+          "ref": "Foreground"
+        },
+        "identity": {
+          "type": "string"
+        },
+        "keep": {
+          "type": "boolean"
+        },
+        "labels": {
+          "required": true,
+          "type": "object",
+          "values": {
+            "type": "string"
+          }
+        },
+        "name": {
+          "nullable": true,
+          "type": "string"
+        },
+        "notify": {
+          "type": "boolean"
+        },
+        "output": {
+          "nullable": true,
+          "type": "string"
+        },
+        "parent": {
+          "nullable": true,
+          "type": "string"
+        },
+        "paste_gap_ms": {
+          "nullable": true,
+          "type": "integer"
+        },
+        "pid": {
+          "nullable": true,
+          "type": "integer"
+        },
+        "reason": {
+          "nullable": true,
+          "type": "string"
+        },
+        "records": {
+          "type": "object",
+          "values": {
+            "ref": "Status"
+          }
+        },
+        "reported": {
+          "type": "boolean"
+        },
+        "rm": {
+          "type": "boolean"
+        },
+        "rows": {
+          "required": true,
+          "type": "integer"
+        },
+        "screen": {
+          "required": true,
+          "type": "string"
+        },
+        "signal": {
+          "nullable": true,
+          "type": "integer"
+        },
+        "state": {
+          "required": true,
+          "type": "string"
+        },
+        "status": {
+          "nullable": true,
+          "ref": "Status"
+        },
+        "status_ms": {
+          "nullable": true,
+          "type": "integer"
+        },
+        "stop": {
+          "nullable": true,
+          "type": "string"
+        },
+        "submit": {
+          "nullable": true,
+          "type": "string"
+        },
+        "template": {
+          "nullable": true,
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "turn": {
+          "type": "integer"
+        },
+        "wait": {
+          "nullable": true,
+          "ref": "WaitResult"
+        }
+      },
+      "SendResult": {
+        "started": {
+          "nullable": true,
+          "type": "boolean"
+        },
+        "status": {
+          "nullable": true,
+          "type": "string"
+        },
+        "turn": {
+          "required": true,
+          "type": "integer"
+        },
+        "wait": {
+          "nullable": true,
+          "ref": "WaitResult"
+        }
+      },
+      "Status": {
+        "app": {
+          "type": "string"
+        },
+        "kind": {
+          "nullable": true,
+          "type": "string"
+        },
+        "msg": {
+          "type": "string"
+        },
+        "progress": {
+          "nullable": true,
+          "type": "integer"
+        },
+        "state": {
+          "required": true,
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "StatusResult": {
+        "core": {
+          "ref": "CoreInfo",
+          "required": true
+        },
+        "finished": {
+          "required": true,
+          "type": "integer"
+        },
+        "holder": {
+          "nullable": true,
+          "ref": "HolderInfo"
+        },
+        "holders": {
+          "items": {
+            "ref": "HolderInfo"
+          },
+          "required": true,
+          "type": "array"
+        },
+        "installed_by": {
+          "nullable": true,
+          "type": "string"
+        },
+        "live": {
+          "required": true,
+          "type": "integer"
+        },
+        "pid": {
+          "required": true,
+          "type": "integer"
+        },
+        "uptime_ms": {
+          "required": true,
+          "type": "integer"
+        },
+        "version": {
+          "required": true,
+          "type": "string"
+        }
+      },
+      "StopResult": {
+        "stopped": {
+          "required": true,
+          "type": "boolean"
+        }
+      },
+      "Terminal": {
+        "address": {
+          "required": true,
+          "type": "string"
+        },
+        "argv": {
+          "items": {
+            "type": "string"
+          },
+          "required": true,
+          "type": "array"
+        },
+        "cols": {
+          "required": true,
+          "type": "integer"
+        },
+        "created_ms": {
+          "required": true,
+          "type": "integer"
+        },
+        "cwd": {
+          "required": true,
+          "type": "string"
+        },
+        "die_with_parent": {
+          "type": "boolean"
+        },
+        "exit_code": {
+          "nullable": true,
+          "type": "integer"
+        },
+        "finished_ms": {
+          "nullable": true,
+          "type": "integer"
+        },
+        "first_message": {
+          "nullable": true,
+          "ref": "FirstMessage"
+        },
+        "foreground": {
+          "nullable": true,
+          "ref": "Foreground"
+        },
+        "identity": {
+          "type": "string"
+        },
+        "keep": {
+          "type": "boolean"
+        },
+        "labels": {
+          "required": true,
+          "type": "object",
+          "values": {
+            "type": "string"
+          }
+        },
+        "name": {
+          "nullable": true,
+          "type": "string"
+        },
+        "notify": {
+          "type": "boolean"
+        },
+        "parent": {
+          "nullable": true,
+          "type": "string"
+        },
+        "paste_gap_ms": {
+          "nullable": true,
+          "type": "integer"
+        },
+        "pid": {
+          "nullable": true,
+          "type": "integer"
+        },
+        "reason": {
+          "nullable": true,
+          "type": "string"
+        },
+        "records": {
+          "type": "object",
+          "values": {
+            "ref": "Status"
+          }
+        },
+        "reported": {
+          "type": "boolean"
+        },
+        "rm": {
+          "type": "boolean"
+        },
+        "rows": {
+          "required": true,
+          "type": "integer"
+        },
+        "screen": {
+          "required": true,
+          "type": "string"
+        },
+        "signal": {
+          "nullable": true,
+          "type": "integer"
+        },
+        "state": {
+          "required": true,
+          "type": "string"
+        },
+        "status": {
+          "nullable": true,
+          "ref": "Status"
+        },
+        "status_ms": {
+          "nullable": true,
+          "type": "integer"
+        },
+        "stop": {
+          "nullable": true,
+          "type": "string"
+        },
+        "submit": {
+          "nullable": true,
+          "type": "string"
+        },
+        "template": {
+          "nullable": true,
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "turn": {
+          "type": "integer"
+        }
+      },
+      "WaitResult": {
+        "children": {
+          "items": {
+            "ref": "WaitResult"
+          },
+          "required": true,
+          "type": "array"
+        },
+        "ended": {
+          "required": true,
+          "type": "boolean"
+        },
+        "exit_code": {
+          "nullable": true,
+          "type": "integer"
+        },
+        "from": {
+          "nullable": true,
+          "type": "string"
+        },
+        "reason": {
+          "required": true,
+          "type": "string"
+        },
+        "signal": {
+          "nullable": true,
+          "type": "integer"
+        },
+        "status": {
+          "nullable": true,
+          "type": "string"
+        },
+        "terminal": {
+          "required": true,
+          "type": "string"
+        },
+        "turn": {
+          "required": true,
+          "type": "integer"
+        }
+      }
+    }
+  },
+  "wire_exceptions": [
+    {
+      "applied": {
+        "required": false
+      },
+      "declared": {
+        "required": true
+      },
+      "field": "machines",
+      "observed": "omitted when there are no remote machines",
+      "type": "ListResult",
+      "version": "0.1.20"
+    }
+  ]
 }

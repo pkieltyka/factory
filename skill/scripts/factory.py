@@ -8,6 +8,8 @@ harnesses and models; it is not committed (factory.toml.sample is, as the projec
 rest: a member's pane is labeled with its @name and its agent carries that name. Harnesses are described in
 harnesses.toml. `factory.py --help` lists the commands.
 """
+from __future__ import annotations
+
 import argparse
 import collections
 import datetime
@@ -18,12 +20,14 @@ import json
 import os
 import pathlib
 import re
+import selectors
 import shlex
 import shutil
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import tomllib
 
@@ -40,6 +44,18 @@ CONF = "factory.toml"             # one person's formation: not committed
 SAMPLE = "factory.toml.sample"    # the project's suggested formation: committed, copied to factory.toml by `init`
 OPERATOR = "operator"  # the operator's @name, unless `[operator] name` in factory.toml says otherwise
 TABS = {"operator": "factory operator", "team": "factory team"}  # herdr tab labels
+HC = os.environ.get("HC_BIN", "hc")
+HC_MIN = (0, 1, 20)
+VERSION = hashlib.sha1(pathlib.Path(__file__).read_bytes()).hexdigest()[:12]
+TICK = 1.0
+LATCH_AFTER = 5
+BEAT_STALE = 30
+SAY_WAIT = 10
+LAUNCH_TIMEOUT = 60
+QUIET_GRACE = 120
+READY_EVERY, READY_TIMEOUT = 300, 30
+MAX_TEXT = 64 * 1024
+CAS_TRIES = 8
 
 
 class Problem(Exception):
@@ -48,6 +64,262 @@ class Problem(Exception):
     def __init__(self, what, fix):
         super().__init__(what)
         self.what, self.fix = what, fix
+
+
+# ================================================================ hc transport
+
+class HcError(Exception):
+    """An error reply from hc."""
+
+    def __init__(self, kind, message, hint=""):
+        super().__init__(f"{kind}: {message}" if kind else message)
+        self.kind, self.message, self.hint = kind, message, hint
+
+
+class HcDown(Exception):
+    """No usable answer from hc. A sent request may already have taken effect."""
+
+    def __init__(self, sent, detail, timeout=False):
+        super().__init__(detail)
+        self.sent, self.detail, self.timeout = sent, detail, timeout
+
+
+class Hc:
+    def __init__(self, bin: str | None = None, timeout: float | None = 30, expect_core: str | None = None):
+        self.bin, self.timeout, self.expect_core = bin, timeout, expect_core
+        self.version: tuple[int, ...] | None = None
+        self.core: str | None = None
+        self.children: set[subprocess.Popen] = set()
+        self._lock = threading.Lock()
+        self._closed = False
+
+    def kill_children(self) -> None:
+        with self._lock:
+            self._closed = True
+            for process in self.children:
+                process.kill()
+
+    def call(self, method, params=None, timeout=...) -> dict:
+        timeout = self.timeout if timeout is ... else timeout
+        setup_timeout = self.timeout if timeout is None else timeout
+        deadline = None if setup_timeout is None else time.monotonic() + setup_timeout
+        process = None
+        complete = sent = False
+        buffer = bytearray()
+        try:
+            stderr = tempfile.TemporaryFile()
+        except OSError as error:
+            raise HcDown(False, str(error)) from error
+
+        def wait_for(fd, writing=False):
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                raise TimeoutError("timed out")
+            with selectors.PollSelector() as poll:
+                poll.register(fd, selectors.EVENT_WRITE if writing else selectors.EVENT_READ)
+                if not poll.select(remaining):
+                    raise TimeoutError("timed out")
+
+        def write_line(ident, name, fields):
+            nonlocal sent
+            wire = json.dumps({"jsonrpc": "2.0", "id": ident, "method": name,
+                               "params": {} if fields is None else fields}).encode() + b"\n"
+            fd = process.stdin.fileno()
+            offset = 0
+            while offset < len(wire):
+                wait_for(fd, writing=True)
+                try:
+                    count = os.write(fd, memoryview(wire)[offset:])
+                except BlockingIOError:
+                    continue
+                if count <= 0:
+                    raise OSError("hc connect stdin made no progress")
+                if ident == 1:
+                    sent = True
+                offset += count
+
+        def read_reply(ident, description):
+            fd = process.stdout.fileno()
+            end = buffer.find(b"\n")
+            while end < 0:
+                wait_for(fd)
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    raise OSError("hc connect closed its output")
+                buffer.extend(chunk)
+                end = buffer.find(b"\n")
+            line = bytes(buffer[:end])
+            del buffer[:end + 1]
+            try:
+                reply = json.loads(line)
+            except ValueError as error:
+                raise ValueError(f"unexpected {description} reply: {error}") from error
+            if (not isinstance(reply, dict) or reply.get("jsonrpc") != "2.0"
+                    or type(reply.get("id")) is not int or reply["id"] != ident):
+                raise ValueError(f"unexpected {description} reply: invalid JSON-RPC envelope")
+            return reply
+
+        with stderr:
+            try:
+                with self._lock:
+                    if self._closed:
+                        raise HcDown(False, "hc client closed")
+                    process = subprocess.Popen([HC if self.bin is None else self.bin, "connect"],
+                                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr, bufsize=0)
+                    self.children.add(process)
+                os.set_blocking(process.stdin.fileno(), False)
+                write_line(0, "hello", {"generation": 1, "framed": False})
+                hello = read_reply(0, "hello")
+                info = hello.get("result")
+                if not isinstance(info, dict) or "error" in hello:
+                    raise ValueError("unexpected hello reply: missing result")
+                version, core = info.get("version"), info.get("core")
+                if (type(info.get("generation")) is not int or info["generation"] != 1
+                        or info.get("framed") is not False
+                        or not isinstance(core, dict) or not isinstance(core.get("id"), str) or not core["id"]):
+                    raise ValueError("unexpected hello reply: invalid generation, framing or core")
+                numeric = re.fullmatch(r"([0-9]+(?:\.[0-9]+)+)(?:[-+].+)?", version) if isinstance(version, str) else None
+                if numeric is None:
+                    raise ValueError(f"unrecognised hc version: {version!r}")
+                parsed_version = tuple(map(int, numeric[1].split(".")))
+                if parsed_version < HC_MIN:
+                    raise HcDown(False, f"hc {'.'.join(map(str, HC_MIN))} or newer is required (found {version})")
+                if self.expect_core is not None and core["id"] != self.expect_core:
+                    raise HcDown(False, f"this is another hc core ({core['id']}) than the team's ({self.expect_core})")
+                self.version, self.core = parsed_version, core["id"]
+                write_line(1, method, params)
+                if timeout is None:
+                    deadline = None  # Draft holds apply only after the request was written.
+                reply = read_reply(1, "request")
+                if "error" in reply:
+                    error = reply["error"]
+                    data = error.get("data", {}) if isinstance(error, dict) else None
+                    if ("result" in reply or not isinstance(data, dict)
+                            or type(error.get("code")) is not int or not isinstance(error.get("message"), str)
+                            or not isinstance(data.get("kind", ""), str)
+                            or (data.get("hint") is not None and not isinstance(data["hint"], str))):
+                        raise ValueError("unexpected reply: malformed error")
+                    raise HcError(data.get("kind", ""), error["message"], data.get("hint") or "")
+                if not isinstance(reply.get("result"), dict):
+                    raise ValueError("unexpected reply: missing result object")
+                complete = True
+                return reply["result"]
+            except (OSError, ValueError) as error:
+                if process is not None:
+                    process.kill()
+                    process.wait()
+                size = stderr.seek(0, os.SEEK_END)
+                stderr.seek(max(0, size - 2000))
+                tail = stderr.read().decode(errors="replace").strip()
+                detail = "hc not found" if process is None and isinstance(error, FileNotFoundError) else str(error)
+                if tail:
+                    detail = f"{detail}: {tail}"
+                raise HcDown(sent, detail, timeout=isinstance(error, TimeoutError)) from error
+            finally:
+                if process is not None:
+                    try:
+                        try:
+                            process.stdin.close()
+                        except OSError:
+                            pass
+                        if complete:
+                            try:
+                                process.wait(timeout=2)
+                            except subprocess.TimeoutExpired:
+                                process.kill()
+                        else:
+                            process.kill()
+                        process.wait()
+                    finally:
+                        process.stdout.close()
+                        with self._lock:
+                            self.children.remove(process)
+
+    def list(self, team: str) -> list[dict]:
+        return self.call("terminal.list", {"all": True, "labels": {"factory.team": team}})["terminals"]
+
+    def get(self, term: str) -> dict:
+        return self.call("terminal.get", {"terminal": term})
+
+    def run(self, argv: list[str], cwd: str, env: dict, labels: dict) -> dict:
+        return self.call("terminal.run", {"argv": argv, "cwd": cwd, "env": env, "labels": labels,
+                                          "no_parent": True, "no_notify": True})
+
+    def send(self, term: str, text: str) -> dict:
+        return self.call("terminal.send", {"terminal": term, "text": text}, timeout=None)
+
+    def keys(self, term: str, keys: list[str]) -> dict:
+        return self.call("terminal.keys", {"terminal": term, "keys": keys})
+
+    def read(self, term: str) -> str:
+        return self.call("terminal.read", {"terminal": term, "lines": 0})["text"]
+
+    def label(self, term: str, labels: dict) -> dict:
+        return self.call("terminal.label", {"terminal": term, "labels": labels})
+
+    def keep_off(self, term: str) -> None:
+        self.call("terminal.keep", {"terminal": term, "keep": False})
+
+    def kill(self, term: str) -> dict:
+        return self.call("terminal.kill", {"terminal": term})
+
+    def rm(self, term: str) -> None:
+        self.call("terminal.rm", {"terminal": term})
+
+    def doc_get(self) -> tuple[dict | None, int]:
+        result = self.call("doc.get", {"name": "herdr-app"})
+        return result["value"], result["version"]
+
+    def doc_set(self, value: dict | None, version: int) -> int:
+        return self.call("doc.set", {"name": "herdr-app", "value": value, "version": version})["version"]
+
+
+class View:
+    """Newest team terminal per member, plus the operator and keeper."""
+
+    def __init__(self, records: list[dict]):
+        self.operator: dict | None = None
+        self.operator_lost: dict | None = None
+        self.keeper: dict | None = None
+        self.strays: list[dict] = []
+        self._live: dict[str, dict] = {}
+        self._finished: dict[str, dict] = {}
+        for record in sorted(records, key=lambda t: t["created_ms"], reverse=True):
+            labels = record["labels"]
+            kind, name = labels.get("factory.kind"), labels.get("factory.member")
+            if record["state"] == "live":
+                if kind == "operator" and self.operator is None:
+                    self.operator = record
+                if kind == "operator-lost" and self.operator_lost is None:
+                    self.operator_lost = record
+                if kind == "keeper" and self.keeper is None:
+                    self.keeper = record
+                if name and kind in ("member", "operator"):
+                    if name in self._live:
+                        self.strays.append(record)
+                    else:
+                        self._live[name] = record
+            elif name and kind in ("member", "operator", "operator-lost") and not labels.get("factory.down"):
+                self._finished.setdefault(name, record)
+
+    def terminal(self, name: str) -> dict | None:
+        return self._live.get(name)
+
+    def finished(self, name: str) -> dict | None:
+        return None if name in self._live else self._finished.get(name)
+
+    def state(self, name: str) -> str:
+        record = self.terminal(name)
+        if record is None:
+            lost = self.operator_lost
+            return "gone" if self.finished(name) or (lost and lost["labels"].get("factory.member") == name) else "not started"
+        if record.get("status") is None:
+            return "gone" if record.get("reported") else "starting"
+        return record["status"]["state"]
+
+
+def team_view(hc: Hc, team: str) -> View:
+    return View(hc.list(team))
 
 
 # ================================================================ files
@@ -121,10 +393,20 @@ class Config:
             self.user = ""
         if not re.fullmatch(r"[A-Za-z0-9._-]+", self.user):
             raise SystemExit(f"{self.conf_file}: set `user` to your name for branches, e.g. user = \"peter\"")
-        unknown = self.team.keys() - {"user", "permissions", "worktree_dir", "operator", "members"}
+        unknown = self.team.keys() - {"user", "permissions", "worktree_dir", "operator", "members",
+                                      "quiet_grace", "ready_check", "ready_check_every"}
         if unknown:
             raise SystemExit(f"{self.conf_file}: unknown top-level key(s): {sorted(unknown)};"
                              " operator fields belong under [operator].")
+        self.quiet_grace = self.team.get("quiet_grace", QUIET_GRACE)
+        self.ready_every = self.team.get("ready_check_every", READY_EVERY)
+        for key, value, minimum in (("quiet_grace", self.quiet_grace, 30),
+                                    ("ready_check_every", self.ready_every, 60)):
+            if type(value) is not int or value < minimum:
+                raise SystemExit(f"{self.conf_file}: {key} must be an integer of at least {minimum} seconds")
+        self.ready_check = self.team.get("ready_check")
+        if self.ready_check is not None and (not isinstance(self.ready_check, str) or not self.ready_check.strip()):
+            raise SystemExit(f"{self.conf_file}: ready_check must be a non-blank string")
         for name, m in self.members.items():
             role = m.get("role", name)
             if role not in self.roles:
