@@ -3798,6 +3798,28 @@ class LogTests(unittest.TestCase):
         finally:
             os.close(held)
 
+    def test_a_writer_racing_the_first_writer_looks_again(self):
+        """A sees no lock; B creates lock and log and commits 1; A must find B's lock, not report damage."""
+        real_open, paused = factory.private_open, []
+
+        def racing(path, flags, fix_mode=True, dir_fd=None):
+            if path == "lock" and flags == os.O_RDWR and not paused:
+                paused.append(path)
+                self.assertEqual(factory.Log(self.state).add("pm", ["operator"], "B, the first writer")[0], 1)
+                raise FileNotFoundError(path)               # what A saw before B ran
+            return real_open(path, flags, fix_mode, dir_fd)
+        with patch.object(factory, "private_open", racing):
+            self.assertEqual(self.log.add("lead-dev", ["operator"], "A")[0], 2)
+        self.assertEqual([r["id"] for r in self.log.read()[0] if r["t"] == "msg"], [1, 2])
+
+    def test_a_malformed_lineage_is_a_miss(self):
+        self.log.add("pm", ["operator"], "one")
+        raw = self.log.check_path.read_text()
+        check = json.loads(raw)
+        self.log.check_path.write_text(raw.replace(json.dumps(check["lineage"]), '"\\ud800"'))
+        self.assertEqual(self.log.add("pm", ["operator"], "two")[0], 2)    # one full validation, then a new proof
+        self.assertRegex(json.loads(self.log.check_path.read_text())["lineage"], r"^[0-9a-f]{16}$")
+
     def test_an_edited_checkpoint_is_a_miss_not_a_wrong_id(self):
         self.log.add("pm", ["operator"], "one")
         self.log.add("pm", ["operator"], "two")

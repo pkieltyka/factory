@@ -923,9 +923,12 @@ class Log:
         try:
             return self._open(self.LOCK, os.O_RDWR)
         except FileNotFoundError:
-            if self._lexists(self.LOG) or self._lexists(self.CHECK):
-                raise LogDamage(self.path, None, "the log exists but its lock file is missing") from None
-            return self._open(self.LOCK, os.O_CREAT | os.O_RDWR)
+            if not (self._lexists(self.LOG) or self._lexists(self.CHECK)):
+                return self._open(self.LOCK, os.O_CREAT | os.O_RDWR)
+        try:   # a first writer may have created the lock, then the log, since we looked: look again, never create
+            return self._open(self.LOCK, os.O_RDWR)
+        except FileNotFoundError:
+            raise LogDamage(self.path, None, "the log exists but its lock file is missing") from None
 
     def _open_lock_for_reading(self):
         for attempt in (1, 2):
@@ -943,7 +946,8 @@ class Log:
         return None
 
     def _snapshot(self, offset):
-        """(records, end) from offset, with the lock held. offset 0 also replays a full box to check references."""
+        """(records, end, box) from offset, with the lock held. At offset 0 the records are also replayed into a
+        full box, to check references and transitions before anything is returned; otherwise box is None."""
         try:
             fd = self._open(self.LOG, os.O_RDONLY, fix_mode=False)
         except FileNotFoundError:
@@ -951,7 +955,7 @@ class Log:
                 raise LogDamage(self.path, None, f"the log was removed (reader was at byte {offset})")
             if self._lexists(self.CHECK):
                 raise LogDamage(self.path, None, "log.jsonl is missing but log.check remains")
-            return [], 0
+            return [], 0, Box(self.path)
         with os.fdopen(fd, "rb") as f:
             size = os.fstat(f.fileno()).st_size
             if offset > size:
@@ -970,20 +974,20 @@ class Log:
                     line += f.read(offset).count(b"\n")
                 raise LogDamage(self.path, line, damage.reason) from None
         end = offset + len(data)
+        box = None
         if offset == 0:
             box = Box(self.path)
             box.apply(records)              # references and transitions, before anything is returned
             box.offset = end
-            self._local.box = box           # the full read's validated box, for _full_box and read_box
-        return records, end
+        return records, end, box
 
     def read_box(self):
         """(records, box): one full, validated read and the box it built. Raises LogDamage."""
         with self._locked(exclusive=False) as fd:
             if fd is None:
                 return [], Box(self.path)
-            records, end = self._snapshot(0)
-            return records, (self._local.box if records or end else Box(self.path))
+            records, _, box = self._snapshot(0)
+            return records, box
 
     def read(self, offset=0):
         """(records, end) from byte offset; offset 0 validates the whole log. Raises LogDamage."""
@@ -994,7 +998,7 @@ class Log:
                 if offset:
                     raise LogDamage(self.path, None, f"the log was removed (reader was at byte {offset})")
                 return [], 0
-            return self._snapshot(offset)
+            return self._snapshot(offset)[:2]
 
     # ---------------------------------------------------------------- the checkpoint
 
@@ -1024,8 +1028,8 @@ class Log:
             return None
         fields = ("ino", "size", "mtime_ns", "last")
         if not (isinstance(check, dict) and all(type(check.get(k)) is int and check[k] >= 0 for k in fields)
-                and isinstance(check.get("lineage"), str) and check["lineage"]
-                and check.get("digest") == _checkpoint_digest(check)):
+                and isinstance(check.get("lineage"), str) and re.fullmatch(r"[0-9a-f]{16}", check["lineage"])
+                and isinstance(check.get("digest"), str) and check["digest"] == _checkpoint_digest(check)):
             return None       # unparsable, or edited by hand: one full validation instead
         if (check["ino"], check["size"], check["mtime_ns"]) != (info.st_ino, info.st_size, info.st_mtime_ns):
             return None
@@ -1057,8 +1061,7 @@ class Log:
                 pass
 
     def _full_box(self):
-        records, end = self._snapshot(0)
-        return self._local.box if records else Box(self.path)
+        return self._snapshot(0)[2]
 
     def _prove(self, info):
         """The checkpoint if it proves the file, else None; records the lineage the next append continues."""
@@ -1169,11 +1172,11 @@ class Log:
         check = self._prove(info)
         if box._damage is None and check is not None and box._lineage == check["lineage"] \
                 and box.offset <= info.st_size:
-            records, end = self._snapshot(box.offset)
+            records, end, _ = self._snapshot(box.offset)
             box.apply(records)
             box.offset = end
             return
-        records, end = self._snapshot(0)
+        records, end, _ = self._snapshot(0)
         box._reset()
         box.apply(records)
         box.offset, box._lineage = end, self._local.lineage   # the caller's own object, rebuilt in place
