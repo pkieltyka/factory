@@ -35,6 +35,84 @@ os.environ["LOGNAME"] = "ada"  # whose team the tests run as: the first part of 
 TEMPLATE = ("+++\n" + (factory.SKILL / "templates/factory.toml").read_text().strip() + "\n+++\n"
             + (factory.SKILL / "templates/FACTORY.md").read_text())
 GIT = shutil.which("git")
+HC_FIXTURES = json.loads(pathlib.Path(__file__).with_name("hc_fixtures.json").read_text())
+
+
+def conforms(value, spec, named_types, path="$"):
+    kind = spec.get("type")
+    if kind == "any" or (value is None and spec.get("nullable")):
+        return []
+    if "ref" in spec:
+        if not isinstance(value, dict):
+            return [f"{path}: expected {spec['ref']} object"]
+        fields = named_types[spec["ref"]]
+        missing = [f"{path}.{key}: required" for key in fields if fields[key].get("required") and key not in value]
+        unknown = [f"{path}.{key}: unknown" for key in value if key not in fields]
+        return missing + unknown + [problem for key in value.keys() & fields.keys()
+                                    for problem in conforms(value[key], fields[key], named_types, f"{path}.{key}")]
+    valid_types = {"string": (str,), "integer": (int,), "number": (int, float), "boolean": (bool,),
+                   "array": (list,), "object": (dict,)}
+    if type(value) not in valid_types[kind]:
+        return [f"{path}: expected {kind}"]
+    if kind == "array":
+        return [problem for i, item in enumerate(value)
+                for problem in conforms(item, spec["items"], named_types, f"{path}[{i}]")]
+    if "values" in spec:
+        return [problem for key, item in value.items()
+                for problem in conforms(item, spec["values"], named_types, f"{path}.{key}")]
+    return []
+
+
+RPC_ERROR_TYPES = {
+    "Error": {"code": {"type": "integer", "required": True}, "message": {"type": "string", "required": True},
+              "data": {"ref": "ErrorData", "required": True}},
+    "ErrorData": {"kind": {"type": "string", "required": True}, "hint": {"type": "string"}},
+}
+
+
+class HcContract(unittest.TestCase):
+    @staticmethod
+    def check_result(method, value):
+        schema = HC_FIXTURES["schema"]
+        return conforms(value, {"ref": schema["results"][method]}, schema["types"])
+
+    def test_recorded_replies_conform(self):
+        for name, example in HC_FIXTURES["replies"].items():
+            with self.subTest(name=name):
+                self.assertEqual(self.check_result(example["method"], example["result"]), [])
+        for kind, example in HC_FIXTURES["errors"].items():
+            with self.subTest(kind=kind):
+                self.assertEqual(conforms(example["error"], {"ref": "Error"}, RPC_ERROR_TYPES), [])
+                self.assertEqual(example["error"]["data"]["kind"], kind)
+
+    def test_validator_rejects(self):
+        hello = HC_FIXTURES["replies"]["hello"]["result"]
+        terminal = HC_FIXTURES["replies"]["terminal.get.live"]["result"]
+        for method, value in (
+            ("hello", {k: v for k, v in hello.items() if k != "version"}),
+            ("hello", {**hello, "extra": True}),
+            ("hello", {**hello, "version": None}),
+            ("hello", {**hello, "generation": True}),
+            ("terminal.get", {**terminal, "labels": {"team": 42}}),
+            ("terminal.get", {**terminal, "records": {"agent": {"state": 42}}}),
+        ):
+            with self.subTest(method=method, value=value):
+                self.assertTrue(self.check_result(method, value))
+
+    def test_any_accepts_null(self):
+        self.assertEqual(self.check_result("doc.get", {"value": None, "version": 0}), [])
+
+    def test_wire_exceptions_are_applied(self):
+        for rule in HC_FIXTURES["wire_exceptions"]:
+            with self.subTest(type=rule["type"], field=rule["field"]):
+                self.assertEqual(rule["version"], HC_FIXTURES["hc_version"])
+                field = HC_FIXTURES["schema"]["types"][rule["type"]][rule["field"]]
+                self.assertEqual(field["required"], rule["applied"]["required"])
+        result = HC_FIXTURES["replies"]["terminal.list.all"]["result"]
+        self.assertNotIn("machines", result)
+        self.assertEqual(self.check_result("terminal.list", result), [])
+        self.assertEqual(self.check_result("terminal.list", {**result, "machines": []}), [])
+        self.assertTrue(self.check_result("terminal.list", {**result, "machines": [False]}))
 
 FAKE_HERDR = textwrap.dedent(r'''
     #!/usr/bin/env python3
@@ -2614,6 +2692,12 @@ class LiveToolTests(unittest.TestCase):
                    "foreground": {"name": "idle"}, "labels": {"name": "live"}}
         self.assertEqual(scrub(payload), payload)
         self.assertFalse(scrub.leaks(payload))
+
+    def test_scrubbed_fixture_still_conforms(self):
+        original = {**HC_FIXTURES["replies"]["hello"]["result"], "login_session": {"id": 51, "user": 103}}
+        cleaned = self.scrubber()(original)
+        self.assertEqual(cleaned["login_session"], {"id": 1, "user": 1})
+        self.assertEqual(HcContract.check_result("hello", cleaned), [])
 
 
 class ConstantsTests(unittest.TestCase):

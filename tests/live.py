@@ -844,6 +844,59 @@ def scrubber(core):
 
 ERROR_KINDS = {"blocked", "conflict", "finished", "invalid_params", "live", "not_found", "spawn_failed",
                "status_mismatch"}
+WIRE_EXCEPTIONS = (
+    {"version": "0.1.20", "type": "ListResult", "field": "machines",
+     "declared": {"required": True}, "observed": "omitted when there are no remote machines",
+     "applied": {"required": False}},
+)
+
+
+def schema_extract(replies, version):
+    """Keep the required keys and JSON types reachable from the recorded success replies."""
+    schema = json.loads(subprocess.check_output([HC, "schema"], timeout=15))
+    source = schema["components"]["schemas"]
+    methods = {entry["name"]: entry["result"]["schema"] for entry in schema["methods"]}
+    types = {}
+
+    def describe(field):
+        if field is True:
+            return {"type": "any"}
+        if "anyOf" in field:
+            choices = [choice for choice in field["anyOf"] if choice != {"type": "null"}]
+            if len(choices) == 1 and len(field["anyOf"]) == 2:
+                return {**describe(choices[0]), "nullable": True}
+            raise ValueError(f"unsupported schema union: {field}")
+        if "$ref" in field:
+            name = field["$ref"].rsplit("/", 1)[1]
+            if name not in types:
+                types[name] = {}  # WaitResult.children can lead back here.
+                required = set(source[name].get("required", []))
+                types[name].update({key: {**describe(prop), **({"required": True} if key in required else {})}
+                                    for key, prop in source[name]["properties"].items()})
+            return {"ref": name}
+        kind = field.get("type")
+        nullable = isinstance(kind, list) and "null" in kind
+        if nullable:
+            kind, = (entry for entry in kind if entry != "null")
+        if kind not in ("string", "integer", "number", "boolean", "array", "object"):
+            raise ValueError(f"unsupported schema field: {field}")
+        spec = {"type": kind}
+        if nullable:
+            spec["nullable"] = True
+        if kind == "array":
+            spec["items"] = describe(field["items"])
+        if kind == "object" and field.get("additionalProperties"):
+            spec["values"] = describe(field["additionalProperties"])
+        return spec
+
+    results = {method: describe(methods[method])["ref"] for method in sorted({r["method"] for r in replies.values()})}
+    exceptions = [rule for rule in WIRE_EXCEPTIONS if rule["version"] == version]
+    for rule in exceptions:
+        field = types[rule["type"]][rule["field"]]
+        if any(field.get(key) != value for key, value in rule["declared"].items()):
+            raise ValueError(f"remove obsolete wire exception: {rule['type']}.{rule['field']}")
+        field.update(rule["applied"])
+    return {"results": results, "types": types}, exceptions
 
 
 def fixtures(out):
@@ -929,9 +982,10 @@ def fixtures(out):
     leaks = sorted(set(scrub.leaks([scrub(replies), scrub(errors)])))
     if leaks:
         raise RuntimeError(f"fixtures still contain host details: {leaks}")
+    schema, exceptions = schema_extract(replies, version)
     data = {"hc_version": version, "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "note": "Recorded by tests/live.py fixtures from a private core; host details replaced by placeholders.",
-            "replies": scrub(replies), "errors": scrub(errors)}
+            "replies": scrub(replies), "errors": scrub(errors), "schema": schema, "wire_exceptions": exceptions}
     pathlib.Path(out).write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
     return {"check": "fixtures", "out": str(out), "hc": version, "replies": sorted(replies), "errors": sorted(errors)}
 

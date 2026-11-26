@@ -131,6 +131,17 @@ testing.md §4 already fixes the rule: required fields present, optional ones ch
 - `results`: keyed by method name (`"terminal.get"`, not the fixture case `"terminal.get.live"`): for every method the fixtures hold a reply for, the name of its result type. Each fixture entry already carries its `method`, which is how a case finds its type.
 - `types`: every type reachable from those, each field reduced to `type` (one of `string`, `integer`, `number`, `boolean`, `array`, `object`, or `any` for a field the schema leaves open, such as `doc.get`'s `value`) or `ref`, plus `items` for arrays, `values` for maps (from `additionalProperties`: `labels` is a map of strings, `records` a map of `Status`), `required`, `nullable`. In the 0.1.20 schema every `anyOf` in reach is one `$ref` plus `null`, so this set is enough (walked by @lead-dev). From the JSON Schema: `required` is membership in the type's `required` list; `nullable` is `"null"` in a `type` list or a `{"type": "null"}` branch of `anyOf`; `ref` is the last segment of `$ref`. The literal schema `true` (as for `DocGetResult.value`) becomes `{"type": "any"}`. The walk keeps a set of visited type names, because `WaitResult.children` is an array of `WaitResult`. A field the extractor cannot reduce this way fails the recording, so nothing is silently skipped.
 
+**Wire exceptions.** Where the published schema and the real core disagree, the core's behaviour is the contract, and the disagreement is written down, not coded around silently. `live.py` holds a table of them, applied when the extract is built and copied into the fixtures:
+
+```json
+"wire_exceptions": [
+  {"type": "ListResult", "field": "machines", "declared": "required",
+   "observed": "absent when no machine has been added", "applied": "optional", "hc": "0.1.20"}
+]
+```
+
+The extract then marks `ListResult.machines` optional; when the field is present it is still checked as an array of `MachineView`. This is the only entry today (found by @lead-dev: the schema lists it as required, and no genuine `terminal.list` reply carries it). Two tests keep the table honest: `test_wire_exceptions_are_applied` (fake mode: each entry's field has the `applied` setting in the extract, and the recorded replies conform) and `test_wire_exceptions_still_hold` (real only: for each entry the real core still behaves as `observed`; when a later `hc` fixes it, this test fails and the entry is removed).
+
 The validator lives in `tests/test_factory.py`, about 30 lines, and is not a JSON Schema implementation:
 
 ```python
