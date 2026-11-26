@@ -20,6 +20,7 @@ import re
 import select
 import shutil
 import signal
+import socket
 import struct
 import subprocess
 import sys
@@ -241,11 +242,33 @@ class Core:
             print(f"warning: no core id known for {self.dir}; nothing stopped, directory left", file=sys.stderr)
             return
         try:
-            self.server_stop()
+            reply = self.server_stop()
         except Exception as error:
             print(f"warning: could not stop core in {self.dir}: {error}", file=sys.stderr)
             return
-        shutil.rmtree(self.dir, ignore_errors=True)
+        if reply is not None and "error" in reply:
+            print(f"warning: server.stop failed for {self.dir}: {reply['error']}; directory left", file=sys.stderr)
+            return
+        # Confirm on the socket itself: hc connect (and so hello) would start the core again.
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if not self.listening():
+                shutil.rmtree(self.dir, ignore_errors=True)
+                return
+            time.sleep(0.2)
+        print(f"warning: core {self.id} still listens after server.stop; directory {self.dir} left", file=sys.stderr)
+
+    def listening(self):
+        """Whether a core accepts connections on the private socket, checked without hc (which would start one)."""
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(1)
+        try:
+            sock.connect(self.env["HC_SOCKET"])
+            return True
+        except OSError:
+            return False
+        finally:
+            sock.close()
 
     def __enter__(self):
         return self
@@ -430,9 +453,11 @@ def lc1():
             remaining = draft_wait + 3 - (now() - t_key)
             if remaining > 0:
                 time.sleep(remaining)
-            if conn.p.poll() is None:
-                conn.kill()
             typed = probe.first(token)
+            if conn.p.poll() is None:
+                if variant == "eof" and typed is None:
+                    row["inconclusive"] = "EOF client still alive and token not typed by the deadline"
+                conn.kill()
             row["typed"] = typed is not None
             row["typed_after_send_s"] = rounded(typed - t_send) if typed else None
             row["typed_after_last_key_s"] = rounded(typed - t_key) if typed else None
@@ -465,6 +490,7 @@ def lc1():
             reasons.append("control: not typed after the hold")
         reasons += [f"{k}: follow-up not delivered" for k in four if v[k]["follow_typed_after_s"] is None]
         reasons += [f"{k}: first token typed twice" for k in four if not v[k]["first_typed_once"]]
+        reasons += [f"{k}: {v[k]['inconclusive']}" for k in four if v[k].get("inconclusive")]
         if v["mid_paste_kill"]["not_pasted"]:
             reasons.append("mid_paste_kill: some runs never pasted")
         result["result"] = "inconclusive: " + "; ".join(reasons) if reasons else "pass"
@@ -688,6 +714,7 @@ def lc13():
         # Draft typed through rodeo: the send must be held well past the baseline, until Enter.
         for ch in "draft":
             rodeo.keys(ch)
+        t_key = now()   # the hold runs from the last draft key
         time.sleep(0.5)
         result["draft_reached_op"] = "draft" in op.text()
         token = f"TOKEN_LC13_{os.getpid()}"
@@ -721,7 +748,7 @@ def lc13():
             result["allow_nested_screen"] = nested.screen()[-1500:]
         nested.close()
         result["typed_after_enter_s"] = rounded(typed - t_enter) if typed else None
-        released = typed is not None and typed - t_enter <= 2.0 and typed - t_send < draft_wait
+        released = typed is not None and typed - t_enter <= 2.0 and typed - t_key < draft_wait
         result["released_by_enter"] = released
         passed = (result["render"] and released and result["focus_at_start"] == ["op"]
                   and moves == {"left": ["op"], "right": ["dev"]} and baseline is not None
@@ -735,7 +762,6 @@ def lc13():
 
 def scrubber(core):
     import getpass
-    import socket
     subs = [(str(core.dir), "/tmp/hc-fixture"), (core.id, "0" * 32),
             (os.path.expanduser("~"), "/home/user"), (sys.executable, "/usr/bin/python3")]
     host, user = socket.gethostname(), getpass.getuser()
@@ -750,10 +776,14 @@ def scrubber(core):
             for old, new in subs:
                 value = value.replace(old, new)
             value = nix.sub("/nix/store/HASH-pkg", value)
-            if host:
-                value = value.replace(host, "host")
-            if len(user) > 2:
-                value = value.replace(user, "user")
+            # Host and user names appear only as core.name and inside paths; protocol values ("live", "idle") are
+            # left alone even when the host has such a name.
+            if key == "name" and host and value == host:
+                return "host"
+            if "/" in value:
+                for name, placeholder in ((host, "host"), (user, "user")):
+                    if name:
+                        value = re.sub(rf"(?<![\w.-]){re.escape(name)}(?![\w.-])", placeholder, value)
             return value
         if isinstance(value, bool) or value is None:
             return value
@@ -762,8 +792,23 @@ def scrubber(core):
         if isinstance(value, int) and key and (key == "uptime_ms" or key.endswith("_ms") and value > 10**12):
             return 0
         return value
-    scrub.host, scrub.user = host, user if len(user) > 2 else ""
-    scrub.home, scrub.tmp = os.path.expanduser("~"), str(core.dir)
+    user = user if len(user) > 2 else ""
+
+    def leaks(value, key=None):
+        """Host details still present after scrubbing, found the same way scrub looks for them."""
+        if isinstance(value, dict):
+            return [x for k, v in value.items() for x in leaks(v, k)]
+        if isinstance(value, list):
+            return [x for v in value for x in leaks(v, key)]
+        if not isinstance(value, str):
+            return []
+        found = [n for n in (os.path.expanduser("~"), str(core.dir), core.id) if n in value]
+        found += ["/nix/store hash"] if nix.search(value) else []
+        found += [host] if key == "name" and host and value == host else []
+        if "/" in value:
+            found += [n for n in (host, user) if n and re.search(rf"(?<![\w.-]){re.escape(n)}(?![\w.-])", value)]
+        return found
+    scrub.leaks = leaks
     return scrub
 
 
@@ -840,15 +885,18 @@ def fixtures(out):
             problems.append(f"server.stop: expected a result, got {stop}")
         time.sleep(0.5)
         qa.start()
-        rec("terminal.get.after_restart", "terminal.get", {"terminal": plain["address"]})
+        after = rec("terminal.get.after_restart", "terminal.get", {"terminal": plain["address"]}) or {}
+        if (after.get("state"), after.get("reason"), (after.get("labels") or {}).get("factory.team")) != (
+                "finished", "server_stop", "fix"):
+            problems.append(f"terminal.get.after_restart: expected finished, reason server_stop, labels kept; got "
+                            f"{after.get('state')}, {after.get('reason')}, {after.get('labels')}")
         rec("terminal.list.after_restart", "terminal.list", {"all": True, "labels": {"factory.team": "fix"}})
         scrub = scrubber(qa)
         version = replies["hello"]["result"]["version"]
     missing = ERROR_KINDS - set(errors)
     if problems or missing:
         raise RuntimeError(f"fixtures not written: {problems + [f'{k}: not recorded' for k in sorted(missing)]}")
-    leaks = [needle for needle in (scrub.host, scrub.user, scrub.home, "/nix/store/", scrub.tmp)
-             if needle and needle in json.dumps([scrub(replies), scrub(errors)]).replace("/nix/store/HASH-pkg", "")]
+    leaks = sorted(set(scrub.leaks([scrub(replies), scrub(errors)])))
     if leaks:
         raise RuntimeError(f"fixtures still contain host details: {leaks}")
     data = {"hc_version": version, "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
