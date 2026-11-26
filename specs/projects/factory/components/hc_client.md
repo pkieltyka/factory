@@ -21,7 +21,7 @@ One `hc connect` process per call (verified: V1 in [architecture.md](../architec
 
 - **The request is written only after the `hello` reply has been read and checked.** An old core, or a core other than the team's, never receives a mutating call.
 - Replies are read with `os.read` on the pipe's file descriptor into the client's own buffer, never through a buffered file object: a buffered `readline` can swallow a second line and leave `select` waiting on an empty descriptor.
-- stdin stays open until the reply is read. What `hc` does with a pending send when its client goes away is unknown (LC-1), so the client never closes early on purpose.
+- stdin stays open until the reply is read. Verified (LC-1, [hc-checks.md](../../../../docs/qualification/hc-checks.md)): closing stdin alone (EOF) does not cancel a held `terminal.send`; only dropping the `hc connect` connection (for example `kill_children()` / `SIGKILL`) cancels it.
 - A call costs one process start plus about 1 ms. No connection is kept open, so there is no reconnect logic.
 - `caller` is never passed. Only the keeper sends, its terminal reports no agent status, and `hc` tags a message only when the caller is an agent (hc-capabilities §10.2).
 
