@@ -74,7 +74,7 @@ class Hc:
 
 The two lines are fixed: `hello` is `{"jsonrpc":"2.0","id":0,"method":"hello","params":{"generation":1,"framed":false}}`; the request has `id` 1. Nothing is dispatched until the `hello` reply has been checked for all of: `id == 0`; `result` is an object; `result.generation == 1`; `result.framed is False`; `result.version` is a string of dot-separated integers; `result.core.id` is a non-empty string.
 
-`sent` becomes True when the first raw `os.write` of the request line returns a positive count, and stays True whatever happens next. Until then nothing of the request has crossed the pipe: an `EPIPE` on that first write, or a deadline before any byte went, is `sent=False`, which the keeper may safely retry (keeper.md §4). After a partial write the request may be on its way, so every later failure is `sent=True`. One deadline covers the whole call (both writes and both reads); `None` means no deadline.
+`sent` becomes True when the first raw `os.write` of the request line returns a positive count, and stays True whatever happens next. Until then nothing of the request has crossed the pipe: an `EPIPE` on that first write, or a deadline before any byte went, is `sent=False`, which the keeper may safely retry (keeper.md §4). After a partial write the request may be on its way, so every later failure is `sent=True`. One deadline covers both writes and reads. With `timeout=None`, the client's default timeout still covers hello and the request write. Only the reply can wait without a deadline.
 
 | Point | Failure | Raised |
 |---|---|---|
@@ -100,8 +100,8 @@ The two lines are fixed: `hello` is `{"jsonrpc":"2.0","id":0,"method":"hello","p
 ### The child process
 
 - `Popen([bin, "connect"], stdin=PIPE, stdout=PIPE, stderr=<spool>, bufsize=0)`, where the spool is a `tempfile.TemporaryFile()`. stderr is never a pipe: an unread pipe that fills would block the child where no deadline can see it, above all on `send` with no timeout. After the process has ended the last 2,000 bytes of the spool go into `detail`.
-- **Reads:** only `select` and `os.read` on stdout's descriptor into a per-call buffer; a line ends at `\n`, and bytes after it stay in the buffer.
-- **Writes are deadline-aware too.** stdin's descriptor is set non-blocking (`os.set_blocking`); a line is written in a loop of `select` for writability with the time remaining, then `os.write` of what is left. A message can be 64 KiB, more than a pipe takes at once, so a child that stops reading must not hang a call that has a deadline. With `timeout=None` the same loop waits without limit.
+- **Reads:** poll and `os.read` on stdout's descriptor into a per-call buffer. A line ends at `\n`, and bytes after it stay in the buffer.
+- **Writes are deadline-aware too.** Set stdin non-blocking and poll for writability with the time remaining, then use `os.write` on the remaining bytes. This also covers messages larger than the pipe capacity.
 - **Registration.** `children` is a set guarded by a `threading.Lock`, and the lock is held across `Popen` and the `add`, so `kill_children()` sees every live child. `kill_children()` takes the lock, sets `self.closed`, and kills every process in the set; a `call` that starts after that raises `HcDown(sent=False, "client closed")` without starting anything.
 - On **every** exit from `call`, in a `finally`: on an exception `p.kill()` at once; otherwise close stdin and `p.wait(2)`, then `p.kill()` if it is still there. Always `p.wait()`, close the pipes and the spool, remove `p` from `children` under the lock.
 - A `call` whose child is killed by `kill_children()` sees EOF or a failed write and raises `HcDown` with `sent` as it stood at that moment: False when the kill came during the `hello` exchange or before any request byte went, True afterwards (the case for a held send). Its own `finally` reaps the process. LC-1 showed this is what cancels a held send.
@@ -135,12 +135,13 @@ testing.md §4 already fixes the rule: required fields present, optional ones ch
 
 ```json
 "wire_exceptions": [
-  {"type": "ListResult", "field": "machines", "declared": "required",
-   "observed": "absent when no machine has been added", "applied": "optional", "hc": "0.1.20"}
+  {"version": "0.1.20", "type": "ListResult", "field": "machines",
+   "declared": {"required": true}, "observed": "omitted when there are no remote machines",
+   "applied": {"required": false}}
 ]
 ```
 
-The extract then marks `ListResult.machines` optional; when the field is present it is still checked as an array of `MachineView`. This is the only entry today (found by @lead-dev: the schema lists it as required, and no genuine `terminal.list` reply carries it). Two tests keep the table honest: `test_wire_exceptions_are_applied` (fake mode: each entry's field has the `applied` setting in the extract, and the recorded replies conform) and `test_wire_exceptions_still_hold` (real only: for each entry the real core still behaves as `observed`; when a later `hc` fixes it, this test fails and the entry is removed).
+The extract marks `ListResult.machines` optional and checks that it is an array of `MachineView` when present. The omission was observed with no remote machines. `test_wire_exceptions_are_applied` checks that each entry applies to the extract and that recorded replies conform. `test_wire_exceptions_still_hold` checks the observed omission on a real standalone core and fails when a later version includes the field.
 
 The validator lives in `tests/test_factory.py`, about 30 lines, and is not a JSON Schema implementation:
 
@@ -186,6 +187,7 @@ Named so a reviewer can tick them off. "both" means fake and real mode.
 - both: `test_call_returns_result`; `test_call_maps_error_kind` (`terminal.get` of `t999`: `not_found`, message and hint kept); `test_wrong_core_refused_before_request`; `test_old_hc_refused_before_request` (fake: hello says 0.1.19 and `received()` holds only `hello`; real: `factory.HC_MIN` patched to `(99,)` and the terminal list is unchanged afterwards).
 - fake only, one per row of §3's table: `test_missing_binary`; `test_hello_timeout_is_unsent`; `test_hello_eof_is_unsent`; `test_malformed_hello_is_unsent` (one sub-case per check: not JSON, `id` 1, an error object, `generation` 2, `framed: true`, no version, a non-string version, no core id), each asserting `received()` holds only `hello`; `test_request_epipe_before_any_byte_is_unsent` and `test_request_failure_after_partial_write_is_sent` (both by patching `factory.os.write` for the request line only: the first raises `BrokenPipeError` on the first call; the second returns a short count, then raises. A fake that exits after `hello` would race the writer, so it is not used here); `test_request_deadline_before_any_byte_is_unsent_timeout`; `test_blocked_write_hits_the_deadline` (the fake stops reading; a 200 KiB request with a 0.5 s timeout raises `HcDown(sent=True, timeout=True)`); `test_stderr_flood_does_not_block` (the fake writes 1 MiB to stderr before answering; the call succeeds, and on a failure `detail` holds the tail); `test_reply_timeout_is_sent_and_kills_connect`; `test_reply_eof_is_sent`; `test_malformed_reply_is_sent` (not JSON, wrong `id`, neither key, `error` a string, `error.data` a list).
 - fake only: `test_timeout_flag_only_on_deadlines`; `test_fragmented_and_coalesced_replies`; `test_one_deadline_covers_hello_and_reply`.
+- fake only: `test_send_handshake_is_bounded` and `test_send_reply_outlives_setup_timeout`.
 - fake only: `test_no_child_left_after_any_outcome`: after each case above and after a success, `hc.children` is empty and the `hc connect` process has been reaped.
 - fake only: `test_kill_children_ends_held_send`: a held send in a thread; `kill_children()`; the thread gets `HcDown(sent=True)` (the request was written), the fake recorded no typed text, no process is left. `test_kill_during_hello_is_unsent`: the fake delays its `hello` reply; `kill_children()`; the call raises `HcDown(sent=False)`. `test_no_call_after_kill_children`: a later `call` raises `HcDown(sent=False)` and starts no process. `test_kill_children_sees_a_child_being_started`: with `Popen` patched to pause, a concurrent `kill_children()` waits for the lock and kills that child.
 - fake only: `test_wrapper_requests`: each wrapper sends the method and parameters of hc_client.md; `send` has no `caller`, `force` or `if`; `run` has `no_parent` and `no_notify` true and no `name`, `keep`, `size`, `parent`.

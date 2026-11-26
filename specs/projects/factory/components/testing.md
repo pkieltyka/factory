@@ -15,7 +15,7 @@ How every behaviour in the functional spec is proven: automated tests that run i
 | `tests/test_factory.py` | All automated tests, standard `unittest`, run with `python3 tests/test_factory.py` (v1's entry point and CI step) |
 | `tests/fake_hc.py` | The fake `hc`, about 300 lines |
 | `tests/fake_agent.py` | A program that reports OSC 7501 and plays a scripted agent |
-| `tests/live.py` | Driver for per-harness qualification, the rodeo-driven cases and smoke test, and the end-to-end runs; never run by CI |
+| `tests/live.py` | Private core helper, fixture recorder, and driver for live qualification and end-to-end runs |
 | `tests/gate1-setup.sh` | v1's cold-recovery fixture, kept (§9.5) |
 | `tests/hc_fixtures.json` | Replies recorded from `hc 0.1.20`, for the contract tests |
 
@@ -64,6 +64,8 @@ class FakeHc:
 
 `hold` makes the `connect` process poll the state file until `release`: this models a `draft_wait` hold. `die` makes it exit after reading the request, without a reply: `HcDown(sent=True)`.
 
+Replies are built from the recorded fixture of the same shape. The state also keeps `received` (every JSON-RPC line, including hello) and `polls` (the pending status transitions registered by `on_run`).
+
 ### Fault and crash injection
 
 - **Disk faults** in the log tests are made by patching `os.write`, `os.fsync` and `os.ftruncate` on the `factory` module's `os` binding for one call each, singly and together ([message_log.md](message_log.md)).
@@ -76,7 +78,7 @@ class FakeHc:
 
 | Script | Behaviour |
 |---|---|
-| `reports` (default) | `idle`; on each message: `working` for `FAKE_WORK` seconds, runs `factory.py say <FAKE_REPLY_TO> --file …` with the message's first line, then `idle` |
+| `reports` (default) | `idle`, then `working` for `FAKE_WORK` seconds on each message. If set, runs the JSON argv in `FAKE_REPLY_CMD` with the message's first line on stdin, then reports `idle` |
 | `forgets` | As `reports` without the `say` |
 | `works_forever` | `working` after the first message, never leaves it |
 | `blocks` | `blocked` (kind `permission`) after the first message, until it receives `enter` |
@@ -88,9 +90,11 @@ A line in a message of the form `FAKE: <script>` switches the script, so one tes
 
 ## 4. Test modes and isolation
 
-- **Fake mode (default, CI).** `HC_BIN=tests/fake_hc.py`; harness names on `PATH` are v1's fake executables that record their argv; tests that exercise `say` as a member set that harness's `session_env` variable in the command's environment. No terminal exists; nothing can reach a real `hc`.
-- **Real mode (`FACTORY_TEST_HC=real`, local).** Tests marked `@real_hc` run against a private core. `setUpModule` creates a temp directory and sets `HOME`, `XDG_RUNTIME_DIR`, `XDG_STATE_HOME`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME` inside it, `HC_SESSION=factory-test-<pid>`, `HC_SETTLE_MS=0`, and removes `HC_SOCKET` and `HC_TERMINAL_ID`; `tearDownModule` runs `hc server stop` and deletes the directory. Before the first call it asserts that `XDG_RUNTIME_DIR` is under the temp directory and refuses to run otherwise, so the owner's sessions cannot be touched (§13). Harness names on `PATH` point at `fake_agent.py`. This is the setup the architect's verification used.
-- **Contract tests (`HcContract`, replaces v1's `HerdrContract`).** `hc_fixtures.json` holds recorded examples of real replies (not a rigid exact key set, because optional fields like `Terminal.foreground` may be absent on one call and present on a later call). In fake mode and real mode: every reply must carry every key the `hc 0.1.20` schema marks required for its result type, optional keys are checked only when present (unknown keys fail), and every present field matches its schema JSON type, allowing `null` only where the schema declares the field nullable (so `null` in a required field like `hello.version` fails): `Terminal` (`exit_code`, `finished_ms`, `first_message`, `foreground`, `name`, `parent`, `paste_gap_ms`, `pid`, `reason`, `signal`, `status`, `status_ms`, `stop`, `submit`, `template`), `Status` (`kind`, `progress`), `SendResult` (`started`, `status`, `wait`), `HelloResult` (`login_session`), `StatusResult` (`holder`, `installed_by`, which is `null` on release builds and `"nix"` on Nix builds, LC-9). Real mode also checks each mirrored behaviour of §2. A new `hc` version is adopted by re-recording the fixtures in real mode and fixing what the contract tests then fail.
+- **Fake mode (default).** Each hc test patches `factory.HC` to `tests/fake_hc.py` and sets its own temporary `FAKE_HC_DIR`.
+- **Real mode (`FACTORY_TEST_HC=real`).** `setUpModule` starts a private `live.Core` with its own socket, session, HOME and XDG directories. Each hc test patches its environment to select that core and checks the core ID before issuing requests. A test labels its terminals with a unique team and removes them on cleanup. A test that changes the app doc restores its previous value. Restart coverage uses a separate private core. Teardown confirms the stop on the raw socket before deleting the directory. The v1 tests run in both modes.
+- **Selection.** `@fake_only` scripts the fake, `@real_only` needs a real core, and unmarked backend tests exercise both. Real mode prints how many tests used the real core.
+- **Contracts.** `tests/live.py fixtures` records replies and the reachable schema in `hc_fixtures.json`. The tests' `conforms()` checks required keys, allows optional keys when present, rejects unknown keys, and checks schema types recursively. It allows null only for fields that support it. For example `Terminal.foreground` may be absent, and `StatusResult.installed_by` can be null (release builds) or a string (Nix, LC-9).
+- **Wire exceptions.** The extract also records version-scoped discrepancies. In 0.1.20 `terminal.list` omits `machines` on a standalone core. The extract makes that field optional and checks its array type if present. Real mode verifies the omission. Re-record and check the contracts when upgrading the pinned release.
 
 ### Time
 
@@ -168,7 +172,7 @@ class Rodeo:
 | End-of-phase smoke test, from Phase 5b on (`live.py smoke`) | A team of fake agents (no model cost): `up`; the tab, titles and keeper pane render; `type` and `enter` into a member pane reach the fake agent; a `say` shows in the keeper pane as one line; `down`; the tab is gone |
 | LC-13 | The driver itself: rodeo starts this way, `keys` reach the focused QA pane as human input (a held `terminal.send` proves it), and `screen()` returns the rendered text |
 
-CI never runs any of this: it stays on the fake `hc`.
+CI leaves harness qualification and the rodeo cases to local runs.
 
 ## 7. End-to-end autonomy runs
 
@@ -184,7 +188,7 @@ Results go to `docs/qualification/e2e-<date>.md` with the versions tested.
 
 ## 8. CI
 
-`.github/workflows/test.yml` runs `python3 tests/test_factory.py` in fake mode on every push and pull request. Verified by LC-9 ([hc-checks.md](../../../../docs/qualification/hc-checks.md)): GitHub Actions `ubuntu-latest` can download and SHA-256-verify the pinned `hc 0.1.20` release (`https://releases.herdr.dev/core/0.1.20/herdr-core-linux-x86_64.tar.gz`) and run an isolated real core in ~11 s, so Phase 2 can add a real-mode CI job alongside fake mode. `live.py` qualification and e2e runs stay local.
+`.github/workflows/test.yml` runs `python3 tests/test_factory.py` in fake mode on every push and pull request. The `test-real-hc` job verifies the SHA-256 of the pinned hc 0.1.20 Linux release and runs the same suite with `FACTORY_TEST_HC=real`. The installation was verified in LC-9. [Qualification record](../../../../docs/qualification/hc-checks.md)
 
 ## Dependencies
 

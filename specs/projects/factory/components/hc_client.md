@@ -14,7 +14,7 @@ One `hc connect` process per call (verified: V1 in [architecture.md](../architec
 
 ```json
 → {"jsonrpc":"2.0","id":0,"method":"hello","params":{"generation":1,"framed":false}}
-← {"jsonrpc":"2.0","id":0,"result":{"version":"0.1.20","core":{"id":"2b0e…","name":"pax"},…}}
+← {"jsonrpc":"2.0","id":0,"result":{"generation":1,"framed":false,"version":"0.1.20","core":{"id":"2b0e…","name":"pax"},…}}
 → {"jsonrpc":"2.0","id":1,"method":"terminal.send","params":{"terminal":"t9","text":"…"}}
 ← {"jsonrpc":"2.0","id":1,"result":{"started":true,"status":"idle","turn":7}}
 ```
@@ -36,11 +36,12 @@ class HcError(Exception):
 
 class HcDown(Exception):
     """No usable answer: hc missing, connect failed, wrong or old core, EOF, timeout, or not JSON."""
-    sent: bool       # True once the request line (not hello) was written
+    sent: bool       # True on the first positive write of the request line
     detail: str
+    timeout: bool    # True only when a deadline expired
 
 class Hc:
-    def __init__(self, bin: str = HC, timeout: float = 30, expect_core: str | None = None): ...
+    def __init__(self, bin: str | None = None, timeout: float | None = 30, expect_core: str | None = None): ...
     version: tuple[int, ...] | None   # from hello, after the first call
     core: str | None                  # hello.core.id
     children: set                     # Popen objects of calls in progress, for kill_children()
@@ -64,20 +65,26 @@ class Hc:
 def team_view(hc: Hc, team: str) -> View                          # architecture.md §3.4
 ```
 
-The keeper builds its client as `Hc(timeout=10)`: every call it makes except `send` is bounded well below `BEAT_STALE`, so one slow call cannot make a healthy keeper look hung.
+The default binary is resolved from `HC` at call time. The keeper uses `Hc(timeout=10)`, well below `BEAT_STALE`.
 
 ### `call`
 
-With `deadline = now + timeout` (none when `timeout` is `None`):
+One monotonic deadline covers both writes and both reads. With `timeout=None` (used by `send`), the client's default timeout still covers hello and writing the request. The reply can wait through a draft hold.
 
-1. `p = Popen([bin, "connect"], stdin=PIPE, stdout=PIPE, stderr=PIPE, bufsize=0)`; add `p` to `children`. `FileNotFoundError`: `HcDown(sent=False, "hc not found")`.
-2. Write the `hello` line. `line = read_line(p, deadline)`.
-3. Check it: it must be a JSON object with a `result`. Store `version` and `core`. If `version < HC_MIN`: `HcDown(sent=False, "hc 0.1.20 or newer is required (found X)")`. If `expect_core` is set and differs from `core`: `HcDown(sent=False, "this is another hc core (<id>) than the team's (<id>)")`. In both cases kill `p`; nothing else was written.
-4. Write the request line. From here `sent` is True. `line = read_line(p, deadline)`.
-5. `result` is returned; `error` raises `HcError(error.data.kind, error.message, error.data.hint)`.
-6. Close stdin, `p.wait(2)` then kill; remove `p` from `children`.
+| Point | Failure | Result |
+|---|---|---|
+| Start `hc connect` | Missing binary or other launch error | `HcDown(sent=False)` |
+| Hello | Write failure, EOF, deadline, malformed reply, old version or wrong core | `HcDown(sent=False)` |
+| Request write | Deadline or write failure before any byte was accepted | `HcDown(sent=False)` |
+| Request write | Deadline or write failure after a positive write | `HcDown(sent=True)` |
+| Request reply | EOF, deadline or malformed reply | `HcDown(sent=True)` |
+| Request reply | Valid JSON-RPC error | `HcError(kind, message, hint)` |
 
-`read_line(p, deadline)`: loop `select([fd], [], [], remaining)` then `os.read(fd, 65536)`, appending to a per-call buffer until it holds a `\n`; return the bytes before it and keep the rest. An empty read (EOF) or the deadline, at any fragment, kills `p` and raises `HcDown(sent=<as set>, stderr or "timed out")`.
+The hello reply must have a matching JSON-RPC envelope, an object result, generation 1, `framed: false`, a version of dot-separated integers at or above `HC_MIN`, and a non-empty core ID matching `expect_core` when set. The request reply must have a matching envelope and an object result or error. An absent or null error hint becomes an empty string.
+
+Reads poll stdout and use `os.read` in a per-call buffer. Writes poll non-blocking stdin and use `os.write`, counting the first positive request write even if the rest fails. stderr goes to a temporary spool to avoid blocking on a full pipe. The last 2,000 bytes are available for transport errors.
+
+`kill_children()` closes the client and kills every registered child. Launch and registration share its lock. Each call reaps its child, closes its descriptors and removes the child from the set, including on errors.
 
 Fields read from a `Terminal` record: `address`, `state` (`live` or `finished`), `status` (`state`, `kind`, `msg`), `reported`, `turn`, `status_ms`, `labels`, `keep`, `created_ms`, `finished_ms`, `reason`, `exit_code`, `signal`. Nothing else is relied on.
 
@@ -111,6 +118,8 @@ Built from one `hc.list(team)`.
 
 ## `check`: version and `draft_wait`
 
+Built in Phase 5a.
+
 `check` must work with no core running, so it does not use `call`. It runs `hc --version` (parses `hc X.Y.Z`), and reads `draft_wait` from `$XDG_CONFIG_HOME/herdr-core/config.toml` (default `~/.config/herdr-core/config.toml`) with `tomllib`: a missing file or key means 60; a negative value means 0. It prints `hc 0.1.20, draft_wait 60 s` and, under 600, the warning "raise draft_wait to 600 or more in <path> so a report never lands in text you are typing". When `hc` is missing it says so and continues: `check` is an offline command.
 
 ## Dependencies
@@ -122,18 +131,18 @@ Depends on: the `hc` binary (`HC_BIN`). Used by: every team command, the keeper,
 Against the fake `hc` ([testing.md](testing.md)):
 
 - `test_call_returns_result`: `terminal.list` round trip; `version` and `core` are set.
-- `test_request_not_written_before_hello_is_checked`: the fake records what it received; with hello 0.1.19 it received only `hello`, and `HcDown.sent` is False.
+- `test_old_hc_refused_before_request`: with hello 0.1.19 the fake received only `hello` and `HcDown.sent` is False.
 - `test_wrong_core_refused_before_request`: `expect_core` differs; only `hello` was received.
-- `test_call_maps_error_kind`: fake answers `blocked`; `HcError.kind`, message and hint kept.
+- `test_call_maps_error_kind`: `HcError.kind`, message and hint are kept.
 - `test_missing_binary`: `HcDown(sent=False)`.
-- `test_eof_after_request_is_sent`: fake exits after reading the request; `HcDown(sent=True)`.
-- `test_timeout_kills_connect`: fake never answers; `HcDown(sent=True)` at the deadline and no process left.
+- `test_reply_eof_is_sent`: fake exits after reading the request with `HcDown(sent=True)`.
+- `test_reply_timeout_is_sent_and_kills_connect`: fake never answers, giving `HcDown(sent=True, timeout=True)` and no child left.
+- `test_send_handshake_is_bounded` and `test_send_reply_outlives_setup_timeout` cover the two parts of an unbounded send.
 - `test_fragmented_and_coalesced_replies`: the fake writes the reply in three chunks with pauses, and in another run writes extra bytes after the newline; both parse, and the timeout still applies across fragments.
-- `test_kill_children_ends_pending_send`: a held send's `hc connect` is gone after `kill_children()`.
-- `test_send_has_no_caller`: the recorded request has no `caller`, `force` or `if`.
-- `test_run_always_parentless`: recorded `terminal.run` has `no_parent` and `no_notify` true and no `name`, `keep`, `size` or `parent`.
+- `test_kill_children_ends_held_send`: a held send's `hc connect` is gone after `kill_children()`.
+- `test_wrapper_requests`: send omits `caller`, `force` and `if`. Run has `no_parent` and `no_notify` true and omits `name`, `keep`, `size` and `parent`.
 - `test_view_states`: each row of the `state` table.
 - `test_view_ignores_other_team`; `test_view_newest_live_wins`; `test_view_down_record_is_not_gone`.
-- `test_check_reads_draft_wait`: missing file gives 60 and a warning; 900 gives no warning; `hc` missing is reported without failing the formation check.
+- Phase 5a's `test_check_reads_draft_wait`: missing file gives 60 and a warning, 900 gives no warning, and a missing `hc` does not fail the formation check.
 
 Against a real isolated core (`FACTORY_TEST_HC=real`): the first, the two refusal tests (with a fake version floor), and the `View` tests, using the fake agent.
