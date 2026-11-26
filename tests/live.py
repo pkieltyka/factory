@@ -28,7 +28,7 @@ import threading
 import time
 
 HC = os.environ.get("HC_BIN", "hc")
-RODEO = os.environ.get("RODEO_BIN") or shutil.which("rodeo") or "/home/peter/Dev/pkieltyka/rodeo/target/release/rodeo"
+RODEO = os.environ.get("RODEO_BIN") or shutil.which("rodeo") or ""
 HC_MIN = (0, 1, 20)
 CONTROL, DATA, CREDIT, CLOSE = 0, 0, 1, 2
 MAX_SOCKET = 95
@@ -75,19 +75,22 @@ class Conn:
             raise HcDown(False, "hc not found")
         self.buf = b""
         self.sent = False
-        self.write(rpc_line("hello", {"generation": 1, "framed": framed}, 0))
-        reply = json.loads(self.line(10))
-        if "error" in reply:
+        try:
+            self.write(rpc_line("hello", {"generation": 1, "framed": framed}, 0))
+            reply = json.loads(self.line(10))
+            if "error" in reply:
+                raise HcError(reply["error"])
+            self.hello = reply["result"]
+            version = tuple(int(x) for x in self.hello["version"].split(".")[:3])
+            if version < HC_MIN:
+                raise HcDown(False, f"hc {'.'.join(map(str, HC_MIN))} or newer is required (found {self.hello['version']})")
+            if core_id is not None and self.hello["core"]["id"] != core_id:
+                raise HcDown(False, f"reached core {self.hello['core']['id']}, expected {core_id}: refusing")
+            if self.hello.get("framed") is not framed:
+                raise HcDown(False, f"asked for framed={framed}, hello says {self.hello.get('framed')}")
+        except BaseException:
             self.kill()
-            raise HcError(reply["error"])
-        self.hello = reply["result"]
-        version = tuple(int(x) for x in self.hello["version"].split(".")[:3])
-        if version < HC_MIN:
-            self.kill()
-            raise HcDown(False, f"hc {'.'.join(map(str, HC_MIN))} or newer is required (found {self.hello['version']})")
-        if core_id is not None and self.hello["core"]["id"] != core_id:
-            self.kill()
-            raise HcDown(False, f"reached core {self.hello['core']['id']}, expected {core_id}: refusing")
+            raise
 
     def write(self, data):
         self.p.stdin.write(data)
@@ -184,10 +187,15 @@ class Core:
         if self.id is not None and started != self.id:
             raise RuntimeError(f"core id changed across restart: {self.id} -> {started}")
         self.id = started
-        self.connect().close()
+        self.hello()
 
     def connect(self, framed=False):
         return Conn(self.env, self.id, framed)
+
+    def hello(self):
+        c = self.connect()
+        c.close()
+        return c.hello
 
     def call(self, method, params=None, timeout=15):
         """The whole JSON-RPC message (result or error), for fixtures."""
@@ -362,7 +370,7 @@ def lc1():
     draft_wait = 3
     result = {"check": "LC-1", "draft_wait": draft_wait, "variants": {}}
     with Core("lc1", config=f"draft_wait = {draft_wait}\n") as qa:
-        result["hc"] = qa.connect().hello["version"]
+        result["hc"] = qa.hello()["version"]
         for variant in ("control", "sigkill", "eof", "sigkill_then_enter"):
             probe = Probe(qa, f"lc1-{variant}")
             attach = Attach(qa, probe.address)
@@ -405,6 +413,18 @@ def lc1():
             row["typed_after_send_s"] = rounded(typed - t_send) if typed else None
             row["typed_after_last_key_s"] = rounded(typed - t_key) if typed else None
             row["terminal"] = qa.rpc("terminal.get", {"terminal": probe.address})["state"]
+            # Delivery goes on: a fresh send to the same terminal arrives, after the first token if that was typed.
+            follow = f"FOLLOW_LC1_{variant}_{os.getpid()}"
+            t_follow = now()
+            try:
+                qa.rpc("terminal.send", {"terminal": probe.address, "text": follow}, timeout=30)
+            except (HcError, HcDown) as error:
+                row["follow_error"] = str(error)
+            followed = probe.first(follow)
+            row["follow_typed_after_s"] = rounded(followed - t_follow) if followed else None
+            text = probe.text()
+            row["follow_after_first"] = (text.index(token) < text.index(follow)) if typed and followed else None
+            row["first_typed_once"] = text.count(token) <= 1
             attach.close()
             result["variants"][variant] = row
         result["variants"]["mid_paste_kill"] = mid_paste_kill(qa)
@@ -536,11 +556,12 @@ class Rodeo:
 def hc_env_names(core):
     """Names of the HC_* variables a terminal of this core gets."""
     out = core.dir / "env.txt"
-    t = core.rpc("terminal.run", {"argv": ["sh", "-c", f"env > {out}"], "cwd": str(core.dir)})
+    names_only = f"env | sed -n 's/^\\(HC_[A-Za-z0-9_]*\\)=.*/\\1/p' > {out}"   # names only, never values
+    t = core.rpc("terminal.run", {"argv": ["sh", "-c", names_only], "cwd": str(core.dir)})
     deadline = time.monotonic() + 10
     while core.rpc("terminal.get", {"terminal": t["address"]})["state"] == "live" and time.monotonic() < deadline:
         time.sleep(0.1)
-    return sorted(line.split("=", 1)[0] for line in out.read_text().splitlines() if line.startswith("HC_"))
+    return sorted(line for line in out.read_text().splitlines() if line)
 
 
 def focused(op, dev, before):
@@ -551,11 +572,13 @@ def focused(op, dev, before):
 
 def lc13():
     result = {"check": "LC-13", "rodeo": RODEO}
-    if not os.path.exists(RODEO):
-        result["result"] = "not run: rodeo not found"
+    if not RODEO or not os.path.exists(RODEO):
+        result["result"] = "not run: rodeo not found (set RODEO_BIN)"
         return result
     result["rodeo_version"] = subprocess.run([RODEO, "--version"], capture_output=True, text=True).stdout.strip()
-    with Core("lc13qa", config="draft_wait = 4\n") as qa, Core("lc13drv") as drv:
+    draft_wait = int(os.environ.get("LC13_DRAFT_WAIT", "15"))   # 0 is the negative control: the check must fail
+    result["draft_wait"] = draft_wait
+    with Core("lc13qa", config=f"draft_wait = {draft_wait}\n") as qa, Core("lc13drv") as drv:
         result["driver_terminal_hc_env"] = hc_env_names(drv)
         op = Probe(qa, "op")
         dev = Probe(qa, "dev")
@@ -596,20 +619,38 @@ def lc13():
             got = focused(op, dev, before)
             moves[name] = [n for n, t in got.items() if "z" in t]
         result["focus_after"] = moves
-        # Put focus on @op for the draft check.
+        # Submit the marker keys in both panes (focus is on @dev), then focus @op again.
+        rodeo.keys("enter")
+        time.sleep(0.3)
         rodeo.keys("ctrl+b")
         time.sleep(0.2)
         rodeo.keys("h")
         time.sleep(0.5)
+        rodeo.keys("enter")
+        time.sleep(1.0)
+        # Baseline: no draft in @op, so only hc's quiet pause delays the send.
+        base = f"BASE_LC13_{os.getpid()}"
+        t_base = now()
+        conn = qa.spawn_send(op.address, base)
+        try:
+            conn.reply(20)
+        except (HcDown, HcError) as error:
+            result["baseline_error"] = str(error)
+        conn.close()
+        typed = op.first(base)
+        baseline = typed - t_base if typed else None
+        result["baseline_typed_after_send_s"] = rounded(baseline)
+        # Draft typed through rodeo: the send must be held well past the baseline, until Enter.
         for ch in "draft":
             rodeo.keys(ch)
-        t_key = now()
         time.sleep(0.5)
         result["draft_reached_op"] = "draft" in op.text()
         token = f"TOKEN_LC13_{os.getpid()}"
         t_send = now()
         conn = qa.spawn_send(op.address, token)
-        time.sleep(1.5)
+        check_at = max((baseline or 3) + 3, 6)
+        time.sleep(check_at)
+        result["held_check_after_send_s"] = rounded(check_at)
         result["send_held_by_rodeo_keys"] = conn.p.poll() is None and op.first(token) is None
         rodeo.keys("enter")
         t_enter = now()
@@ -634,8 +675,11 @@ def lc13():
         if not result["allow_nested_render"]:
             result["allow_nested_screen"] = nested.screen()[-1500:]
         nested.close()
-        passed = (result["render"] and result["draft_reached_op"] and result["send_held_by_rodeo_keys"]
-                  and result["draft_submitted_before_token"])
+        result["typed_after_enter_s"] = rounded(typed - t_enter) if typed else None
+        passed = (result["render"] and result["focus_at_start"] == ["op"]
+                  and moves == {"left": ["op"], "right": ["dev"]} and baseline is not None
+                  and result["draft_reached_op"] and result["send_held_by_rodeo_keys"]
+                  and result["draft_submitted_before_token"] and result["token_on_rodeo_screen"])
         result["result"] = "pass" if passed else "fail"
     return result
 
@@ -659,9 +703,10 @@ def scrubber(core):
             for old, new in subs:
                 value = value.replace(old, new)
             value = nix.sub("/nix/store/HASH-pkg", value)
-            if key == "name" and value == host:
-                value = "host"
-            value = value.replace(host, "host").replace(user, "user") if len(user) > 2 else value
+            if host:
+                value = value.replace(host, "host")
+            if len(user) > 2:
+                value = value.replace(user, "user")
             return value
         if isinstance(value, bool) or value is None:
             return value
@@ -670,6 +715,8 @@ def scrubber(core):
         if isinstance(value, int) and key and (key == "uptime_ms" or key.endswith("_ms") and value > 10**12):
             return 0
         return value
+    scrub.host, scrub.user = host, user if len(user) > 2 else ""
+    scrub.home, scrub.tmp = os.path.expanduser("~"), str(core.dir)
     return scrub
 
 
@@ -688,7 +735,7 @@ def fixtures(out):
             return msg.get("result")
 
         replies["hello"] = {"method": "hello", "params": {"generation": 1, "framed": False},
-                            "result": qa.connect().hello}
+                            "result": qa.hello()}
         rec("server.status", "server.status")
         agent = Probe(qa, "agent", labels={"factory.team": "fix", "factory.kind": "member"})
         replies["terminal.run"] = {"method": "terminal.run", "params": {"argv": ["python3", "probe.py"], "labels": {}},
@@ -739,6 +786,10 @@ def fixtures(out):
         rec("terminal.list.after_restart", "terminal.list", {"all": True, "labels": {"factory.team": "fix"}})
         scrub = scrubber(qa)
         version = replies["hello"]["result"]["version"]
+    leaks = [needle for needle in (scrub.host, scrub.user, scrub.home, "/nix/store/", scrub.tmp)
+             if needle and needle in json.dumps([scrub(replies), scrub(errors)]).replace("/nix/store/HASH-pkg", "")]
+    if leaks:
+        raise RuntimeError(f"fixtures still contain host details: {leaks}")
     data = {"hc_version": version, "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "note": "Recorded by tests/live.py fixtures from a private core; host details replaced by placeholders.",
             "replies": scrub(replies), "errors": scrub(errors)}
