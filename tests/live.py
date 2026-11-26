@@ -251,22 +251,29 @@ class Core:
             return
         # Confirm on the socket itself: hc connect (and so hello) would start the core again.
         deadline = time.monotonic() + 10
+        state = True
         while time.monotonic() < deadline:
-            if not self.listening():
+            state = self.listening()
+            if state is False:
                 shutil.rmtree(self.dir, ignore_errors=True)
                 return
             time.sleep(0.2)
-        print(f"warning: core {self.id} still listens after server.stop; directory {self.dir} left", file=sys.stderr)
+        what = "still listens" if state else "could not be confirmed stopped"
+        print(f"warning: core {self.id} {what} after server.stop; directory {self.dir} left", file=sys.stderr)
 
     def listening(self):
-        """Whether a core accepts connections on the private socket, checked without hc (which would start one)."""
+        """True if a core accepts connections on the private socket, False only when the socket is gone or
+        refuses (ENOENT, ECONNREFUSED), None when that cannot be told (a timeout, EACCES, ...). Checked
+        without hc, which would start a core."""
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(1)
         try:
             sock.connect(self.env["HC_SOCKET"])
             return True
-        except OSError:
+        except (FileNotFoundError, ConnectionRefusedError):
             return False
+        except OSError:
+            return None
         finally:
             sock.close()
 
@@ -780,6 +787,8 @@ def scrubber(core):
             # left alone even when the host has such a name.
             if key == "name" and host and value == host:
                 return "host"
+            if key == "user" and user and value == user:   # hello.login_session.user
+                return "user"
             if "/" in value:
                 for name, placeholder in ((host, "host"), (user, "user")):
                     if name:
@@ -805,6 +814,7 @@ def scrubber(core):
         found = [n for n in (os.path.expanduser("~"), str(core.dir), core.id) if n in value]
         found += ["/nix/store hash"] if nix.search(value) else []
         found += [host] if key == "name" and host and value == host else []
+        found += [user] if key == "user" and user and value == user else []
         if "/" in value:
             found += [n for n in (host, user) if n and re.search(rf"(?<![\w.-]){re.escape(n)}(?![\w.-])", value)]
         return found
