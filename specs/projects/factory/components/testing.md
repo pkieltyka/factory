@@ -21,12 +21,13 @@ How every behaviour in the functional spec is proven: automated tests that run i
 
 ## 2. Fake `hc`
 
-An executable Python script; tests set `HC_BIN` to it. It implements `--version` (prints `hc <FAKE_HC_VERSION or 0.1.20>`) and `connect`: read JSON lines on stdin, answer each on stdout, exit at EOF. State is `$FAKE_HC_DIR/state.json`, read and written under `flock`, so the many `connect` processes of one test share it.
+Tests point `HC_BIN` at this script. It implements `--version` and serves JSON lines on `connect` until EOF. Processes share `$FAKE_HC_DIR/state.json` under `flock`. Changes replace the snapshot atomically so killing a connection cannot destroy the previous state.
 
 ```json
 {"core": "fakecore00000000", "next": 1,
  "terminals": {"t1": {"address": "t1", "state": "live", "status": null, "turn": 0, "labels": {}, "argv": [], "cwd": "", "env": {},
-                      "created_ms": 0, "status_ms": null, "finished_ms": null, "reason": null, "exit_code": null, "screen": ""}},
+                      "created_ms": 0, "status_ms": null, "finished_ms": null, "reason": null, "exit_code": null, "screen": "exact"}},
+ "screens": {"t1": ""},
  "docs": {"herdr-app": {"value": null, "version": 0}},
  "calls": [{"method": "terminal.send", "params": {}}],
  "rules": {"send": {"t1": {"hold": true}}, "run": {}, "doc_conflicts": 0}}
@@ -65,6 +66,7 @@ class FakeHc:
 `hold` makes the `connect` process poll the state file until `release`: this models a `draft_wait` hold. `die` makes it exit after reading the request, without a reply: `HcDown(sent=True)`.
 
 Replies are built from the recorded fixture of the same shape. The state also keeps `received` (every JSON-RPC line, including hello) and `polls` (the pending status transitions registered by `on_run`).
+Display text lives in `screens` and is returned by `terminal.read`. The terminal record's `screen` describes its fidelity (`exact` or `inexact`).
 
 ### Fault and crash injection
 

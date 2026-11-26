@@ -23,14 +23,19 @@ def state_at(directory):
     with (directory / "lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         path = directory / "state.json"
-        state = json.loads(path.read_text()) if path.exists() else {
-            "core": "fakecore00000000", "next": 1, "terminals": {}, "docs": {},
+        previous = path.read_text() if path.exists() else None
+        state = json.loads(previous) if previous is not None else {
+            "core": "fakecore00000000", "next": 1, "terminals": {}, "screens": {}, "docs": {},
             "calls": [], "received": [], "rules": {}, "polls": {}, "sent": {},
         }
         try:
             yield state
         finally:
-            path.write_text(json.dumps(state))
+            snapshot = json.dumps(state)
+            if snapshot != previous:
+                staging = path.with_suffix(".tmp")
+                staging.write_text(snapshot)
+                staging.replace(path)
 
 
 class RpcFailure(Exception):
@@ -93,9 +98,10 @@ def launch(state, params):
     record = example("terminal.run")
     record.update(address=address, labels=labels, argv=params["argv"], cwd=params.get("cwd", "/tmp"),
                   parent=params.get("parent"), keep=params.get("keep", False), notify=not params.get("no_notify"),
-                  screen=rule.get("screen", ""), created_ms=timestamp())
+                  created_ms=timestamp())
     set_status(record, rule.get("status"))
     state["terminals"][address] = record
+    state["screens"][address] = rule.get("screen", "")
     if rule.get("then"):
         remaining, word = rule["then"]
         state["polls"][address] = {"remaining": remaining, "status": word}
@@ -148,14 +154,15 @@ def terminal_call(state, method, params):
         if record["state"] == "live":
             raise RpcFailure("live")
         del state["terminals"][target]
+        state["screens"].pop(target, None)
         return {**example("terminal.rm"), "removed": target}
     if method == "terminal.read":
-        return {**example("terminal.read"), "text": record["screen"]}
+        return {**example("terminal.read"), "text": state["screens"].get(target, "")}
     if method == "terminal.keys":
         if record["state"] != "live":
             raise RpcFailure("finished")
         for key in params["keys"]:
-            record["screen"] += "\n" if key == "enter" else key
+            state["screens"][target] = state["screens"].get(target, "") + ("\n" if key == "enter" else key)
         return {**example("terminal.keys"), "turn": record["turn"], "status": (record.get("status") or {}).get("state")}
     raise RpcFailure("invalid_params", f"unknown method {method}")
 

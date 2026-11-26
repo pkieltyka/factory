@@ -856,9 +856,9 @@ WIRE_EXCEPTIONS = (
 )
 
 
-def schema_extract(replies, version):
+def schema_extract(replies, version, env):
     """Keep the required keys and JSON types reachable from the recorded success replies."""
-    schema = json.loads(subprocess.check_output([HC, "schema"], timeout=15))
+    schema = json.loads(subprocess.check_output([HC, "schema"], env=env, timeout=15))
     source = schema["components"]["schemas"]
     methods = {entry["name"]: entry["result"]["schema"] for entry in schema["methods"]}
     types = {}
@@ -981,13 +981,13 @@ def fixtures(out):
         rec("terminal.list.after_restart", "terminal.list", {"all": True, "labels": {"factory.team": "fix"}})
         scrub = scrubber(qa)
         version = replies["hello"]["result"]["version"]
+        schema, exceptions = schema_extract(replies, version, qa.env)
     missing = ERROR_KINDS - set(errors)
     if problems or missing:
         raise RuntimeError(f"fixtures not written: {problems + [f'{k}: not recorded' for k in sorted(missing)]}")
     leaks = sorted(set(scrub.leaks([scrub(replies), scrub(errors)])))
     if leaks:
         raise RuntimeError(f"fixtures still contain host details: {leaks}")
-    schema, exceptions = schema_extract(replies, version)
     data = {"hc_version": version, "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "note": "Recorded by tests/live.py fixtures from a private core; host details replaced by placeholders.",
             "replies": scrub(replies), "errors": scrub(errors), "schema": schema, "wire_exceptions": exceptions}

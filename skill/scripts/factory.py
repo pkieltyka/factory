@@ -178,9 +178,10 @@ class Hc:
                         or info.get("framed") is not False
                         or not isinstance(core, dict) or not isinstance(core.get("id"), str) or not core["id"]):
                     raise ValueError("unexpected hello reply: invalid generation, framing or core")
-                if not isinstance(version, str) or not re.fullmatch(r"[0-9]+(?:\.[0-9]+)+", version):
+                numeric = re.fullmatch(r"([0-9]+(?:\.[0-9]+)+)(?:[-+].+)?", version) if isinstance(version, str) else None
+                if numeric is None:
                     raise ValueError(f"unrecognised hc version: {version!r}")
-                parsed_version = tuple(map(int, version.split(".")))
+                parsed_version = tuple(map(int, numeric[1].split(".")))
                 if parsed_version < HC_MIN:
                     raise HcDown(False, f"hc {'.'.join(map(str, HC_MIN))} or newer is required (found {version})")
                 if self.expect_core is not None and core["id"] != self.expect_core:
@@ -312,7 +313,7 @@ class View:
             lost = self.operator_lost
             return "gone" if self.finished(name) or (lost and lost["labels"].get("factory.member") == name) else "not started"
         if record.get("status") is None:
-            return "gone" if record["reported"] else "starting"
+            return "gone" if record.get("reported") else "starting"
         return record["status"]["state"]
 
 

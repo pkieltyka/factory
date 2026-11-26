@@ -72,7 +72,7 @@ class Hc:
 
 ### What `call` raises, and when `sent` turns true
 
-The two lines are fixed: `hello` is `{"jsonrpc":"2.0","id":0,"method":"hello","params":{"generation":1,"framed":false}}`; the request has `id` 1. Nothing is dispatched until the `hello` reply has been checked for all of: `id == 0`; `result` is an object; `result.generation == 1`; `result.framed is False`; `result.version` is a string of dot-separated integers; `result.core.id` is a non-empty string.
+The two lines are fixed: `hello` is `{"jsonrpc":"2.0","id":0,"method":"hello","params":{"generation":1,"framed":false}}`; the request has `id` 1. Before dispatch, check the hello envelope and object result, generation 1, `framed: false`, and a non-empty core ID. Compare the version's leading dot-separated integers against `HC_MIN`, allowing a suffix starting with `-` or `+`.
 
 `sent` becomes True when the first raw `os.write` of the request line returns a positive count, and stays True whatever happens next. Until then nothing of the request has crossed the pipe: an `EPIPE` on that first write, or a deadline before any byte went, is `sent=False`, which the keeper may safely retry (keeper.md §4). After a partial write the request may be on its way, so every later failure is `sent=True`. One deadline covers both writes and reads. With `timeout=None`, the client's default timeout still covers hello and the request write. Only the reply can wait without a deadline.
 
@@ -158,7 +158,7 @@ Object of a named type: every required field present; every present field known 
 As testing.md §2, with one design rule that keeps it honest: **every reply is built from the recorded reply of the same name** in `hc_fixtures.json` (loaded from beside the script), with the varying fields overwritten. A terminal record starts as a copy of `replies["terminal.get.live"].result`; an error is a copy of `errors[kind].error` with the message rewritten. Re-recording the fixtures for a new `hc` therefore moves the fake with it.
 
 - CLI: `--version` prints `hc <FAKE_HC_VERSION or the fixtures' hc_version>`; `connect` serves JSON lines until EOF; anything else exits 2.
-- State: `$FAKE_HC_DIR/state.json` under `flock`, shape as testing.md §2, plus `received` (every line read, `hello` included) and `polls` (per terminal, the count of `get`/`list` reads, for `on_run`'s "after n polls").
+- State: atomically replaced `$FAKE_HC_DIR/state.json` under `flock`, shape as testing.md §2. `received` records every line read, `polls` tracks scheduled status changes, and display text lives in `screens` for `terminal.read`.
 - It answers `hello` before reading the next line.
 - Methods and mirrored behaviour: testing.md §2. `terminal.send` with a `hold` rule polls the state file every 20 ms and records the text as typed only when released; if the process is killed first, nothing is recorded (LC-1). `die` exits after reading the request. `set_status` in the helper keeps `turn` (plus one on leaving `working`), `status_ms` and `reported` consistent.
 - Test-side helper `FakeHc` in `test_factory.py`: the methods of testing.md §2.

@@ -216,7 +216,7 @@ class FakeHc:
             address = f"t{state['next']}"
             state["next"] += 1
             record = fake_hc.example("terminal.get.live")
-            record.update(address=address, labels=labels, turn=0, screen="", created_ms=fake_hc.timestamp(),
+            record.update(address=address, labels=labels, turn=0, created_ms=fake_hc.timestamp(),
                           status_ms=fake_hc.timestamp() if status else None,
                           status={"state": status, "app": "fake"} if status else None, reported=status is not None)
             record.update(fields)
@@ -248,10 +248,11 @@ class FakeHc:
     def remove(self, term):
         with self.state() as state:
             del state["terminals"][term]
+            state["screens"].pop(term, None)
 
     def screen(self, term, text):
         with self.state() as state:
-            state["terminals"][term]["screen"] = text
+            state["screens"][term] = text
 
     def reply_in_chunks(self, sizes, delay):
         self.rule("reply", chunks=sizes, chunk_delay=delay)
@@ -315,6 +316,27 @@ class FakeHcTests(unittest.TestCase):
         self.assertEqual(self.hc.get(record["address"])["status"]["state"], "idle")
         self.assertEqual(self.hc.read(record["address"]), "starting")
 
+    def test_display_text_is_only_in_read(self):
+        self.fake.on_run("worker", screen="Trust this folder?")
+        labels = {"factory.team": "test-team", "factory.member": "worker"}
+        record = self.hc.run(["probe"], "/tmp", {}, labels)
+        target = record["address"]
+        self.assertEqual(self.hc.read(target), "Trust this folder?")
+        for reply in (record, self.hc.get(target), self.hc.list("test-team")[0]):
+            self.assertIn(reply["screen"], ("exact", "inexact"))
+            self.assertNotIn("Trust this folder?", json.dumps(reply))
+
+    def test_interrupted_write_preserves_snapshot(self):
+        term = self.fake.add({})
+        self.hc.send(term, "already typed")
+        with patch.object(fake_hc.os, "replace", side_effect=InterruptedError("before commit")):
+            with self.assertRaises(InterruptedError):
+                with self.fake.state() as state:
+                    state["sent"][term].append("interrupted")
+        self.assertEqual(self.fake.sent(term), ["already typed"])
+        self.hc.send(term, "later")
+        self.assertEqual(self.fake.sent(term), ["already typed", "later"])
+
     def test_doc_conflicts_rule(self):
         self.fake.doc_conflicts(1)
         with self.assertRaises(factory.HcError) as raised:
@@ -374,6 +396,20 @@ class HcClientTests(unittest.TestCase):
     def test_old_hc_refused_before_request(self):
         with patch.dict(os.environ, {"FAKE_HC_VERSION": "0.1.19"}):
             self.check_failure(sent=False)
+        self.assertEqual([r["method"] for r in self.fake.received()], ["hello"])
+
+    def test_version_suffixes_use_numeric_floor(self):
+        for version, expected in (("0.2.0-rc.1", (0, 2, 0)), ("0.1.21+nix", (0, 1, 21))):
+            with self.subTest(version=version):
+                self.fake.hello(version)
+                self.assertEqual(self.hc.list("team"), [])
+                self.assertEqual(self.hc.version, expected)
+        self.fake.hello("0.1.19-dev")
+        self.check_failure(sent=False)
+
+    def test_version_requires_numeric_prefix(self):
+        self.fake.hello("dev-0.1.20")
+        self.assertIn("unrecognised hc version", self.check_failure(sent=False).detail)
         self.assertEqual([r["method"] for r in self.fake.received()], ["hello"])
 
     def test_wrong_core_refused_before_request(self):
@@ -634,13 +670,17 @@ class ViewTests(unittest.TestCase):
 
     def test_view_states(self):
         self.add("starting", None)
+        term = self.add("no-reported-field", None)
+        with self.fake.state() as state:
+            del state["terminals"][term]["reported"]
         self.add("shell", None, reported=True)
         self.fake.finish(self.add("exited"))
         words = ("idle", "working", "done", "blocked", "error")
         for word in words:
             self.add(word, word)
         view = self.view()
-        expected = {"missing": "not started", "starting": "starting", "shell": "gone", "exited": "gone",
+        expected = {"missing": "not started", "starting": "starting", "no-reported-field": "starting",
+                    "shell": "gone", "exited": "gone",
                     **{word: word for word in words}}
         self.assertEqual({name: view.state(name) for name in expected}, expected)
 
