@@ -3734,12 +3734,13 @@ class DeliveryDecisionTests(unittest.TestCase):
 class ManualClock:
     def __init__(self):
         self.now = 0
+        self.start = time.time()
 
     def monotonic(self):
         return self.now
 
     def time(self):
-        return 1_800_000_000 + self.now
+        return self.start + self.now
 
     def sleep(self, seconds):
         self.now += seconds
@@ -4301,6 +4302,148 @@ class KeeperTests(TeamCase):
         self.keeper.tick()
         self.assertEqual(self.outcome(ident, "operator")["o"], "delivered")
         self.assertEqual(self.keeper.stop, "team is down")
+
+
+@fake_only
+class EnsureKeeperTests(TeamCase):
+    def beat(self, terminal, version=factory.VERSION, age=0):
+        path = self.state_dir / "keeper.beat"
+        path.write_text(f"42 {version} {terminal}\n")
+        stamp = self.clock.time() - age
+        os.utime(path, (stamp, stamp))
+        return path
+
+    def ensure(self, **kwargs):
+        return factory.ensure_keeper(self.cfg, self.state_dir, self.hc, factory.View([]), **kwargs)
+
+    def test_starts_missing_keeper_with_labelled_terminal_and_waits_for_beat(self):
+        run = self.hc.run
+
+        def start(*args, **kwargs):
+            result = run(*args, **kwargs)
+            self.beat(result["address"])
+            return result
+
+        with (patch.object(factory, "time", self.clock),
+              patch.object(self.hc, "run", side_effect=start),
+              patch.dict(os.environ, {"HC_BIN": self.hc.bin or factory.HC})):
+            terminal = self.ensure()
+            self.assertEqual(factory.read_beat(self.state_dir), (42, factory.VERSION, terminal, 0))
+        request = self.fake.calls("terminal.run")[0]["params"]
+        self.assertEqual(request["argv"], [sys.executable, str(factory.SCRIPT), "keeper", "--state",
+                                          str(self.state_dir)])
+        self.assertEqual(request["labels"], {"factory.team": self.team, "factory.kind": "keeper",
+                                             "factory.dir": str(self.state_dir), "factory.version": factory.VERSION,
+                                             "name": "keeper"})
+        self.assertEqual(request["cwd"], str(self.root))
+        self.assertTrue(request["no_parent"])
+        self.assertTrue(request["no_notify"])
+        self.assertEqual(request["env"]["HC_BIN"], factory.HC)
+        self.assertEqual(self.clock.now, 0)
+
+    def test_leaves_young_keeper_alone_even_if_a_beat_is_missing_or_names_another_terminal(self):
+        keeper, _ = self.terminal("keeper", kind="keeper", status=None)
+        with patch.object(factory, "time", self.clock):
+            self.assertEqual(self.ensure(), keeper)
+            self.beat("t999")
+            self.assertEqual(self.ensure(), keeper)
+        self.assertEqual(self.fake.calls("terminal.run"), [])
+        self.assertEqual(self.fake.calls("terminal.kill"), [])
+
+    def test_other_version_is_alive_when_its_beat_is_fresh(self):
+        keeper, _ = self.terminal("keeper", kind="keeper", status=None)
+        self.clock.sleep(factory.BEAT_STALE + 1)
+        self.beat(keeper, version="older")
+        with patch.object(factory, "time", self.clock):
+            self.assertEqual(self.ensure(), keeper)
+        self.assertEqual(self.fake.calls("terminal.kill"), [])
+
+    def test_kills_hung_keeper_by_terminal_id_and_removes_old_finished_records(self):
+        keeper, _ = self.terminal("keeper", kind="keeper", status=None)
+        finished, _ = self.terminal("keeper", kind="keeper", status=None)
+        self.fake.finish(finished)
+        unrelated, _ = self.terminal("lead-dev")
+        self.clock.sleep(factory.BEAT_STALE + 1)
+        self.beat(unrelated)
+        with patch.object(factory, "time", self.clock):
+            replacement = self.ensure()
+        self.assertNotEqual(replacement, keeper)
+        self.assertEqual(self.fake.calls("terminal.kill")[0]["params"], {"terminal": keeper})
+        self.assertEqual({req["params"]["terminal"] for req in self.fake.calls("terminal.rm")}, {keeper, finished})
+        self.assertEqual(self.hc.get(unrelated)["state"], "live")
+
+    def test_reports_keeper_that_exits_at_start_and_removes_it(self):
+        run = self.hc.run
+
+        def start(*args, **kwargs):
+            result = run(*args, **kwargs)
+            self.fake.screen(result["address"], "older output\n\nobserved startup error\n\n")
+            self.fake.finish(result["address"])
+            return result
+
+        with patch.object(self.hc, "run", side_effect=start):
+            with self.assertRaisesRegex(factory.Problem, "the keeper did not start: observed startup error"):
+                self.ensure()
+        self.assertEqual(self.hc.list(self.team), [])
+
+    def test_leaves_stopped_team_stopped_unless_forced_or_operator_has_pending(self):
+        factory.update_team(self.state_dir, up=False)
+        self.add("lead-dev")
+        self.assertIsNone(self.ensure())
+        self.assertFalse(self.fake.calls("terminal.run"))
+        with patch.object(factory, "time", self.clock):
+            first = self.ensure(force=True)
+        self.fake.remove(first)
+        self.add("operator")
+        with patch.object(factory, "time", self.clock):
+            self.assertNotEqual(self.ensure(), first)
+        self.assertEqual(len(self.fake.calls("terminal.run")), 2)
+
+    def test_serializes_two_starters(self):
+        # Separate descriptors in separate processes, both initially with no keeper in their view.
+        script = """import importlib.util, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("factory", sys.argv[1])
+f = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(f)
+f.KEEPER_START = 0.5
+print(f.ensure_keeper(f.Config(sys.argv[2]), Path(sys.argv[3]), f.Hc(), f.View([])))
+"""
+        env = {**os.environ, "HC_BIN": factory.HC}
+        argv = [sys.executable, "-c", script, str(SCRIPT), str(self.root), str(self.state_dir)]
+        with (subprocess.Popen(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as first,
+              subprocess.Popen(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as second):
+            results = [child.communicate(timeout=10) for child in (first, second)]
+            self.assertEqual((first.returncode, second.returncode), (0, 0), results)
+        self.assertEqual(results[0], results[1])
+        self.assertEqual(len(self.fake.calls("terminal.run")), 1)
+
+    def test_start_lock_waits_at_most_fifteen_seconds(self):
+        with (self.state_dir / "keeper.start").open("wb") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            with patch.object(factory, "time", self.clock):
+                with self.assertRaisesRegex(factory.Problem, "another command is starting the keeper"):
+                    self.ensure()
+        self.assertGreaterEqual(self.clock.now, 15)
+        self.assertLess(self.clock.now, 15.2)
+        self.assertFalse(self.fake.calls("terminal.run"))
+
+    def test_start_lock_refuses_a_symlink(self):
+        outside = self.root / "outside"
+        outside.write_text("keep")
+        (self.state_dir / "keeper.start").symlink_to(outside)
+        with self.assertRaisesRegex(OSError, "keeper.start"):
+            self.ensure()
+        self.assertEqual(outside.read_text(), "keep")
+        self.assertFalse(self.fake.calls("terminal.run"))
+
+    def test_read_beat_requires_the_full_record(self):
+        self.assertIsNone(factory.read_beat(self.state_dir))
+        path = self.beat("t1")
+        for data in (b"", b"42 too short? too long", b"x version t1", b"\xff"):
+            with self.subTest(data=data):
+                path.write_bytes(data)
+                self.assertIsNone(factory.read_beat(self.state_dir))
 
 
 class TeamLookupTests(unittest.TestCase):

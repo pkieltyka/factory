@@ -56,6 +56,7 @@ VERSION = hashlib.sha1(SCRIPT.read_bytes()).hexdigest()[:12]
 TICK = 1.0
 LATCH_AFTER = 5
 BEAT_STALE = 30
+KEEPER_START = 5
 SAY_WAIT = 10
 LAUNCH_TIMEOUT = 60
 QUIET_GRACE = 120
@@ -2103,6 +2104,112 @@ def cmd_keeper(args):
         print(f"no team.json in {args.state}")
         return
     Keeper(args.state, Hc(timeout=10, expect_core=team["core"]), emit=functools.partial(print, flush=True)).run()
+
+
+def read_beat(state):
+    """Return the keeper PID, version, terminal ID and age, or None without a valid beat."""
+    directory = open_log(state).open_dir(create=False)
+    if directory is None:
+        return None
+    try:
+        try:
+            fd = private_open("keeper.beat", os.O_RDONLY, fix_mode=False, dir_fd=directory)
+        except FileNotFoundError:
+            return None
+        with os.fdopen(fd, "r", encoding="utf-8") as stream:
+            try:
+                pid, version, terminal = stream.read(1024).split()
+                return int(pid), version, terminal, time.time() - os.fstat(stream.fileno()).st_mtime
+            except ValueError:
+                return None
+    finally:
+        os.close(directory)
+
+
+def _take_keeper_start(lock):
+    deadline = time.monotonic() + 15
+    while True:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise Problem("another command is starting the keeper", "run factory.py status") from None
+            time.sleep(0.1)
+
+
+def _wait_for_beat(state, hc, terminal):
+    begin = time.monotonic()
+    next_poll = begin
+    while True:
+        beat = read_beat(state)
+        if beat and beat[2] == terminal:
+            return terminal
+        now = time.monotonic()
+        if now >= next_poll:
+            try:
+                finished = hc.get(terminal)["state"] == "finished"
+            except HcError as error:
+                if error.kind != "not_found":
+                    raise
+                raise Problem("the keeper did not start: terminal disappeared", "run factory.py status") from error
+            if finished:
+                lines = [line.strip() for line in hc.read(terminal).splitlines() if line.strip()]
+                hc.rm(terminal)
+                raise Problem(f"the keeper did not start: {lines[-1] if lines else 'terminal exited'}",
+                              "run factory.py status")
+            next_poll = now + 1
+        if now - begin >= KEEPER_START:
+            return terminal
+        time.sleep(0.1)
+
+
+def ensure_keeper(cfg, state, hc, view, force=False):
+    """Return this team's keeper terminal, starting it headless if it is missing or stale."""
+    team = read_team(state)
+    if not team:
+        raise Problem(f"no team.json in {state}", "run factory.py up")
+    log = open_log(state)
+    if not force and team.get("up") is not True and not log.read_box()[1].pending(cfg.operator["name"]):
+        return None
+    directory = log.open_dir(create=False)
+    if directory is None:
+        raise Problem(f"no state directory: {state}", "run factory.py up")
+    with contextlib.ExitStack() as resources:
+        resources.callback(os.close, directory)
+        lock = private_open("keeper.start", os.O_CREAT | os.O_RDWR, dir_fd=directory)
+        resources.callback(os.close, lock)
+        _take_keeper_start(lock)
+        records = hc.list(team["team"])
+        view = View(records)  # the caller's view preceded acquisition of the start lock
+        if view.keeper is not None:
+            term = view.keeper["address"]
+            beat = read_beat(state)
+            if (beat and beat[2] == term and beat[3] <= BEAT_STALE
+                    or time.time() - view.keeper["created_ms"] / 1000 < BEAT_STALE):
+                return term
+            try:
+                records.append(hc.kill(term))
+            except HcError as error:
+                if error.kind == "finished":
+                    records.append({**view.keeper, "state": "finished"})
+                elif error.kind != "not_found":
+                    raise
+        for record in records:
+            if record["labels"].get("factory.kind") == "keeper" and record["state"] == "finished":
+                try:
+                    hc.rm(record["address"])
+                except HcError as error:
+                    if error.kind != "not_found":
+                        raise
+        argv = [sys.executable, str(SCRIPT), "keeper", "--state", str(log.state)]
+        env = {"PATH": os.environ.get("PATH", "")}
+        if "HC_BIN" in os.environ:
+            env["HC_BIN"] = os.environ["HC_BIN"]
+        labels = {"factory.team": team["team"], "factory.kind": "keeper", "factory.dir": str(log.state),
+                  "factory.version": VERSION, "name": "keeper"}
+        terminal = hc.run(argv, cwd=team["root"], env=env, labels=labels)["address"]
+        return _wait_for_beat(log.state, hc, terminal)
 
 
 def cmd_inbox(args):
