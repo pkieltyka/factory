@@ -239,11 +239,12 @@ Each step is mergeable alone and ends with its tests green ([testing.md](compone
 | V14 | `doc.set` with a stale version fails with kind `conflict`; a never-written doc is `{"value": null, "version": 0}` | Layout compare-and-set |
 | V15 | A terminal started without `size` is 200×120 until a viewer attaches | Dialog text is not wrapped at start |
 
-## 10. Live checks still owed
+## 10. Live checks
+
+### Still owed
 
 | # | Question | Needed by | Fallback |
 |---|---|---|---|
-| LC-1 | Does an in-flight `terminal.send` still type if its `hc connect` client dies during `draft_wait`? | keeper restart test (§10.10) | Either answer is safe: the message is `unconfirmed`. Record the answer in the docs. |
 | LC-2 | Codex: does `-c 'projects."<dir>".trust_level="trusted"'` suppress the trust dialog without writing `config.toml`? | launch | Answer the dialog with `enter`, as v1 |
 | LC-3 | Claude Code: is `--session-id <uuid>` accepted together with `--append-system-prompt-file` and `--settings`, and does `--resume <id>` reopen that conversation? | sessions | Drop the flag; the ID recorded by `say` is enough |
 | LC-4 | OpenCode: which ID format does `--session <id>` accept for a session that does not exist yet? | sessions | Its variable if LC-11 finds one; else OpenCode starts fresh with a notice |
@@ -251,10 +252,16 @@ Each step is mergeable alone and ends with its tests green ([testing.md](compone
 | LC-7 | agy: does `--settings '{"trustedWorkspaces": ["<dir>"]}'` suppress the trust dialog for that session without writing the global list? | launch | The dialog is left to the owner (§6.3) |
 | LC-11 | OpenCode: is there a variable like the others in its tool environment? | sessions | Its launch flag only (`--session`) |
 | LC-12 | Claude Code, Codex, agy: does a `say` run by a sub-agent or sub-thread carry the parent conversation's ID in the variable? | sessions | `session_follow = false` for that harness: record once per launch, from the ready line |
-| LC-8 | Do rodeo and the Herdr app render the tab and panes Factory writes (a `row` root always), keep a block's `size.weight`, leave unlabelled terminals alone, and do they turn `keep` on for terminals placed in the doc? | layout | Drop the keeper's `size`; the keeper already turns `keep` off |
-| LC-9 | Can GitHub Actions install a pinned `hc` release? | CI | Fake `hc` only in CI (already the plan) |
-| LC-10 | Does the core honour `HC_DRAFT_MS` (named in `hc --skill` as the test fallback for `draft_wait`)? | live cases 3 and 10 | Run those cases with the configured `draft_wait` (60 s by default): slower, same proof |
-| LC-13 | Does rodeo work as a test client without tmux: started as a terminal of a second, separate `hc` core with `HC_TERMINAL_ID` removed and attached to the QA core, do keys sent to it with `hc` reach the focused QA pane as human input, and does `hc read` return its rendered screen? | owner-typing cases (§10 cases 3, 4, 10), LC-8, the smoke test from Phase 5b ([testing.md](components/testing.md) §6) | The framed-attach client types for the owner; LC-8 and the smoke test are checked by a person looking at rodeo |
+| LC-8 | Do rodeo and the Herdr app render the tab and panes Factory writes (a `row` root always), keep a block's `size.weight`, leave unlabelled terminals alone, and do they turn `keep` on for terminals placed in the doc? | layout | Drop the keeper's `size`; the keeper already turns `keep` off (LC-13 already saw `keep=false` on doc-placed panes in rodeo 0.2.1) |
+
+### Resolved in Phase 1 (26 November 2026, [docs/qualification/hc-checks.md](../../../docs/qualification/hc-checks.md))
+
+| # | Result | Consequence applied |
+|---|---|---|
+| LC-1 | `SIGKILL` of `hc connect` at `6 s` (`draft_wait = 12`, past quiet pause) cancels a held `terminal.send` (even if Enter follows); stdin EOF alone does not (typed at `12.0 s`); 0 of 20 trials left an unsubmitted paste when killed 18–294 ms after an observed paste. | `keeper.md` §8 (`kill_children()` stops held sends; SIGKILL/OOM leaves them alive via EOF; pairs stay `unconfirmed`), `hc_client.md` (EOF does not cancel). |
+| LC-9 | **Pass** on GitHub Actions `ubuntu-latest` (11 s): pinned `hc 0.1.20` release tarball + SHA-256 ran `live.py fixtures` with matching reply key shape (`installed_by` is `null` on release vs `"nix"` on Nix). | `testing.md` §8 (Phase 2 can enable pinned-`hc` real-mode CI), `testing.md` §4 (contract tests check required schema keys, optional keys when present, and schema types with `null` only on nullable fields). |
+| LC-10 | **Pass:** `HC_DRAFT_MS` is honoured; `config.toml` `draft_wait` overrides it; `HC_SETTLE_MS=0` does not shorten draft holds. | `testing.md` §6 (live cases 3 & 10 use a private `XDG_CONFIG_HOME` for the QA core with private copies of mutable harness settings and only needed credential paths shared). |
+| LC-13 | **Pass** with `rodeo 0.2.1` (baseline `0.0 s`, draft held past `6 s` and typed `0.17 s` after Enter; negative control `draft_wait=0` failed as intended at `2.47 s`): works in a second private core (`env -u HC_TERMINAL_ID` or `allow_nested = true`), `ctrl+b` + `h`/`l` (0.2 s apart) switches focus, `hc read` returns rendered screen, `keep` stayed `false`. | `testing.md` §6 (keep `Rodeo` driver with these launch/focus details). |
 
 ## 11. Owner decisions
 
