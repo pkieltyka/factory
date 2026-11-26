@@ -535,6 +535,67 @@ class HcClientTests(unittest.TestCase):
             call("doc.set", {"name": "herdr-app", "value": {}, "version": 7}),
         ])
 
+
+class ViewTests(unittest.TestCase):
+    def setUp(self):
+        self.fake = self.enterContext(FakeHc())
+        self.hc = factory.Hc()
+
+    def add(self, name, status="idle", team="team", kind="member", **record):
+        labels = {"factory.team": team, "factory.kind": kind}
+        if name is not None:
+            labels["factory.member"] = name
+        return self.fake.add(labels, status, **record)
+
+    def view(self):
+        return factory.team_view(self.hc, "team")
+
+    def test_view_states(self):
+        self.add("starting", None)
+        self.add("shell", None, reported=True)
+        self.fake.finish(self.add("exited"))
+        words = ("idle", "working", "done", "blocked", "error")
+        for word in words:
+            self.add(word, word)
+        view = self.view()
+        expected = {"missing": "not started", "starting": "starting", "shell": "gone", "exited": "gone",
+                    **{word: word for word in words}}
+        self.assertEqual({name: view.state(name) for name in expected}, expected)
+
+    def test_view_ignores_other_team(self):
+        own = self.add("worker")
+        self.add("worker", "working", team="other", created_ms=30)
+        self.add("other", team="other")
+        view = self.view()
+        self.assertEqual(view.terminal("worker")["address"], own)
+        self.assertIsNone(view.terminal("other"))
+        self.assertEqual(len(self.fake.calls("terminal.list")), 1)
+
+    def test_view_newest_live_wins(self):
+        old = self.add("worker", created_ms=1)
+        fresh = self.add("worker", "working", created_ms=2)
+        view = self.view()
+        self.assertEqual(view.terminal("worker")["address"], fresh)
+        self.assertEqual(view.state("worker"), "working")
+        self.assertEqual([record["address"] for record in view.strays], [old])
+
+    def test_view_down_record_is_not_gone(self):
+        term = self.add("worker")
+        self.hc.label(term, {"factory.down": "1"})
+        self.fake.finish(term)
+        self.assertEqual(self.view().state("worker"), "not started")
+
+    def test_view_operator_keeper_and_lost(self):
+        previous = self.add("boss", kind="operator-lost")
+        active = self.add("boss", kind="operator")
+        keeper = self.add(None, None, kind="keeper")
+        view = self.view()
+        self.assertEqual(view.operator["address"], active)
+        self.assertEqual(view.operator_lost["address"], previous)
+        self.assertEqual(view.keeper["address"], keeper)
+        self.assertEqual(view.terminal("boss")["address"], active)
+        self.assertFalse(view.strays)
+
 FAKE_HERDR = textwrap.dedent(r'''
     #!/usr/bin/env python3
     # A herdr stand-in. Like herdr: `pane list` carries labels but no agent names, `agent list` carries names

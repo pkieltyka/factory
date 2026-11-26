@@ -263,6 +263,54 @@ class Hc:
         return self.call("doc.set", {"name": "herdr-app", "value": value, "version": version})["version"]
 
 
+class View:
+    """Newest team terminal per member, plus the operator and keeper."""
+
+    def __init__(self, records: list[dict]):
+        self.operator: dict | None = None
+        self.operator_lost: dict | None = None
+        self.keeper: dict | None = None
+        self.strays: list[dict] = []
+        self._live: dict[str, dict] = {}
+        self._finished: dict[str, dict] = {}
+        for record in sorted(records, key=lambda t: t["created_ms"], reverse=True):
+            labels = record["labels"]
+            kind, name = labels.get("factory.kind"), labels.get("factory.member")
+            if record["state"] == "live":
+                if kind == "operator" and self.operator is None:
+                    self.operator = record
+                if kind == "operator-lost" and self.operator_lost is None:
+                    self.operator_lost = record
+                if kind == "keeper" and self.keeper is None:
+                    self.keeper = record
+                if name and kind in ("member", "operator"):
+                    if name in self._live:
+                        self.strays.append(record)
+                    else:
+                        self._live[name] = record
+            elif name and kind in ("member", "operator", "operator-lost") and not labels.get("factory.down"):
+                self._finished.setdefault(name, record)
+
+    def terminal(self, name: str) -> dict | None:
+        return self._live.get(name)
+
+    def finished(self, name: str) -> dict | None:
+        return None if name in self._live else self._finished.get(name)
+
+    def state(self, name: str) -> str:
+        record = self.terminal(name)
+        if record is None:
+            lost = self.operator_lost
+            return "gone" if self.finished(name) or (lost and lost["labels"].get("factory.member") == name) else "not started"
+        if record.get("status") is None:
+            return "gone" if record["reported"] else "starting"
+        return record["status"]["state"]
+
+
+def team_view(hc: Hc, team: str) -> View:
+    return View(hc.list(team))
+
+
 # ================================================================ files
 
 def find_root(cwd):
