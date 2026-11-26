@@ -137,22 +137,22 @@ The operator is **reachable** when `view.operator` exists and its `status` is no
 
 ## 4. Module layout of `factory.py`
 
-Sections in file order, with a size estimate. v1 is 1,786 lines. The owner's target for v2 is about 2,200 lines: a target, not a cap. Clear error handling and the recovery paths below are not to be compressed to meet it.
+Sections in file order. v1 is 1,786 lines. The first estimate for v2 was about 2,200 lines; with two parts built, the expected size at the end of v2 is about 3,200 to 3,400 lines. The message log came to 873 lines against an estimate of 230, and the hc client to 256 against 140, because of behaviour decided in review and by the owner after the estimate was made: validation of every record with strict replay, the append fault matrix with read-back, the checkpoint with lineage and digest, file handling relative to a directory descriptor, the message-file sweep, and deadline-aware transport with a spooled stderr. None of that is to be compressed. The remaining rows of the table are still the original estimates and should be read with the same caution. Phase 5c (simplification), which runs once every main part is in place, cuts duplication, dead paths and v1 leftovers without dropping specified behaviour or tests, measures the file again and records the result here.
 
 | Section | Main units | From v1 | Lines |
 |---|---|---|---|
 | Constants, `Problem`, files | `find_root`, `refuse_dangling_links`, `VERSION` | kept | 60 |
 | Config | `Config`, `parse_role`, `plan` | kept; three new optional keys | 135 |
 | Availability checks | `run_probe`, `listed_models`, `resolve_listed`, `Checker`, `check_all`, `checked` | kept | 190 |
-| hc client | `Hc`, `HcError`, `HcDown`, `team_view`, `View` | new | 140 |
-| Message log | `Log`, `Box`, `LogDamage`, `NotStored` | replaces `Inbox` | 230 |
+| hc client | `Hc`, `HcError`, `HcDown`, `team_view`, `View` | new | 256 (built) |
+| Message log | `Log`, `Box`, `LogDamage`, `NotStored`, `inbox_rows`, message-file helpers | replaces `Inbox` | 873 (built) |
 | Harness adapters | `CODE`, `launch_argv`, `claude_settings`, session functions | kept; sessions new | 240 |
 | Briefs | `member_prompt`, `render_team_brief`, `message_for` | kept | 80 |
 | Layout | `edit_layout`, `resolve_tab`, `add_panes`, `remove_panes`, `swap_terminal` | new | 120 |
 | Launch | `check_operator`, `mark_operator`, `start_member`, `await_ready` | rewritten | 150 |
 | Keeper | `Keeper`, `decide`, `head_of`, `quiet_now`, `ensure_keeper` | new | 400 |
 | Commands | `cmd_init` … `cmd_keeper`, `resolve_team`, `main` | rewritten except `init`, `harnesses`, `check` | 450 |
-| | | **Total** | **about 2,200** |
+| | | **Total** | **about 3,200 to 3,400 expected; re-measured in Phase 5c** |
 
 Removed from v1: `Inbox`, `cmd_wait`, `operator_wait`, `queue_message`, `herdr()`, integration checks, `Team`, `place`, `launch`'s typed start, `deliver`, `prompt_error`, `report_launch_drift`, `harness_argv`, `print_retry`, `cmd_prompt`, `session_key`, `session_id`, `remember_sessions`' herdr reads.
 
@@ -211,7 +211,7 @@ Each step is mergeable alone and ends with its tests green ([testing.md](compone
 
 ## 8. Risks and gaps
 
-- **Size.** About 2,200 lines against v1's 1,786. The keeper (about 400) and the commands (about 450) carry most of the growth; the reviewers' independent estimates were 2,050 to 2,250.
+- **Size.** About 3,200 to 3,400 lines expected against the first estimate of 2,200 and v1's 1,786 (§4). The growth so far is decided behaviour in the message log and the hc client, not padding. The keeper and the commands are the largest parts still to come and may overrun in the same way. Phase 5c re-measures and simplifies.
 - **Log growth.** The log is never compacted in v2.0. At about 0.5 MB a busy day, a full read (keeper start, `status`, `inbox`, `up`) stays under 100 ms for months. `status` warns above 64 MiB. A writer does not read the log at all when the checkpoint matches, so the cost of `say` does not grow.
 - **A state shorter than a second.** Decided by the owner: the keeper polls and sends notes only for states it observes. A block or error that begins and clears inside one tick produces no note; the `turn` counter still shows that work happened, which is all the quiet rule needs. The spec's §8.4 should say so (§11).
 - **Clients and `keep`.** A client may turn `keep` on for a pane it shows; `hc` then leaves a shell when the harness dies. The keeper turns `keep` off when it sees it, a live terminal that stopped reporting counts as `gone`, and nothing is ever typed into a terminal with no status. LC-8 measures how often clients do this.
