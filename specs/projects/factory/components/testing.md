@@ -15,7 +15,7 @@ How every behaviour in the functional spec is proven: automated tests that run i
 | `tests/test_factory.py` | All automated tests, standard `unittest`, run with `python3 tests/test_factory.py` (v1's entry point and CI step) |
 | `tests/fake_hc.py` | The fake `hc`, about 300 lines |
 | `tests/fake_agent.py` | A program that reports OSC 7501 and plays a scripted agent |
-| `tests/live.py` | Driver for per-harness qualification and the end-to-end runs; never run by CI |
+| `tests/live.py` | Driver for per-harness qualification, the rodeo-driven cases and smoke test, and the end-to-end runs; never run by CI |
 | `tests/gate1-setup.sh` | v1's cold-recovery fixture, kept (§9.5) |
 | `tests/hc_fixtures.json` | Replies recorded from `hc 0.1.20`, for the contract tests |
 
@@ -130,15 +130,45 @@ Coverage rule: every row of every decision table in the component docs (delivery
 
 `python3 tests/live.py qualify <harness> [--role operator|member] [--case N]`
 
-- Starts its own core, isolated on every axis that selects one: a unique `HC_SESSION=factory-qa-<pid>`, an explicit `HC_SOCKET=<private temp dir>/hc.sock` (it outranks an inherited `HC_SOCKET` and a `socket` set in `hc`'s config) and a private `XDG_RUNTIME_DIR`. `HOME` and `XDG_CONFIG_HOME` stay real, because the harness needs its credentials and settings. The owner can watch with the same three variables and `rodeo`.
+- Starts its own core, isolated on every axis that selects one: a unique `HC_SESSION=factory-qa-<pid>`, an explicit `HC_SOCKET=<private temp dir>/hc.sock` (it outranks an inherited `HC_SOCKET` and a `socket` set in `hc`'s config) and a private `XDG_RUNTIME_DIR`. `HOME` and `XDG_CONFIG_HOME` stay real, because the harness needs its credentials and settings. The owner can watch with the same three variables and `rodeo`; the tests themselves drive a rodeo of their own (below).
 - Reads the new core's ID from `hello` once and builds every later client as `Hc(expect_core=<that id>)`: a send, interrupt, kill or teardown that would reach any other core fails before the request is written. Teardown runs `hc server stop` only after `server.status` shows that ID.
 - Sets the draft hold for cases 3 and 10 with `HC_DRAFT_MS` on that core if LC-10 confirms it; otherwise those cases run with the configured `draft_wait`. The owner's `hc` config is never edited.
 - Builds a scratch repository in a temp directory with a two-member formation in which the harness under test is the operator, the member, or both.
-- Types the owner's keystrokes through a framed `terminal.attach` client (`Kind::Data`, which `hc` counts as human input: hc-capabilities §10.1). This small client lives only in `live.py`.
+- Types the owner's keystrokes through the rodeo driver (below), which is the path a real owner uses. A small framed `terminal.attach` client (`Kind::Data`, which `hc` counts as human input: hc-capabilities §10.1) also lives in `live.py`: it serves LC-1 and LC-10, which run before the driver exists, and is the fallback for the owner-typing cases if LC-13 fails.
 - Runs the ten cases of §10 in order, each with a unique token in its message and a check that the recipient acted on it (a file it was asked to write, or a reply quoting the token), and writes one row per case to `docs/qualification/<harness>.md`: result, observed behaviour (for case 4: queued or steered), harness version, `hc` version, Factory `VERSION`.
-- Runs the live checks (LC-1 to LC-4, LC-6 to LC-8, LC-10 to LC-12) as named subcommands (`live.py check lc3`), each printing the fact and writing it to `docs/qualification/hc-checks.md`.
+- Runs the live checks (LC-1 to LC-4, LC-6 to LC-8, LC-10 to LC-13) as named subcommands (`live.py check lc3`), each printing the fact and writing it to `docs/qualification/hc-checks.md`.
 
 A harness is supported when all ten rows pass in both roles (§10). A case 4 result of "lost or garbled" is the trigger to build delivery between turns ([keeper.md](keeper.md) §9) for that harness; the case is then run again. Case 6 checks, per harness, that the ready line recorded the conversation ID, that `down` then `up` reopens that conversation (the member is asked for a token from before), and that a conversation switched inside the harness is the one resumed after the member's next `say`.
+
+### The rodeo driver
+
+rodeo is the client the owner uses, so the tests that need "the owner at a client" use rodeo itself, without tmux: rodeo runs as a terminal of a second `hc` core, and the tests press keys in that terminal and read its screen through `hc`.
+
+```python
+class Rodeo:
+    """rodeo attached to the QA core, running as a terminal of a separate driver core."""
+    def __init__(self, qa_env: dict, cols: int = 200, rows: int = 60): ...
+    def keys(self, *names: str) -> None        # terminal.keys on the driver core: named keys, or single characters
+    def type(self, text: str) -> None           # keys, one per character: text typed without Enter (an unsent draft)
+    def screen(self) -> str                     # terminal.read on the driver core: rodeo's rendered screen as text
+    def wait_for(self, text: str, timeout: float = 10) -> None   # poll screen() until it contains text
+    def focus(self, pane_title: str) -> None    # rodeo's own navigation keys until that pane is focused (fixed by LC-13)
+    def close(self) -> None                     # end rodeo, stop the driver core
+```
+
+- **Two cores, both private.** The QA core holds the team under test. The driver core (`HC_SESSION=factory-drv-<pid>`, its own `HC_SOCKET` and `XDG_RUNTIME_DIR`) holds one terminal: `rodeo`, started with `HC_TERMINAL_ID` removed from its environment (rodeo refuses to nest otherwise; a test-only `allow_nested` setting is the alternative) and with the QA core's `HC_SESSION` and `HC_SOCKET`, at a fixed size so the layout is the same on every run. `RODEO_BIN` names the binary. Each core has its own `Hc(expect_core=…)`; neither is ever the owner's.
+- **Typing is the owner's path.** A key pressed in the rodeo terminal is forwarded by rodeo to the focused QA terminal as viewer input, which the QA core counts as human input: `draft_wait` applies exactly as it does for a person. `type()` never presses Enter, so it leaves an unsent draft.
+- **Reading is what the owner sees.** `screen()` returns rodeo's rendered text: tab names, pane titles, and the panes' contents.
+
+| Used for | How |
+|---|---|
+| §10 case 3 (a report while the owner has unsent text) and case 10 (`say` returns while `hc` holds the message) | `focus("@operator")`; `type(draft)`; a member's `say`; assert the report is not on `screen()` during the hold; `keys("enter")`; assert the draft arrived byte-for-byte and the report after it |
+| §10 case 4 (the owner interrupts the operator while a message is pending) | `focus("@operator")`; `keys("esc")` mid-turn; then the checks of case 4 |
+| LC-8 (the layout as a client renders it) | After `up`: `wait_for("team")`; each `@member` title and `keeper` appear once; the keeper pane is the last and narrowest; an owner-added pane survives `up` and `down`; `terminal.get` on the QA core shows whether rodeo turned `keep` on |
+| End-of-phase smoke test, from Phase 5b on (`live.py smoke`) | A team of fake agents (no model cost): `up`; the tab, titles and keeper pane render; `type` and `enter` into a member pane reach the fake agent; a `say` shows in the keeper pane as one line; `down`; the tab is gone |
+| LC-13 | The driver itself: rodeo starts this way, `keys` reach the focused QA pane as human input (a held `terminal.send` proves it), and `screen()` returns the rendered text |
+
+CI never runs any of this: it stays on the fake `hc`.
 
 ## 7. End-to-end autonomy runs
 

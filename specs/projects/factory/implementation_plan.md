@@ -1,20 +1,21 @@
 ---
-status: draft
+status: complete
 ---
 
 # Implementation Plan: Factory v2
 
-Each phase is one ticket on the board, built on its own branch, reviewed (fast lane plus `codex review`) and merged through the `FACTORY.md` workflow. Details live in the spec and architecture; this list is the order.
+Each phase is one ticket on the board, built on its own branch, reviewed (fast lane plus `codex review`) and merged through the `FACTORY.md` workflow. CI stays green on every phase: each phase deletes the v1 code and tests it replaces and updates the skill text that describes what it changed. Each phase is planned by an architect and built by lead devs working together: the architect writes `phase_plans/phase_N.md` with the lead devs, the lead devs build it in their worktrees, the other architects and lead devs challenge the plan and the code, and @reviewer gives the verdict. Details live in the spec and architecture; this list is the order.
 
 ## Phases
 
-- [ ] Phase 1: Live checks. Run LC-1 to LC-12 (architecture.md §10) on a separate `hc` session viewed in rodeo; record each answer and apply its fallback in the architecture, `harnesses.toml` and tests before the code that depends on it is written.
-- [ ] Phase 2: Foundation. `hc` client (hc_client.md), shared constants, config with the three new optional keys, the fake `hc` and its contract tests against `hc_fixtures.json`; CI runs the suite (with a pinned `hc` if LC-9 allows). v1 back-port: accept and ignore the new `factory.toml` keys on the `v1` branch.
-- [ ] Phase 3: Message log. `Log`, `Box`, append and commit, full validation and `log.check`, damage handling, outcomes, message files (message_log.md, spec §8.6–8.7), with the fault tests.
-- [ ] Phase 4: Keeper delivery and `say`. `decide`, per-recipient delivery and send-result mapping, `say`, `inbox`, `ensure_keeper`, heartbeat, single instance, re-exec on version change, the pane log and title (keeper.md §1–4, §7–8); crash and restart tests.
-- [ ] Phase 5: Launch, layout and team commands. Harness adapters and session capture (`session_env`, launch flags, resume), readiness and startup dialogs, labels, the `herdr-app` doc with compare-and-set and the team tab with the keeper pane, `check_operator`, and `up`, `down`, `status`, `brief`, `check` (launch_layout.md, cli_skill.md).
-- [ ] Phase 6: Notes and autonomy. Member notes by observed episode, the team-quiet rule, the ready check (keeper.md §5–6), with the fake OSC 7501 agent and controlled-clock tests for every keeper row of spec §8a.3.
-- [ ] Phase 7: Skill text and cleanup. `SKILL.md`, references, roles, templates (including the workflow in the `FACTORY.md` template and the member prompt), README and docs; remove v1's herdr-only code, docs and tests; installed-copy and docs checks (cli_skill.md).
+- [ ] Phase 1: Early live checks. LC-1, LC-9 and LC-10 (architecture.md §10), plus LC-13: driving rodeo from a second `hc` core (started without `HC_TERMINAL_ID` or with a test-only `allow_nested`), typing into it with `hc keys` and reading its screen with `hc read`; on a separate `hc` session viewed in rodeo, with the small framed-attach client they need; record `tests/hc_fixtures.json` from the real core. Apply each fallback in the architecture before dependent code is written.
+- [ ] Phase 2: Foundation. `hc` client (hc_client.md), shared constants, config with the three new optional keys, the fake `hc` and the fake OSC 7501 agent with contract tests against `hc_fixtures.json`; CI runs the suite (with a pinned `hc` if LC-9 allows). v1 back-port on the `v1` branch: accept and ignore the new `factory.toml` keys.
+- [ ] Phase 3: Message log. `Log`, `Box`, append and commit, full validation and `log.check`, damage handling, outcomes, message files, and `inbox` (message_log.md, spec §8.6–8.7), with the fault tests. Removes v1's `Inbox`.
+- [ ] Phase 4: Keeper delivery and `say`. `decide`, per-recipient delivery and send-result mapping, `say`, `ensure_keeper`, heartbeat and single instance, the pane log (keeper.md §1–4, §8); crash and restart tests. Removes v1's `wait` and old `say`; updates the member prompt's sending paragraph.
+- [ ] Phase 5a: Launch and team commands. Remaining live checks LC-2 to LC-8, LC-11, LC-12 first. Harness adapters and session capture (`session_env`, launch flags, resume), readiness and startup dialogs, labels, `check_operator`, and `up`, `down`, `status`, `check` with members running without panes (launch_layout.md, cli_skill.md). Removes `herdr()`, `Team` and v1's launch; updates the command table.
+- [ ] Phase 5b: Layout and recovery. The `herdr-app` doc with compare-and-set, the team tab and keeper pane, placement labels, `brief` and `not ready` recovery, leftover message files, adoption by a new operator. From here on every phase ends with a rodeo smoke test (separate session, `up`, screen check, a message, a typed draft).
+- [ ] Phase 6: Notes and autonomy. Member notes by observed episode, the team-quiet rule, the ready check, re-exec on version change and the pane title (keeper.md §5–7), with controlled-clock tests for every keeper row of spec §8a.3.
+- [ ] Phase 7: Skill text. `leading.md`, the setup and recovery references, roles, templates (including the workflow in the `FACTORY.md` template), README and docs; installed-copy and docs checks.
 - [ ] Phase 8: Qualification, first set. Spec §10 cases 1–10 with Claude Code and Codex as operator and all six harnesses as members, plus the cross-team cases; results recorded with versions.
 - [ ] Phase 9: End-to-end autonomy. The local run (bare remote, file tracker, injected faults), then the private `pkieltyka/factory-test` run with its board, pull requests and CI; the empty-board run.
 - [ ] Phase 10: Qualification, second set, and release. pi, omp, OpenCode and agy as operator; fix what they find; tag v2, and point skills-sync back at `master`.

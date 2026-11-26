@@ -217,7 +217,7 @@ Each step is mergeable alone and ends with its tests green ([testing.md](compone
 - **Clients and `keep`.** A client may turn `keep` on for a pane it shows; `hc` then leaves a shell when the harness dies. The keeper turns `keep` off when it sees it, a live terminal that stopped reporting counts as `gone`, and nothing is ever typed into a terminal with no status. LC-8 measures how often clients do this.
 - **Environment.** A member gets `PATH` from the process that ran `up` and everything else from the `hc` core's login environment. An API key exported only in the operator's shell does not reach members; the docs say so and `up`'s failure line shows the harness's own error.
 - **Resume.** The environment variables are confirmed for three harnesses; the launch flags, the by-ID resume arguments and the sub-agent case are not all exercised yet (LC-3, LC-4, LC-6, LC-11, LC-12). Each fails safe: a resume that does not work is retried fresh once, with a warning. A Codex or agy member that never ran `say` has no recorded conversation and starts fresh.
-- **Layout doc shape** is taken from rodeo's source through the research, not from a client rendering a Factory-written doc (LC-8).
+- **Layout doc shape** is taken from rodeo's source through the research, not from a client rendering a Factory-written doc (LC-8, checked through the rodeo driver of LC-13).
 
 ## 9. Verified on `hc 0.1.20` (isolated core, 26 November 2026)
 
@@ -254,6 +254,7 @@ Each step is mergeable alone and ends with its tests green ([testing.md](compone
 | LC-8 | Do rodeo and the Herdr app render the tab and panes Factory writes (a `row` root always), keep a block's `size.weight`, leave unlabelled terminals alone, and do they turn `keep` on for terminals placed in the doc? | layout | Drop the keeper's `size`; the keeper already turns `keep` off |
 | LC-9 | Can GitHub Actions install a pinned `hc` release? | CI | Fake `hc` only in CI (already the plan) |
 | LC-10 | Does the core honour `HC_DRAFT_MS` (named in `hc --skill` as the test fallback for `draft_wait`)? | live cases 3 and 10 | Run those cases with the configured `draft_wait` (60 s by default): slower, same proof |
+| LC-13 | Does rodeo work as a test client without tmux: started as a terminal of a second, separate `hc` core with `HC_TERMINAL_ID` removed and attached to the QA core, do keys sent to it with `hc` reach the focused QA pane as human input, and does `hc read` return its rendered screen? | owner-typing cases (§10 cases 3, 4, 10), LC-8, the smoke test from Phase 5b ([testing.md](components/testing.md) §6) | The framed-attach client types for the owner; LC-8 and the smoke test are checked by a person looking at rodeo |
 
 ## 11. Owner decisions
 
