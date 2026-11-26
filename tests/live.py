@@ -6,7 +6,8 @@ temporary directory, with its own HC_SESSION, HC_SOCKET and XDG_RUNTIME_DIR. Eve
 connection checks hello's core id before it writes a request, and a core is stopped
 only after server.status names that id, so the owner's sessions are never reached.
 
-    python3 tests/live.py check lc1|lc10|lc13|all [--json PATH]
+    python3 tests/live.py check lc1|lc10|lc13|lc8|all [--json PATH]
+    python3 tests/live.py check lc2|lc3|lc4|lc6|lc7|lc12|login [--json PATH]   # real harnesses, the owner's login
     python3 tests/live.py fixtures [--out tests/hc_fixtures.json]
 """
 
@@ -775,6 +776,536 @@ def lc13():
         result["result"] = "pass" if passed else "fail"
     return result
 
+# Phase 5a (phase_5a.md §2). LC-8 drives rodeo against private cores and needs no login. The others start real
+# harnesses with the owner's own login: a member allowed to runs them (@operator's decision), each harness started
+# normally, on a private core, in a throwaway folder. Nothing here reads a credential, a transcript or a settings
+# file: a settings file is only stat()ed to show it did not change, and a variable a harness gives its commands is
+# written to a private file by the harness, compared here and never recorded.
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+OWNER_KEYS = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "COLORTERM", "USER", "LOGNAME", "SHELL",
+              "DBUS_SESSION_BUS_ADDRESS")
+REMEMBER = ("This is a test of resuming conversations. Remember this code word: {token}. "
+            "Reply with only the code word, in lowercase letters.")
+RECALL = ("What code word did I give you earlier in this conversation? Reply with only that code word spelled "
+          "backwards, in capital letters, or with the single word NONE if I gave you none.")
+ENV_COMMAND = ("Run this exact shell command and nothing else, then reply with only the word finished: "
+               "printf 'v=%s\\n' \"$" "{{{var}}}\" > '{path}'")
+SUBAGENT = ("Start exactly one sub-agent ({how}) and tell it to run this exact shell command and nothing else: "
+            "printf 'v=%s\\n' \"$" "{{{var}}}\" > '{child}' . When it has finished, run this exact shell command "
+            "yourself: printf 'v=%s\\n' \"$" "{{{var}}}\" > '{parent}' . Then reply with only the word finished.")
+
+
+class NotRun(Exception):
+    pass
+
+
+def harness_table():
+    import tomllib
+    return tomllib.loads((ROOT / "skill" / "harnesses.toml").read_text())
+
+
+def owner_env():
+    """What a harness started normally finds: the owner's HOME and XDG base directories (their defaults when unset),
+    so that it uses its own login and settings. Passed on, never read or recorded."""
+    home = os.path.expanduser("~")
+    env = {"HOME": home}
+    for key, default in (("XDG_CONFIG_HOME", ".config"), ("XDG_DATA_HOME", ".local/share"),
+                         ("XDG_STATE_HOME", ".local/state"), ("XDG_CACHE_HOME", ".cache")):
+        env[key] = os.environ.get(key) or os.path.join(home, default)
+    env.update({k: os.environ[k] for k in OWNER_KEYS if k in os.environ})
+    return env
+
+
+def stamps(roots, depth=2):
+    """(size, mtime_ns) of the files under each root, to show that nothing changed them; nothing is read."""
+    found = {}
+    for root in map(pathlib.Path, roots):
+        if root.is_file():
+            st = root.stat()
+            found[str(root)] = (st.st_size, st.st_mtime_ns)
+            continue
+        if not root.is_dir():
+            continue
+        for path, dirs, files in os.walk(root):
+            if len(pathlib.Path(path).relative_to(root).parts) >= depth:
+                dirs[:] = []
+            for name in files:
+                p = os.path.join(path, name)
+                try:
+                    st = os.lstat(p)
+                except OSError:
+                    continue
+                found[p] = (st.st_size, st.st_mtime_ns)
+    return found
+
+
+def changed(before, after):
+    return sorted(p for p in set(before) | set(after) if before.get(p) != after.get(p))
+
+
+def token():
+    return "ZQ" + "".join(random.choices("ABCDEFGHJKLMNPRSTUVWXY", k=8))
+
+
+def folder(qa, name, git=True):
+    """A throwaway project folder no harness has seen."""
+    d = qa.dir / "work" / f"{name}-{random.randrange(16 ** 6):06x}"
+    d.mkdir(parents=True)
+    if git:
+        subprocess.run(["git", "init", "-q", str(d)], check=True)
+    return d
+
+
+def env_value(path, timeout=240):
+    """The value a harness wrote with ENV_COMMAND: None when no file came, "" when the variable was empty."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists():
+            text = path.read_text()
+            if text.endswith("\n"):
+                return text[2:-1] if text.startswith("v=") else text.strip()
+        time.sleep(1)
+    return None
+
+
+class Harness:
+    """A real harness in a terminal of the QA core, started as the owner would start it."""
+
+    def __init__(self, qa, harness, args, cwd, env=None, cols=200, rows=50):
+        exe = shutil.which(harness)
+        if not exe:
+            raise NotRun(f"{harness} is not on PATH")
+        self.qa, self.harness = qa, harness
+        self.dialogs = harness_table().get(harness, {}).get("dialogs", [])
+        self.argv = [exe, *args]
+        self.record = qa.rpc("terminal.run", {"argv": self.argv, "cwd": str(cwd), "env": {**owner_env(), **(env or {})},
+                                              "size": {"cols": cols, "rows": rows}, "labels": {"name": "@lc-" + harness}})
+        self.term = self.record["address"]
+        self.answered = []
+
+    def get(self):
+        return self.qa.rpc("terminal.get", {"terminal": self.term})
+
+    def screen(self):
+        try:
+            return self.qa.rpc("terminal.read", {"terminal": self.term, "lines": 0}).get("text", "")
+        except HcError:
+            return ""
+
+    def flat(self):
+        return "".join(self.screen().split())
+
+    def dialog(self, flat):
+        for text, keys in self.dialogs:
+            if "".join(text.split()) in flat:
+                return text, keys
+        return None
+
+    def settle(self, timeout=120, answer=True, quiet=6.0):
+        """Wait until the harness takes a prompt. Returns "idle" (its OSC status, or a screen unchanged for quiet
+        seconds when it reports none), "dialog: <text>" (when answer is False or the dialog has no keys),
+        "finished (...)" or "timeout". With answer, a configured dialog is answered once, as up does."""
+        deadline = time.monotonic() + timeout
+        last, since = None, time.monotonic()
+        while time.monotonic() < deadline:
+            t = self.get()
+            if t["state"] == "finished":
+                return f"finished (code {t.get('exit_code')}): {self.last_line()}"
+            word = (t.get("status") or {}).get("state")
+            flat = self.flat()
+            found = self.dialog(flat) if word != "working" else None
+            if found:
+                text, keys = found
+                if not answer or not keys:
+                    return f"dialog: {text}"
+                if text not in self.answered:
+                    self.qa.rpc("terminal.keys", {"terminal": self.term, "keys": keys})
+                    self.answered.append(text)
+                time.sleep(1.5)
+                last = None
+                continue
+            if word == "idle":
+                return "idle"
+            if flat != last:
+                last, since = flat, time.monotonic()
+            elif word is None and time.monotonic() - since >= quiet:
+                return "idle (quiet screen; no status)"
+            time.sleep(0.5)
+        return "timeout"
+
+    def last_line(self):
+        lines = [line for line in self.screen().splitlines() if line.strip()]
+        return lines[-1].strip()[:200] if lines else ""
+
+    def send(self, text):
+        self.qa.rpc("terminal.send", {"terminal": self.term, "text": text}, timeout=90)
+
+    def ask(self, text, expect=None, timeout=300):
+        """Send a prompt; with expect, wait for that text on the screen (whitespace ignored), else for the turn to
+        end. True when it came."""
+        turn = self.get().get("turn")
+        self.send(text)
+        time.sleep(3)
+        deadline = time.monotonic() + timeout
+        last, since = None, time.monotonic()
+        while time.monotonic() < deadline:
+            flat = self.flat()
+            if expect is not None and expect in flat:
+                return True
+            t = self.get()
+            if t["state"] == "finished":
+                return False
+            word = (t.get("status") or {}).get("state")
+            if expect is None:
+                if word == "idle" and t.get("turn") != turn:
+                    return True
+                if flat != last:
+                    last, since = flat, time.monotonic()
+                elif word is None and time.monotonic() - since >= 15:
+                    return True
+            time.sleep(1)
+        return False
+
+    def stop(self):
+        time.sleep(2)   # let the harness save the last turn
+        try:
+            self.qa.rpc("terminal.kill", {"terminal": self.term})
+        except HcError:
+            return
+        deadline = time.monotonic() + 15
+        while self.get()["state"] != "finished" and time.monotonic() < deadline:
+            time.sleep(0.3)
+
+
+def store(h, tok):
+    return h.ask(REMEMBER.format(token=tok), expect=tok.lower())
+
+
+def recall(h, tok, others=()):
+    """Which code word the conversation holds: tok, one of others, or None."""
+    h.ask(RECALL)
+    flat = h.flat()
+    for t in (tok, *others):
+        if t[::-1] in flat:
+            return t
+    return None
+
+
+def capture(h, var, where):
+    """The value of var in the harness's commands (kept out of the results), or None when none was written."""
+    path = where / f"{var}-{random.randrange(16 ** 6):06x}.txt"
+    h.ask(ENV_COMMAND.format(var=var, path=path))
+    return env_value(path, timeout=60)
+
+
+def harness_version(name):
+    exe = shutil.which(name)
+    if not exe:
+        return None
+    out = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=30, check=False)
+    text = (out.stdout or out.stderr).strip()
+    return text.splitlines()[0] if text else "unknown"
+
+
+def harness_check(name, harnesses, body):
+    """Common frame: versions, a private QA core with no draft hold, NotRun as "not run: <why>"."""
+    result = {"check": name, "versions": {h: harness_version(h) for h in harnesses},
+              "os": f"{os.uname().sysname} {os.uname().release}"}
+    missing = [h for h, v in result["versions"].items() if v is None]
+    if len(missing) == len(harnesses):
+        result["result"] = f"not run: {', '.join(missing)} not on PATH"
+        return result
+    try:
+        with Core(name.lower().replace("-", "").replace("+", ""), config="draft_wait = 0\n") as qa:
+            body(qa, result)
+    except NotRun as why:
+        result["result"] = f"not run: {why}"
+    return result
+
+
+def lc2():
+    """Codex: does -c 'projects."<dir>".trust_level="trusted"' suppress the trust dialog without writing config?"""
+    def body(qa, result):
+        codex_home = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+        before = stamps([codex_home], depth=1)
+        base = folder(qa, "codex-baseline")
+        h = Harness(qa, "codex", ["--no-daemon"], base)
+        result["baseline"] = h.settle(timeout=90, answer=False)
+        h.stop()
+        trusted = folder(qa, "codex-trusted")
+        key = f'projects."{trusted}".trust_level="trusted"'
+        h = Harness(qa, "codex", ["--no-daemon", "-c", key], trusted)
+        result["with_flag"] = h.settle(timeout=90, answer=False)
+        result["with_flag_answers"] = store(h, token()) if result["with_flag"].startswith("idle") else False
+        h.stop()
+        result["codex_home_changed"] = changed(before, stamps([codex_home], depth=1))   # paths only
+        if not result["baseline"].startswith("dialog"):
+            result["result"] = "inconclusive: the baseline showed no trust dialog"
+        else:
+            passed = result["with_flag"].startswith("idle") and result["with_flag_answers"] \
+                and not result["codex_home_changed"]
+            result["result"] = "pass" if passed else "fail"
+    return harness_check("LC-2", ["codex"], body)
+
+
+def claude_args(qa):
+    d = qa.dir / "claude-files"
+    d.mkdir(exist_ok=True)
+    prompt = d / "probe.md"
+    prompt.write_text("You are a test probe. Keep every reply as short as asked.\n")
+    settings = d / "probe.settings.json"
+    settings.write_text(json.dumps({"promptSuggestionEnabled": False, "skipDangerousModePermissionPrompt": True}))
+    return ["--append-system-prompt-file", str(prompt), "--settings", str(settings),
+            "--permission-mode", "bypassPermissions"]
+
+
+def lc3():
+    """Claude Code: --session-id with the prompt file and settings, then --resume of that ID."""
+    import uuid
+
+    def body(qa, result):
+        work = folder(qa, "claude")
+        sid = str(uuid.uuid4())
+        h = Harness(qa, "claude", ["--session-id", sid, *claude_args(qa)], work)
+        result["fresh"] = h.settle()
+        if not result["fresh"].startswith("idle"):
+            result["result"] = "fail: did not start with --session-id"
+            result["screen_tail"] = h.last_line()
+            h.stop()
+            return
+        value = capture(h, "CLAUDE_CODE_SESSION_ID", qa.dir)
+        result["env_matches_assigned"] = None if value is None else value == sid
+        tok = token()
+        result["stored"] = store(h, tok)
+        h.stop()
+        h = Harness(qa, "claude", ["--resume", sid, *claude_args(qa)], work)
+        result["resume"] = h.settle()
+        result["recalled"] = recall(h, tok) == tok if result["resume"].startswith("idle") else False
+        value = capture(h, "CLAUDE_CODE_SESSION_ID", qa.dir) if result["recalled"] else None
+        result["env_after_resume_matches"] = None if value is None else value == sid
+        h.stop()
+        passed = result["stored"] and result["recalled"] and result["env_matches_assigned"]
+        result["result"] = "pass" if passed else "fail"
+    return harness_check("LC-3", ["claude"], body)
+
+
+def opencode_ids():
+    import uuid
+    alphabet = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    return {"uuid4": str(uuid.uuid4()), "ses_prefixed": "ses_" + "".join(random.choices(alphabet, k=26))}
+
+
+def lc4():
+    """OpenCode: which never-used ID does --session accept, and is it reopened (LC-4); which variable its commands
+    get, before and after a switch to a new conversation (LC-11)."""
+    def body(qa, result):
+        result["formats"] = {}
+        for fmt, sid in opencode_ids().items():
+            work = folder(qa, f"opencode-{fmt}")
+            seen = result["formats"][fmt] = {}
+            h = Harness(qa, "opencode", ["--session", sid], work)
+            seen["start"] = h.settle()
+            if not seen["start"].startswith("idle"):
+                seen["screen_tail"] = h.last_line()
+                h.stop()
+                continue
+            tok = token()
+            seen["stored"] = store(h, tok)
+            listing = qa.dir / f"opencode-env-{fmt}.txt"
+            h.ask("Run this exact shell command and nothing else, then reply with only the word finished: "
+                  "{ for v in $(env | cut -d= -f1 | grep -iE 'opencode|session|conversation|thread'); do "
+                  "printf '%s=%s\\n' \"$v\" \"$(printenv \"$v\")\"; done; echo end; } > '" + str(listing) + "'")
+            env_value(listing, timeout=60)
+            pairs = [line.split("=", 1) for line in (listing.read_text().splitlines() if listing.exists() else [])
+                     if "=" in line]
+            seen["variables"] = sorted(k for k, _ in pairs)                       # names only
+            seen["variables_equal_to_id"] = sorted(k for k, v in pairs if v == sid)
+            h.send("/new")
+            time.sleep(3)
+            h.settle(timeout=30)
+            seen["after_new_still_equal"] = {k: capture(h, k, qa.dir) == sid for k in seen["variables_equal_to_id"]}
+            h.stop()
+            h = Harness(qa, "opencode", ["--session", sid], work)
+            seen["reopen"] = h.settle()
+            seen["recalled"] = recall(h, tok) == tok if seen["reopen"].startswith("idle") else False
+            h.stop()
+        ok = [f for f, s in result["formats"].items() if s.get("stored") and s.get("recalled")]
+        result["accepted_formats"] = ok
+        result["lc11_variable_candidates"] = sorted(   # equal to the ID, and changed by /new: it follows a switch
+            {k for s in result["formats"].values() for k, same in s.get("after_new_still_equal", {}).items() if not same})
+        result["result"] = "pass" if ok else "fail"
+    return harness_check("LC-4+LC-11", ["opencode"], body)
+
+
+def lc6():
+    """pi and omp, each in its own session directories: fresh without --continue, the newest with it, members apart."""
+    def flags(binary, d):
+        return ["--session-dir", str(d)] if binary == "pi" else [f"--session-dir={d}", "--approval-mode", "yolo"]
+
+    def one(qa, binary):
+        seen = {}
+        work = folder(qa, binary)
+        a, b = qa.dir / f"{binary}-sessions-a", qa.dir / f"{binary}-sessions-b"
+        a.mkdir()
+        b.mkdir()
+        t1, t2, t3 = token(), token(), token()
+        names = {t1: "t1", t2: "t2", t3: "t3"}
+        steps = [("a_first", a, [], t1, False), ("a_second_fresh", a, [], t2, True),
+                 ("b_first", b, [], t3, False), ("a_continue", a, ["--continue"], None, True),
+                 ("b_continue", b, ["--continue"], None, True)]
+        for step, d, extra, keep, check in steps:
+            h = Harness(qa, binary, [*flags(binary, d), *extra], work)
+            seen[step] = {"start": h.settle()}
+            if not seen[step]["start"].startswith("idle"):
+                seen[step]["screen_tail"] = h.last_line()
+                h.stop()
+                return seen, False
+            if check:
+                seen[step]["holds"] = names.get(recall(h, t1, (t2, t3)))
+            if keep:
+                seen[step]["stored"] = store(h, keep)
+            if binary == "pi" and step == "a_first":
+                seen["pi_session_id_set"] = bool(capture(h, "PI_SESSION_ID", qa.dir))
+            h.stop()
+        ok = (seen["a_second_fresh"].get("holds") is None and seen["a_continue"].get("holds") == "t2"
+              and seen["b_continue"].get("holds") == "t3"
+              and all(seen[s].get("stored") for s in ("a_first", "a_second_fresh", "b_first")))
+        return seen, ok
+
+    def body(qa, result):
+        verdicts = {}
+        for binary in ("pi", "omp"):
+            if shutil.which(binary) is None:
+                result[binary] = "not run: not on PATH"
+                continue
+            result[binary], verdicts[binary] = one(qa, binary)
+            result[f"{binary}_result"] = "pass" if verdicts[binary] else "fail"
+        result["result"] = "pass" if len(verdicts) == 2 and all(verdicts.values()) else "fail"
+    return harness_check("LC-6", ["pi", "omp"], body)
+
+
+AGY_SETTINGS = ["~/.gemini", "~/.antigravity", "~/.config/antigravity", "~/.config/Antigravity",
+                "~/.antigravity-cli", "~/.config/agy"]
+
+
+def lc7():
+    """agy: does the session-only --settings with trustedWorkspaces skip the trust dialog, with nothing saved?"""
+    def body(qa, result):
+        roots = [os.path.expanduser(p) for p in AGY_SETTINGS]
+        before = stamps(roots)
+        result["settings_roots_present"] = [r for r in roots if os.path.exists(r)]
+        base = folder(qa, "agy-baseline")
+        h = Harness(qa, "agy", ["--mode", "accept-edits", "--settings", '{"toolPermission":"always-proceed"}'], base)
+        result["baseline"] = h.settle(timeout=90, answer=False)
+        h.stop()
+        trusted = folder(qa, "agy-trusted")
+        settings = json.dumps({"toolPermission": "always-proceed", "trustedWorkspaces": [str(trusted)]})
+        h = Harness(qa, "agy", ["--mode", "accept-edits", "--settings", settings], trusted)
+        result["with_settings"] = h.settle(timeout=90, answer=False)
+        result["answers"] = store(h, token()) if result["with_settings"].startswith("idle") else False
+        h.stop()
+        result["settings_changed"] = changed(before, stamps(roots))   # paths only; nothing is read
+        if not result["baseline"].startswith("dialog"):
+            result["result"] = "inconclusive: the baseline showed no trust dialog"
+        else:
+            result["result"] = "pass" if result["answers"] and result["with_settings"].startswith("idle") else "fail"
+            result["note"] = "settings_changed lists every file agy touched; a trust list among them fails the check"
+    return harness_check("LC-7", ["agy"], body)
+
+
+SUBAGENTS = {
+    "claude": ("CLAUDE_CODE_SESSION_ID", "with your Task tool"),
+    "codex": ("CODEX_THREAD_ID", "spawn one of your agents"),
+    "agy": ("ANTIGRAVITY_CONVERSATION_ID", "with your sub-agent tool"),
+}
+
+
+def lc12():
+    """Claude Code, Codex, agy: does a command run by a sub-agent see the parent's conversation ID?"""
+    def body(qa, result):
+        verdicts = {}
+        for name, (var, how) in SUBAGENTS.items():
+            if shutil.which(name) is None:
+                result[name] = "not run: not on PATH"
+                continue
+            work = folder(qa, f"lc12-{name}")
+            args = {"claude": claude_args(qa), "codex": ["--no-daemon", "--dangerously-bypass-approvals-and-sandbox"],
+                    "agy": ["--mode", "accept-edits", "--settings", json.dumps(
+                        {"toolPermission": "always-proceed", "trustedWorkspaces": [str(work)]})]}[name]
+            h = Harness(qa, name, args, work)
+            seen = result[name] = {"start": h.settle()}
+            if not seen["start"].startswith("idle"):
+                seen["screen_tail"] = h.last_line()
+                h.stop()
+                continue
+            child, parent = qa.dir / f"{name}-child.txt", qa.dir / f"{name}-parent.txt"
+            h.ask(SUBAGENT.format(how=how, var=var, child=child, parent=parent), timeout=420)
+            c, p = env_value(child, timeout=30), env_value(parent, timeout=30)
+            seen["child_ran"], seen["parent_ran"] = c is not None, p is not None
+            seen["parent_has_value"] = bool(p)
+            seen["child_equals_parent"] = None if c is None or p is None else c == p
+            h.stop()
+            if c is not None and p:
+                verdicts[name] = "follow" if c == p else "session_follow = false"
+        result["selected"] = verdicts
+        result["result"] = "pass" if len(verdicts) == len(SUBAGENTS) else "partial" if verdicts else "fail"
+    return harness_check("LC-12", list(SUBAGENTS), body)
+
+
+def lc8():
+    """rodeo renders the tab and panes Factory writes: a row root, member titles, the keeper last with
+    size.weight 0.4; an unlabelled terminal stays out of the doc; keep as rodeo leaves it."""
+    result = {"check": "LC-8", "rodeo": RODEO}
+    if not RODEO or not os.path.exists(RODEO):
+        result["result"] = "not run: rodeo not found (set RODEO_BIN)"
+        return result
+    result["rodeo_version"] = subprocess.run([RODEO, "--version"], capture_output=True, text=True,
+                                             check=False).stdout.strip()
+    result["desktop_app"] = "not run: checked only when pointed at a private session by hand"
+    with Core("lc8qa") as qa, Core("lc8drv") as drv:
+        alice, bob, keeper = Probe(qa, "alpha"), Probe(qa, "beta"), Probe(qa, "kp")
+        stray = Probe(qa, "stray")   # no herdr labels: a client must leave it alone
+        space, tab = "sp" + "8" * 32, "tb" + "8" * 32
+        blocks = [{"id": "p" + "1" * 32, "type": "block", "title": "@alice", "content": {"terminal": alice.address}},
+                  {"id": "p" + "2" * 32, "type": "block", "title": "@bob", "content": {"terminal": bob.address}},
+                  {"id": "p" + "3" * 32, "type": "block", "title": "keeper", "size": {"weight": 0.4},
+                   "content": {"terminal": keeper.address}}]
+        doc = {"spaces": [{"id": space, "name": "lc8", "folder": str(qa.dir), "tabs": [
+            {"id": tab, "name": "team", "root": {"id": "s" + "8" * 32, "type": "row", "children": blocks}}]}]}
+        qa.rpc("doc.set", {"name": "herdr-app", "value": doc, "version": 0})
+        for p, name in ((alice, "@alice"), (bob, "@bob"), (keeper, "keeper")):
+            qa.rpc("terminal.label", {"terminal": p.address, "labels": {
+                "herdr.space": space, "herdr.tab": tab, "herdr.seen": "0", "name": name}})
+        rodeo = Rodeo(qa, drv, "unset_env")
+        screen = rodeo.wait_for(["team", "@alice", "@bob", "keeper"])
+        result["render"] = screen is not None
+        if screen is None:
+            result["screen"] = rodeo.screen()[-3000:]
+            result["result"] = "fail: rodeo did not render the tab"
+            rodeo.close()
+            return result
+        time.sleep(5)   # past a client's adoption delay (about 2 s)
+        screen = rodeo.screen()
+        result["titles_once"] = {t: screen.count(t) == 1 for t in ("@alice", "@bob")}
+        row = next((line for line in screen.splitlines() if "@alice" in line and "keeper" in line), "")
+        starts = [row.find(t) for t in ("@alice", "@bob", "keeper")]
+        widths = [starts[1] - starts[0], starts[2] - starts[1], len(row.rstrip()) - starts[2]] if row else []
+        result["title_row_widths"] = widths
+        result["keeper_narrowest"] = bool(widths) and widths[2] < 0.7 * min(widths[0], widths[1])
+        value = qa.rpc("doc.get", {"name": "herdr-app"})["value"]
+        kept = json.dumps(value, sort_keys=True)
+        result["doc_unchanged"] = kept == json.dumps(doc, sort_keys=True)
+        result["keeper_weight_in_doc"] = '"weight": 0.4' in kept
+        result["stray_in_doc"] = stray.address in kept
+        result["keep"] = {name: qa.rpc("terminal.get", {"terminal": p.address}).get("keep")
+                          for name, p in (("alice", alice), ("bob", bob), ("keeper", keeper), ("stray", stray))}
+        rodeo.close()
+        result["result"] = "pass" if (result["render"] and all(result["titles_once"].values())
+                                      and result["keeper_narrowest"] and result["keeper_weight_in_doc"]
+                                      and not result["stray_in_doc"]) else "fail"
+    return result
+
 
 # Fixtures: replies recorded from a real core, scrubbed of host details.
 
@@ -995,14 +1526,15 @@ def fixtures(out):
     return {"check": "fixtures", "out": str(out), "hc": version, "replies": sorted(replies), "errors": sorted(errors)}
 
 
-CHECKS = {"lc1": lc1, "lc10": lc10, "lc13": lc13}
+CHECKS = {"lc1": lc1, "lc10": lc10, "lc13": lc13, "lc8": lc8}
+LOGIN_CHECKS = {"lc2": lc2, "lc3": lc3, "lc4": lc4, "lc6": lc6, "lc7": lc7, "lc12": lc12}   # start real harnesses
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
     check = sub.add_parser("check")
-    check.add_argument("name", choices=[*CHECKS, "all"])
+    check.add_argument("name", choices=[*CHECKS, *LOGIN_CHECKS, "all", "login"])
     check.add_argument("--json", help="also write the results to this file")
     fix = sub.add_parser("fixtures")
     fix.add_argument("--out", default=str(pathlib.Path(__file__).with_name("hc_fixtures.json")))
@@ -1011,10 +1543,13 @@ def main(argv=None):
     if args.command == "fixtures":
         results = [fixtures(args.out)]
     else:
-        names = list(CHECKS) if args.name == "all" else [args.name]
-        results = [CHECKS[n]() for n in names]
-        if args.json:
-            pathlib.Path(args.json).write_text(json.dumps(results, indent=2) + "\n")
+        every = {**CHECKS, **LOGIN_CHECKS}
+        names = list(CHECKS) if args.name == "all" else list(LOGIN_CHECKS) if args.name == "login" else [args.name]
+        results = []
+        for n in names:   # one at a time, each result kept as it lands
+            results.append(every[n]())
+            if args.json:
+                pathlib.Path(args.json).write_text(json.dumps(results, indent=2) + "\n")
     print(json.dumps(results, indent=2))
 
 
