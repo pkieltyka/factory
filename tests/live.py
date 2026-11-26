@@ -163,8 +163,6 @@ class Core:
         env.update(HC_SESSION=f"factory-{tag}-{os.getpid()}", HC_SOCKET=str(d / "hc.sock"),
                    XDG_RUNTIME_DIR=str(d / "run"), XDG_STATE_HOME=str(d / "state"),
                    XDG_CONFIG_HOME=str(d / "config"), HOME=str(d / "home"))
-        if HC.startswith("/") is False and "HC_BIN" in os.environ:
-            env["HC_BIN"] = HC
         for key in ("HC_SOCKET", "XDG_RUNTIME_DIR", "XDG_STATE_HOME", "XDG_CONFIG_HOME", "HOME"):
             if not env[key].startswith(str(d) + "/"):
                 raise RuntimeError(f"{key} is not private: {env[key]}")
@@ -421,13 +419,9 @@ def mid_paste_kill(qa, runs=20):
         token = f"MIDPASTE_{i}_{os.getpid()}"
         conn = qa.spawn_send(probe.address, token)
         deadline = time.monotonic() + 15
-        pasted = None
-        while time.monotonic() < deadline:
-            text = probe.text()
-            at = text.find(token)
-            if at >= 0:
-                pasted = now()
-                break
+        pasted = False
+        while time.monotonic() < deadline and not pasted:
+            pasted = token in probe.text()
             time.sleep(0.005)
         delay = random.uniform(0, 0.3)
         time.sleep(delay)
@@ -437,15 +431,15 @@ def mid_paste_kill(qa, runs=20):
         at = text.find(token)
         tail = text[at + len(token):] if at >= 0 else ""
         submitted = "\r" in tail.split("MIDPASTE_", 1)[0]
-        rows.append({"run": i, "kill_after_paste_ms": round(delay * 1000), "pasted": pasted is not None,
+        rows.append({"run": i, "kill_after_paste_ms": round(delay * 1000), "pasted": pasted,
                      "submitted": submitted})
         if at >= 0 and not submitted:
-            Attach_enter(qa, probe.address)
+            press_enter(qa, probe.address)
     return {"runs": runs, "pasted_without_enter": sum(1 for r in rows if r["pasted"] and not r["submitted"]),
             "not_pasted": sum(1 for r in rows if not r["pasted"]), "rows": rows}
 
 
-def Attach_enter(qa, term):
+def press_enter(qa, term):
     """Clear a pasted line left without Enter, so the next run starts clean."""
     a = Attach(qa, term)
     a.type(b"\r")
@@ -539,15 +533,14 @@ class Rodeo:
             pass
 
 
-def env_of(core, term):
-    """The environment a terminal of this core gets, read back from a probe-like env dump."""
-    out = core.dir / f"env-{term}.txt"
+def hc_env_names(core):
+    """Names of the HC_* variables a terminal of this core gets."""
+    out = core.dir / "env.txt"
     t = core.rpc("terminal.run", {"argv": ["sh", "-c", f"env > {out}"], "cwd": str(core.dir)})
     deadline = time.monotonic() + 10
     while core.rpc("terminal.get", {"terminal": t["address"]})["state"] == "live" and time.monotonic() < deadline:
         time.sleep(0.1)
-    names = sorted(line.split("=", 1)[0] for line in out.read_text().splitlines() if line.startswith("HC_"))
-    return names
+    return sorted(line.split("=", 1)[0] for line in out.read_text().splitlines() if line.startswith("HC_"))
 
 
 def focused(op, dev, before):
@@ -563,7 +556,7 @@ def lc13():
         return result
     result["rodeo_version"] = subprocess.run([RODEO, "--version"], capture_output=True, text=True).stdout.strip()
     with Core("lc13qa", config="draft_wait = 4\n") as qa, Core("lc13drv") as drv:
-        result["driver_terminal_hc_env"] = env_of(drv, "drv")
+        result["driver_terminal_hc_env"] = hc_env_names(drv)
         op = Probe(qa, "op")
         dev = Probe(qa, "dev")
         doc = {"spaces": [{"id": "sp" + "1" * 32, "name": "lc13", "folder": str(qa.dir), "tabs": [
@@ -672,9 +665,10 @@ def scrubber(core):
             return value
         if isinstance(value, bool) or value is None:
             return value
-        if isinstance(value, int) and key in ("pid", "uid", "gid", "uptime_ms") or (
-                isinstance(value, int) and key and key.endswith("_ms") and value > 10**12):
-            return 1 if key in ("pid", "uid", "gid") else 0
+        if isinstance(value, int) and key in ("pid", "uid", "gid"):
+            return 1
+        if isinstance(value, int) and key and (key == "uptime_ms" or key.endswith("_ms") and value > 10**12):
+            return 0
         return value
     return scrub
 
