@@ -6,6 +6,7 @@ flags factory.py passes."""
 import importlib.util
 import contextlib
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
 import io
 import json
 import os
@@ -2571,7 +2572,46 @@ class DownTests(unittest.TestCase):
             self.assertEqual(native(e.starts()["lead-dev"])[:2], ["resume", "same"])
 
 
+class ConstantsTests(unittest.TestCase):
+    def test_version_is_sha1_of_script(self):
+        self.assertEqual(factory.VERSION, hashlib.sha1(SCRIPT.read_bytes()).hexdigest()[:12])
+
+
 class ConfigTests(unittest.TestCase):
+    @staticmethod
+    def load_config(settings):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            (root / "factory.toml").write_text(settings)
+            (root / "FACTORY.md").write_text("# Factory\n")
+            return factory.Config(root)
+
+    def test_new_keys_default(self):
+        cfg = self.load_config("")
+        self.assertEqual((cfg.quiet_grace, cfg.ready_check, cfg.ready_every), (120, None, 300))
+
+    def test_new_keys_accepted(self):
+        cfg = self.load_config('quiet_grace = 30\nready_check = "printf todo"\nready_check_every = 60\n')
+        self.assertEqual((cfg.quiet_grace, cfg.ready_check, cfg.ready_every), (30, "printf todo", 60))
+
+    def test_invalid_new_keys_are_rejected(self):
+        for key, values in {
+            "quiet_grace": ("false", "29", "30.5", '"30"'),
+            "ready_check": ('""', '"  "', "true", "30"),
+            "ready_check_every": ("true", "59", "60.5", '"60"'),
+        }.items():
+            for value in values:
+                with self.subTest(key=key, value=value), self.assertRaisesRegex(SystemExit, rf"factory\.toml: {key}"):
+                    self.load_config(f"{key} = {value}\n")
+
+    def test_unknown_top_level_key_still_rejected(self):
+        with self.assertRaisesRegex(SystemExit, r"unknown top-level key.*ready_checks"):
+            self.load_config("ready_checks = 10\n")
+
+    def test_v1_sample_loads_unchanged(self):
+        cfg = self.load_config((factory.SKILL / "templates/factory.toml").read_text())
+        self.assertEqual((cfg.quiet_grace, cfg.ready_check, cfg.ready_every), (120, None, 300))
+
     @staticmethod
     def files(root):
         return {str(p.relative_to(root)): ("symlink", os.readlink(p)) if p.is_symlink() else p.read_bytes()

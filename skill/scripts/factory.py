@@ -40,6 +40,18 @@ CONF = "factory.toml"             # one person's formation: not committed
 SAMPLE = "factory.toml.sample"    # the project's suggested formation: committed, copied to factory.toml by `init`
 OPERATOR = "operator"  # the operator's @name, unless `[operator] name` in factory.toml says otherwise
 TABS = {"operator": "factory operator", "team": "factory team"}  # herdr tab labels
+HC = os.environ.get("HC_BIN", "hc")
+HC_MIN = (0, 1, 20)
+VERSION = hashlib.sha1(pathlib.Path(__file__).read_bytes()).hexdigest()[:12]
+TICK = 1.0
+LATCH_AFTER = 5
+BEAT_STALE = 30
+SAY_WAIT = 10
+LAUNCH_TIMEOUT = 60
+QUIET_GRACE = 120
+READY_EVERY, READY_TIMEOUT = 300, 30
+MAX_TEXT = 64 * 1024
+CAS_TRIES = 8
 
 
 class Problem(Exception):
@@ -121,10 +133,20 @@ class Config:
             self.user = ""
         if not re.fullmatch(r"[A-Za-z0-9._-]+", self.user):
             raise SystemExit(f"{self.conf_file}: set `user` to your name for branches, e.g. user = \"peter\"")
-        unknown = self.team.keys() - {"user", "permissions", "worktree_dir", "operator", "members"}
+        unknown = self.team.keys() - {"user", "permissions", "worktree_dir", "operator", "members",
+                                      "quiet_grace", "ready_check", "ready_check_every"}
         if unknown:
             raise SystemExit(f"{self.conf_file}: unknown top-level key(s): {sorted(unknown)};"
                              " operator fields belong under [operator].")
+        self.quiet_grace = self.team.get("quiet_grace", QUIET_GRACE)
+        self.ready_every = self.team.get("ready_check_every", READY_EVERY)
+        for key, value, minimum in (("quiet_grace", self.quiet_grace, 30),
+                                    ("ready_check_every", self.ready_every, 60)):
+            if type(value) is not int or value < minimum:
+                raise SystemExit(f"{self.conf_file}: {key} must be an integer of at least {minimum} seconds")
+        self.ready_check = self.team.get("ready_check")
+        if self.ready_check is not None and (not isinstance(self.ready_check, str) or not self.ready_check.strip()):
+            raise SystemExit(f"{self.conf_file}: ready_check must be a non-blank string")
         for name, m in self.members.items():
             role = m.get("role", name)
             if role not in self.roles:
