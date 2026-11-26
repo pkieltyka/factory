@@ -51,6 +51,8 @@ queued ──▶ sending ──▶ delivered
 queued ──▶ dropped                    (down; a superseded brief; a quiet or ready note that is no longer true)
 ```
 
+Replay is strict: a recorded move the diagram does not allow (`queued → delivered`, a second `sending`, any record after a final outcome) is `LogDamage` at its line, and the log is kept for repair, because ignoring it could expose a delivered pair for redelivery. The one tolerated repeat is a `queued` record with the reason the pair already has. Because readers reject what they do not know, a later Factory version may only widen the allowed records and moves, never narrow or rename them: during an update a keeper and a command of different versions write the same log, and each must read the other's records.
+
 ## Locking
 
 `<state>/lock` is the `flock` target for `log.jsonl`, `log.check`, `team.json` and `sessions.jsonl`. Readers take `LOCK_SH`, writers `LOCK_EX`. It is held only around file operations, never across an `hc` call or a sleep (v1's rule). The lock gives mutual exclusion only. It is not the commit rule: a writer can die, or fail twice, while holding it, and the log must still say only true things. The commit record is what makes that so.
@@ -59,8 +61,9 @@ queued ──▶ dropped                    (down; a superseded brief; a quiet o
 
 ```python
 class LogDamage(Exception):
-    def __init__(self, path, line: int, reason: str): ...
+    def __init__(self, path, line: int | None, reason: str): ...
     # str(): "message log needs repair: <path>, line <n>: <reason>. Nothing was written. Repair or move the file, then run factory.py up."
+    # line is None for a fault of the files rather than of one line (a log without its lock, a checkpoint without its log)
 
 class NotStored(Exception):
     partial: bool     # True: an incomplete line may remain; readers will report damage
@@ -73,17 +76,36 @@ class Log:
     def add(self, sender: str, to: list[str], text: str, kind: str = "say",
             file: str | None = None, meta: dict | None = None) -> tuple[int, int, str | None]
         # LOCK_EX. Validates the prefix, allocates the id, appends msg then ok. Returns (id, offset after the ok record, warning or None).
-        # Raises LogDamage (nothing written) or NotStored (the message will never be delivered).
+        # Raises ValueError (bad arguments, nothing touched), LogDamage (nothing written), NotStored (the message will never
+        # be delivered), or OSError "storage outcome unknown; do not resend; check inbox after repair" (see Append and commit).
     def out(self, box: "Box", id: int, to: str, o: str, **extra) -> bool
-        # LOCK_EX. Validates the prefix, applies records after box.offset, then appends the out record only if the pair's
-        # current outcome is not final and (for o == "sending") is "queued". Returns whether it wrote. Raises LogDamage, NotStored.
+        # LOCK_EX. Brings box up to the validated file, then appends the out record only if the move is allowed from the pair's
+        # current outcome: sending from queued; delivered and unconfirmed from sending; queued from queued (a new reason) or
+        # sending; dropped from queued or sending; nothing after a final outcome. A stale or repeated attempt returns False.
+        # Raises ValueError (bad arguments, a partial box), LogDamage, NotStored, OSError (unreadable read-back).
+    def drop_queued(self, box: "Box", names: set[str], why: str = "stopped by down") -> int
+        # LOCK_EX, one section: dropped for every pair still queued to one of names; returns how many were written.
+    def remove_delivered_file(self, box: "Box", id: int) -> str | None
+        # LOCK_EX. Unlinks the message's managed file once every recipient is delivered; a warning naming the path if it failed.
+    def leftovers(self, now: float | None = None) -> tuple[list[dict], list[str]]
+        # LOCK_EX. Files left in messages/*/: rows {sender, path, age_s, id or None, outcomes} and warnings (§ Message files).
+
+def managed_file(state, sender, path) -> bool    # the removal predicate of § Message files; lexical, resolves nothing
+def format_leftovers(rows) -> list[str]           # up's lines for leftovers, with the reminder once
+def inbox_rows(log: Log, name: str, count: int = 10) -> list[tuple[dict, dict]]
+    # the last count committed messages to name, oldest first, with its outcome; read-only (the inbox command uses it)
 
 class Box:
     """In-memory index of the committed log."""
     offset: int
     msgs: dict[int, dict]                         # committed messages; text is dropped once every recipient is final
     uncommitted: int                              # msg records with no ok
-    def apply(self, records: list[dict]) -> None  # raises LogDamage on a broken reference when the box started at offset 0
+    @classmethod
+    def for_message(cls, path, id: int, recipients: list[str], offset: int) -> "Box"
+        # a partial, outcome-only view of one committed message from the offset add returned (say's wait); it ignores other
+        # ids and can never authorize a write or prove a prefix
+    def apply(self, records: list[dict]) -> None  # raises LogDamage on a broken reference or an illegal recorded transition;
+                                                  # a box that raised stays unusable until Log.out rebuilds it
     def outcome(self, id: int, to: str) -> dict   # the last out record, or {"o": "queued", "why": "waiting"}
     def pending(self, to: str | None = None) -> list[tuple[dict, str]]   # (msg, recipient) pairs not final, by id
     def last_to(self, name: str, sender: str | None = None) -> dict | None   # newest message delivered to name
@@ -115,7 +137,7 @@ References are checked by `Box.apply` for a box that started at offset 0: an `ou
 Every writer validates everything already in the log before it appends (§8.6). Reading the whole file on every `say` would grow with the log, so writers keep a checkpoint, `<state>/log.check`:
 
 ```json
-{"ino": 1234567, "size": 81234, "mtime_ns": 1795713707392000000, "last": 42}
+{"ino": 1234567, "size": 81234, "mtime_ns": 1795713707392000000, "last": 42, "lineage": "9f2c4e1a7b3d5608"}
 ```
 
 `_prefix() -> int` (the highest `msg` id), called inside `LOCK_EX`:
@@ -123,7 +145,11 @@ Every writer validates everything already in the log before it appends (§8.6). 
 1. `st = os.stat(log)`. If `log.check` parses and its `ino`, `size` and `mtime_ns` all equal `st`'s: the file is the one a previous writer validated and extended; return `last`.
 2. Otherwise read and `parse` the whole file and build a throwaway `Box` from offset 0 (which also checks references). Damage raises `LogDamage` and nothing is written. Success: return the highest id.
 
-After every successful append the writer rewrites `log.check` from a fresh `os.stat` (write a temp file, `os.replace`; no fsync, since losing it only costs one full validation). Any change to the log that did not go through a writer, including one byte in an early line, changes `mtime_ns` or `size` and forces step 2. A missing log with no checkpoint is the empty log, id 0.
+After every successful append the writer rewrites `log.check` from a fresh `os.stat` (write a uniquely named temp file, `os.replace`; no fsync, since losing it only costs one full validation; a failure to publish it, cleanup included, never changes a committed result). Any change to the log that did not go through a writer, including one byte in an early line, changes `mtime_ns` or `size` and forces step 2. A missing log with no checkpoint is the empty log, id 0; a checkpoint without its log is damage, so ids are never reused. An unsafe `log.check` (a symbolic link, not a regular file) is an error; unparsable JSON is only a miss. Accepted limit: an outside edit that keeps the size and inode and restores the old mtime is not detected.
+
+`lineage` names an unbroken run of writers' appends. A writer that proves the file through a matching checkpoint continues its lineage; one that had to validate in full starts a new one. `out` reads only the tail of a caller's `Box` when the box's last proven view belongs to the current lineage, and rebuilds any other box from the whole file: a matching checkpoint written after someone else's full validation proves nothing about an older view.
+
+Every operation holds a no-follow descriptor of the state directory and opens, stats, replaces and syncs its files relative to it, so no component is followed through a symbolic link and the directory cannot be swapped mid-operation. Only writers create the directory and its files, and the lock before the log; readers create, chmod and rewrite nothing.
 
 ### Append and commit
 
@@ -147,7 +173,7 @@ After every successful append the writer rewrites `log.check` from a fresh `os.s
 3. `_append(ok line)`. On `NotStored`: re-raise; the `msg` stays uncommitted and inert (with `partial`, readers report damage). On `"visible"`: the message **is** committed, because the keeper will read the `ok` and deliver it; return with the warning `stored and will be delivered, but the disk reported an error: it may not survive a power loss. Do not resend.`
 4. Rewrite `log.check`; return `(id, offset, warning)`.
 
-What this guarantees, including when a write, a sync and a rollback fail together, and when the writer is killed at any point: **a message is delivered if and only if its complete `ok` record is in the log, and `say` reports it stored if and only if that record is there when `say` releases the lock.** Two gaps cannot be closed: a writer killed after writing `ok` and before printing (delivered, sender saw no result), and a power loss after a `"visible"` `ok` (the sender was warned).
+What this guarantees, including when a write, a sync and a rollback fail together, and when the writer is killed at any point: **a message is delivered if and only if its complete `ok` record is in the log, and `say` reports it stored if and only if that record is there when `say` releases the lock**, as far as the tail can be read back. If the read-back of a failed `ok` itself fails, `add` raises an `OSError` naming the message ID and the log, "storage outcome unknown; do not resend; check inbox after repair": no `NotStored`, no retry, no checkpoint update, nothing persisted. A complete `ok` found after repair is authoritative. An unreadable read-back of a `msg` is `NotStored(partial=True)` (it was never committed), and of an outcome an `OSError` that authorizes no handoff. Two gaps cannot be closed: a writer killed after writing `ok` and before printing (delivered, sender saw no result), and a power loss after a `"visible"` `ok` (the sender was warned).
 
 Sentence proposed for spec §8.6: "If the disk reports an error after an entry is completely written and the entry cannot be removed, the message counts as stored and is delivered; `say` warns that it may not survive a power loss and must not be resent."
 
@@ -188,6 +214,8 @@ A file is **managed** when its parent directory is exactly `<state>/messages/<se
 
 ### `inbox` output
 
+`inbox_rows(log, name, count)` (Phase 3) selects the rows from one validated snapshot, keeping each message's original text after its outcomes are final; the command itself, its rendering and its caller and checkout resolution arrive with `say` in Phase 4 (until then v1's `inbox` stays).
+
 `inbox [N] [--for NAME]` reads the whole log and prints the last N committed messages whose `to` contains the name, oldest first:
 
 ```
@@ -215,7 +243,7 @@ Validation
 - `test_incomplete_last_line_is_damage`, `test_invalid_json_is_damage`, `test_ids_out_of_order_is_damage`, `test_ok_without_its_msg_is_damage`: each names the line; `add` after each writes nothing.
 - `test_out_for_unknown_message_is_damage`, `test_out_for_non_recipient_is_damage`, `test_out_for_uncommitted_message_is_damage`.
 - `test_early_corruption_blocks_append`: a 2 MB log; flip one byte in line 3 (so mtime changes); `add` raises `LogDamage` naming line 3 and the file is unchanged.
-- `test_checkpoint_skips_full_read`: with a matching `log.check`, `add` reads no log bytes (patch `os.read`); with a missing, stale or unparsable one it validates everything and rewrites it.
+- `test_checkpoint_skips_full_read`: with a matching `log.check`, `add` does no full read (spy on `Log._snapshot`); with a missing, stale or unparsable one it validates everything and rewrites it.
 - `test_truncated_log_is_damage`: a reader holding an offset past the end reports it.
 
 Commit, with faults injected by patching `os.write`, `os.fsync` and `os.ftruncate`

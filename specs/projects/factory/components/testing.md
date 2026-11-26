@@ -71,7 +71,7 @@ Display text lives in `screens` and is returned by `terminal.read`. The terminal
 ### Fault and crash injection
 
 - **Disk faults** in the log tests are made by patching `os.write`, `os.fsync` and `os.ftruncate` on the `factory` module's `os` binding for one call each, singly and together ([message_log.md](message_log.md)).
-- **A writer killed mid-append** is a child process that the test stops with SIGKILL at a named point (an environment variable makes `Log._append` pause there).
+- **A writer killed mid-append** is a child process that wraps its own `Log._append` (in the test's child script, not in `factory.py`): after the chosen append returns it tells the parent through a pipe and blocks; the parent sends SIGKILL, reaps it and opens the log from another process. No production pause variable exists.
 - **A keeper killed between two steps** is modelled by raising from a patched method after the step under test (for example right after `log.out(…, "delivered")`), discarding that `Keeper`, and building a new one on the same state directory and fake `hc`. The crash-recovery tests in [keeper.md](keeper.md) all use this.
 
 ## 3. Fake agent

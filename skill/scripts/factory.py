@@ -773,7 +773,7 @@ class Box:
         self._usable()
         for ident in sorted(self.msgs, reverse=True):
             msg = self.msgs[ident]
-            if (name in msg["to"] and (sender is None or msg["from"] == sender)
+            if (name in msg["to"] and (sender is None or msg.get("from") == sender)
                     and self.outcome(ident, name)["o"] == "delivered"):
                 return msg
         return None
@@ -828,7 +828,7 @@ class Log:
     LOG, LOCK, CHECK = "log.jsonl", "lock", "log.check"
 
     def __init__(self, state):
-        self.state = pathlib.Path(state)
+        self.state = pathlib.Path(os.path.abspath(state))   # lexical: a symbolic link in the cache base is kept
         self.path = self.state / self.LOG
         self.lock_path = self.state / self.LOCK
         self.check_path = self.state / self.CHECK
@@ -1125,6 +1125,8 @@ class Log:
     def _refresh(self, box):
         """Bring box up to the current, validated file (lock held). Only a box whose view belongs to the
         checkpoint's lineage (nothing but writers' appends since) refreshes its tail; any other is rebuilt."""
+        if box._only is not None:
+            raise ValueError("a partial box cannot authorize a write")   # before anything could widen it
         info = self._stat()
         check = self._prove(info)
         if box._damage is None and check is not None and box._lineage == check["lineage"] \
@@ -1185,6 +1187,8 @@ class Log:
     def drop_queued(self, box, names, why="stopped by down"):
         """down's batch: drop every pair still queued to one of names, in one locked section; the count written."""
         names = set(names)
+        if not (isinstance(why, str) and why.strip()):
+            raise ValueError("dropped needs a reason")
         with self._locked(exclusive=True):
             self._refresh(box)
             written = 0
@@ -1227,9 +1231,11 @@ class Log:
 
     @staticmethod
     def _newest_use(box, sender, path):
+        """The newest committed message from sender naming this file, by the lexical identity of the path."""
+        key = lexical_path(path)
         for ident in sorted(box.msgs, reverse=True):
             msg = box.msgs[ident]
-            if msg.get("from") == sender and msg.get("file") == path:
+            if key and msg.get("from") == sender and "file" in msg and lexical_path(msg["file"]) == key:
                 return msg
         return None
 
@@ -1241,15 +1247,16 @@ class Log:
             msg = box.msgs.get(ident)
             if msg is None or "file" not in msg or self._newest_use(box, msg["from"], msg["file"]) is not msg:
                 return None
+            path = lexical_path(msg["file"])
             if not all(box.outcome(ident, r)["o"] == "delivered" for r in msg["to"]):
                 return None
-            if not managed_file(self.state, msg["from"], pathlib.Path(msg["file"])):
+            if not managed_file(self.state, msg["from"], path):
                 return None
             sender_fd = self._sender_dir(msg["from"])
             if sender_fd is None:
                 return None
             try:
-                return self._unlink_in(sender_fd, os.path.basename(msg["file"]), msg["file"])
+                return self._unlink_in(sender_fd, os.path.basename(path), path)
             finally:
                 os.close(sender_fd)
 
@@ -1277,9 +1284,16 @@ class Log:
                     with os.scandir(sender_fd) as listing:
                         entries = sorted(listing, key=lambda e: e.name)
                     for entry in entries:
-                        if not entry.is_file(follow_symlinks=False):
-                            continue
                         path = str(self.state / "messages" / sender / entry.name)
+                        try:
+                            if not entry.is_file(follow_symlinks=False):
+                                continue
+                            mtime = entry.stat(follow_symlinks=False).st_mtime
+                        except FileNotFoundError:
+                            continue          # gone since the listing: nothing left to check
+                        except OSError as error:
+                            warnings.append(f"could not inspect {path}: {error}")
+                            continue
                         msg = self._newest_use(box, sender, path)
                         outcomes = {r: box.outcome(msg["id"], r) for r in msg["to"]} if msg else {}
                         if (msg and MESSAGE_FILE.fullmatch(entry.name)
@@ -1288,13 +1302,27 @@ class Log:
                             if warning:
                                 warnings.append(warning)
                             continue
-                        rows.append({"sender": sender, "path": path,
-                                     "age_s": max(0.0, now - entry.stat(follow_symlinks=False).st_mtime),
+                        rows.append({"sender": sender, "path": path, "age_s": max(0.0, now - mtime),
                                      "id": msg["id"] if msg else None,
                                      "outcomes": {r: outcome_word(o) for r, o in outcomes.items()}})
                 finally:
                     os.close(sender_fd)
         return rows, warnings
+
+
+def inbox_rows(log, name, count=10):
+    """The last count committed messages addressed to name, oldest first, each with that recipient's current
+    outcome: [(message, outcome)]. One validated snapshot; reads only (phase_3.md §7). Raises LogDamage."""
+    if type(count) is not int or count < 1:
+        raise ValueError(f"count must be a positive integer, not {count!r}")
+    if not (isinstance(name, str) and name):
+        raise ValueError("a recipient name is needed")
+    records, _ = log.read()
+    box = Box(log.path)
+    box.apply(records)
+    originals = {r["id"]: r for r in records if r["t"] == "msg"}   # the box drops text once final; these keep it
+    chosen = [ident for ident in sorted(box.msgs) if name in box.msgs[ident]["to"]][-count:]
+    return [(originals[ident], box.outcome(ident, name)) for ident in chosen]
 
 
 MESSAGE_FILE = re.compile(r"[A-Za-z0-9-]+\.[A-Za-z0-9]+")
@@ -1304,11 +1332,20 @@ def outcome_word(outcome):
     return f"queued ({outcome['why']})" if outcome["o"] == "queued" else outcome["o"]
 
 
+def lexical_path(path):
+    """A path's lexical identity: absolute, with "." and repeated slashes removed; None for a relative path or one
+    with a ".." component. Nothing is resolved."""
+    path = os.fspath(path)
+    if not os.path.isabs(path) or ".." in path.split("/"):
+        return None
+    return os.path.normpath(path)
+
+
 def managed_file(state, sender, path):
     """Whether path is a message file Factory may remove: a regular file named like a-b-1.md directly in
     <state>/messages/<sender>/, with no symbolic link from the state directory down. Lexical: nothing is resolved."""
-    path, state = os.fspath(path), os.fspath(state)
-    if not (os.path.isabs(path) and os.path.normpath(path) == path and MESSAGE_FILE.fullmatch(os.path.basename(path))):
+    path, state = lexical_path(path), os.path.abspath(os.fspath(state))
+    if path is None or not MESSAGE_FILE.fullmatch(os.path.basename(path)):
         return False
     if os.path.dirname(path) != os.path.join(state, "messages", sender) or not sender or "/" in sender:
         return False

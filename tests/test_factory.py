@@ -4589,6 +4589,87 @@ class LogOutcomeTests(unittest.TestCase):
         self.assertIn(str(path), warning)
         self.assertEqual(box.outcome(1, "operator")["o"], "delivered")
 
+    def test_spellings_of_one_path_are_one_file(self):
+        """"." and repeated slashes name the same file everywhere; ".." never names a managed one."""
+        path = self.message_file("dev", "text.md")
+        dotted = str(self.state / "messages" / "dev") + "/./text.md"
+        doubled = str(self.state / "messages" / "dev") + "//text.md"
+        self.assertTrue(factory.managed_file(self.state, "dev", dotted))
+        self.assertTrue(factory.managed_file(self.state, "dev", doubled))
+        self.assertFalse(factory.managed_file(self.state, "dev",
+                                              str(self.state / "messages" / "x" / ".." / "dev" / "text.md")))
+        self.log.add("dev", ["operator"], "old", file=str(path))
+        self.log.add("dev", ["operator"], "new", file=dotted)     # pending, under another spelling
+        box = self.box()
+        self.deliver(box, 1, "operator")
+        self.assertIsNone(self.log.remove_delivered_file(box, 1))
+        self.assertTrue(path.exists())                            # the newer pending use protects it
+        self.deliver(box, 2, "operator")
+        self.log.remove_delivered_file(box, 2)
+        self.assertFalse(path.exists())
+
+    def test_a_relative_state_path_still_matches_absolute_records(self):
+        path = self.message_file("dev", "text.md")
+        relative = factory.Log(os.path.relpath(self.state))
+        relative.add("dev", ["operator"], "x", file=str(path))
+        box = self.box()
+        self.deliver(box, 1, "operator")
+        self.assertIsNone(relative.remove_delivered_file(box, 1))
+        self.assertFalse(path.exists())
+
+    def test_partial_boxes_never_widen(self):
+        _, offset, _ = self.log.add("pm", ["a"], "one")
+        self.log.add("pm", ["a"], "two")
+        partial = factory.Box.for_message(self.log.path, 1, ["a"], offset)
+        for attempt in (lambda: self.log.drop_queued(partial, {"a"}),
+                        lambda: self.log.remove_delivered_file(partial, 1),
+                        lambda: self.log.out(partial, 1, "a", "sending")):
+            with self.subTest(attempt=attempt), self.assertRaisesRegex(ValueError, "partial"):
+                attempt()
+        self.assertEqual((sorted(partial.msgs), partial._only), ([1], 1))
+        self.assertEqual([m["id"] for m, _ in self.box().pending()], [1, 2])
+        with self.assertRaisesRegex(ValueError, "reason"):
+            self.log.drop_queued(self.box(), {"a"}, why=" ")
+
+    def test_drop_queued_failing_partway_keeps_earlier_drops(self):
+        for n in range(3):
+            self.log.add("pm", ["a"], str(n))
+        box = self.box()
+        real, calls = factory.Log._append, []
+
+        def second_fails(log, line):
+            calls.append(line)
+            if len(calls) == 2:
+                raise factory.NotStored(False, "disk full")
+            return real(log, line)
+        with patch.object(factory.Log, "_append", second_fails), self.assertRaises(factory.NotStored):
+            self.log.drop_queued(box, {"a"})
+        fresh = self.box()
+        self.assertEqual([fresh.outcome(i, "a")["o"] for i in (1, 2, 3)], ["dropped", "queued", "queued"])
+        self.assertEqual(self.log.drop_queued(self.box(), {"a"}), 2)
+
+    def test_leftovers_skip_vanished_entries_and_warn_on_failures(self):
+        stay = self.message_file("dev", "stay-1.md")
+        gone = self.message_file("dev", "gone-2.md")
+        done = self.message_file("dev", "done-3.md")
+        self.log.add("dev", ["operator"], "done", file=str(done))
+        self.deliver(self.box(), 1, "operator")
+        real_scandir, real_unlink = factory.os.scandir, factory.os.unlink
+
+        def vanishing(fd):
+            with real_scandir(fd) as it:
+                listing = list(it)
+            if any(e.name == "gone-2.md" for e in listing) and gone.exists():
+                real_unlink(gone)                              # disappears between the listing and its stat
+            return contextlib.nullcontext(listing)
+        with patch.object(factory.os, "scandir", vanishing), \
+                patch.object(factory.os, "unlink", side_effect=PermissionError(13, "Permission denied")):
+            rows, warnings = self.log.leftovers()
+        self.assertEqual([pathlib.Path(r["path"]).name for r in rows], ["stay-1.md"])
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("done-3.md", warnings[0])
+        self.assertTrue(stay.exists() and done.exists())
+
     def test_leftovers(self):
         delivered = self.message_file("lead-dev", "a-1.md")
         pending = self.message_file("lead-dev", "b-2.md")
@@ -4614,6 +4695,91 @@ class LogOutcomeTests(unittest.TestCase):
         self.assertTrue(lines[1].endswith("c-3.md: never stored"))
         self.assertEqual(lines[-1], "Check before resending or discarding.")
         self.assertEqual(factory.format_leftovers([]), [])
+
+
+class InboxReaderTests(unittest.TestCase):
+    """inbox_rows, the Phase 3 offline reader (phase_3.md §7, §8 step 4). The CLI comes with say in Phase 4."""
+
+    def setUp(self):
+        self.base = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.log = factory.Log(self.base / "team" / "core")
+
+    def box(self):
+        records, end = self.log.read()
+        box = factory.Box(self.log.path)
+        box.apply(records)
+        box.offset = end
+        return box
+
+    def test_default_ten_oldest_first(self):
+        for n in range(1, 13):
+            self.log.add("pm", ["operator"], f"m{n}")
+        rows = factory.inbox_rows(self.log, "operator")
+        self.assertEqual([m["text"] for m, _ in rows], [f"m{n}" for n in range(3, 13)])
+        self.assertEqual([m["text"] for m, _ in factory.inbox_rows(self.log, "operator", 2)], ["m11", "m12"])
+
+    def test_no_cap_at_a_hundred(self):
+        for n in range(120):
+            self.log.add("pm", ["operator"], str(n))
+        self.assertEqual(len(factory.inbox_rows(self.log, "operator", 105)), 105)
+        self.assertEqual(len(factory.inbox_rows(self.log, "operator", 500)), 120)
+
+    def test_each_recipient_sees_its_own_outcome(self):
+        self.log.add("pm", ["operator", "reviewer"], "both")
+        self.log.add("pm", ["reviewer"], "reviewer only")
+        box = self.box()
+        self.log.out(box, 1, "operator", "queued", why="blocked")
+        self.log.out(box, 1, "reviewer", "sending", term="t2")
+        self.log.out(box, 1, "reviewer", "delivered", term="t2")
+        self.assertEqual([(m["id"], o["o"], o.get("why")) for m, o in factory.inbox_rows(self.log, "operator")],
+                         [(1, "queued", "blocked")])
+        self.assertEqual([(m["id"], o["o"]) for m, o in factory.inbox_rows(self.log, "reviewer")],
+                         [(1, "delivered"), (2, "queued")])
+        self.assertEqual(factory.inbox_rows(self.log, "pm"), [])     # the sender is not a recipient
+
+    def test_original_text_survives_final_outcomes(self):
+        text = "first line\nsecond line\n"
+        self.log.add("pm", ["operator"], text)
+        box = self.box()
+        self.log.out(box, 1, "operator", "dropped", why="stopped by down")
+        self.assertNotIn("text", box.msgs[1])
+        (msg, outcome), = factory.inbox_rows(self.log, "operator")
+        self.assertEqual((msg["text"], outcome["o"]), (text, "dropped"))
+
+    def test_uncommitted_messages_are_hidden(self):
+        self.log.add("pm", ["operator"], "committed")
+        with self.log.path.open("ab") as f:
+            f.write(b'{"t":"msg","id":2,"at":"2026-11-26T17:00:00Z","from":"pm","to":["operator"],"kind":"say",'
+                    b'"text":"never committed"}\n')
+        self.assertEqual([m["id"] for m, _ in factory.inbox_rows(self.log, "operator")], [1])
+
+    def test_empty_store_and_no_match(self):
+        self.assertEqual(factory.inbox_rows(self.log, "operator"), [])
+        self.assertFalse(self.log.state.exists())
+        self.log.add("pm", ["reviewer"], "x")
+        self.assertEqual(factory.inbox_rows(self.log, "operator"), [])
+
+    def test_damage_anywhere_raises_before_any_row(self):
+        self.log.add("pm", ["operator"], "fine")
+        with self.log.path.open("ab") as f:
+            f.write(b"garbage\n")
+        with self.assertRaises(factory.LogDamage):
+            factory.inbox_rows(self.log, "operator")
+
+    def test_invalid_arguments(self):
+        for name, count in (("operator", 0), ("operator", -1), ("operator", True), ("operator", 1.0), ("", 10),
+                            (None, 10)):
+            with self.subTest(name=name, count=count), self.assertRaises(ValueError):
+                factory.inbox_rows(self.log, name, count)
+
+    def test_reading_changes_nothing_and_needs_no_hc(self):
+        self.log.add("pm", ["operator"], "x")
+        os.chmod(self.log.path, 0o640)
+        before = {p.name: (p.read_bytes(), p.stat().st_mode, p.stat().st_mtime_ns) for p in self.log.state.iterdir()}
+        with patch.object(factory.Hc, "call", side_effect=AssertionError("hc")):
+            self.assertEqual(len(factory.inbox_rows(self.log, "operator")), 1)
+        after = {p.name: (p.read_bytes(), p.stat().st_mode, p.stat().st_mtime_ns) for p in self.log.state.iterdir()}
+        self.assertEqual(after, before)
 
 
 class LiveToolTests(unittest.TestCase):
