@@ -920,11 +920,11 @@ class Log:
             try:
                 fcntl.flock(directory, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
             except OSError as error:
-                if error.errno in (errno.EBADF, errno.ENOLCK, errno.EOPNOTSUPP):
-                    raise OSError(error.errno, f"cannot lock the state directory {self.state}: {error.strerror}."
-                                               " If it is on a filesystem that cannot lock a directory (NFS, for"
-                                               " one), set XDG_CACHE_HOME to a local path.") from error
-                raise
+                if not exclusive:
+                    raise
+                raise OSError(error.errno, f"cannot lock the state directory {self.state}: {error.strerror}."
+                                           " If it is on a filesystem that cannot lock a directory (NFS, for"
+                                           " one), set XDG_CACHE_HOME to a local path.") from error
             yield directory
         finally:
             self._dir = None

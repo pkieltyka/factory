@@ -3837,12 +3837,13 @@ class LogTests(unittest.TestCase):
         self.assertEqual([r["id"] for r in records if r["t"] == "msg"], list(range(1, 41)))
 
     def test_a_filesystem_that_cannot_lock_a_directory_is_named(self):
-        for code in (errno.EBADF, errno.ENOLCK):
+        for code in (errno.EBADF, errno.ENOLCK, errno.EIO):
             with self.subTest(code=code), \
                     patch.object(factory.fcntl, "flock", side_effect=OSError(code, os.strerror(code))), \
                     self.assertRaisesRegex(OSError, "cannot lock the state directory.*XDG_CACHE_HOME") as raised:
                 self.log.add("pm", ["operator"], "x")
             self.assertEqual(raised.exception.errno, code)
+            self.assertEqual(raised.exception.__cause__.errno, code)
 
     def test_a_new_store_is_durable_before_its_first_commit(self):
         """The directory chain is synced by the writer that creates the log, whoever made the directories;
