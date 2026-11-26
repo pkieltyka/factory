@@ -24,16 +24,17 @@ The team works through the board on its own. The owner sets direction; the team 
 | 2. Tickets | @pm | Tickets with acceptance criteria from the direction and from discoveries; a current board. |
 | 3. Plan | An architect | A plan for the ticket against the specs and the code: interfaces, edge cases, tests, files. Another architect or a lead dev may challenge it; the operator settles disagreements. Small fixes skip this step. |
 | 4. Build | Lead devs, plus frontend-dev for UI work when the team has one | Code and tests on the ticket branch, following the plan. |
-| 5. Review | @reviewer | A verdict on the exact diff (see Review). Fixes until approved; after three rounds on one ticket the operator decides. |
+| 5. Review | @reviewer | A verdict on the exact diff (see Review). Fixes until approved; after two rounds on one ticket the operator decides, and remaining minor findings become follow-up tickets. |
 | 6. Pull request and CI | The developer who wrote it | Pushes, opens the pull request, watches CI and fixes failures. |
 | 7. Merge | The operator | Confirms the reviewer approved the head commit and CI is green, squash-merges, and tells @pm, who closes the ticket. |
 | 8. Next | The operator | Takes the next ticket in Todo without asking. |
 
-- **Pairing on every ticket.** One lead dev is the main writer; the other lead devs follow along closely: they review each commit as it lands on the ticket branch, run its tests, and send the writer suggestions. The architect who planned the ticket and the other architects review the plan before building starts (the plan is final only after their review) and give the final design review of the finished work against the plan before @reviewer's verdict.
+- **Pairing on every ticket.** One architect plans the ticket and one other architect reviews the plan before building starts. One lead dev is the main writer and one other lead dev follows along: reviews each commit as it lands, runs its tests and sends suggestions. The planning architect gives the final design review against the plan before @reviewer's verdict.
+- **The bar for a merge.** This is a tool for one owner on their own machine. Only a defect that breaks normal use, or loses, duplicates or misroutes a message, blocks a merge; rare corner cases and hostile filesystem tricks go to the backlog as follow-up tickets.
 - The operator assigns each step with acceptance criteria. When the team has a @pm, it records owner, criteria, branch or commit, verdict and next step on the issue, and only @pm updates the tracker; otherwise the operator does.
 - Consult an architect before changing a shared interface, the brief or formation format, or the shape of SKILL.md and references/. Its plans are advice; the operator decides.
 - Developers with a worktree work on its branch (`<user>/<member>`); the others share the main checkout, where only one task writes at a time. Members do not commit in the main checkout.
-- One ticket is in progress at a time; its tasks may run in parallel when each writer has its own worktree.
+- Independent tickets may be in progress at the same time, each with its own writer in its own worktree; the architects agree any shared interface first, and whichever merges second rebases onto the first.
 - Every member reports to whoever assigned its work when it finishes, is blocked, or needs a decision. A member that is rate-limited or stuck says so; the operator reassigns.
 
 ## Pull requests
