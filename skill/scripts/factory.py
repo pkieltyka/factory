@@ -33,7 +33,8 @@ import threading
 import time
 import tomllib
 
-SKILL = pathlib.Path(__file__).resolve().parent.parent
+SCRIPT = pathlib.Path(__file__).resolve()
+SKILL = SCRIPT.parent.parent
 HERDR = os.environ.get("HERDR_BIN", "herdr")
 HERDR_TIMEOUT = 90  # seconds for one herdr call, so a herdr that hangs cannot hang a command for ever
 TABLE = tomllib.loads((SKILL / "harnesses.toml").read_text())  # harness -> its data
@@ -48,7 +49,7 @@ OPERATOR = "operator"  # the operator's @name, unless `[operator] name` in facto
 TABS = {"operator": "factory operator", "team": "factory team"}  # herdr tab labels
 HC = os.environ.get("HC_BIN", "hc")
 HC_MIN = (0, 1, 20)
-VERSION = hashlib.sha1(pathlib.Path(__file__).read_bytes()).hexdigest()[:12]
+VERSION = hashlib.sha1(SCRIPT.read_bytes()).hexdigest()[:12]
 TICK = 1.0
 LATCH_AFTER = 5
 BEAT_STALE = 30
@@ -349,6 +350,18 @@ def session_key():
     return re.sub(r"[^A-Za-z0-9_.-]", "-", session)[:24] + "-" + hashlib.sha1(session.encode()).hexdigest()[:8]
 
 
+def cache_base():
+    return pathlib.Path(os.environ.get("XDG_CACHE_HOME") or pathlib.Path.home() / ".cache")
+
+
+def team_key(root):
+    return f"{root.name[:24]}-{hashlib.sha1(str(root).encode()).hexdigest()[:8]}"
+
+
+def state_dir(root, core):
+    return pathlib.Path(_absolute(cache_base() / "factory-skill" / team_key(root) / core[:8]))
+
+
 def parse_role(path):
     _, head, body = path.read_text().split("---\n", 2)
     meta = {}
@@ -423,9 +436,7 @@ class Config:
     def cache(self):
         """Per-repo scratch outside the repo: members' prompt files and the sessions `up` resumes from.
         The path is short on purpose: it is typed into a shell line that macOS limits to 1024 bytes."""
-        base = pathlib.Path(os.environ.get("XDG_CACHE_HOME") or pathlib.Path.home() / ".cache")
-        key = f"{self.root.name[:24]}-{hashlib.sha1(str(self.root).encode()).hexdigest()[:8]}"
-        return base / "factory-skill" / key
+        return cache_base() / "factory-skill" / team_key(self.root)
 
     @property
     def session_dir(self):
@@ -892,7 +903,7 @@ class Log:
         except FileNotFoundError:
             return False
 
-    def _open_state(self, create):
+    def open_dir(self, create):
         """A no-follow descriptor of the state directory, or None for a reader when it does not exist. The cache
         base may be the owner's symbolic link; every component below it is opened (or created) one at a time
         relative to its parent's descriptor, never through a symbolic link."""
@@ -945,12 +956,15 @@ class Log:
                           " directory, check before resending")
 
     @contextlib.contextmanager
-    def _locked(self, exclusive):
+    def locked(self, exclusive):
         """The team lock is the state directory itself, flocked through the same no-follow descriptor every operation
         uses, so no two writers can append to one log under different locks. A writer then checks that the state path
         still names that directory: one moved or replaced meanwhile is damage, with nothing written. Writers create
-        the private directory; readers create nothing."""
-        directory = self._open_state(create=exclusive)
+        the private directory; readers create nothing.
+
+        Do only descriptor-relative file operations here. Public Log methods and the team metadata helpers
+        take their own lock, so calling them inside this context would wait on the lock already held."""
+        directory = self.open_dir(create=exclusive)
         if directory is None:
             yield None
             return
@@ -1009,7 +1023,7 @@ class Log:
 
     def read_box(self):
         """(records, box): one full, validated read and the box it built. Raises LogDamage."""
-        with self._locked(exclusive=False) as fd:
+        with self.locked(exclusive=False) as fd:
             if fd is None:
                 return [], Box(self.path)
             records, _, box = self._snapshot(0)
@@ -1019,12 +1033,22 @@ class Log:
         """(records, end) from byte offset; offset 0 validates the whole log. Raises LogDamage."""
         if type(offset) is not int or offset < 0:
             raise ValueError(f"offset must be a non-negative integer, not {offset!r}")
-        with self._locked(exclusive=False) as fd:
+        with self.locked(exclusive=False) as fd:
             if fd is None:
                 if offset:
                     raise LogDamage(self.path, None, f"the log was removed (reader was at byte {offset})")
                 return [], 0
             return self._snapshot(offset)[:2]
+
+    def refresh(self, box):
+        """Bring a full box up to the validated log, reading just the tail when its lineage still matches."""
+        if box._only is not None:
+            raise ValueError("a partial box cannot validate the log")
+        with self.locked(exclusive=False) as fd:
+            if fd is None:
+                box._reset()
+            else:
+                self._refresh(box)
 
     # ---------------------------------------------------------------- the checkpoint
 
@@ -1194,7 +1218,7 @@ class Log:
             self._line(rec)   # serializable (no NaN, no foreign objects in meta) before anything is touched
         except (TypeError, ValueError) as error:
             raise ValueError(f"message is not JSON-serializable: {error}") from error
-        with self._locked(exclusive=True):
+        with self.locked(exclusive=True):
             ident = self._prefix() + 1
             self._first_log()
             rec["id"] = ident
@@ -1274,7 +1298,7 @@ class Log:
     def out(self, box, ident, to, o, **extra):
         """Record one outcome if the pair's current outcome allows it; returns whether it wrote."""
         rec = self._check_out(box, ident, to, o, extra)
-        with self._locked(exclusive=True):
+        with self.locked(exclusive=True):
             self._refresh(box)
             return self._out_locked(box, rec)
 
@@ -1283,7 +1307,7 @@ class Log:
         names = set(names)
         if not (isinstance(why, str) and why.strip()):
             raise ValueError("dropped needs a reason")
-        with self._locked(exclusive=True):
+        with self.locked(exclusive=True):
             self._refresh(box)
             written = 0
             for msg, to in box.pending():
@@ -1336,7 +1360,7 @@ class Log:
     def remove_delivered_file(self, box, ident):
         """After a delivered receipt: unlink the message's managed file once every recipient has it.
         Returns a warning naming the path when the unlink failed, else None."""
-        with self._locked(exclusive=True):
+        with self.locked(exclusive=True):
             self._refresh(box)
             msg = box.msgs.get(ident)
             if msg is None or "file" not in msg or self._newest_use(box, msg["from"], msg["file"]) is not msg:
@@ -1359,7 +1383,7 @@ class Log:
         was delivered to every recipient are removed silently. Symbolic links and non-regular entries are ignored."""
         now = time.time() if now is None else now
         rows, warnings = [], []
-        with self._locked(exclusive=True):
+        with self.locked(exclusive=True):
             box = self._full_box()
             try:
                 messages = os.open("messages", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=self._dir)
@@ -1461,6 +1485,74 @@ def format_leftovers(rows):
     if lines:
         lines.append("Check before resending or discarding.")
     return lines
+
+
+# ================================================================ v2 team state
+
+def open_log(state):
+    raw = os.fspath(state)
+    path = pathlib.Path(raw)
+    if lexical_path(raw) != raw or len(path.parents) < 3 or path.parent.parent.name != "factory-skill":
+        raise Problem(f"{state} is not a Factory state directory", "run factory.py up")
+    return Log(path, base=path.parents[2])
+
+
+def _validate_team(team):
+    if not isinstance(team, dict) or type(team.get("v")) is not int or team["v"] != 1:
+        raise ValueError("expected a version 1 object")
+    for key in ("root", "team", "core"):
+        if not isinstance(team.get(key), str) or not team[key]:
+            raise ValueError(f"expected a non-empty {key}")
+    if "up" in team and type(team["up"]) is not bool:
+        raise ValueError("expected up to be true or false")
+
+
+def _read_team_file(state, directory):
+    if directory is None:
+        return {}
+    try:
+        try:
+            fd = private_open("team.json", os.O_RDONLY, fix_mode=False, dir_fd=directory)
+        except FileNotFoundError:
+            return {}
+        with os.fdopen(fd, "rb") as stream:
+            team = json.load(stream)
+        _validate_team(team)
+        return team
+    except (OSError, ValueError) as error:
+        raise Problem(f"{state}/team.json cannot be read: {error}", "run factory.py up") from error
+
+
+def read_team(state):
+    log = open_log(state)
+    try:
+        with log.locked(exclusive=False) as directory:
+            return _read_team_file(log.state, directory)
+    except (LogDamage, OSError) as error:
+        raise Problem(f"{log.state}/team.json cannot be read: {error}", "run factory.py up") from error
+
+
+def update_team(state, reset=False, **changes):
+    log = open_log(state)
+    with log.locked(exclusive=True) as directory:
+        current = {} if reset else _read_team_file(log.state, directory)
+        team = {"v": 1, **current, **changes}
+        _validate_team(team)
+        data = json.dumps(team, allow_nan=False).encode() + b"\n"
+        temp = f"team.json.{secrets.token_hex(8)}.tmp"
+        fd = private_open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, dir_fd=directory)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temp, "team.json", src_dir_fd=directory, dst_dir_fd=directory)
+            os.fsync(directory)
+        except OSError:
+            with contextlib.suppress(OSError):
+                os.unlink(temp, dir_fd=directory)
+            raise
+        return team
 
 
 class InboxDamage(ValueError):

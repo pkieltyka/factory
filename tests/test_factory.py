@@ -1332,7 +1332,11 @@ class Env:
         operator = {"pane_id": "w1:p1", "tab_id": "w1:t1", "workspace_id": "w1", "label": None, "agent": "claude",
                 "name": None, "agent_status": "working", "rect": {"x": 0, "y": 0, "width": 200, "height": 50}}
         self.write_fake({"calls": [], "next": 1, "tabs": {"w1:t1": "1"}, "panes": {"w1:p1": operator}})
-        self.env = {**os.environ, "HERDR_BIN": str(bin_ / "herdr"), "FAKE_HERDR": str(self.fake),
+        hc_dir = self.root / "hc"
+        hc_dir.mkdir()
+        self.env = {**{key: value for key, value in os.environ.items() if not key.startswith("HC_")},
+                    "HC_BIN": str(pathlib.Path(fake_hc.__file__).resolve()), "FAKE_HC_DIR": str(hc_dir),
+                    "HERDR_BIN": str(bin_ / "herdr"), "FAKE_HERDR": str(self.fake),
                     "HERDR_ENV": "1", "HERDR_PANE_ID": "w1:p1", "HERDR_TAB_ID": "w1:t1", "HERDR_WORKSPACE_ID": "w1",
                     "PATH": str(bin_), "HOME": str(self.home), "XDG_CACHE_HOME": str(self.root / "cache"),
                     "FAKE_MODELS": models, "FACTORY_SETTLE": "0.2"}
@@ -1982,7 +1986,7 @@ class UpTests(unittest.TestCase):
 
     def test_cold_up_warns_about_unreadable_drafts_and_lists_readable_siblings(self):
         members = {name: CATALOG_MEMBERS[name] for name in ("architect", "reviewer")}
-        with Env(formation(members)) as e, patch.dict(os.environ, e.env), \
+        with Env(formation(members)) as e, patch.dict(os.environ, e.env, clear=True), \
                 patch.object(factory, "HERDR", e.env["HERDR_BIN"]):
             drafts = factory.Config(e.repo).messages
             unreadable = drafts / "architect"
@@ -2019,7 +2023,7 @@ class UpTests(unittest.TestCase):
     def test_member_queues_for_configured_operator_without_a_pane(self):
         with Env(formation({"reviewer": CATALOG_MEMBERS["reviewer"]}, operator={"name": "lead"})) as e:
             e.run("up", "--no-brief")
-            with patch.dict(os.environ, e.env):
+            with patch.dict(os.environ, e.env, clear=True):
                 cfg = factory.Config(e.repo)
                 draft = cfg.messages / "reviewer/message-one.md"
                 inbox = factory.Inbox(cfg)
@@ -2036,7 +2040,7 @@ class UpTests(unittest.TestCase):
     def test_draft_name_validation_is_scoped_to_the_sender_folder(self):
         with Env(UI) as e:
             e.run("up", "--no-brief")
-            with patch.dict(os.environ, e.env):
+            with patch.dict(os.environ, e.env, clear=True):
                 directory = factory.Config(e.repo).messages / "reviewer"
             for name in ("review notes.md", "review_name.txt", "review.one.txt", "review", "review$.md"):
                 draft = directory / name
@@ -2056,7 +2060,7 @@ class UpTests(unittest.TestCase):
     def test_say_recipient_lists_accept_spaces_and_commas(self):
         with Env(UI) as e:
             e.run("up", "reviewer", "lead-dev", "--no-brief")
-            with patch.dict(os.environ, e.env):
+            with patch.dict(os.environ, e.env, clear=True):
                 cfg = factory.Config(e.repo)
                 inbox = factory.Inbox(cfg)
                 directory = cfg.messages / "reviewer"
@@ -2076,7 +2080,7 @@ class UpTests(unittest.TestCase):
     def test_mixed_send_reports_each_target_without_replaying_a_queue(self):
         with Env(UI) as e:
             e.run("up", "--no-brief")
-            with patch.dict(os.environ, e.env):
+            with patch.dict(os.environ, e.env, clear=True):
                 cfg = factory.Config(e.repo)
                 draft = cfg.messages / "reviewer/mixed-one.txt"
                 inbox = factory.Inbox(cfg)
@@ -2290,7 +2294,7 @@ class WorktreeTests(unittest.TestCase):
 
 class InboxTests(unittest.TestCase):
     def prepare(self, e):
-        with patch.dict(os.environ, e.env), factory.Inbox(factory.Config(e.repo)) as inbox:
+        with patch.dict(os.environ, e.env, clear=True), factory.Inbox(factory.Config(e.repo)) as inbox:
             inbox.save_state()
             return inbox
 
@@ -2298,13 +2302,13 @@ class InboxTests(unittest.TestCase):
         return e.say("lead-dev", "operator", text, **options)
 
     def seed(self, e, text="done", sender="lead-dev"):
-        with patch.dict(os.environ, e.env):
+        with patch.dict(os.environ, e.env, clear=True):
             outcome, number = factory.queue_message(factory.Config(e.repo), sender, text)
         self.assertEqual(outcome, "queued", number)
         return number
 
     def invoke(self, e):
-        with patch.dict(os.environ, e.env):
+        with patch.dict(os.environ, e.env, clear=True):
             return factory.queue_message(factory.Config(e.repo), "lead-dev", "literal '$herdr' @pm.")
 
     def test_inbox_and_generated_text_for_every_member_harness(self):
@@ -2336,7 +2340,7 @@ class InboxTests(unittest.TestCase):
             self.assertIn(prefix, settings["sandbox"]["excludedCommands"])
             self.assertIn(f"Bash({prefix})", settings["permissions"]["allow"])
             codex = starts["lead-dev"]
-            with patch.dict(os.environ, e.env):
+            with patch.dict(os.environ, e.env, clear=True):
                 cache = str(factory.Config(e.repo).cache)
             self.assertEqual(codex[codex.index("--add-dir") + 1], cache)
             self.assertIn("Use this command for teammates", e.run("prompt", "lead-dev", HERDR_ENV="").stdout)
@@ -2418,7 +2422,7 @@ class InboxTests(unittest.TestCase):
         with Env(formation({"lead-dev": {**CATALOG_MEMBERS["lead-dev"], "worktree": True}},
                            operator={"harness": "claude"}), git=True) as e:
             e.run("up")
-            with patch.dict(os.environ, e.env):
+            with patch.dict(os.environ, e.env, clear=True):
                 cfg = factory.Config(e.repo)
                 worktree = factory.plan(cfg, "lead-dev")["dir"]
                 inbox = factory.Inbox(cfg)
@@ -2515,7 +2519,7 @@ class InboxTests(unittest.TestCase):
             inbox = self.prepare(e)
             self.seed(e, "recover me")
             before = inbox.path.read_bytes(), inbox.state_path.read_bytes()
-            with patch.dict(os.environ, e.env), factory.Inbox(factory.Config(e.repo)) as current:
+            with patch.dict(os.environ, e.env, clear=True), factory.Inbox(factory.Config(e.repo)) as current:
                 with patch.object(current, "replace", side_effect=OSError("state save failed")), self.assertRaises(OSError):
                     current.acknowledge(1)
             self.assertEqual((inbox.path.read_bytes(), inbox.state_path.read_bytes()), before)
@@ -2555,7 +2559,7 @@ class InboxTests(unittest.TestCase):
             inode = inbox.lock_path.stat().st_ino
             waiter = subprocess.Popen([sys.executable, str(SCRIPT), "wait", "--cwd", str(e.repo), "--seen", "1"],
                                       env=e.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            with patch.dict(os.environ, e.env), ThreadPoolExecutor(max_workers=6) as pool:
+            with patch.dict(os.environ, e.env, clear=True), ThreadPoolExecutor(max_workers=6) as pool:
                 cfg = factory.Config(e.repo)
                 results = list(pool.map(lambda n: factory.queue_message(cfg, "lead-dev", str(n)), range(6)))
             waiter.communicate(timeout=15)
@@ -2600,7 +2604,7 @@ class InboxTests(unittest.TestCase):
             inbox = self.prepare(e)
             self.seed(e, "one")
             self.seed(e, "two")
-            with patch.dict(os.environ, e.env), factory.Inbox(factory.Config(e.repo)) as current:
+            with patch.dict(os.environ, e.env, clear=True), factory.Inbox(factory.Config(e.repo)) as current:
                 replace = current.replace
                 def interrupt(path, data):
                     if path == current.path:
@@ -2743,7 +2747,7 @@ class InboxTests(unittest.TestCase):
             self.assertEqual(json.loads(inbox.state_path.read_text())["seen"], 1)
             before = (inbox.path.read_bytes(), inbox.state_path.read_bytes())
             args = types.SimpleNamespace(cwd=str(e.repo), names=[], restart=False, fresh=False, timeout=1000, no_brief=False)
-            with patch.dict(os.environ, e.env), patch.object(factory, "ensure_operator", return_value="operator"), \
+            with patch.dict(os.environ, e.env, clear=True), patch.object(factory, "ensure_operator", return_value="operator"), \
                     patch.object(factory, "Team", side_effect=SystemExit("query failed")):
                 with self.assertRaisesRegex(SystemExit, "query failed"):
                     factory.cmd_up(args)
@@ -2776,7 +2780,7 @@ class StockTransportTests(unittest.TestCase):
             e.close("operator")
             calls = e.calls()
             blocked = {"FAKE_ROSTER_FAIL": "1", "FAKE_GET_FAIL": "1"}
-            with patch.dict(os.environ, e.env):
+            with patch.dict(os.environ, e.env, clear=True):
                 inbox = factory.Inbox(factory.Config(e.repo))
             self.assertFalse(inbox.state_path.exists())
             before = inbox.path.read_bytes()
@@ -2810,7 +2814,7 @@ class StockTransportTests(unittest.TestCase):
                      procs=[{"name": "codex", "argv": ["codex"]}])
             native_calls = e.root / "codex-invoked"
             (e.root / "bin/codex").write_text(f"#!/bin/sh\nprintf called > {shlex.quote(str(native_calls))}\n")
-            with patch.dict(os.environ, e.env):
+            with patch.dict(os.environ, e.env, clear=True):
                 draft = factory.Config(e.repo).messages / "lead-dev/report.md"
             draft.write_text("a Codex operator report")
             before = len(e.calls())
@@ -2862,7 +2866,7 @@ class WaitTests(unittest.TestCase):
                           operator={"name": "captain", "harness": "codex"})
         for case, operator, named_pane, explicit, named_default, unnamed_default in cases:
             for names, expected in ((["@lead-dev"], named_default), ([], unnamed_default)):
-                with self.subTest(case=case, names=names), Env(brief) as e, patch.dict(os.environ, e.env):
+                with self.subTest(case=case, names=names), Env(brief) as e, patch.dict(os.environ, e.env, clear=True):
                     cfg = factory.Config(e.repo)
                     args = types.SimpleNamespace(cwd=str(e.repo), names=names, seen=None, timeout=explicit, interval=0)
                     now = 0
@@ -2904,7 +2908,7 @@ class WaitTests(unittest.TestCase):
                 state["on_second_poll"] = {"name": "lead-dev", "status": "done"}
                 e.write_fake(state)
                 sleeps = []
-                with patch.dict(os.environ, e.env):
+                with patch.dict(os.environ, e.env, clear=True):
                     inbox = factory.Inbox(factory.Config(e.repo))
                 def after_poll(_):
                     sleeps.append(e.fake_state()["polls"])
@@ -2921,7 +2925,7 @@ class WaitTests(unittest.TestCase):
                 args = types.SimpleNamespace(cwd=str(e.repo), names=[], seen=None, timeout=None, interval=0)
                 out, err = io.StringIO(), io.StringIO()
                 # Patch factory's binding: changing time.sleep also intercepts subprocess timeout polling.
-                with patch.dict(os.environ, e.env), patch.object(factory, "HERDR", e.env["HERDR_BIN"]), \
+                with patch.dict(os.environ, e.env, clear=True), patch.object(factory, "HERDR", e.env["HERDR_BIN"]), \
                         patch.object(factory, "time", types.SimpleNamespace(sleep=after_poll)), \
                         contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
                     if event == "message":
@@ -3443,7 +3447,7 @@ class DownTests(unittest.TestCase):
             e.say("lead-dev", "operator", "acknowledged report")
             e.run("wait", "--seen", "1", "--timeout", "0")
             self.assertIn("queued message", e.say("lead-dev", "operator", "unread report").stdout)
-            with patch.dict(os.environ, e.env):
+            with patch.dict(os.environ, e.env, clear=True):
                 cfg = factory.Config(e.repo)
                 draft = cfg.messages / "pm" / "pending.md"
                 draft.write_text("unsent report")
@@ -3493,7 +3497,7 @@ class DownTests(unittest.TestCase):
             self.assertEqual(e.pane_of("reviewer"), caller)
             self.assertEqual(e.pane_of("pm"), other)
             self.assertEqual(len(e.calls("pane", "close")), 1)
-            with patch.dict(os.environ, e.env):
+            with patch.dict(os.environ, e.env, clear=True):
                 self.assertNotIn("pm", factory.past_sessions(factory.Config(e.repo)))
 
     def test_down_validates_before_closing_anything(self):
@@ -3531,7 +3535,7 @@ class DownTests(unittest.TestCase):
         with Env(UI) as e:
             e.run("up", "lead-dev", "--no-brief")
             e.set_session("lead-dev", {"agent": "codex", "kind": "id", "value": "cx-1"})
-            with patch.dict(os.environ, e.env):
+            with patch.dict(os.environ, e.env, clear=True):
                 (factory.Config(e.repo).cache / "sessions.jsonl").mkdir()
             p = e.run("down", check=False)
             self.assertNotEqual(p.returncode, 0)
@@ -3562,15 +3566,94 @@ class DownTests(unittest.TestCase):
             e.run("up", "lead-dev", "--no-brief")
             current = {"agent": "codex", "kind": "id", "value": "same"}
             e.set_session("lead-dev", current)
-            with patch.dict(os.environ, e.env):
+            with patch.dict(os.environ, e.env, clear=True):
                 cfg = factory.Config(e.repo)
                 stale = {"member": "lead-dev", **current, "agent": "claude", "kind": "path"}
                 (cfg.cache / "sessions.jsonl").write_text(json.dumps(stale) + '\n{"member":')
             e.run("down", "lead-dev")
-            with patch.dict(os.environ, e.env):
+            with patch.dict(os.environ, e.env, clear=True):
                 self.assertEqual(factory.past_sessions(cfg)["lead-dev"], {"member": "lead-dev", **current})
             e.run("up", "lead-dev")
             self.assertEqual(native(e.starts()["lead-dev"])[:2], ["resume", "same"])
+
+
+class TeamStateTests(unittest.TestCase):
+    def setUp(self):
+        self.base = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.root = self.base / "repo"
+        self.core = "0011223344556677"
+        self.enterContext(patch.dict(os.environ, {"XDG_CACHE_HOME": str(self.base / "cache")}))
+        self.state = factory.state_dir(self.root, self.core)
+        self.metadata = {"root": str(self.root), "team": factory.team_key(self.root), "core": self.core, "up": True}
+
+    def test_state_dir_uses_the_checkout_and_core(self):
+        self.assertEqual(self.state, self.base / "cache" / "factory-skill" /
+                         factory.team_key(self.root) / "00112233")
+        with patch.dict(os.environ, {"XDG_CACHE_HOME": str(self.base / "another-cache")}):
+            self.assertEqual(factory.open_log(self.state).state, self.state)
+        for invalid in ("relative", str(self.state.parent), str(self.state) + "/../00112233"):
+            with self.subTest(invalid=invalid), self.assertRaises(factory.Problem):
+                factory.open_log(invalid)
+        self.assertFalse(self.state.exists())
+
+    def test_read_team_missing_is_empty_and_unreadable_is_a_problem(self):
+        self.assertEqual(factory.read_team(self.state), {})
+        self.assertFalse(self.state.exists())
+        self.state.mkdir(parents=True)
+        self.assertEqual(factory.read_team(self.state), {})
+        path = self.state / "team.json"
+        for value in (b"torn", b'{"v":1}', json.dumps({"v": True, **self.metadata}).encode()):
+            with self.subTest(value=value), self.assertRaisesRegex(factory.Problem, "team.json cannot be read"):
+                path.write_bytes(value)
+                factory.read_team(self.state)
+        path.unlink()
+        outside = self.base / "outside.json"
+        outside.write_text(json.dumps({"v": 1, **self.metadata}))
+        path.symlink_to(outside)
+        with self.assertRaisesRegex(factory.Problem, "team.json cannot be read"):
+            factory.read_team(self.state)
+        self.assertTrue(path.is_symlink())
+
+    def test_update_team_keeps_other_keys_and_is_atomic(self):
+        expected = {"v": 1, **self.metadata, "layout": {"tab": "one"}}
+        self.assertEqual(factory.update_team(self.state, **self.metadata, layout={"tab": "one"}), expected)
+        self.assertEqual(factory.read_team(self.state), expected)
+        path = self.state / "team.json"
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        with patch.object(factory.os, "replace", side_effect=OSError("replace failed")):
+            with self.assertRaisesRegex(OSError, "replace failed"):
+                factory.update_team(self.state, up=False)
+        self.assertEqual(list(self.state.iterdir()), [path])
+        self.assertEqual(factory.read_team(self.state), expected)
+        self.assertEqual(factory.update_team(self.state, up=False), {**expected, "up": False})
+
+    def test_update_team_reset_replaces_unreadable(self):
+        self.state.mkdir(parents=True)
+        path = self.state / "team.json"
+        path.write_text("torn")
+        with self.assertRaises(factory.Problem):
+            factory.update_team(self.state, **self.metadata)
+        self.assertEqual(path.read_text(), "torn")
+        factory.update_team(self.state, reset=True, **self.metadata)
+        self.assertEqual(factory.read_team(self.state), {"v": 1, **self.metadata})
+
+    def test_log_refresh_rebuilds_an_edited_prefix(self):
+        log = factory.open_log(self.state)
+        log.add("pm", ["operator"], "one")
+        box = factory.Box(log.path)
+        log.refresh(box)
+        self.assertEqual(box.msgs[1]["text"], "one")
+        before = log.path.stat()
+        log.path.write_bytes(log.path.read_bytes().replace(b'"one"', b'"two"'))
+        os.utime(log.path, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000))
+        log.add("pm", ["operator"], "another message")
+        log.refresh(box)
+        self.assertEqual([msg["text"] for msg in box.msgs.values()], ["two", "another message"])
+        absent = factory.open_log(self.state.with_name("absent"))
+        partial = factory.Box.for_message(absent.path, 1, ["operator"], 10)
+        with self.assertRaisesRegex(ValueError, "partial box"):
+            absent.refresh(partial)
+        self.assertEqual(list(partial.msgs), [1])
 
 
 class LogTests(unittest.TestCase):
@@ -3782,13 +3865,13 @@ class LogTests(unittest.TestCase):
         self.log.add("lead-dev", ["operator"], "x")
         other = os.open(self.state, os.O_RDONLY | os.O_DIRECTORY)
         try:
-            with self.log._locked(exclusive=True):
+            with self.log.locked(exclusive=True):
                 with self.assertRaises(BlockingIOError):
                     factory.fcntl.flock(other, factory.fcntl.LOCK_EX | factory.fcntl.LOCK_NB)
                 with self.assertRaises(BlockingIOError):
                     factory.fcntl.flock(other, factory.fcntl.LOCK_SH | factory.fcntl.LOCK_NB)
             factory.fcntl.flock(other, factory.fcntl.LOCK_SH | factory.fcntl.LOCK_NB)   # readers share
-            with self.log._locked(exclusive=False):
+            with self.log.locked(exclusive=False):
                 pass
             factory.fcntl.flock(other, factory.fcntl.LOCK_UN)
         finally:
@@ -4429,7 +4512,7 @@ class LogFaultTests(unittest.TestCase):
         """The open state directory belongs to each operation, not to the shared Log."""
         self.log.add("pm", ["operator"], "second")
         results, entered = [], threading.Event()
-        with self.log._locked(exclusive=True):
+        with self.log.locked(exclusive=True):
             reader = threading.Thread(target=lambda: (entered.set(), results.append(self.log.read())))
             reader.start()
             entered.wait(5)
