@@ -2572,6 +2572,17 @@ class DownTests(unittest.TestCase):
 
 
 class ConfigTests(unittest.TestCase):
+    def test_v2_keys_are_accepted_and_ignored(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            (root / "FACTORY.md").write_text("# Team\n")
+            (root / "factory.toml").write_text(
+                'quiet_grace = false\nready_check = 42\nready_check_every = "ignored"\n'
+            )
+            cfg = factory.Config(root)
+            for name in ("quiet_grace", "ready_check", "ready_check_every"):
+                self.assertFalse(hasattr(cfg, name))
+
     @staticmethod
     def files(root):
         return {str(p.relative_to(root)): ("symlink", os.readlink(p)) if p.is_symlink() else p.read_bytes()
