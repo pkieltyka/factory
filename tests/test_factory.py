@@ -3955,7 +3955,7 @@ class LogFaultTests(unittest.TestCase):
         box.offset = end
         return box
 
-    def faults(self, writes=(), fsync_fail=(), truncate_fails=False, readback_fails=False):
+    def faults(self, writes=(), fsync_fail=(), truncate_fails=False, readback_fails=False, dirsync_fail=()):
         """Patch the module's os calls for the log only. writes: per os.write call, an int (bytes to write),
         "zero" or "fail"; later calls write fully. fsync_fail: which fsync calls (1-based) raise."""
         real_write, real_fsync, real_truncate, real_open = os.write, os.fsync, os.ftruncate, factory.private_open
@@ -3993,7 +3993,14 @@ class LogFaultTests(unittest.TestCase):
         stack.enter_context(patch.object(factory.os, "fsync", fsync))
         stack.enter_context(patch.object(factory.os, "ftruncate", ftruncate))
         stack.enter_context(patch.object(factory, "private_open", private_open))
-        stack.enter_context(patch.object(factory.Log, "_sync_directory", lambda log: None))
+        dirsyncs = []
+
+        def sync_directory(log):
+            dirsyncs.append(1)
+            if len(dirsyncs) in dirsync_fail:
+                self.failed = True
+                raise OSError(5, "Input/output error")
+        stack.enter_context(patch.object(factory.Log, "_sync_directory", sync_directory))
         return stack
 
     def committed(self):
@@ -4036,6 +4043,16 @@ class LogFaultTests(unittest.TestCase):
             self.log.add("pm", ["operator"], "x")
         self.assertFalse(raised.exception.partial)
         self.assertEqual(self.log.path.read_bytes(), before)
+
+    def test_directory_sync_failure(self):
+        before = self.log.path.read_bytes()
+        with self.faults(dirsync_fail=(1,)), self.assertRaises(factory.NotStored) as raised:
+            self.log.add("pm", ["operator"], "msg directory sync fails")
+        self.assertFalse(raised.exception.partial)
+        self.assertEqual(self.log.path.read_bytes(), before)
+        with self.faults(dirsync_fail=(2,), truncate_fails=True):
+            ident, _, warning = self.log.add("pm", ["operator"], "ok directory sync fails")
+        self.assertEqual((ident, warning), (2, factory.STORED_WARNING))
 
     def test_truncate_succeeds_but_its_sync_fails(self):
         for failing in ((1, 2), (2, 3)):   # the msg append, then the ok append
@@ -4097,6 +4114,7 @@ class LogFaultTests(unittest.TestCase):
                 self.assertRaises(OSError) as raised:
             self.log.add("pm", ["operator"], "x")
         self.assertNotIsInstance(raised.exception, factory.NotStored)
+        self.assertIsInstance(raised.exception.__cause__, OSError)
         message = str(raised.exception)
         self.assertIn("message 2", message)
         self.assertIn(str(self.log.path), message)
@@ -4114,11 +4132,15 @@ class LogFaultTests(unittest.TestCase):
             ident, _, warning = self.log.add("pm", ["operator"], "x")
         self.assertEqual((ident, warning), (2, None))
         self.assertEqual(self.committed(), ([1, 2], 0))
-        for leftover in self.state.glob("log.check.*.tmp"):
-            leftover.unlink()
-        with patch.object(factory.Log, "_snapshot", autospec=True, side_effect=factory.Log._snapshot) as snapshot:
+        leftover = list(self.state.glob("log.check.*.tmp"))
+        self.assertEqual(len(leftover), 1)
+        with patch.object(factory.Log, "_snapshot", autospec=True,
+                          side_effect=factory.Log._snapshot) as snapshot:
             self.assertEqual(factory.Log(self.state).add("pm", ["operator"], "y")[0], 3)
-        self.assertTrue(any(c.args[1:] == (0,) for c in snapshot.call_args_list))
+        self.assertTrue(any(c.args[1:] == (0,) for c in snapshot.call_args_list))   # the stale proof cost a read
+        check = json.loads(self.log.check_path.read_text())            # unique temp names: publishing works again
+        self.assertEqual((check["size"], check["last"]), (self.log.path.stat().st_size, 3))
+        leftover[0].unlink()
 
     # outcomes under faults
 
@@ -4201,6 +4223,52 @@ class LogFaultTests(unittest.TestCase):
         self.assertEqual(raised.exception.line, 3)
         self.assertEqual(self.log.path.read_bytes(), before)
 
+    def test_a_stale_box_is_rebuilt_after_an_in_place_edit(self):
+        """A matching checkpoint written after someone else's full validation proves nothing about an older view."""
+        self.log.add("pm", ["alice", "other"], "x")
+        a = self.box()
+        self.assertTrue(self.log.out(a, 2, "alice", "sending", term="t1"))
+        data = self.log.path.read_bytes()
+        edited = data.replace(b'"to":"alice","o":"sending"', b'"to":"other","o":"sending"')
+        self.assertEqual(len(edited), len(data))
+        info = self.log.path.stat()
+        with open(self.log.path, "r+b") as f:     # same inode, same size
+            f.write(edited)
+        os.utime(self.log.path, ns=(info.st_atime_ns, info.st_mtime_ns + 1000))
+        factory.Log(self.state).add("pm", ["operator"], "b validates and publishes a checkpoint")
+        self.assertFalse(self.log.out(a, 2, "alice", "delivered", term="t1"))   # rebuilt: alice is queued
+        box = self.box()
+        self.assertEqual((box.outcome(2, "alice")["o"], box.outcome(2, "other")["o"]), ("queued", "sending"))
+
+    def test_one_log_shared_by_threads(self):
+        """The open state directory belongs to each operation, not to the shared Log."""
+        self.log.add("pm", ["operator"], "second")
+        results, entered = [], threading.Event()
+        with self.log._locked(exclusive=True):
+            reader = threading.Thread(target=lambda: (entered.set(), results.append(self.log.read())))
+            reader.start()
+            entered.wait(5)
+            time.sleep(0.2)                    # the reader is now blocked on the shared lock
+        reader.join(10)
+        self.assertEqual(len(results[0][0]), 4)
+        self.assertEqual(self.log.add("pm", ["operator"], "third")[0], 3)
+        self.assertEqual(list(pathlib.Path.cwd().glob("log.jsonl")), [])
+
+    def test_a_reader_racing_the_first_writer_looks_again(self):
+        """Lock missing, then the writer creates lock, log and checkpoint: the reader retries, not 'orphan'."""
+        fresh = factory.Log(self.base / "team" / "fresh")
+        real_open, calls = factory.private_open, []
+
+        def racing(path, flags, fix_mode=True, dir_fd=None):
+            if path == "lock" and not calls:
+                calls.append(path)
+                factory.Log(fresh.state).add("pm", ["operator"], "the first writer")
+                raise FileNotFoundError(path)
+            return real_open(path, flags, fix_mode, dir_fd)
+        fresh.state.mkdir(mode=0o700)
+        with patch.object(factory, "private_open", racing):
+            self.assertEqual(len(fresh.read()[0]), 2)
+
     # processes
 
     def child(self, *args):
@@ -4210,7 +4278,8 @@ class LogFaultTests(unittest.TestCase):
     def test_concurrent_writers_get_distinct_ids(self):
         children = [self.child("adds", "25") for _ in range(8)]
         for child in children:
-            self.assertEqual(child.wait(timeout=120), 0)
+            child.communicate(timeout=120)
+            self.assertEqual(child.returncode, 0)
         records, _ = self.log.read()
         msgs = [r["id"] for r in records if r["t"] == "msg"]
         self.assertEqual(msgs, list(range(1, 202)))
@@ -4234,6 +4303,317 @@ class LogFaultTests(unittest.TestCase):
         self.killed(2)
         self.assertEqual(self.committed(), ([1, 2], 0))
         self.assertEqual(self.log.add("pm", ["operator"], "after")[0], 3)
+
+
+class LogOutcomeTests(unittest.TestCase):
+    """Outcomes, derived facts and message files (phase_3.md §§5-6, §8 step 3)."""
+
+    def setUp(self):
+        self.base = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.state = self.base / "team" / "core"
+        self.log = factory.Log(self.state)
+
+    def box(self):
+        records, end = self.log.read()
+        box = factory.Box(self.log.path)
+        box.apply(records)
+        box.offset = end
+        return box
+
+    def raw(self, *records):
+        with self.log.path.open("ab") as f:
+            for rec in records:
+                f.write((json.dumps({"at": "2026-11-26T17:00:01Z", **rec}) + "\n").encode())
+
+    # transitions
+
+    def test_stale_boxes_cannot_repeat_a_claim_or_finalize_twice(self):
+        self.log.add("pm", ["operator"], "x")
+        one, two = self.box(), self.box()
+        self.assertTrue(self.log.out(one, 1, "operator", "sending", term="t1"))
+        self.assertFalse(self.log.out(two, 1, "operator", "sending", term="t1"))   # refreshed: already claimed
+        self.assertEqual(two.outcome(1, "operator")["o"], "sending")
+        self.assertTrue(self.log.out(two, 1, "operator", "delivered", term="t1", started=True, turn=2))
+        self.assertFalse(self.log.out(one, 1, "operator", "unconfirmed", why="keeper restarted during the send"))
+        self.assertEqual(self.box().outcome(1, "operator")["o"], "delivered")
+
+    def test_transition_table(self):
+        cases = (
+            (("queued", {"why": "blocked"}), ("queued", {"why": "gone"}), True),
+            (("queued", {"why": "blocked"}), ("queued", {"why": "blocked"}), False),
+            (("sending", {"term": "t1"}), ("queued", {"why": "blocked"}), True),
+            (("sending", {"term": "t1"}), ("dropped", {"why": "stopped by down"}), True),
+            (("queued", {"why": "gone"}), ("dropped", {"why": "stopped by down"}), True),
+            (("queued", {"why": "gone"}), ("delivered", {"term": "t1"}), False),
+            (("queued", {"why": "gone"}), ("unconfirmed", {"why": "lost"}), False),
+            (("sending", {"term": "t1"}), ("sending", {"term": "t1"}), False),
+        )
+        for first, then, written in cases:
+            with self.subTest(first=first, then=then):
+                self.setUp()
+                self.log.add("pm", ["operator"], "x")
+                box = self.box()
+                self.assertTrue(self.log.out(box, 1, "operator", first[0], **first[1]))
+                self.assertEqual(self.log.out(box, 1, "operator", then[0], **then[1]), written)
+        self.setUp()
+        self.log.add("pm", ["operator"], "x")
+        box = self.box()
+        self.log.out(box, 1, "operator", "dropped", why="stopped by down")
+        for o, extra in (("queued", {"why": "gone"}), ("sending", {}), ("dropped", {"why": "again"})):
+            with self.subTest(after="dropped", o=o):
+                self.assertFalse(self.log.out(box, 1, "operator", o, **extra))
+
+    def test_invalid_outcome_calls_raise(self):
+        self.log.add("pm", ["operator"], "x")
+        box = self.box()
+        for args, kwargs in (((9, "operator", "sending"), {}), ((1, "reviewer", "sending"), {}),
+                             ((1, "operator", "lost"), {}), ((1, "operator", "sending"), {"why": "x"}),
+                             ((1, "operator", "queued"), {"why": "busy"}), ((1, "operator", "queued"), {}),
+                             ((1, "operator", "dropped"), {"why": " "}),
+                             ((1, "operator", "delivered"), {"started": 1})):
+            with self.subTest(args=args, kwargs=kwargs), self.assertRaises(ValueError):
+                self.log.out(box, *args, **kwargs)
+        partial = factory.Box.for_message(self.log.path, 1, ["operator"], box.offset)
+        with self.assertRaisesRegex(ValueError, "partial"):
+            self.log.out(partial, 1, "operator", "sending")
+
+    def test_drop_queued_drops_only_queued_pairs_of_those_names(self):
+        self.log.add("pm", ["a", "b"], "one")
+        self.log.add("pm", ["a"], "two")
+        box = self.box()
+        self.log.out(box, 1, "a", "sending", term="t1")
+        stale = self.box()
+        self.log.out(box, 2, "a", "sending", term="t1")            # after the stale box was built
+        self.assertEqual(self.log.drop_queued(stale, {"a"}), 0)    # both of @a's pairs are sending now
+        self.assertEqual(self.log.drop_queued(stale, {"a", "b"}), 1)
+        self.assertEqual(self.log.drop_queued(stale, {"a", "b"}), 0)
+        fresh = self.box()
+        self.assertEqual([fresh.outcome(1, "a")["o"], fresh.outcome(1, "b")["o"], fresh.outcome(2, "a")["o"]],
+                         ["sending", "dropped", "sending"])
+
+    def test_text_is_dropped_when_final_but_references_still_hold(self):
+        self.log.add("pm", ["operator", "reviewer"], "text")
+        box = self.box()
+        for to in ("operator", "reviewer"):
+            self.log.out(box, 1, to, "dropped", why="stopped by down")
+        self.assertNotIn("text", box.msgs[1])
+        self.assertEqual(box.msgs[1]["to"], ["operator", "reviewer"])
+        self.assertFalse(self.log.out(box, 1, "operator", "sending"))
+        with self.assertRaises(ValueError):
+            self.log.out(box, 1, "pm", "sending")
+        self.assertEqual(self.log.read()[0][0]["text"], "text")    # the raw records keep it
+
+    # replay of what is on disk
+
+    def test_forbidden_recorded_transitions_are_damage(self):
+        sending = {"t": "out", "id": 1, "to": "operator", "o": "sending"}
+        delivered = {"t": "out", "id": 1, "to": "operator", "o": "delivered"}
+        cases = (
+            ([delivered], 3), ([{"t": "out", "id": 1, "to": "operator", "o": "unconfirmed", "why": "x"}], 3),
+            ([sending, sending], 4), ([sending, delivered, delivered], 5),
+            ([sending, delivered, {"t": "out", "id": 1, "to": "operator", "o": "queued", "why": "gone"}], 5),
+        )
+        for history, line in cases:
+            with self.subTest(history=history):
+                self.setUp()
+                self.log.add("pm", ["operator"], "x")
+                self.raw(*history)
+                before = self.log.path.read_bytes()
+                with self.assertRaises(factory.LogDamage) as raised:
+                    self.log.read()
+                self.assertEqual(raised.exception.line, line)
+                with self.assertRaises(factory.LogDamage):
+                    self.log.add("pm", ["operator"], "y")
+                self.assertEqual(self.log.path.read_bytes(), before)
+
+    def test_a_repeated_queued_reason_replays_as_a_no_op(self):
+        self.log.add("pm", ["operator"], "x")
+        self.raw({"t": "out", "id": 1, "to": "operator", "o": "queued", "why": "waiting"},
+                 {"t": "out", "id": 1, "to": "operator", "o": "queued", "why": "blocked"},
+                 {"t": "out", "id": 1, "to": "operator", "o": "queued", "why": "blocked"})
+        self.assertEqual(self.box().outcome(1, "operator")["why"], "blocked")
+
+    def test_partial_box_follows_one_message(self):
+        _, offset, _ = self.log.add("pm", ["operator", "reviewer"], "x")
+        self.log.add("pm", ["operator"], "other")
+        full = self.box()
+        self.log.out(full, 2, "operator", "sending", term="t1")
+        self.log.out(full, 1, "reviewer", "sending", term="t2")
+        partial = factory.Box.for_message(self.log.path, 1, ["operator", "reviewer"], offset)
+        records, end = self.log.read(offset)
+        partial.apply(records)
+        self.assertEqual([partial.outcome(1, r)["o"] for r in ("operator", "reviewer")], ["queued", "sending"])
+        self.assertEqual(sorted(partial.msgs), [1])
+        wrong = factory.Box.for_message(self.log.path, 1, ["operator"], offset)
+        with self.assertRaisesRegex(factory.LogDamage, "non-recipient"):
+            wrong.apply(records)
+
+    # derived facts
+
+    def test_last_to_and_last_from(self):
+        self.log.add("pm", ["lead-dev"], "one")
+        self.log.add("operator", ["lead-dev"], "two")
+        self.log.add("operator", ["lead-dev"], "three")
+        box = self.box()
+        for ident in (1, 2):
+            self.log.out(box, ident, "lead-dev", "sending", term="t1")
+            self.log.out(box, ident, "lead-dev", "delivered", term="t1")
+        self.assertEqual(box.last_to("lead-dev")["id"], 2)            # 3 is not delivered
+        self.assertEqual(box.last_to("lead-dev", sender="pm")["id"], 1)
+        self.assertIsNone(box.last_to("reviewer"))
+        self.assertEqual(box.last_from("operator")["id"], 3)
+        self.raw({"t": "msg", "id": 4, "from": "operator", "to": ["lead-dev"], "kind": "say", "text": "uncommitted"})
+        self.assertEqual(self.box().last_from("operator")["id"], 3)
+
+    def test_briefed_counts_delivered_briefs_only(self):
+        for to in ("a", "b", "c"):
+            self.log.add("operator", [to], "brief", kind="brief")
+        self.log.add("operator", ["d"], "not a brief")
+        box = self.box()
+        for ident, to, term, final in ((1, "a", "t1", ("delivered", {})), (2, "b", "t2", ("unconfirmed", {"why": "x"})),
+                                       (3, "c", "t3", ("dropped", {"why": "stopped by down"})),
+                                       (4, "d", "t4", ("delivered", {}))):
+            self.log.out(box, ident, to, "sending", term=term)
+            self.log.out(box, ident, to, final[0], term=term, **final[1])
+        self.assertEqual(box.briefed(), {"t1"})
+
+    def test_member_and_team_notes(self):
+        def note(meta):
+            return self.log.add("factory", ["operator"], "note", kind="note", meta=meta)[0]
+        note({"what": "blocked:permission", "about": "a", "term": "t1", "since": 10})
+        note({"what": "error", "about": "a", "term": "t1", "since": 20})
+        note({"what": "exit", "about": "b", "term": "t2"})
+        quiet_old = note({"what": "quiet", "turns": {"a": 1}})
+        quiet_new = note({"what": "quiet", "turns": {"a": 2}})
+        ready = note({"what": "ready", "digest": "abc"})
+        box = self.box()
+        self.assertEqual(box.last_note("t1")["what"], "error")
+        self.assertEqual(box.last_note("t2"), {"what": "exit", "about": "b", "term": "t2"})
+        self.assertIsNone(box.last_note("t9"))
+        self.assertEqual(box.quiet_note()["id"], quiet_new)
+        self.log.out(box, quiet_new, "operator", "dropped", why="work resumed")
+        self.assertEqual(box.quiet_note()["id"], quiet_old)
+        self.assertEqual(box.ready_note()["id"], ready)
+        self.log.out(box, ready, "operator", "dropped", why="operator could not take it")
+        self.assertIsNone(box.ready_note())
+
+    # message files
+
+    def message_file(self, sender, name="op-done-1.md", text="hello"):
+        directory = self.state / "messages" / sender
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        path = directory / name
+        path.write_text(text)
+        return path
+
+    def deliver(self, box, ident, *recipients):
+        for to in recipients:
+            self.log.out(box, ident, to, "sending", term="t1")
+            self.log.out(box, ident, to, "delivered", term="t1")
+
+    def test_managed_file_rules(self):
+        self.log.add("pm", ["operator"], "seed")
+        good = self.message_file("lead-dev")
+        self.assertTrue(factory.managed_file(self.state, "lead-dev", good))
+        outside = self.base / "op-done-1.md"
+        outside.write_text("x")
+        bad_name = self.message_file("lead-dev", "notes.final.md")
+        for path, sender in ((outside, "lead-dev"), (good, "reviewer"), (bad_name, "lead-dev"),
+                             (self.state / "messages" / "lead-dev" / ".." / "lead-dev" / good.name, "lead-dev"),
+                             (pathlib.Path("messages/lead-dev") / good.name, "lead-dev"),
+                             (self.state / "messages" / "lead-dev" / "missing-1.md", "lead-dev")):
+            with self.subTest(path=path, sender=sender):
+                self.assertFalse(factory.managed_file(self.state, sender, path))
+        link = self.state / "messages" / "linked"
+        link.symlink_to(self.state / "messages" / "lead-dev")
+        self.assertFalse(factory.managed_file(self.state, "linked", link / good.name))
+
+    def test_file_removed_only_when_every_recipient_has_it(self):
+        path = self.message_file("lead-dev")
+        self.log.add("lead-dev", ["operator", "reviewer"], "x", file=str(path))
+        box = self.box()
+        self.deliver(box, 1, "operator")
+        self.assertIsNone(self.log.remove_delivered_file(box, 1))
+        self.assertTrue(path.exists())
+        self.deliver(box, 1, "reviewer")
+        self.assertIsNone(self.log.remove_delivered_file(box, 1))
+        self.assertFalse(path.exists())
+        self.assertIsNone(self.log.remove_delivered_file(box, 1))   # already gone: no warning
+
+    def test_unconfirmed_or_dropped_keeps_the_file(self):
+        path = self.message_file("lead-dev")
+        self.log.add("lead-dev", ["operator", "reviewer"], "x", file=str(path))
+        box = self.box()
+        self.deliver(box, 1, "operator")
+        self.log.out(box, 1, "reviewer", "dropped", why="stopped by down")
+        self.assertIsNone(self.log.remove_delivered_file(box, 1))
+        self.assertTrue(path.exists())
+
+    def test_a_newer_use_of_the_path_decides(self):
+        path = self.message_file("lead-dev")
+        self.log.add("lead-dev", ["operator"], "old", file=str(path))
+        self.log.add("lead-dev", ["operator"], "new", file=str(path))
+        box = self.box()
+        self.deliver(box, 1, "operator")
+        self.log.remove_delivered_file(box, 1)
+        self.assertTrue(path.exists())
+        self.deliver(box, 2, "operator")
+        self.log.remove_delivered_file(box, 2)
+        self.assertFalse(path.exists())
+
+    def test_external_or_symlinked_paths_are_never_removed(self):
+        outside = self.base / "op-done-1.md"
+        outside.write_text("mine")
+        self.log.add("lead-dev", ["operator"], "x", file=str(outside))
+        real = self.base / "elsewhere"
+        real.mkdir()
+        (real / "op-done-2.md").write_text("theirs")
+        (self.state / "messages").mkdir(mode=0o700)
+        (self.state / "messages" / "pm").symlink_to(real)
+        self.log.add("pm", ["operator"], "y", file=str(self.state / "messages" / "pm" / "op-done-2.md"))
+        box = self.box()
+        self.deliver(box, 1, "operator")
+        self.deliver(box, 2, "operator")
+        self.assertIsNone(self.log.remove_delivered_file(box, 1))
+        self.assertIsNone(self.log.remove_delivered_file(box, 2))
+        self.assertEqual(((self.base / "op-done-1.md").read_text(), (real / "op-done-2.md").read_text()),
+                         ("mine", "theirs"))
+
+    def test_unlink_failure_is_a_warning(self):
+        path = self.message_file("lead-dev")
+        self.log.add("lead-dev", ["operator"], "x", file=str(path))
+        box = self.box()
+        self.deliver(box, 1, "operator")
+        with patch.object(factory.os, "unlink", side_effect=PermissionError(13, "Permission denied")):
+            warning = self.log.remove_delivered_file(box, 1)
+        self.assertIn(str(path), warning)
+        self.assertEqual(box.outcome(1, "operator")["o"], "delivered")
+
+    def test_leftovers(self):
+        delivered = self.message_file("lead-dev", "a-1.md")
+        pending = self.message_file("lead-dev", "b-2.md")
+        never = self.message_file("pm", "c-3.md")
+        self.message_file("pm", "odd.name.md")
+        (self.state / "messages" / "pm" / "link-4.md").symlink_to(never)
+        self.log.add("lead-dev", ["operator"], "a", file=str(delivered))
+        self.log.add("lead-dev", ["operator", "reviewer"], "b", file=str(pending))
+        box = self.box()
+        self.deliver(box, 1, "operator")
+        self.deliver(box, 2, "operator")
+        self.log.out(box, 2, "reviewer", "queued", why="blocked")
+        now = time.time() + 180
+        rows, warnings = self.log.leftovers(now=now)
+        self.assertEqual(warnings, [])
+        self.assertFalse(delivered.exists())
+        self.assertEqual([(r["sender"], pathlib.Path(r["path"]).name, r["id"]) for r in rows],
+                         [("lead-dev", "b-2.md", 2), ("pm", "c-3.md", None), ("pm", "odd.name.md", None)])
+        self.assertEqual(rows[0]["outcomes"], {"operator": "delivered", "reviewer": "queued (blocked)"})
+        lines = factory.format_leftovers(rows)
+        self.assertRegex(lines[0], r"^leftover message file for @lead-dev \(3 min old\): .*b-2\.md: message 2: "
+                                   r"@operator delivered, @reviewer queued \(blocked\)$")
+        self.assertTrue(lines[1].endswith("c-3.md: never stored"))
+        self.assertEqual(lines[-1], "Check before resending or discarding.")
+        self.assertEqual(factory.format_leftovers([]), [])
 
 
 class LiveToolTests(unittest.TestCase):

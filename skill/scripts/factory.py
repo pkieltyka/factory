@@ -23,6 +23,7 @@ import pathlib
 import re
 import selectors
 import shlex
+import secrets
 import shutil
 import stat
 import subprocess
@@ -681,7 +682,7 @@ class Box:
         self.highest = 0                    # highest msg id seen, committed or not
         self._open = None                   # the msg record just read, waiting for its ok
         self._only = None                   # for_message: the one id this partial view follows
-        self._ino = None                    # the log file this box was last proven against, by Log.out
+        self._lineage = None                # the checkpoint lineage this box's view was proven in, by Log.out
         self._damage = None                 # set when an apply failed: the box is unusable until rebuilt
 
     @classmethod
@@ -765,6 +766,58 @@ class Box:
         return [(msg, r) for ident, msg in sorted(self.msgs.items()) for r in msg["to"]
                 if (to is None or r == to) and self.outcome(ident, r)["o"] not in FINAL]
 
+    # derived facts (message_log.md "Derived facts")
+
+    def last_to(self, name, sender=None):
+        """The newest committed message delivered to name (from sender, when given)."""
+        self._usable()
+        for ident in sorted(self.msgs, reverse=True):
+            msg = self.msgs[ident]
+            if (name in msg["to"] and (sender is None or msg["from"] == sender)
+                    and self.outcome(ident, name)["o"] == "delivered"):
+                return msg
+        return None
+
+    def last_from(self, name):
+        """The newest committed message sent by name."""
+        self._usable()
+        for ident in sorted(self.msgs, reverse=True):
+            if self.msgs[ident].get("from") == name:
+                return self.msgs[ident]
+        return None
+
+    def briefed(self):
+        """Terminal IDs that a brief was delivered to: a member terminal is ready when it is in this set."""
+        self._usable()
+        return {rec["term"] for (ident, _), rec in self.outcomes.items()
+                if rec["o"] == "delivered" and "term" in rec and self.msgs[ident].get("kind") == "brief"}
+
+    def last_note(self, term):
+        """The meta of the newest committed member note about that terminal."""
+        self._usable()
+        for ident in sorted(self.msgs, reverse=True):
+            msg = self.msgs[ident]
+            if msg.get("kind") == "note" and (msg.get("meta") or {}).get("term") == term:
+                return msg["meta"]
+        return None
+
+    def _note(self, what):
+        self._usable()
+        for ident in sorted(self.msgs, reverse=True):
+            msg = self.msgs[ident]
+            if (msg.get("kind") == "note" and (msg.get("meta") or {}).get("what") == what
+                    and all(self.outcome(ident, r)["o"] != "dropped" for r in msg["to"])):
+                return msg
+        return None
+
+    def quiet_note(self):
+        """The newest quiet note that was not dropped."""
+        return self._note("quiet")
+
+    def ready_note(self):
+        """The newest ready-work note that was not dropped."""
+        return self._note("ready")
+
 
 class Log:
     """The team's append-only message log in <state>/log.jsonl.
@@ -779,7 +832,15 @@ class Log:
         self.path = self.state / self.LOG
         self.lock_path = self.state / self.LOCK
         self.check_path = self.state / self.CHECK
-        self._dir = None
+        self._local = threading.local()     # the open state directory and lineage belong to one operation
+
+    @property
+    def _dir(self):
+        return getattr(self._local, "dir", None)
+
+    @_dir.setter
+    def _dir(self, fd):
+        self._local.dir = fd
 
     # ---------------------------------------------------------------- locking and reading
 
@@ -808,7 +869,8 @@ class Log:
                 raise
             return None
         except OSError as error:
-            raise OSError(f"not a directory (or a symbolic link): {self.state}") from error
+            raise OSError(f"cannot open the state directory {self.state} (a symbolic link or not a directory?):"
+                          f" {error}") from error
         if create and stat.S_IMODE(os.fstat(fd).st_mode) != 0o700:
             os.fchmod(fd, 0o700)
         return fd
@@ -840,12 +902,15 @@ class Log:
             try:
                 return self._open(self.LOCK, os.O_RDONLY, fix_mode=False)
             except FileNotFoundError:
-                if not self._lexists(self.LOG):
-                    if self._lexists(self.CHECK):
-                        raise LogDamage(self.path, None, "log.jsonl is missing but log.check remains")
+                log, check = self._lexists(self.LOG), self._lexists(self.CHECK)
+                if not (log or check):
                     return None          # nothing written yet: the empty log
-                # A writer creates the lock before the log; seeing the log now means the lock exists. Retry once.
-        raise LogDamage(self.path, None, "the log exists but its lock file is missing")
+                if attempt == 2:
+                    raise LogDamage(self.path, None, "the log exists but its lock file is missing" if log
+                                    else "log.jsonl is missing but log.check remains") from None
+                # A writer creates the lock before the log and the checkpoint: one of them appearing while the
+                # lock looked missing means a writer was starting. Look again.
+        return None
 
     def _snapshot(self, offset):
         """(records, end) from offset, with the lock held. offset 0 also replays a full box to check references."""
@@ -902,7 +967,8 @@ class Log:
         return info
 
     def _checkpoint(self, info):
-        """The highest id if log.check proves this exact file was validated, else None. An unsafe log.check raises."""
+        """log.check when it proves this exact file was validated ({"last", "lineage"}), else None.
+        An unsafe log.check raises."""
         try:
             fd = self._open(self.CHECK, os.O_RDONLY, fix_mode=False)
         except FileNotFoundError:
@@ -916,32 +982,36 @@ class Log:
         except ValueError:
             return None
         fields = ("ino", "size", "mtime_ns", "last")
-        if not (isinstance(check, dict) and all(type(check.get(k)) is int and check[k] >= 0 for k in fields)):
+        if not (isinstance(check, dict) and all(type(check.get(k)) is int and check[k] >= 0 for k in fields)
+                and isinstance(check.get("lineage"), str) and check["lineage"]):
             return None
         if (check["ino"], check["size"], check["mtime_ns"]) != (info.st_ino, info.st_size, info.st_mtime_ns):
             return None
-        return check["last"]
+        return check
 
     def _write_checkpoint(self, last):
-        """Publish a fresh proof of validation; a failure only costs the next writer one full read."""
-        name = f"{self.CHECK}.{os.getpid()}.{threading.get_ident()}.tmp"
+        """Publish a fresh proof of validation; a failure only costs the next writer one full read.
+        lineage names an unbroken run of appends by writers since the last full validation."""
+        name, created = f"{self.CHECK}.{secrets.token_hex(8)}.tmp", False
         try:
             info = self._stat()
             if info is None:
                 return
             data = json.dumps({"ino": info.st_ino, "size": info.st_size, "mtime_ns": info.st_mtime_ns,
-                               "last": last}).encode()
+                               "last": last, "lineage": self._local.lineage}).encode()
             fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=self._dir)
+            created = True
             with os.fdopen(fd, "wb") as f:
                 f.write(data)
             os.replace(name, self.CHECK, src_dir_fd=self._dir, dst_dir_fd=self._dir)
             return
         except OSError:
             pass
-        try:
-            os.unlink(name, dir_fd=self._dir)
-        except OSError:
-            pass
+        if created:
+            try:
+                os.unlink(name, dir_fd=self._dir)
+            except OSError:
+                pass
 
     def _full_box(self):
         records, end = self._snapshot(0)
@@ -950,12 +1020,18 @@ class Log:
         box.offset = end
         return box
 
+    def _prove(self, info):
+        """The checkpoint if it proves the file, else None; records the lineage the next append continues."""
+        check = self._checkpoint(info)
+        self._local.lineage = check["lineage"] if check else secrets.token_hex(8)
+        return check
+
     def _prefix(self):
         """The highest message id, after proving everything already in the log is valid (lock held)."""
         info = self._stat()
-        last = self._checkpoint(info)
-        if last is not None:
-            return last
+        check = self._prove(info)
+        if check is not None:
+            return check["last"]
         if info is None:
             return 0
         return self._full_box().highest
@@ -1047,11 +1123,12 @@ class Log:
              "queued": ("queued", "sending"), "dropped": ("queued", "sending")}
 
     def _refresh(self, box):
-        """Bring box up to the current, validated file (lock held). A box this Log has not proven is rebuilt."""
+        """Bring box up to the current, validated file (lock held). Only a box whose view belongs to the
+        checkpoint's lineage (nothing but writers' appends since) refreshes its tail; any other is rebuilt."""
         info = self._stat()
-        proven = (box._damage is None and self._checkpoint(info) is not None
-                  and box._ino == (info.st_ino if info else None))
-        if proven and box.offset <= info.st_size:
+        check = self._prove(info)
+        if box._damage is None and check is not None and box._lineage == check["lineage"] \
+                and box.offset <= info.st_size:
             records, end = self._snapshot(box.offset)
             box.apply(records)
             box.offset = end
@@ -1059,7 +1136,7 @@ class Log:
         records, end = self._snapshot(0)
         box._reset()
         box.apply(records)
-        box.offset, box._ino = end, info.st_ino if info else None
+        box.offset, box._lineage = end, self._local.lineage
 
     def _check_out(self, box, ident, to, o, extra):
         if box._only is not None:
@@ -1094,7 +1171,7 @@ class Log:
         if status == "visible" and o == "sending":
             raise NotStored(False, "the sending record is not durable: do not send")
         box.apply([rec])
-        box.offset = end
+        box.offset, box._lineage = end, self._local.lineage
         self._write_checkpoint(box.highest)
         return True
 
@@ -1104,6 +1181,157 @@ class Log:
         with self._locked(exclusive=True):
             self._refresh(box)
             return self._out_locked(box, rec)
+
+    def drop_queued(self, box, names, why="stopped by down"):
+        """down's batch: drop every pair still queued to one of names, in one locked section; the count written."""
+        names = set(names)
+        with self._locked(exclusive=True):
+            self._refresh(box)
+            written = 0
+            for msg, to in box.pending():
+                if to in names and box.outcome(msg["id"], to)["o"] == "queued":
+                    rec = self._check_out(box, msg["id"], to, "dropped", {"why": why})
+                    written += self._out_locked(box, rec)
+            return written
+
+    # ---------------------------------------------------------------- message files (§8.7)
+
+    def _sender_dir(self, sender):
+        """A no-follow descriptor of messages/<sender> inside the state directory (lock held), or None."""
+        try:
+            messages = os.open("messages", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=self._dir)
+        except (FileNotFoundError, NotADirectoryError):
+            return None
+        except OSError as error:
+            raise OSError(f"not a directory (or a symbolic link): {self.state / 'messages'}") from error
+        try:
+            return os.open(sender, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=messages)
+        except (FileNotFoundError, NotADirectoryError):
+            return None
+        except OSError as error:
+            raise OSError(f"not a directory (or a symbolic link): {self.state / 'messages' / sender}") from error
+        finally:
+            os.close(messages)
+
+    def _unlink_in(self, sender_fd, name, path):
+        """Remove one regular file by name relative to its sender directory: None, or a warning."""
+        try:
+            if not stat.S_ISREG(os.stat(name, dir_fd=sender_fd, follow_symlinks=False).st_mode):
+                return None
+            os.unlink(name, dir_fd=sender_fd)
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            return f"could not remove {path}: {error}"
+        return None
+
+    @staticmethod
+    def _newest_use(box, sender, path):
+        for ident in sorted(box.msgs, reverse=True):
+            msg = box.msgs[ident]
+            if msg.get("from") == sender and msg.get("file") == path:
+                return msg
+        return None
+
+    def remove_delivered_file(self, box, ident):
+        """After a delivered receipt: unlink the message's managed file once every recipient has it.
+        Returns a warning naming the path when the unlink failed, else None."""
+        with self._locked(exclusive=True):
+            self._refresh(box)
+            msg = box.msgs.get(ident)
+            if msg is None or "file" not in msg or self._newest_use(box, msg["from"], msg["file"]) is not msg:
+                return None
+            if not all(box.outcome(ident, r)["o"] == "delivered" for r in msg["to"]):
+                return None
+            if not managed_file(self.state, msg["from"], pathlib.Path(msg["file"])):
+                return None
+            sender_fd = self._sender_dir(msg["from"])
+            if sender_fd is None:
+                return None
+            try:
+                return self._unlink_in(sender_fd, os.path.basename(msg["file"]), msg["file"])
+            finally:
+                os.close(sender_fd)
+
+    def leftovers(self, now=None):
+        """Message files left in messages/<sender>/: (rows still to check, warnings). Files whose newest message
+        was delivered to every recipient are removed silently. Symbolic links and non-regular entries are ignored."""
+        now = time.time() if now is None else now
+        rows, warnings = [], []
+        with self._locked(exclusive=True):
+            box = self._full_box()
+            try:
+                messages = os.open("messages", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=self._dir)
+            except (FileNotFoundError, NotADirectoryError):
+                return rows, warnings
+            try:
+                with os.scandir(messages) as entries:
+                    senders = sorted(e.name for e in entries if e.is_dir(follow_symlinks=False))
+            finally:
+                os.close(messages)
+            for sender in senders:
+                sender_fd = self._sender_dir(sender)
+                if sender_fd is None:
+                    continue
+                try:
+                    with os.scandir(sender_fd) as listing:
+                        entries = sorted(listing, key=lambda e: e.name)
+                    for entry in entries:
+                        if not entry.is_file(follow_symlinks=False):
+                            continue
+                        path = str(self.state / "messages" / sender / entry.name)
+                        msg = self._newest_use(box, sender, path)
+                        outcomes = {r: box.outcome(msg["id"], r) for r in msg["to"]} if msg else {}
+                        if (msg and MESSAGE_FILE.fullmatch(entry.name)
+                                and all(o["o"] == "delivered" for o in outcomes.values())):
+                            warning = self._unlink_in(sender_fd, entry.name, path)
+                            if warning:
+                                warnings.append(warning)
+                            continue
+                        rows.append({"sender": sender, "path": path,
+                                     "age_s": max(0.0, now - entry.stat(follow_symlinks=False).st_mtime),
+                                     "id": msg["id"] if msg else None,
+                                     "outcomes": {r: outcome_word(o) for r, o in outcomes.items()}})
+                finally:
+                    os.close(sender_fd)
+        return rows, warnings
+
+
+MESSAGE_FILE = re.compile(r"[A-Za-z0-9-]+\.[A-Za-z0-9]+")
+
+
+def outcome_word(outcome):
+    return f"queued ({outcome['why']})" if outcome["o"] == "queued" else outcome["o"]
+
+
+def managed_file(state, sender, path):
+    """Whether path is a message file Factory may remove: a regular file named like a-b-1.md directly in
+    <state>/messages/<sender>/, with no symbolic link from the state directory down. Lexical: nothing is resolved."""
+    path, state = os.fspath(path), os.fspath(state)
+    if not (os.path.isabs(path) and os.path.normpath(path) == path and MESSAGE_FILE.fullmatch(os.path.basename(path))):
+        return False
+    if os.path.dirname(path) != os.path.join(state, "messages", sender) or not sender or "/" in sender:
+        return False
+    try:
+        for component in (state, os.path.join(state, "messages"), os.path.dirname(path)):
+            if not stat.S_ISDIR(os.lstat(component).st_mode):
+                return False
+        return stat.S_ISREG(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+
+def format_leftovers(rows):
+    """up's cold-start lines for leftover message files, with the reminder once."""
+    lines = []
+    for row in rows:
+        where = (f"message {row['id']}: " + ", ".join(f"@{r} {o}" for r, o in row["outcomes"].items())
+                 if row["id"] is not None else "never stored")
+        lines.append(f"leftover message file for @{row['sender']} ({int(row['age_s'] // 60)} min old): "
+                     f"{row['path']}: {where}")
+    if lines:
+        lines.append("Check before resending or discarding.")
+    return lines
 
 
 class InboxDamage(ValueError):
