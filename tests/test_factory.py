@@ -14,6 +14,7 @@ import pathlib
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -3569,6 +3570,292 @@ class DownTests(unittest.TestCase):
                 self.assertEqual(factory.past_sessions(cfg)["lead-dev"], {"member": "lead-dev", **current})
             e.run("up", "lead-dev")
             self.assertEqual(native(e.starts()["lead-dev"])[:2], ["resume", "same"])
+
+
+class LogTests(unittest.TestCase):
+    """The v2 message log (message_log.md, phase_plans/phase_3.md §§2-4)."""
+
+    def setUp(self):
+        self.base = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.state = self.base / "team" / "core"
+        self.log = factory.Log(self.state)
+
+    def lines(self):
+        return self.log.path.read_bytes().splitlines()
+
+    def box(self):
+        records, end = self.log.read()
+        box = factory.Box(self.log.path)
+        box.apply(records)
+        box.offset = end
+        return box
+
+    def write_raw(self, *records):
+        """Append records as they are, bypassing Log (to build histories, valid or damaged)."""
+        if not self.log.lock_path.exists():
+            self.log.add("lead-dev", ["operator"], "seed")
+        with self.log.path.open("ab") as f:
+            for rec in records:
+                f.write(rec if isinstance(rec, bytes) else (json.dumps(rec) + "\n").encode())
+
+    def assert_damage(self, line, reason):
+        before = self.log.path.read_bytes()
+        with self.assertRaises(factory.LogDamage) as raised:
+            self.log.read()
+        self.assertEqual(raised.exception.line, line)
+        self.assertIn(reason, raised.exception.reason)
+        with self.assertRaises(factory.LogDamage):
+            self.log.add("lead-dev", ["operator"], "after damage")
+        self.assertEqual(self.log.path.read_bytes(), before)
+
+    # ids, content, files
+
+    def test_first_id_is_one_and_ids_increase_across_reopen(self):
+        self.assertEqual(self.log.add("lead-dev", ["operator"], "one")[0], 1)
+        self.assertEqual(factory.Log(self.state).add("reviewer", ["operator", "lead-dev"], "two")[0], 2)
+        records, end = self.log.read()
+        self.assertEqual([(r["t"], r["id"]) for r in records], [("msg", 1), ("ok", 1), ("msg", 2), ("ok", 2)])
+        self.assertEqual(end, self.log.path.stat().st_size)
+
+    def test_add_returns_offset_after_its_commit(self):
+        ident, end, warning = self.log.add("lead-dev", ["operator"], "x")
+        self.assertIsNone(warning)
+        self.assertEqual(self.log.read(end), ([], end))
+        self.log.add("pm", ["operator"], "y")
+        self.assertEqual([r["t"] for r in self.log.read(end)[0]], ["msg", "ok"])
+
+    def test_text_is_stored_byte_for_byte(self):
+        text = 'line one\n\t"quoted" — ünïcode ✓\nends with @reviewer'
+        self.log.add("lead-dev", ["operator"], text)
+        self.assertEqual(self.box().msgs[1]["text"], text)
+        self.log.add("lead-dev", ["operator"], text + "\n")
+        self.assertEqual(self.box().msgs[2]["text"], text + "\n")
+
+    def test_message_fields(self):
+        self.log.add("factory", ["operator"], "quiet", kind="note", meta={"what": "quiet"})
+        self.log.add("lead-dev", ["operator"], "file", file="/abs/messages/lead-dev/a-1.md")
+        msgs = self.box().msgs
+        self.assertRegex(msgs[1]["at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+        self.assertEqual((msgs[1]["kind"], msgs[1]["meta"]), ("note", {"what": "quiet"}))
+        self.assertEqual(msgs[2]["file"], "/abs/messages/lead-dev/a-1.md")
+
+    def test_invalid_arguments_raise_before_writing(self):
+        for args, kwargs in (
+            (("", ["operator"], "x"), {}),
+            (("lead-dev", [], "x"), {}),
+            (("lead-dev", ["operator", "operator"], "x"), {}),
+            (("lead-dev", ["lead-dev"], "x"), {}),
+            (("lead-dev", ["operator"], b"x"), {}),
+            (("lead-dev", ["operator"], "x"), {"kind": "wait"}),
+            (("lead-dev", ["operator"], "x"), {"file": "relative.md"}),
+            (("lead-dev", ["operator"], "x"), {"meta": ["not", "object"]}),
+        ):
+            with self.subTest(args=args, kwargs=kwargs), self.assertRaises(ValueError):
+                self.log.add(*args, **kwargs)
+        self.assertFalse(self.state.exists())
+
+    def test_uncommitted_entry_uses_up_its_id(self):
+        self.write_raw({"t": "msg", "id": 2, "at": "2026-11-26T17:00:00Z", "from": "pm", "to": ["operator"],
+                        "kind": "say", "text": "never committed"})
+        box = self.box()
+        self.assertNotIn(2, box.msgs)
+        self.assertEqual((box.uncommitted, box.highest), (1, 2))
+        self.assertEqual([m["id"] for m, _ in box.pending()], [1])
+        self.assertEqual(self.log.add("pm", ["operator"], "next")[0], 3)
+        self.assertEqual(self.box().uncommitted, 1)
+
+    def test_files_are_private(self):
+        self.log.add("lead-dev", ["operator"], "x")
+        self.assertEqual(stat.S_IMODE(self.state.stat().st_mode), 0o700)
+        for name in ("log.jsonl", "lock", "log.check"):
+            with self.subTest(name=name):
+                self.assertEqual(stat.S_IMODE((self.state / name).stat().st_mode), 0o600)
+
+    def test_symlinked_log_is_refused(self):
+        self.log.add("lead-dev", ["operator"], "x")
+        outside = self.base / "outside.jsonl"
+        self.log.path.rename(outside)
+        self.log.path.symlink_to(outside)
+        for attempt in (self.log.read, lambda: self.log.add("lead-dev", ["operator"], "y")):
+            with self.subTest(attempt=attempt), self.assertRaises(OSError):
+                attempt()
+        self.assertEqual(len(outside.read_bytes().splitlines()), 2)
+
+    def test_symlinked_state_directory_is_refused(self):
+        real = self.base / "elsewhere"
+        real.mkdir(mode=0o700)
+        self.state.parent.mkdir(parents=True)
+        self.state.symlink_to(real)
+        with self.assertRaises(OSError):
+            self.log.add("lead-dev", ["operator"], "x")
+        self.assertEqual(list(real.iterdir()), [])
+
+    def test_reading_creates_nothing(self):
+        self.assertEqual(self.log.read(), ([], 0))
+        self.assertFalse(self.state.exists())
+        self.state.mkdir(parents=True)
+        self.assertEqual(self.log.read(), ([], 0))
+        self.assertEqual(list(self.state.iterdir()), [])
+
+    def test_reader_does_not_chmod(self):
+        self.log.add("lead-dev", ["operator"], "x")
+        os.chmod(self.log.path, 0o640)
+        self.log.read()
+        self.assertEqual(stat.S_IMODE(self.log.path.stat().st_mode), 0o640)
+
+    def test_missing_lock_with_a_log_is_retried_then_diagnosed(self):
+        self.log.add("lead-dev", ["operator"], "x")
+        real_open = factory.private_open
+        misses = []
+
+        def first_miss(path, flags, fix_mode=True):
+            if pathlib.Path(path) == self.log.lock_path and not misses:
+                misses.append(path)  # a reader that looked before the writer made the lock
+                raise FileNotFoundError(path)
+            return real_open(path, flags, fix_mode)
+        with patch.object(factory, "private_open", first_miss):
+            self.assertEqual(len(self.log.read()[0]), 2)
+        self.assertEqual(len(misses), 1)
+        self.log.lock_path.unlink()
+        with self.assertRaisesRegex(factory.LogDamage, "lock file is missing"):
+            self.log.read()
+
+    def test_checkpoint_without_log_is_damage(self):
+        self.log.add("lead-dev", ["operator"], "x")
+        self.log.path.unlink()
+        for attempt in (self.log.read, lambda: self.log.add("lead-dev", ["operator"], "y")):
+            with self.subTest(attempt=attempt), self.assertRaisesRegex(factory.LogDamage, "log.check remains"):
+                attempt()
+
+    # validation
+
+    def test_incomplete_last_line_is_damage(self):
+        self.write_raw(b'{"t":"ok","id":1')
+        self.assert_damage(3, "incomplete line")
+
+    def test_blank_line_is_damage(self):
+        self.write_raw(b"\n")
+        self.assert_damage(3, "blank line")
+
+    def test_invalid_json_and_utf8_are_damage(self):
+        for raw, reason in ((b"{not json}\n", "not JSON"), (b'{"t":"ok","x":"\xff"}\n', "not JSON"),
+                            (b"[1,2]\n", "expected a JSON object")):
+            with self.subTest(raw=raw):
+                self.setUp()
+                self.write_raw(raw)
+                self.assert_damage(3, reason)
+
+    def test_record_field_damage(self):
+        msg = {"t": "msg", "id": 2, "at": "2026-11-26T17:00:00Z", "from": "pm", "to": ["operator"],
+               "kind": "say", "text": "x"}
+        for field, value, reason in (
+            ("t", "note", "expected t of"), ("id", True, "positive integer id"), ("id", 0, "positive integer id"),
+            ("at", "yesterday", "UTC at"), ("from", "", "sender"), ("to", [], "distinct recipients"),
+            ("to", ["pm"], "distinct recipients"), ("to", ["a", "a"], "distinct recipients"),
+            ("kind", "wait", "kind say"), ("text", None, "expected text"), ("file", "rel.md", "absolute file"),
+            ("meta", 3, "meta to be an object"),
+        ):
+            with self.subTest(field=field, value=value):
+                self.setUp()
+                self.write_raw({**msg, field: value})
+                self.assert_damage(3, reason)
+
+    def test_outcome_field_damage(self):
+        out = {"t": "out", "id": 1, "to": "operator", "o": "queued", "why": "blocked", "at": "2026-11-26T17:00:01Z"}
+        for changes, reason in (
+            ({"o": "lost"}, "known outcome"), ({"why": "tired"}, "queue reason"), ({"to": ""}, "a recipient"),
+            ({"o": "dropped", "why": " "}, "reason for dropped"), ({"o": "sending", "term": 7}, "terminal ID"),
+            ({"o": "sending", "started": "yes"}, "started"), ({"o": "sending", "turn": True}, "turn"),
+            ({"at": None}, "UTC at"),
+        ):
+            with self.subTest(changes=changes):
+                self.setUp()
+                self.write_raw({**out, **changes})
+                self.assert_damage(3, reason)
+
+    def test_ids_out_of_order_is_damage(self):
+        self.write_raw({"t": "msg", "id": 1, "at": "2026-11-26T17:00:00Z", "from": "pm", "to": ["operator"],
+                        "kind": "say", "text": "again"})
+        self.assert_damage(3, "not above 1")
+
+    def test_ok_must_follow_its_msg(self):
+        for extra, line in (([{"t": "ok", "id": 1}], 3), ([{"t": "ok", "id": 7}], 3)):
+            with self.subTest(extra=extra):
+                self.setUp()
+                self.write_raw(*extra)
+                self.assert_damage(line, "does not follow its message")
+
+    def test_outcome_references_are_checked(self):
+        uncommitted = {"t": "msg", "id": 2, "at": "2026-11-26T17:00:00Z", "from": "pm", "to": ["operator"],
+                       "kind": "say", "text": "x"}
+        cases = (
+            ([{"t": "out", "id": 9, "to": "operator", "o": "sending", "at": "2026-11-26T17:00:01Z"}], 3,
+             "unknown message"),
+            ([{"t": "out", "id": 1, "to": "pm", "o": "sending", "at": "2026-11-26T17:00:01Z"}], 3, "non-recipient"),
+            ([uncommitted, {"t": "out", "id": 2, "to": "operator", "o": "sending", "at": "2026-11-26T17:00:01Z"}],
+             4, "unknown message"),
+        )
+        for extra, line, reason in cases:
+            with self.subTest(reason=reason, line=line):
+                self.setUp()
+                self.write_raw(*extra)
+                self.assert_damage(line, reason)
+
+    def test_damaged_prefix_blocks_a_valid_later_row(self):
+        self.log.add("lead-dev", ["operator"], "seed")
+        self.log.add("pm", ["operator"], "second")
+        data = bytearray(self.log.path.read_bytes())
+        data[data.index(b'"seed"') + 1:data.index(b'"seed"') + 2] = b"\xff"
+        self.log.path.write_bytes(bytes(data))
+        self.log.path.touch()
+        with open(self.log.path, "ab") as f:
+            f.write(b'{"t":"out","id":2,"to":"operator","o":"sending","at":"2026-11-26T17:00:01Z"}\n')
+        self.assert_damage(1, "not JSON")
+
+    def test_offsets_must_be_line_starts_inside_the_log(self):
+        self.log.add("lead-dev", ["operator"], "x")
+        size = self.log.path.stat().st_size
+        with self.assertRaisesRegex(factory.LogDamage, "truncated"):
+            self.log.read(size + 5)
+        with self.assertRaisesRegex(factory.LogDamage, "not at the start of a line"):
+            self.log.read(3)
+        first = len(self.lines()[0]) + 1
+        self.assertEqual(self.log.read(first)[0], [{"t": "ok", "id": 1}])
+
+    def test_tail_damage_names_the_absolute_line(self):
+        _, end, _ = self.log.add("lead-dev", ["operator"], "x")
+        self.write_raw(b"garbage\n")
+        with self.assertRaises(factory.LogDamage) as raised:
+            self.log.read(end)
+        self.assertEqual(raised.exception.line, 3)
+
+    # replay
+
+    def test_incremental_refresh_equals_full_replay(self):
+        box = self.box()
+        for n in range(3):
+            self.log.add("pm", ["operator", "reviewer"], f"m{n}")
+            records, end = self.log.read(box.offset)
+            box.apply(records)
+            box.offset = end
+        full = self.box()
+        self.assertEqual((box.msgs, box.highest, box.offset), (full.msgs, full.highest, full.offset))
+
+    def test_message_waiting_for_its_commit_spans_batches(self):
+        msg = {"t": "msg", "id": 2, "at": "2026-11-26T17:00:00Z", "from": "pm", "to": ["operator"],
+               "kind": "say", "text": "x"}
+        box = self.box()
+        box.apply([msg])
+        self.assertEqual((box.uncommitted, 2 in box.msgs), (1, False))
+        box.apply([{"t": "ok", "id": 2}])
+        self.assertEqual((box.uncommitted, 2 in box.msgs), (0, True))
+
+    def test_default_outcome_and_pending(self):
+        self.log.add("pm", ["operator", "reviewer"], "x")
+        box = self.box()
+        self.assertEqual(box.outcome(1, "operator"), {"o": "queued", "why": "waiting"})
+        self.assertEqual([(m["id"], r) for m, r in box.pending()], [(1, "operator"), (1, "reviewer")])
+        self.assertEqual([(m["id"], r) for m, r in box.pending("reviewer")], [(1, "reviewer")])
 
 
 class LiveToolTests(unittest.TestCase):

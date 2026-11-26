@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import contextlib
 import datetime
 import fcntl
 import getpass
@@ -532,6 +533,471 @@ def resolve_listed(model, listed, harness):
 
 
 
+# ================================================================ message log (v2; spec §8.5-8.7, message_log.md)
+
+LOG_KINDS = ("say", "brief", "note")
+OUTCOMES = ("sending", "delivered", "queued", "unconfirmed", "dropped")
+FINAL = ("delivered", "unconfirmed", "dropped")
+QUEUE_REASONS = ("waiting", "blocked", "not ready", "gone")
+READ_QUEUE_REASONS = QUEUE_REASONS + ("busy",)   # "busy" is reserved for the §8.3 fallback: read, never written
+UTC = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
+STORED_WARNING = ("stored and will be delivered, but the disk reported an error: it may not survive a power loss."
+                  " Do not resend.")
+UNKNOWN = "storage outcome unknown; do not resend; check inbox after repair"
+
+
+def private_open(path, flags, fix_mode=True):
+    """Open a regular file without following a symbolic link; writers make it 0600."""
+    fd = os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(f"not a regular file: {path}")
+        if fix_mode:
+            os.fchmod(fd, 0o600)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def utc_now():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+class LogDamage(Exception):
+    def __init__(self, path, line, reason):
+        where = f", line {line}" if line else ""
+        super().__init__(f"message log needs repair: {path}{where}: {reason}. Nothing was written."
+                         " Repair or move the file, then run factory.py up.")
+        self.path, self.line, self.reason = path, line, reason
+
+
+class NotStored(Exception):
+    """The message or outcome was not stored. partial: an incomplete line may remain, which readers report."""
+
+    def __init__(self, partial, detail):
+        super().__init__(detail)
+        self.partial, self.detail = partial, detail
+
+
+class _Unreadable(Exception):
+    """The tail could not be read back after a failed append (internal)."""
+
+    def __init__(self, error):
+        super().__init__(str(error))
+        self.error = error
+
+
+def _record_problem(rec):
+    """Why a decoded line is not a valid record on its own, or None. Unknown extra keys are allowed."""
+    if not isinstance(rec, dict):
+        return "expected a JSON object"
+    kind = rec.get("t")
+    if kind not in ("msg", "ok", "out"):
+        return "expected t of msg, ok or out"
+    ident = rec.get("id")
+    if type(ident) is not int or ident < 1:
+        return "expected a positive integer id"
+    if kind == "msg":
+        to = rec.get("to")
+        if not (isinstance(rec.get("at"), str) and UTC.fullmatch(rec["at"])):
+            return "expected a UTC at"
+        if not (isinstance(rec.get("from"), str) and rec["from"]):
+            return "expected a sender"
+        if not (isinstance(to, list) and to and all(isinstance(n, str) and n for n in to)
+                and len(set(to)) == len(to) and rec["from"] not in to):
+            return "expected distinct recipients other than the sender"
+        if rec.get("kind") not in LOG_KINDS:
+            return "expected kind say, brief or note"
+        if not isinstance(rec.get("text"), str):
+            return "expected text"
+        if "file" in rec and not (isinstance(rec["file"], str) and os.path.isabs(rec["file"])):
+            return "expected an absolute file path"
+        if "meta" in rec and not isinstance(rec["meta"], dict):
+            return "expected meta to be an object"
+    elif kind == "out":
+        o, why = rec.get("o"), rec.get("why")
+        if not (isinstance(rec.get("to"), str) and rec["to"]):
+            return "expected a recipient"
+        if o not in OUTCOMES:
+            return "expected a known outcome"
+        if not (isinstance(rec.get("at"), str) and UTC.fullmatch(rec["at"])):
+            return "expected a UTC at"
+        if "why" in rec and not isinstance(why, str):
+            return "expected why to be a string"
+        if o == "queued" and why not in READ_QUEUE_REASONS:
+            return "expected a queue reason"
+        if o in ("unconfirmed", "dropped") and not (isinstance(why, str) and why.strip()):
+            return f"expected a reason for {o}"
+        if "term" in rec and not (isinstance(rec["term"], str) and rec["term"]):
+            return "expected term to be a terminal ID"
+        if "started" in rec and rec["started"] not in (True, False, None):
+            return "expected started to be true, false or null"
+        if "turn" in rec and type(rec["turn"]) is not int:
+            return "expected turn to be an integer"
+    return None
+
+
+def _parse(data, first_line):
+    """Records from whole lines of bytes; LogDamage with the 1-based line number on anything else."""
+    if not data:
+        return []
+    if not data.endswith(b"\n"):
+        raise _LineDamage(first_line + data.count(b"\n"), "incomplete line")
+    records = []
+    for n, raw in enumerate(data[:-1].split(b"\n"), first_line):
+        if not raw:
+            raise _LineDamage(n, "blank line")
+        try:
+            rec = json.loads(raw.decode("utf-8"))
+        except (UnicodeError, ValueError) as error:
+            raise _LineDamage(n, f"not JSON: {error}") from error
+        problem = _record_problem(rec)
+        if problem:
+            raise _LineDamage(n, problem)
+        records.append(rec)
+    return records
+
+
+class _LineDamage(Exception):
+    def __init__(self, line, reason):
+        super().__init__(reason)
+        self.line, self.reason = line, reason
+
+
+class Box:
+    """In-memory index of the committed log, replayed from Log.read."""
+
+    def __init__(self, path):
+        self.path = path
+        self._reset()
+
+    def _reset(self):
+        self.offset = 0
+        self.line = 0                       # lines applied so far (full boxes only)
+        self.msgs: dict[int, dict] = {}     # committed messages; text dropped once every recipient is final
+        self.outcomes: dict[tuple[int, str], dict] = {}
+        self.uncommitted = 0
+        self.highest = 0                    # highest msg id seen, committed or not
+        self._open = None                   # the msg record just read, waiting for its ok
+        self._only = None                   # for_message: the one id this partial view follows
+
+    @classmethod
+    def for_message(cls, path, ident, recipients, offset):
+        """A partial, outcome-only view of one committed message, from the offset add returned."""
+        box = cls(path)
+        box.offset, box.line, box._only = offset, None, ident
+        box.msgs[ident] = {"t": "msg", "id": ident, "to": list(recipients)}
+        return box
+
+    def _damage(self, index, reason):
+        line = None if self.line is None else self.line + index + 1
+        where = "" if line else f" (after byte {self.offset})"
+        return LogDamage(self.path, line, reason + where)
+
+    def apply(self, records):
+        for index, rec in enumerate(records):
+            problem = self._apply(rec)
+            if problem:
+                raise self._damage(index, problem)
+        if self.line is not None:
+            self.line += len(records)
+
+    def _apply(self, rec):
+        kind, ident = rec["t"], rec["id"]
+        if self._only is not None:
+            if kind == "out" and ident == self._only:
+                return self._outcome(rec)
+            return None
+        opened, self._open = self._open, None
+        if kind == "msg":
+            if ident <= self.highest:
+                return f"message id {ident} is not above {self.highest}"
+            self.highest = ident
+            self.uncommitted += 1
+            self._open = rec
+            return None
+        if kind == "ok":
+            if opened is None or opened["id"] != ident:
+                return f"commit record for {ident} does not follow its message"
+            self.uncommitted -= 1
+            self.msgs[ident] = dict(opened)
+            return None
+        if ident not in self.msgs:
+            return f"outcome for unknown message {ident}"
+        return self._outcome(rec)
+
+    def _outcome(self, rec):
+        ident, to = rec["id"], rec["to"]
+        msg = self.msgs[ident]
+        if to not in msg["to"]:
+            return f"outcome for a non-recipient @{to} of message {ident}"
+        current = self.outcome(ident, to)
+        new = rec["o"]
+        if current["o"] in FINAL:
+            return f"outcome {new} after the final {current['o']} for @{to} of message {ident}"
+        if new == "queued" and current["o"] == "queued" and current.get("why") == rec.get("why"):
+            return None   # a redundant queued record with the same reason is harmless
+        allowed = {"sending": ("queued",), "delivered": ("sending",), "unconfirmed": ("sending",),
+                   "queued": ("queued", "sending"), "dropped": ("queued", "sending")}[new]
+        if current["o"] not in allowed:
+            return f"illegal outcome {current['o']} -> {new} for @{to} of message {ident}"
+        self.outcomes[(ident, to)] = dict(rec)
+        if "text" in msg and all(self.outcome(ident, r)["o"] in FINAL for r in msg["to"]):
+            msg.pop("text")
+        return None
+
+    def outcome(self, ident, to):
+        rec = self.outcomes.get((ident, to))
+        return dict(rec) if rec else {"o": "queued", "why": "waiting"}
+
+    def pending(self, to=None):
+        return [(msg, r) for ident, msg in sorted(self.msgs.items()) for r in msg["to"]
+                if (to is None or r == to) and self.outcome(ident, r)["o"] not in FINAL]
+
+
+class Log:
+    """The team's append-only message log in <state>/log.jsonl."""
+
+    def __init__(self, state):
+        self.state = pathlib.Path(state)
+        self.path = self.state / "log.jsonl"
+        self.lock_path = self.state / "lock"
+        self.check_path = self.state / "log.check"
+
+    # ---------------------------------------------------------------- locking and reading
+
+    @contextlib.contextmanager
+    def _locked(self, exclusive):
+        """The team lock. Writers create the private directory and the lock (before any log); readers create nothing."""
+        if exclusive:
+            self._ensure_state()
+            fd = private_open(self.lock_path, os.O_CREAT | os.O_RDWR)
+        else:
+            fd = self._open_lock_for_reading()
+            if fd is None:
+                yield None
+                return
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+            yield fd
+        finally:
+            os.close(fd)
+
+    def _ensure_state(self):
+        try:
+            info = os.lstat(self.state)
+        except FileNotFoundError:
+            self.state.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            try:
+                os.mkdir(self.state, 0o700)
+            except FileExistsError:
+                pass
+            info = os.lstat(self.state)
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise OSError(f"not a directory: {self.state}")
+        if stat.S_IMODE(info.st_mode) != 0o700:
+            os.chmod(self.state, 0o700)
+
+    def _open_lock_for_reading(self):
+        for attempt in (1, 2):
+            try:
+                return private_open(self.lock_path, os.O_RDONLY, fix_mode=False)
+            except FileNotFoundError:
+                if not os.path.lexists(self.path):
+                    return None          # nothing written yet: the empty log
+                # A writer creates the lock before the log; seeing the log now means the lock exists. Retry once.
+        raise LogDamage(self.path, None, "the log exists but its lock file is missing")
+
+    def _snapshot(self, offset):
+        """(records, end) from offset, with the lock held. offset 0 also replays a full box to check references."""
+        try:
+            fd = private_open(self.path, os.O_RDONLY, fix_mode=False)
+        except FileNotFoundError:
+            if offset:
+                raise LogDamage(self.path, None, f"the log was removed (reader was at byte {offset})")
+            if os.path.lexists(self.check_path):
+                raise LogDamage(self.path, None, "log.jsonl is missing but log.check remains")
+            return [], 0
+        with os.fdopen(fd, "rb") as f:
+            size = os.fstat(f.fileno()).st_size
+            if offset > size:
+                raise LogDamage(self.path, None, f"the log was truncated (reader was at byte {offset}, size {size})")
+            if offset:
+                f.seek(offset - 1)
+                if f.read(1) != b"\n":
+                    raise LogDamage(self.path, None, f"byte {offset} is not at the start of a line")
+            data = f.read()
+            try:
+                records = _parse(data, 1)
+            except _LineDamage as damage:
+                line = damage.line
+                if offset:
+                    f.seek(0)
+                    line += f.read(offset).count(b"\n")
+                raise LogDamage(self.path, line, damage.reason) from None
+        end = offset + len(data)
+        if offset == 0:
+            Box(self.path).apply(records)   # references and transitions, before anything is returned
+        return records, end
+
+    def read(self, offset=0):
+        """(records, end) from byte offset; offset 0 validates the whole log. Raises LogDamage."""
+        with self._locked(exclusive=False) as fd:
+            if fd is None:
+                if offset:
+                    raise LogDamage(self.path, None, f"the log was removed (reader was at byte {offset})")
+                return [], 0
+            return self._snapshot(offset)
+
+    # ---------------------------------------------------------------- the checkpoint
+
+    def _stat(self):
+        try:
+            info = os.lstat(self.path)
+        except FileNotFoundError:
+            return None
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError(f"not a regular file: {self.path}")
+        return info
+
+    def _checkpoint(self, info):
+        """The highest id if log.check proves this exact file was validated, else None."""
+        if info is None:
+            return None
+        try:
+            fd = private_open(self.check_path, os.O_RDONLY, fix_mode=False)
+            with os.fdopen(fd, "rb") as f:
+                check = json.loads(f.read())
+        except (OSError, ValueError):
+            return None
+        fields = ("ino", "size", "mtime_ns", "last")
+        if not (isinstance(check, dict) and all(type(check.get(k)) is int and check[k] >= 0 for k in fields)):
+            return None
+        if (check["ino"], check["size"], check["mtime_ns"]) != (info.st_ino, info.st_size, info.st_mtime_ns):
+            return None
+        return check["last"]
+
+    def _write_checkpoint(self, last):
+        """Publish a fresh proof of validation; a failure only costs the next writer one full read."""
+        name = None
+        try:
+            info = self._stat()
+            data = json.dumps({"ino": info.st_ino, "size": info.st_size, "mtime_ns": info.st_mtime_ns,
+                               "last": last}).encode()
+            fd, name = tempfile.mkstemp(prefix="log.check.", dir=self.state)
+            with os.fdopen(fd, "wb") as f:
+                os.fchmod(f.fileno(), 0o600)
+                f.write(data)
+            os.replace(name, self.check_path)
+            name = None
+        except OSError:
+            pass
+        finally:
+            if name:
+                pathlib.Path(name).unlink(missing_ok=True)
+
+    def _full_box(self):
+        records, end = self._snapshot(0)
+        box = Box(self.path)
+        box.apply(records)
+        box.offset = end
+        return box
+
+    def _prefix(self):
+        """The highest message id, after proving everything already in the log is valid (lock held)."""
+        info = self._stat()
+        last = self._checkpoint(info)
+        if last is not None:
+            return last
+        if info is None:
+            if os.path.lexists(self.check_path):
+                raise LogDamage(self.path, None, "log.jsonl is missing but log.check remains")
+            return 0
+        return self._full_box().highest
+
+    # ---------------------------------------------------------------- appending
+
+    def _append(self, line):
+        """Append one record: "synced", or "visible" when it is whole but its sync failed. Raises NotStored."""
+        try:
+            fd = private_open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
+        except OSError as error:
+            raise NotStored(False, f"cannot open {self.path}: {error}") from error
+        try:
+            before = os.fstat(fd).st_size
+            try:
+                view, offset = memoryview(line), 0
+                while offset < len(line):
+                    count = os.write(fd, view[offset:])
+                    if count <= 0:
+                        raise OSError("write made no progress")
+                    offset += count
+                os.fsync(fd)
+                self._sync_directory()
+                return "synced"
+            except OSError as error:
+                failure = error
+                try:
+                    os.ftruncate(fd, before)
+                    os.fsync(fd)
+                except OSError:
+                    pass
+        finally:
+            os.close(fd)
+        try:
+            rfd = private_open(self.path, os.O_RDONLY, fix_mode=False)
+            with os.fdopen(rfd, "rb") as f:
+                f.seek(before)
+                tail = f.read()
+        except OSError as error:
+            raise _Unreadable(error) from failure
+        if not tail:
+            raise NotStored(False, f"the disk reported an error ({failure}); nothing was stored") from failure
+        if tail == line:
+            return "visible"
+        raise NotStored(True, f"the disk reported an error ({failure}); an incomplete entry may remain") from failure
+
+    def _sync_directory(self):
+        fd = os.open(self.state, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    @staticmethod
+    def _line(rec):
+        return (json.dumps(rec, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+
+    def add(self, sender, to, text, kind="say", file=None, meta=None):
+        """Store one message: (id, end offset, warning or None). Raises ValueError, LogDamage, NotStored, OSError."""
+        recipients = list(to) if isinstance(to, (list, tuple)) else to
+        rec = {"t": "msg", "id": 1, "at": utc_now(), "from": sender, "to": recipients, "kind": kind, "text": text}
+        if file is not None:
+            rec["file"] = file
+        if meta is not None:
+            rec["meta"] = meta
+        problem = _record_problem(rec)
+        if problem:
+            raise ValueError(problem)
+        with self._locked(exclusive=True):
+            ident = self._prefix() + 1
+            rec["id"] = ident
+            try:
+                if self._append(self._line(rec)) == "visible":
+                    raise NotStored(False, "the disk reported an error; the entry was left uncommitted")
+            except _Unreadable as unreadable:
+                raise NotStored(True, f"the disk reported an error and {self.path} could not be read back;"
+                                      f" message {ident} was not committed") from unreadable.error
+            try:
+                synced = self._append(self._line({"t": "ok", "id": ident})) == "synced"
+            except _Unreadable as unreadable:
+                raise OSError(f"message {ident} in {self.path}: {UNKNOWN}") from unreadable.error
+            end = self._stat().st_size
+            self._write_checkpoint(ident)
+            return ident, end, None if synced else STORED_WARNING
+
+
 class InboxDamage(ValueError):
     def __init__(self, path, line, reason):
         super().__init__(f"inbox needs repair: {path}, line {line}: {reason}. Operator messages are unavailable."
@@ -546,17 +1012,7 @@ class Inbox:
         self.state_path = self.path.with_suffix(".json")
         self.lock_path = self.path.with_suffix(".lock")
 
-    @staticmethod
-    def private_open(path, flags):
-        fd = os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
-        try:
-            if not stat.S_ISREG(os.fstat(fd).st_mode):
-                raise OSError(f"not a regular file: {path}")
-            os.fchmod(fd, 0o600)
-            return fd
-        except BaseException:
-            os.close(fd)
-            raise
+    private_open = staticmethod(private_open)
 
     def __enter__(self):
         for path in (self.directory.parent, self.directory):
