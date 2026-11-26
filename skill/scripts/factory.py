@@ -541,6 +541,8 @@ OUTCOMES = ("sending", "delivered", "queued", "unconfirmed", "dropped")
 FINAL = ("delivered", "unconfirmed", "dropped")
 QUEUE_REASONS = ("waiting", "blocked", "not ready", "gone")
 READ_QUEUE_REASONS = QUEUE_REASONS + ("busy",)   # "busy" is reserved for the §8.3 fallback: read, never written
+MOVES = {"sending": ("queued",), "delivered": ("sending",), "unconfirmed": ("sending",),
+         "queued": ("queued", "sending"), "dropped": ("queued", "sending")}   # new outcome: allowed from these
 UTC = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
 STORED_WARNING = ("stored and will be delivered, but the disk reported an error: it may not survive a power loss."
                   " Do not resend.")
@@ -636,6 +638,10 @@ def _record_problem(rec):
             return "expected started to be true, false or null"
         if "turn" in rec and type(rec["turn"]) is not int:
             return "expected turn to be an integer"
+        if o in ("sending", "delivered") and "term" not in rec:
+            return f"expected the terminal ID of {o}"
+        if o == "delivered" and not ("started" in rec and "turn" in rec):
+            return "expected started and turn on delivered"
     return None
 
 
@@ -650,7 +656,7 @@ def _parse(data, first_line):
         if not raw:
             raise _LineDamage(n, "blank line")
         try:
-            rec = json.loads(raw.decode("utf-8"))
+            rec = json.loads(raw.decode("utf-8"), parse_constant=_reject_constant)
         except (UnicodeError, ValueError) as error:
             raise _LineDamage(n, f"not JSON: {error}") from error
         problem = _record_problem(rec)
@@ -658,6 +664,22 @@ def _parse(data, first_line):
             raise _LineDamage(n, problem)
         records.append(rec)
     return records
+
+
+def _checkpoint_digest(check):
+    """A digest of log.check's fields, so an accidental edit of one of them is a miss, not a wrong id."""
+    fields = ":".join(str(check[k]) for k in ("ino", "size", "mtime_ns", "last", "lineage"))
+    return hashlib.sha256(fields.encode()).hexdigest()
+
+
+def _reject_constant(name):
+    raise ValueError(f"{name} is not standard JSON")
+
+
+def _absolute(path):
+    """Absolute and lexically normalized, with one leading slash ("//x" is "/x" here); nothing is resolved."""
+    path = os.path.abspath(os.fspath(path))
+    return "/" + path.lstrip("/") if path.startswith("//") else path
 
 
 class _LineDamage(Exception):
@@ -747,9 +769,7 @@ class Box:
             return f"outcome {new} after the final {current['o']} for @{to} of message {ident}"
         if new == "queued" and current["o"] == "queued" and current.get("why") == rec.get("why"):
             return None   # a redundant queued record with the same reason is harmless
-        allowed = {"sending": ("queued",), "delivered": ("sending",), "unconfirmed": ("sending",),
-                   "queued": ("queued", "sending"), "dropped": ("queued", "sending")}[new]
-        if current["o"] not in allowed:
+        if current["o"] not in MOVES[new]:
             return f"illegal outcome {current['o']} -> {new} for @{to} of message {ident}"
         self.outcomes[(ident, to)] = dict(rec)
         if "text" in msg and all(self.outcome(ident, r)["o"] in FINAL for r in msg["to"]):
@@ -828,7 +848,7 @@ class Log:
     LOG, LOCK, CHECK = "log.jsonl", "lock", "log.check"
 
     def __init__(self, state):
-        self.state = pathlib.Path(os.path.abspath(state))   # lexical: a symbolic link in the cache base is kept
+        self.state = pathlib.Path(_absolute(state))   # lexical: a symbolic link in the cache base is kept
         self.path = self.state / self.LOG
         self.lock_path = self.state / self.LOCK
         self.check_path = self.state / self.CHECK
@@ -884,7 +904,7 @@ class Log:
             return
         self._dir = directory
         try:
-            fd = self._open(self.LOCK, os.O_CREAT | os.O_RDWR) if exclusive else self._open_lock_for_reading()
+            fd = self._open_lock_for_writing() if exclusive else self._open_lock_for_reading()
             if fd is None:
                 yield None
                 return
@@ -896,6 +916,16 @@ class Log:
         finally:
             self._dir = None
             os.close(directory)
+
+    def _open_lock_for_writing(self):
+        """The lock, created only for a state with no log and no checkpoint yet. Recreating a lock that was removed
+        while a log exists would let a writer still holding the old one commit beside us: that is damage."""
+        try:
+            return self._open(self.LOCK, os.O_RDWR)
+        except FileNotFoundError:
+            if self._lexists(self.LOG) or self._lexists(self.CHECK):
+                raise LogDamage(self.path, None, "the log exists but its lock file is missing") from None
+            return self._open(self.LOCK, os.O_CREAT | os.O_RDWR)
 
     def _open_lock_for_reading(self):
         for attempt in (1, 2):
@@ -941,8 +971,19 @@ class Log:
                 raise LogDamage(self.path, line, damage.reason) from None
         end = offset + len(data)
         if offset == 0:
-            Box(self.path).apply(records)   # references and transitions, before anything is returned
+            box = Box(self.path)
+            box.apply(records)              # references and transitions, before anything is returned
+            box.offset = end
+            self._local.box = box           # the full read's validated box, for _full_box and read_box
         return records, end
+
+    def read_box(self):
+        """(records, box): one full, validated read and the box it built. Raises LogDamage."""
+        with self._locked(exclusive=False) as fd:
+            if fd is None:
+                return [], Box(self.path)
+            records, end = self._snapshot(0)
+            return records, (self._local.box if records or end else Box(self.path))
 
     def read(self, offset=0):
         """(records, end) from byte offset; offset 0 validates the whole log. Raises LogDamage."""
@@ -983,8 +1024,9 @@ class Log:
             return None
         fields = ("ino", "size", "mtime_ns", "last")
         if not (isinstance(check, dict) and all(type(check.get(k)) is int and check[k] >= 0 for k in fields)
-                and isinstance(check.get("lineage"), str) and check["lineage"]):
-            return None
+                and isinstance(check.get("lineage"), str) and check["lineage"]
+                and check.get("digest") == _checkpoint_digest(check)):
+            return None       # unparsable, or edited by hand: one full validation instead
         if (check["ino"], check["size"], check["mtime_ns"]) != (info.st_ino, info.st_size, info.st_mtime_ns):
             return None
         return check
@@ -997,8 +1039,9 @@ class Log:
             info = self._stat()
             if info is None:
                 return
-            data = json.dumps({"ino": info.st_ino, "size": info.st_size, "mtime_ns": info.st_mtime_ns,
-                               "last": last, "lineage": self._local.lineage}).encode()
+            check = {"ino": info.st_ino, "size": info.st_size, "mtime_ns": info.st_mtime_ns,
+                     "last": last, "lineage": self._local.lineage}
+            data = json.dumps({**check, "digest": _checkpoint_digest(check)}).encode()
             fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=self._dir)
             created = True
             with os.fdopen(fd, "wb") as f:
@@ -1015,10 +1058,7 @@ class Log:
 
     def _full_box(self):
         records, end = self._snapshot(0)
-        box = Box(self.path)
-        box.apply(records)
-        box.offset = end
-        return box
+        return self._local.box if records else Box(self.path)
 
     def _prove(self, info):
         """The checkpoint if it proves the file, else None; records the lineage the next append continues."""
@@ -1119,8 +1159,6 @@ class Log:
 
     OUT_FIELDS = {"sending": {"term"}, "delivered": {"term", "started", "turn"}, "queued": {"why"},
                   "unconfirmed": {"why", "term"}, "dropped": {"why", "term"}}
-    MOVES = {"sending": ("queued",), "delivered": ("sending",), "unconfirmed": ("sending",),
-             "queued": ("queued", "sending"), "dropped": ("queued", "sending")}
 
     def _refresh(self, box):
         """Bring box up to the current, validated file (lock held). Only a box whose view belongs to the
@@ -1138,7 +1176,7 @@ class Log:
         records, end = self._snapshot(0)
         box._reset()
         box.apply(records)
-        box.offset, box._lineage = end, self._local.lineage
+        box.offset, box._lineage = end, self._local.lineage   # the caller's own object, rebuilt in place
 
     def _check_out(self, box, ident, to, o, extra):
         if box._only is not None:
@@ -1162,7 +1200,7 @@ class Log:
         if msg is None or to not in msg["to"]:
             raise ValueError(f"@{to} is not a recipient of committed message {ident}")
         current = box.outcome(ident, to)
-        if current["o"] in FINAL or current["o"] not in self.MOVES[o]:
+        if current["o"] in FINAL or current["o"] not in MOVES[o]:
             return False
         if o == "queued" and current["o"] == "queued" and current.get("why") == rec["why"]:
             return False
@@ -1317,9 +1355,7 @@ def inbox_rows(log, name, count=10):
         raise ValueError(f"count must be a positive integer, not {count!r}")
     if not (isinstance(name, str) and name):
         raise ValueError("a recipient name is needed")
-    records, _ = log.read()
-    box = Box(log.path)
-    box.apply(records)
+    records, box = log.read_box()
     originals = {r["id"]: r for r in records if r["t"] == "msg"}   # the box drops text once final; these keep it
     chosen = [ident for ident in sorted(box.msgs) if name in box.msgs[ident]["to"]][-count:]
     return [(originals[ident], box.outcome(ident, name)) for ident in chosen]
@@ -1338,13 +1374,13 @@ def lexical_path(path):
     path = os.fspath(path)
     if not os.path.isabs(path) or ".." in path.split("/"):
         return None
-    return os.path.normpath(path)
+    return _absolute(path)
 
 
 def managed_file(state, sender, path):
     """Whether path is a message file Factory may remove: a regular file named like a-b-1.md directly in
     <state>/messages/<sender>/, with no symbolic link from the state directory down. Lexical: nothing is resolved."""
-    path, state = lexical_path(path), os.path.abspath(os.fspath(state))
+    path, state = lexical_path(path), _absolute(state)
     if path is None or not MESSAGE_FILE.fullmatch(os.path.basename(path)):
         return False
     if os.path.dirname(path) != os.path.join(state, "messages", sender) or not sender or "/" in sender:

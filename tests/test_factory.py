@@ -3749,9 +3749,10 @@ class LogTests(unittest.TestCase):
         for started in (1, 0, 1.0):
             with self.subTest(started=started):
                 self.setUp()
-                self.write_raw({"t": "out", "id": 1, "to": "operator", "o": "sending", "at": "2026-11-26T17:00:01Z"},
+                self.write_raw({"t": "out", "id": 1, "to": "operator", "o": "sending", "term": "t1",
+                                "at": "2026-11-26T17:00:01Z"},
                                {"t": "out", "id": 1, "to": "operator", "o": "delivered", "at": "2026-11-26T17:00:02Z",
-                                "started": started})
+                                "term": "t1", "turn": 1, "started": started})
                 self.assert_damage(4, "started")
 
     def test_unsafe_checkpoint_is_an_error_not_a_cache_miss(self):
@@ -3775,7 +3776,7 @@ class LogTests(unittest.TestCase):
     def test_a_damaged_batch_leaves_the_box_unusable_until_rebuilt(self):
         self.log.add("lead-dev", ["operator"], "x")
         box = self.box()
-        sending = {"t": "out", "id": 1, "to": "operator", "o": "sending", "at": "2026-11-26T17:00:01Z"}
+        sending = {"t": "out", "id": 1, "to": "operator", "o": "sending", "term": "t1", "at": "2026-11-26T17:00:01Z"}
         with self.assertRaises(factory.LogDamage):
             box.apply([sending, sending])
         for use in (lambda: box.outcome(1, "operator"), box.pending, lambda: box.apply([])):
@@ -3783,6 +3784,50 @@ class LogTests(unittest.TestCase):
                 use()
         self.assertTrue(self.log.out(box, 1, "operator", "sending", term="t1"))   # out rebuilds it from the file
         self.assertEqual(box.outcome(1, "operator")["o"], "sending")
+
+    def test_a_writer_refuses_a_missing_lock_once_the_log_exists(self):
+        self.log.add("lead-dev", ["operator"], "x")
+        held = os.open(self.log.lock_path, os.O_RDWR)    # another writer still holds the original lock
+        try:
+            self.log.lock_path.unlink()
+            before = self.log.path.read_bytes()
+            with self.assertRaisesRegex(factory.LogDamage, "lock file is missing"):
+                self.log.add("pm", ["operator"], "y")
+            self.assertEqual(self.log.path.read_bytes(), before)
+            self.assertFalse(self.log.lock_path.exists())
+        finally:
+            os.close(held)
+
+    def test_an_edited_checkpoint_is_a_miss_not_a_wrong_id(self):
+        self.log.add("pm", ["operator"], "one")
+        self.log.add("pm", ["operator"], "two")
+        check = json.loads(self.log.check_path.read_text())
+        check["last"] = 1                                 # valid JSON, consistent stat fields, a wrong id
+        self.log.check_path.write_text(json.dumps(check))
+        self.assertEqual(self.log.add("pm", ["operator"], "three")[0], 3)
+        self.assertEqual(len(self.log.read()[0]), 6)
+
+    def test_receipts_need_their_fields(self):
+        msg = {"t": "out", "id": 1, "to": "operator", "at": "2026-11-26T17:00:01Z"}
+        for history, reason in (
+            ([{**msg, "o": "sending"}], "terminal ID of sending"),
+            ([{**msg, "o": "sending", "term": "t1"}, {**msg, "o": "delivered", "started": True, "turn": 1}],
+             "terminal ID of delivered"),
+            ([{**msg, "o": "sending", "term": "t1"}, {**msg, "o": "delivered", "term": "t1", "turn": 1}],
+             "started and turn"),
+        ):
+            with self.subTest(reason=reason):
+                self.setUp()
+                self.write_raw(*history)
+                self.assert_damage(2 + len(history), reason)
+        self.setUp()
+        self.write_raw({**msg, "o": "sending", "term": "t1"},
+                       {**msg, "o": "delivered", "term": "t1", "started": None, "turn": 0})   # null started is fine
+        self.assertEqual(self.box().outcome(1, "operator")["o"], "delivered")
+        box = self.box()
+        for o, extra in (("sending", {}), ("delivered", {"term": "t1"}), ("delivered", {"term": "t1", "turn": 1})):
+            with self.subTest(o=o, extra=extra), self.assertRaises(ValueError):
+                self.log.out(box, 1, "operator", o, **extra)
 
     # validation
 
@@ -3793,6 +3838,14 @@ class LogTests(unittest.TestCase):
     def test_blank_line_is_damage(self):
         self.write_raw(b"\n")
         self.assert_damage(3, "blank line")
+
+    def test_nonstandard_json_constants_are_damage(self):
+        for constant in (b"NaN", b"Infinity", b"-Infinity"):
+            with self.subTest(constant=constant):
+                self.setUp()
+                self.write_raw(b'{"t":"msg","id":2,"at":"2026-11-26T17:00:00Z","from":"pm","to":["operator"],'
+                               b'"kind":"note","text":"x","meta":{"x":' + constant + b'}}\n', b'{"t":"ok","id":2}\n')
+                self.assert_damage(3, "not standard JSON")
 
     def test_invalid_json_and_utf8_are_damage(self):
         for raw, reason in ((b"{not json}\n", "not JSON"), (b'{"t":"ok","x":"\xff"}\n', "not JSON"),
@@ -3846,10 +3899,12 @@ class LogTests(unittest.TestCase):
         uncommitted = {"t": "msg", "id": 2, "at": "2026-11-26T17:00:00Z", "from": "pm", "to": ["operator"],
                        "kind": "say", "text": "x"}
         cases = (
-            ([{"t": "out", "id": 9, "to": "operator", "o": "sending", "at": "2026-11-26T17:00:01Z"}], 3,
+            ([{"t": "out", "id": 9, "to": "operator", "o": "sending", "term": "t1", "at": "2026-11-26T17:00:01Z"}], 3,
              "unknown message"),
-            ([{"t": "out", "id": 1, "to": "pm", "o": "sending", "at": "2026-11-26T17:00:01Z"}], 3, "non-recipient"),
-            ([uncommitted, {"t": "out", "id": 2, "to": "operator", "o": "sending", "at": "2026-11-26T17:00:01Z"}],
+            ([{"t": "out", "id": 1, "to": "pm", "o": "sending", "term": "t1", "at": "2026-11-26T17:00:01Z"}], 3,
+             "non-recipient"),
+            ([uncommitted, {"t": "out", "id": 2, "to": "operator", "o": "sending", "term": "t1",
+                            "at": "2026-11-26T17:00:01Z"}],
              4, "unknown message"),
         )
         for extra, line, reason in cases:
@@ -4236,7 +4291,8 @@ class LogFaultTests(unittest.TestCase):
             f.write(edited)
         os.utime(self.log.path, ns=(info.st_atime_ns, info.st_mtime_ns + 1000))
         factory.Log(self.state).add("pm", ["operator"], "b validates and publishes a checkpoint")
-        self.assertFalse(self.log.out(a, 2, "alice", "delivered", term="t1"))   # rebuilt: alice is queued
+        rebuilt = self.log.out(a, 2, "alice", "delivered", term="t1", started=True, turn=1)
+        self.assertFalse(rebuilt)                                  # rebuilt from the file: alice is queued
         box = self.box()
         self.assertEqual((box.outcome(2, "alice")["o"], box.outcome(2, "other")["o"]), ("queued", "sending"))
 
@@ -4344,7 +4400,7 @@ class LogOutcomeTests(unittest.TestCase):
             (("sending", {"term": "t1"}), ("queued", {"why": "blocked"}), True),
             (("sending", {"term": "t1"}), ("dropped", {"why": "stopped by down"}), True),
             (("queued", {"why": "gone"}), ("dropped", {"why": "stopped by down"}), True),
-            (("queued", {"why": "gone"}), ("delivered", {"term": "t1"}), False),
+            (("queued", {"why": "gone"}), ("delivered", {"term": "t1", "started": None, "turn": 0}), False),
             (("queued", {"why": "gone"}), ("unconfirmed", {"why": "lost"}), False),
             (("sending", {"term": "t1"}), ("sending", {"term": "t1"}), False),
         )
@@ -4359,7 +4415,7 @@ class LogOutcomeTests(unittest.TestCase):
         self.log.add("pm", ["operator"], "x")
         box = self.box()
         self.log.out(box, 1, "operator", "dropped", why="stopped by down")
-        for o, extra in (("queued", {"why": "gone"}), ("sending", {}), ("dropped", {"why": "again"})):
+        for o, extra in (("queued", {"why": "gone"}), ("sending", {"term": "t1"}), ("dropped", {"why": "again"})):
             with self.subTest(after="dropped", o=o):
                 self.assertFalse(self.log.out(box, 1, "operator", o, **extra))
 
@@ -4398,7 +4454,7 @@ class LogOutcomeTests(unittest.TestCase):
             self.log.out(box, 1, to, "dropped", why="stopped by down")
         self.assertNotIn("text", box.msgs[1])
         self.assertEqual(box.msgs[1]["to"], ["operator", "reviewer"])
-        self.assertFalse(self.log.out(box, 1, "operator", "sending"))
+        self.assertFalse(self.log.out(box, 1, "operator", "sending", term="t1"))
         with self.assertRaises(ValueError):
             self.log.out(box, 1, "pm", "sending")
         self.assertEqual(self.log.read()[0][0]["text"], "text")    # the raw records keep it
@@ -4406,8 +4462,8 @@ class LogOutcomeTests(unittest.TestCase):
     # replay of what is on disk
 
     def test_forbidden_recorded_transitions_are_damage(self):
-        sending = {"t": "out", "id": 1, "to": "operator", "o": "sending"}
-        delivered = {"t": "out", "id": 1, "to": "operator", "o": "delivered"}
+        sending = {"t": "out", "id": 1, "to": "operator", "o": "sending", "term": "t1"}
+        delivered = {"t": "out", "id": 1, "to": "operator", "o": "delivered", "term": "t1", "started": True, "turn": 1}
         cases = (
             ([delivered], 3), ([{"t": "out", "id": 1, "to": "operator", "o": "unconfirmed", "why": "x"}], 3),
             ([sending, sending], 4), ([sending, delivered, delivered], 5),
@@ -4457,7 +4513,7 @@ class LogOutcomeTests(unittest.TestCase):
         box = self.box()
         for ident in (1, 2):
             self.log.out(box, ident, "lead-dev", "sending", term="t1")
-            self.log.out(box, ident, "lead-dev", "delivered", term="t1")
+            self.log.out(box, ident, "lead-dev", "delivered", term="t1", started=True, turn=1)
         self.assertEqual(box.last_to("lead-dev")["id"], 2)            # 3 is not delivered
         self.assertEqual(box.last_to("lead-dev", sender="pm")["id"], 1)
         self.assertIsNone(box.last_to("reviewer"))
@@ -4470,9 +4526,11 @@ class LogOutcomeTests(unittest.TestCase):
             self.log.add("operator", [to], "brief", kind="brief")
         self.log.add("operator", ["d"], "not a brief")
         box = self.box()
-        for ident, to, term, final in ((1, "a", "t1", ("delivered", {})), (2, "b", "t2", ("unconfirmed", {"why": "x"})),
+        receipt = {"started": True, "turn": 1}
+        for ident, to, term, final in ((1, "a", "t1", ("delivered", receipt)),
+                                       (2, "b", "t2", ("unconfirmed", {"why": "x"})),
                                        (3, "c", "t3", ("dropped", {"why": "stopped by down"})),
-                                       (4, "d", "t4", ("delivered", {}))):
+                                       (4, "d", "t4", ("delivered", receipt))):
             self.log.out(box, ident, to, "sending", term=term)
             self.log.out(box, ident, to, final[0], term=term, **final[1])
         self.assertEqual(box.briefed(), {"t1"})
@@ -4509,7 +4567,7 @@ class LogOutcomeTests(unittest.TestCase):
     def deliver(self, box, ident, *recipients):
         for to in recipients:
             self.log.out(box, ident, to, "sending", term="t1")
-            self.log.out(box, ident, to, "delivered", term="t1")
+            self.log.out(box, ident, to, "delivered", term="t1", started=True, turn=1)
 
     def test_managed_file_rules(self):
         self.log.add("pm", ["operator"], "seed")
@@ -4594,16 +4652,22 @@ class LogOutcomeTests(unittest.TestCase):
         path = self.message_file("dev", "text.md")
         dotted = str(self.state / "messages" / "dev") + "/./text.md"
         doubled = str(self.state / "messages" / "dev") + "//text.md"
-        self.assertTrue(factory.managed_file(self.state, "dev", dotted))
-        self.assertTrue(factory.managed_file(self.state, "dev", doubled))
+        rooted = "/" + str(path)                                  # "//tmp/...": the same file on POSIX hosts
+        for spelling in (dotted, doubled, rooted):
+            self.assertTrue(factory.managed_file(self.state, "dev", spelling))
+        self.assertEqual(factory.lexical_path(rooted), str(path))
+        self.assertEqual(factory.Log("/" + str(self.state)).state, self.state)
         self.assertFalse(factory.managed_file(self.state, "dev",
                                               str(self.state / "messages" / "x" / ".." / "dev" / "text.md")))
         self.log.add("dev", ["operator"], "old", file=str(path))
-        self.log.add("dev", ["operator"], "new", file=dotted)     # pending, under another spelling
+        self.log.add("dev", ["operator"], "new", file=rooted)     # pending, under another spelling
         box = self.box()
         self.deliver(box, 1, "operator")
         self.assertIsNone(self.log.remove_delivered_file(box, 1))
         self.assertTrue(path.exists())                            # the newer pending use protects it
+        rows, _ = self.log.leftovers()                            # and the cold-start sweep agrees
+        self.assertEqual([(pathlib.Path(r["path"]).name, r["id"]) for r in rows], [("text.md", 2)])
+        self.assertTrue(path.exists())
         self.deliver(box, 2, "operator")
         self.log.remove_delivered_file(box, 2)
         self.assertFalse(path.exists())
@@ -4730,7 +4794,7 @@ class InboxReaderTests(unittest.TestCase):
         box = self.box()
         self.log.out(box, 1, "operator", "queued", why="blocked")
         self.log.out(box, 1, "reviewer", "sending", term="t2")
-        self.log.out(box, 1, "reviewer", "delivered", term="t2")
+        self.log.out(box, 1, "reviewer", "delivered", term="t2", started=True, turn=1)
         self.assertEqual([(m["id"], o["o"], o.get("why")) for m, o in factory.inbox_rows(self.log, "operator")],
                          [(1, "queued", "blocked")])
         self.assertEqual([(m["id"], o["o"]) for m, o in factory.inbox_rows(self.log, "reviewer")],
