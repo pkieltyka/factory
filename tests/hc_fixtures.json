@@ -153,7 +153,7 @@
   },
   "hc_version": "0.1.20",
   "note": "Recorded by tests/live.py fixtures from a private core; host details replaced by placeholders.",
-  "recorded_at": "2026-11-26T19:13:45Z",
+  "recorded_at": "2026-11-26T19:27:05Z",
   "replies": {
     "doc.get.empty": {
       "method": "doc.get",
@@ -1194,10 +1194,21 @@
       "method": "terminal.run",
       "params": {
         "argv": [
-          "python3",
-          "probe.py"
+          "/usr/bin/python3",
+          "/tmp/hc-fixture/probe.py",
+          "/tmp/hc-fixture/probe-agent.log",
+          "state=idle:app=probe",
+          "agent"
         ],
-        "labels": {}
+        "cwd": "/tmp/hc-fixture",
+        "labels": {
+          "factory.kind": "member",
+          "factory.team": "fix"
+        },
+        "size": {
+          "cols": 100,
+          "rows": 30
+        }
       },
       "result": {
         "address": "t1",

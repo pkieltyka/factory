@@ -28,7 +28,8 @@ import threading
 import time
 
 HC = os.environ.get("HC_BIN", "hc")
-RODEO = os.environ.get("RODEO_BIN") or shutil.which("rodeo") or ""
+RODEO = shutil.which(os.environ.get("RODEO_BIN") or "rodeo") or ""
+RODEO = os.path.abspath(RODEO) if RODEO else ""
 HC_MIN = (0, 1, 20)
 CONTROL, DATA, CREDIT, CLOSE = 0, 0, 1, 2
 MAX_SOCKET = 95
@@ -50,9 +51,10 @@ class HcError(Exception):
 class HcDown(Exception):
     """No usable answer from hc connect (hc_client.md)."""
 
-    def __init__(self, sent, detail):
+    def __init__(self, sent, detail, timeout=False):
         self.sent = sent
         self.detail = detail
+        self.timeout = timeout
         super().__init__(detail)
 
 
@@ -101,7 +103,7 @@ class Conn:
         wait = None if deadline is None else max(0.0, deadline - time.monotonic())
         ready, _, _ = select.select([fd], [], [], wait)
         if not ready:
-            raise HcDown(self.sent, "hc connect did not answer in time")
+            raise HcDown(self.sent, "hc connect did not answer in time", timeout=True)
         chunk = os.read(fd, 65536)
         if not chunk:
             raise HcDown(self.sent, "hc connect closed its output")
@@ -175,8 +177,11 @@ class Core:
         self.start_env = dict(env, **(extra_env or {}))
         self.stopped = False
         self.id = None
-        self.start()
-        CORES.append(self)
+        try:
+            self.start()
+        except BaseException:
+            self.stop()   # stops only a core whose id was verified; otherwise leaves the directory and says so
+            raise
 
     def start(self):
         out = subprocess.run([HC, "server", "start", "--json"], env=self.start_env,
@@ -187,6 +192,8 @@ class Core:
         if self.id is not None and started != self.id:
             raise RuntimeError(f"core id changed across restart: {self.id} -> {started}")
         self.id = started
+        if self not in CORES:
+            CORES.append(self)
         self.hello()
 
     def connect(self, framed=False):
@@ -230,6 +237,9 @@ class Core:
         if self.stopped:
             return
         self.stopped = True
+        if self.id is None:
+            print(f"warning: no core id known for {self.dir}; nothing stopped, directory left", file=sys.stderr)
+            return
         try:
             self.server_stop()
         except Exception as error:
@@ -275,9 +285,9 @@ class Probe:
         script = core.dir / "probe.py"
         if not script.exists():
             script.write_text(PROBE)
-        self.record = core.rpc("terminal.run", {
-            "argv": [sys.executable, str(script), str(self.log), fields, name],
-            "cwd": str(core.dir), "labels": labels or {}, "size": {"cols": 100, "rows": 30}})
+        self.params = {"argv": [sys.executable, str(script), str(self.log), fields, name],
+                       "cwd": str(core.dir), "labels": labels or {}, "size": {"cols": 100, "rows": 30}}
+        self.record = core.rpc("terminal.run", self.params)
         self.address = self.record["address"]
         if wait_status:
             deadline = time.monotonic() + 10
@@ -367,10 +377,21 @@ def rounded(value):
 # LC-1: an in-flight terminal.send whose hc connect client dies during draft_wait.
 
 def lc1():
-    draft_wait = 3
+    draft_wait = 12
     result = {"check": "LC-1", "draft_wait": draft_wait, "variants": {}}
     with Core("lc1", config=f"draft_wait = {draft_wait}\n") as qa:
         result["hc"] = qa.hello()["version"]
+        # Baseline: a send with no draft, so only hc's quiet pause delays it.
+        base = Probe(qa, "lc1-baseline")
+        time.sleep(1.0)
+        token = f"BASE_LC1_{os.getpid()}"
+        t_send = now()
+        qa.rpc("terminal.send", {"terminal": base.address, "text": token}, timeout=30)
+        typed = base.first(token)
+        baseline = typed - t_send if typed else None
+        result["baseline_typed_after_send_s"] = rounded(baseline)
+        end_at = max((baseline or 3) + 3, 6)   # the client ends here, well past the baseline and before draft_wait
+        result["client_ends_after_send_s"] = rounded(end_at)
         for variant in ("control", "sigkill", "eof", "sigkill_then_enter"):
             probe = Probe(qa, f"lc1-{variant}")
             attach = Attach(qa, probe.address)
@@ -380,13 +401,12 @@ def lc1():
             token = f"TOKEN_LC1_{variant}_{os.getpid()}"
             t_send = now()
             conn = qa.spawn_send(probe.address, token)
-            time.sleep(0.8)
+            time.sleep(end_at)
             held = conn.p.poll() is None and probe.first(token) is None
             row = {"held_when_client_ended": held}
             if variant == "control":
                 try:
-                    reply = conn.reply(30)
-                    row["reply"] = reply
+                    row["reply"] = conn.reply(draft_wait + 15)
                 except (HcError, HcDown) as error:
                     row["reply_error"] = str(error)
                 row["reply_after_s"] = rounded(now() - t_send)
@@ -406,8 +426,12 @@ def lc1():
                     row["client_exited_after_s"] = rounded(now() - t_send)
                 except subprocess.TimeoutExpired:
                     row["client_exit"] = "still running 5 s after EOF"
-                    conn.kill()
-            time.sleep(draft_wait + 3)
+            # Watch until well past the draft hold.
+            remaining = draft_wait + 3 - (now() - t_key)
+            if remaining > 0:
+                time.sleep(remaining)
+            if conn.p.poll() is None:
+                conn.kill()
             typed = probe.first(token)
             row["typed"] = typed is not None
             row["typed_after_send_s"] = rounded(typed - t_send) if typed else None
@@ -428,6 +452,9 @@ def lc1():
             attach.close()
             result["variants"][variant] = row
         result["variants"]["mid_paste_kill"] = mid_paste_kill(qa)
+        v = result["variants"]
+        result["result"] = "pass" if (baseline is not None and all(v[k]["held_when_client_ended"] for k in
+                                      ("control", "sigkill", "eof", "sigkill_then_enter"))) else "fail"
     return result
 
 
@@ -483,9 +510,14 @@ def timed_hold(tag, config="", extra_env=None, cap=20):
         try:
             conn.reply(cap)
             row["reply_after_send_s"] = rounded(now() - t_send)
-        except HcDown:
-            row["held_past_cap_s"] = cap
-            attach.type(b"\r")
+        except HcDown as error:
+            if not error.timeout:
+                row["error"] = f"connection failed: {error}"
+            elif probe.first(token) is not None:
+                row["reply_late"] = f"typed before the {cap} s cap; reply still pending"
+            else:
+                row["held_past_cap_s"] = cap
+                attach.type(b"\r")
             try:
                 conn.reply(30)
             except (HcDown, HcError):
@@ -676,7 +708,9 @@ def lc13():
             result["allow_nested_screen"] = nested.screen()[-1500:]
         nested.close()
         result["typed_after_enter_s"] = rounded(typed - t_enter) if typed else None
-        passed = (result["render"] and result["focus_at_start"] == ["op"]
+        released = typed is not None and typed - t_enter <= 2.0 and typed - t_send < draft_wait
+        result["released_by_enter"] = released
+        passed = (result["render"] and released and result["focus_at_start"] == ["op"]
                   and moves == {"left": ["op"], "right": ["dev"]} and baseline is not None
                   and result["draft_reached_op"] and result["send_held_by_rodeo_keys"]
                   and result["draft_submitted_before_token"] and result["token_on_rodeo_screen"])
@@ -720,17 +754,27 @@ def scrubber(core):
     return scrub
 
 
+ERROR_KINDS = {"blocked", "conflict", "finished", "invalid_params", "live", "not_found", "spawn_failed",
+               "status_mismatch"}
+
+
 def fixtures(out):
-    replies, errors = {}, {}
+    replies, errors, problems = {}, {}, []
     with Core("fix", config="draft_wait = 0\n", extra_env={"HC_SETTLE_MS": "0"}) as qa:
-        def rec(name, method, params=None, timeout=15, into=None):
+        def rec(name, method, params=None, timeout=15):
+            """Record one call. A case named after an error kind must fail with that kind; any other must succeed."""
             msg = qa.call(method, params, timeout)
             entry = {"method": method, "params": params or {}}
-            if "error" in msg:
-                entry["error"] = msg["error"]
-                (into if into is not None else errors)[name] = entry
+            if name in ERROR_KINDS:
+                kind = ((msg.get("error") or {}).get("data") or {}).get("kind")
+                if kind != name:
+                    problems.append(f"{name}: expected error kind {name}, got {kind or 'a result'}")
+                entry["error"] = msg.get("error")
+                errors[name] = entry
             else:
-                entry["result"] = msg["result"]
+                if "error" in msg:
+                    problems.append(f"{name}: expected a result, got error {msg['error']}")
+                entry["result"] = msg.get("result")
                 replies[name] = entry
             return msg.get("result")
 
@@ -738,8 +782,7 @@ def fixtures(out):
                             "result": qa.hello()}
         rec("server.status", "server.status")
         agent = Probe(qa, "agent", labels={"factory.team": "fix", "factory.kind": "member"})
-        replies["terminal.run"] = {"method": "terminal.run", "params": {"argv": ["python3", "probe.py"], "labels": {}},
-                                   "result": agent.record}
+        replies["terminal.run"] = {"method": "terminal.run", "params": agent.params, "result": agent.record}
         plain = rec("terminal.run.plain", "terminal.run", {"argv": ["sleep", "300"], "cwd": str(qa.dir),
                                                             "labels": {"factory.team": "fix"}})
         rec("terminal.get.live", "terminal.get", {"terminal": agent.address})
@@ -780,12 +823,17 @@ def fixtures(out):
         stop = qa.server_stop()
         if stop is not None and "result" in stop:
             replies["server.stop"] = {"method": "server.stop", "params": {}, "result": stop["result"]}
+        else:
+            problems.append(f"server.stop: expected a result, got {stop}")
         time.sleep(0.5)
         qa.start()
         rec("terminal.get.after_restart", "terminal.get", {"terminal": plain["address"]})
         rec("terminal.list.after_restart", "terminal.list", {"all": True, "labels": {"factory.team": "fix"}})
         scrub = scrubber(qa)
         version = replies["hello"]["result"]["version"]
+    missing = ERROR_KINDS - set(errors)
+    if problems or missing:
+        raise RuntimeError(f"fixtures not written: {problems + [f'{k}: not recorded' for k in sorted(missing)]}")
     leaks = [needle for needle in (scrub.host, scrub.user, scrub.home, "/nix/store/", scrub.tmp)
              if needle and needle in json.dumps([scrub(replies), scrub(errors)]).replace("/nix/store/HASH-pkg", "")]
     if leaks:
