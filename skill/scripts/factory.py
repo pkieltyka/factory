@@ -121,7 +121,8 @@ class Config:
             self.user = ""
         if not re.fullmatch(r"[A-Za-z0-9._-]+", self.user):
             raise SystemExit(f"{self.conf_file}: set `user` to your name for branches, e.g. user = \"peter\"")
-        unknown = self.team.keys() - {"user", "permissions", "worktree_dir", "operator", "members"}
+        unknown = self.team.keys() - {"user", "permissions", "worktree_dir", "operator", "members",
+                                      "quiet_grace", "ready_check", "ready_check_every"}
         if unknown:
             raise SystemExit(f"{self.conf_file}: unknown top-level key(s): {sorted(unknown)};"
                              " operator fields belong under [operator].")
