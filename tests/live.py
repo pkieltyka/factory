@@ -460,11 +460,18 @@ def lc1():
             remaining = draft_wait + 3 - (now() - t_key)
             if remaining > 0:
                 time.sleep(remaining)
-            typed = probe.first(token)
-            if conn.p.poll() is None:
-                if variant == "eof" and typed is None:
+            # Snapshot at the deadline: was the token typed, and is the client still alive?
+            typed_by_deadline = probe.first(token)
+            alive = conn.p.poll() is None
+            if alive:
+                if variant == "eof" and typed_by_deadline is None:
                     row["inconclusive"] = "EOF client still alive and token not typed by the deadline"
                 conn.kill()
+            time.sleep(0.5)
+            typed = probe.first(token)   # final delivery comes from the complete log
+            if typed is not None and typed_by_deadline is None:
+                row["typed_after_deadline"] = True
+                row.setdefault("inconclusive", "token typed only after the deadline")
             row["typed"] = typed is not None
             row["typed_after_send_s"] = rounded(typed - t_send) if typed else None
             row["typed_after_last_key_s"] = rounded(typed - t_key) if typed else None
@@ -721,9 +728,9 @@ def lc13():
         # Draft typed through rodeo: the send must be held well past the baseline, until Enter.
         for ch in "draft":
             rodeo.keys(ch)
-        t_key = now()   # the hold runs from the last draft key
         time.sleep(0.5)
         result["draft_reached_op"] = "draft" in op.text()
+        t_key = op.first("draft") or now()   # the hold runs from when @op received the last draft key
         token = f"TOKEN_LC13_{os.getpid()}"
         t_send = now()
         conn = qa.spawn_send(op.address, token)
@@ -768,31 +775,36 @@ def lc13():
 # Fixtures: replies recorded from a real core, scrubbed of host details.
 
 def scrubber(core):
+    """Replace host details with placeholders that can never be a real name ("<host>", "<user>")."""
     import getpass
-    subs = [(str(core.dir), "/tmp/hc-fixture"), (core.id, "0" * 32),
-            (os.path.expanduser("~"), "/home/user"), (sys.executable, "/usr/bin/python3")]
+    home = os.path.expanduser("~")
+    subs = [(str(core.dir), "/tmp/hc-fixture"), (core.id, "0" * 32), (home, "/home/<user>"),
+            (sys.executable, "/usr/bin/python3")]
     host, user = socket.gethostname(), getpass.getuser()
+    user = user if len(user) > 2 else ""
     nix = re.compile(r"/nix/store/[a-z0-9]{32}-[^/\s\"]+")
+    names = [(n, f"<{p}>") for n, p in ((host, "host"), (user, "user")) if n]
 
-    def scrub(value, key=None):
+    def word(name):
+        return re.compile(rf"(?<![\w.-]){re.escape(name)}(?![\w.-])")
+
+    def scrub(value, key=None, parent=None):
+        # Host and user names are replaced only where hc puts them: core.name, login_session.user, and paths.
         if isinstance(value, dict):
-            return {k: scrub(v, k) for k, v in value.items()}
+            return {k: scrub(v, k, key) for k, v in value.items()}
         if isinstance(value, list):
-            return [scrub(v, key) for v in value]
+            return [scrub(v, key, parent) for v in value]
         if isinstance(value, str):
+            if (parent, key) == ("core", "name") and host and value == host:
+                return "<host>"
+            if (parent, key) == ("login_session", "user") and user and value == user:
+                return "<user>"
             for old, new in subs:
                 value = value.replace(old, new)
             value = nix.sub("/nix/store/HASH-pkg", value)
-            # Host and user names appear only as core.name and inside paths; protocol values ("live", "idle") are
-            # left alone even when the host has such a name.
-            if key == "name" and host and value == host:
-                return "host"
-            if key == "user" and user and value == user:   # hello.login_session.user
-                return "user"
             if "/" in value:
-                for name, placeholder in ((host, "host"), (user, "user")):
-                    if name:
-                        value = re.sub(rf"(?<![\w.-]){re.escape(name)}(?![\w.-])", placeholder, value)
+                for name, placeholder in names:
+                    value = word(name).sub(placeholder, value)
             return value
         if isinstance(value, bool) or value is None:
             return value
@@ -801,22 +813,22 @@ def scrubber(core):
         if isinstance(value, int) and key and (key == "uptime_ms" or key.endswith("_ms") and value > 10**12):
             return 0
         return value
-    user = user if len(user) > 2 else ""
 
-    def leaks(value, key=None):
-        """Host details still present after scrubbing, found the same way scrub looks for them."""
+    def leaks(value, key=None, parent=None):
+        """Host details still present after scrubbing, looked for where scrub looks for them."""
         if isinstance(value, dict):
-            return [x for k, v in value.items() for x in leaks(v, k)]
+            return [x for k, v in value.items() for x in leaks(v, k, key)]
         if isinstance(value, list):
-            return [x for v in value for x in leaks(v, key)]
+            return [x for v in value for x in leaks(v, key, parent)]
         if not isinstance(value, str):
             return []
-        found = [n for n in (os.path.expanduser("~"), str(core.dir), core.id) if n in value]
+        found = [n for n in (home, str(core.dir), core.id) if n in value]
         found += ["/nix/store hash"] if nix.search(value) else []
-        found += [host] if key == "name" and host and value == host else []
-        found += [user] if key == "user" and user and value == user else []
+        found += [host] if (parent, key) == ("core", "name") and host and value == host else []
+        found += [user] if (parent, key) == ("login_session", "user") and user and value == user else []
         if "/" in value:
-            found += [n for n in (host, user) if n and re.search(rf"(?<![\w.-]){re.escape(n)}(?![\w.-])", value)]
+            bare = value.replace("<host>", "").replace("<user>", "")
+            found += [n for n, _ in names if word(n).search(bare)]
         return found
     scrub.leaks = leaks
     return scrub

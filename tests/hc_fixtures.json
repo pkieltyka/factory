@@ -153,7 +153,7 @@
   },
   "hc_version": "0.1.20",
   "note": "Recorded by tests/live.py fixtures from a private core; host details replaced by placeholders.",
-  "recorded_at": "2026-11-26T19:56:30Z",
+  "recorded_at": "2026-11-26T19:59:57Z",
   "replies": {
     "doc.get.empty": {
       "method": "doc.get",
@@ -251,7 +251,7 @@
       "result": {
         "core": {
           "id": "00000000000000000000000000000000",
-          "name": "host"
+          "name": "<host>"
         },
         "features": [
           "framed",
@@ -308,7 +308,7 @@
       "result": {
         "core": {
           "id": "00000000000000000000000000000000",
-          "name": "host"
+          "name": "<host>"
         },
         "finished": 0,
         "holder": null,
