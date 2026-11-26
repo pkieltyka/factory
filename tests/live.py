@@ -453,8 +453,21 @@ def lc1():
             result["variants"][variant] = row
         result["variants"]["mid_paste_kill"] = mid_paste_kill(qa)
         v = result["variants"]
-        result["result"] = "pass" if (baseline is not None and all(v[k]["held_when_client_ended"] for k in
-                                      ("control", "sigkill", "eof", "sigkill_then_enter"))) else "fail"
+        four = ("control", "sigkill", "eof", "sigkill_then_enter")
+        control = v["control"]
+        reasons = []
+        if baseline is None:
+            reasons.append("no baseline")
+        reasons += [f"{k}: not held when the client ended" for k in four if not v[k]["held_when_client_ended"]]
+        if "reply" not in control:
+            reasons.append(f"control: no reply ({control.get('reply_error')})")
+        if not control["typed"] or control["typed_after_send_s"] < end_at:
+            reasons.append("control: not typed after the hold")
+        reasons += [f"{k}: follow-up not delivered" for k in four if v[k]["follow_typed_after_s"] is None]
+        reasons += [f"{k}: first token typed twice" for k in four if not v[k]["first_typed_once"]]
+        if v["mid_paste_kill"]["not_pasted"]:
+            reasons.append("mid_paste_kill: some runs never pasted")
+        result["result"] = "inconclusive: " + "; ".join(reasons) if reasons else "pass"
     return result
 
 
