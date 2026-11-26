@@ -48,7 +48,7 @@ Work reaches `master` only through a pull request on GitHub. Ticket branches are
 
 ## Review
 
-Reviews start in the fast lane. Deep lane: for any change beyond a small fix, @reviewer also runs Codex's built-in review (the engine behind Codex's interactive `/review`) from its shell: `codex review --base master` for a branch (run in its worktree), `codex review --uncommitted` for uncommitted work in the main checkout, or `codex review --commit <sha>` for one commit, with the issue and acceptance criteria as the prompt argument. Learn and check it with `codex review --help`. Its report is input, not the verdict: verify each finding, cover anything it skipped, and name the lane and what it reviewed. It publishes nothing.
+Reviews start in the fast lane: @reviewer's own full review. Deep lane: for any change beyond a small fix, @reviewer also runs codegenie (github.com/0xPolygon/codegenie) from the ticket's worktree: `codegenie review --base <base sha> --head <head sha> --no-progress` for committed work on a branch, or `codegenie review --uncommitted --no-progress` for uncommitted work in a worktree. Learn it with `codegenie skill` and `codegenie review --help`; check it with `codegenie --version`. A run can take up to 30 minutes. Never pass `--post-github-comments` or anything else that publishes. Its report is input, not the verdict: verify each finding, read its coverage and health sections, cover anything it skipped, and name the lane and what it reviewed. Run it with `hc` pointed at a private, throwaway session and socket, so nothing it starts can reach the owner's sessions.
 
 ## Specs
 
