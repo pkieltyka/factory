@@ -2409,6 +2409,40 @@ class TeamCommandTests(TeamCase):
         self.assertIn("sessions cannot be saved (No space left on device): members left running", out)
         self.assertEqual(self.member_terms(), {"lead-dev": member})
 
+    def test_down_keeps_the_keeper_pane_until_the_last_member(self):
+        self.assertEqual(self.cmd(self.operator, "up", "lead-dev", "reviewer")[0], 0)
+        terms = self.member_terms()
+        self.assertEqual(self.cmd(self.operator, "down", "lead-dev")[0], 0)
+        doc, _ = self.hc.doc_get()
+        self.assertEqual(set(factory.blocks(doc)), {"keeper", terms["reviewer"]})
+        self.assertTrue(factory.read_team(self.state_dir)["up"])
+        self.assertEqual(self.cmd(self.operator, "down", "reviewer")[0], 0)
+        self.assertEqual(self.hc.doc_get()[0], {"spaces": []})
+        self.assertEqual(factory.read_team(self.state_dir)["layout"], {"made_space": False})
+
+    def test_last_down_removes_the_saved_keeper_pane_after_a_headless_replacement(self):
+        owner = LayoutTests.space("owner", LayoutTests.tab("home", LayoutTests.pane(self.operator)))
+        self.hc.doc_set({"spaces": [owner]}, 0)
+        self.hc.label(self.operator, {"herdr.space": "owner", "herdr.tab": "home", "herdr.seen": "7"})
+        self.assertEqual(self.cmd(self.operator, "up", "lead-dev")[0], 0)
+        replacement = self.terminal("keeper", kind="keeper")[0]
+        self.assertNotIn(replacement, factory.blocks(self.hc.doc_get()[0]))
+        code, out, err = self.cmd(self.operator, "down")
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(self.hc.doc_get()[0], {"spaces": [owner]})
+        self.assertEqual(factory.read_team(self.state_dir)["layout"], {"space": "owner", "made_space": False})
+        self.assertEqual(self.hc.get(self.operator)["labels"]["herdr.seen"], "7")
+
+    def test_layout_failure_does_not_change_down_exit_code(self):
+        self.assertEqual(self.cmd(self.operator, "up", "lead-dev")[0], 0)
+        original = self.hc.doc_get()
+        self.fake.doc_conflicts(factory.CAS_TRIES)
+        code, out, err = self.cmd(self.operator, "down")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("close the panes of @lead-dev in your client", err)
+        self.assertEqual(self.hc.doc_get()[0], original[0])
+        self.assertFalse(factory.read_team(self.state_dir)["up"])
+
     def test_status_shows_the_team(self):
         self.cmd(self.operator, "up", "lead-dev", "reviewer")
         reviewer = self.member_terms()["reviewer"]
@@ -2525,9 +2559,11 @@ class IntegratedTeamTests(TeamCase):
         self.assertIn("stopped @lead-dev (was idle)", out)
         self.assertEqual(set(self.members()), {"reviewer"})
         keeper = factory.team_view(self.hc, self.team).keeper["address"]
+        self.assertEqual(set(factory.blocks(self.hc.doc_get()[0])), {first["reviewer"], keeper})
         code, out, err = self.cmd("down")
         self.assertEqual(code, 0, out + err)
         self.assertIn("run factory.py up to bring members back", out)
+        self.assertFalse(factory.blocks(self.hc.doc_get()[0]))
         self.until(lambda: self.hc.get(keeper)["state"] == "finished", "the keeper's exit after the last down")
         code, out, err = self.cmd("up", "lead-dev")
         self.assertEqual(code, 0, out + err)

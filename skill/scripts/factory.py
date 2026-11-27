@@ -2437,6 +2437,48 @@ def _place_team(cfg, state, hc, team, me, keeper, replacements):
             print(f"warning: could not label the placed terminal {terminal}: {error}", file=sys.stderr)
 
 
+def _unplace_team(state, hc, recorded, last, keeper):
+    names = ", ".join(f"@{name}" for name in dict(recorded))
+    close = f"close the panes of {names} in your client" if names else "close the keeper pane in your client"
+    try:
+        layout = read_team(state).get("layout", {})
+    except (Problem, LogDamage, OSError) as error:
+        print(f"layout not updated ({error}): {close}", file=sys.stderr)
+        return
+    if not isinstance(layout, dict):
+        layout = {}
+    terminals = {term for _, term in recorded}
+    if last:
+        terminals.update((keeper, layout.get("keeper")))
+    saved_layout = layout
+
+    def change(doc):
+        nonlocal saved_layout
+        before = blocks(doc)
+        tabs = list(_layout_tabs(doc))
+        remove_panes(doc, layout, terminals)
+        saved_layout = dict(layout)
+        if saved_layout.get("keeper") not in blocks(doc):
+            saved_layout.pop("keeper", None)
+        after = list(_layout_tabs(doc))
+        if not any(tab["id"] == layout.get("tab") for _, tab in after):
+            saved_layout.pop("tab", None)
+        if not any(space["id"] == layout.get("space") for space in doc["spaces"]):
+            if "space" in saved_layout:
+                saved_layout.pop("space")
+                saved_layout["made_space"] = False
+        return bool(terminals.intersection(before) or len(after) != len(tabs))
+
+    reason = edit_layout(hc, change)
+    if reason is not None:
+        print(f"layout not updated ({reason}): {close}", file=sys.stderr)
+    elif saved_layout != layout:
+        try:
+            update_team(state, layout=saved_layout)
+        except (Problem, OSError, LogDamage) as error:
+            print(f"layout updated, but team.json was not updated: {error}", file=sys.stderr)
+
+
 def wait_outcomes(log, ident, recipients, offset, timeout=SAY_WAIT):
     """Follow only this message from its commit, without rereading the log prefix."""
     box = Box.for_message(log.path, ident, recipients, offset)
@@ -3895,11 +3937,15 @@ def _down(cfg, hc, team, state, names):
                           f" {name} again")
                     code = 1
     try:
-        after = team_view(hc, team)
+        after = hc.list(team)
     except (HcDown, HcError) as error:
         print(f"could not check whether any member still runs: {error}")
         return 1
-    if not any(after.terminal(n) or after.finished(n) for n in cfg.members):
+    last = not any(r["labels"].get("factory.kind") == "member" for r in after)
+    if recorded or last:
+        keeper = View(after).keeper if last else None
+        _unplace_team(state, hc, recorded, last, keeper["address"] if keeper else None)
+    if last:
         try:
             update_team(state, up=False)
         except (Problem, ValueError, OSError, LogDamage) as error:
@@ -3907,6 +3953,7 @@ def _down(cfg, hc, team, state, names):
             code = 1
         print("run factory.py up to bring members back")
     return code
+
 
 def cmd_status(args):
     hc = Hc()
