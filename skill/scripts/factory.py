@@ -4044,7 +4044,8 @@ def _down(cfg, hc, team, state, names):
     except (HcDown, HcError) as error:
         print(f"could not check whether any member still runs: {error}")
         return 1
-    last = not any(r["labels"].get("factory.kind") == "member" for r in after)
+    last = not any(r["labels"].get("factory.kind") == "member" and r["labels"].get("factory.member") in cfg.members
+                   for r in after)
     if recorded or last:
         keeper = View(after).keeper if last else None
         _unplace_team(state, hc, recorded, last, keeper["address"] if keeper else None)
@@ -4116,7 +4117,7 @@ def cmd_status(args):
     if box is not None:
         briefed = box.briefed()
         for name, term in live_members.items():
-            if term not in briefed and view.state(name) != "starting":
+            if term not in briefed and view.state(name) not in ("starting", "gone"):
                 pending = _pending_brief_line(box, name)
                 print(pending or f"@{name} has no confirmed brief: run factory.py brief --send {name}")
     reachable = view.operator is not None and view.operator.get("status") is not None

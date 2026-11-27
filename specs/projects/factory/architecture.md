@@ -114,7 +114,7 @@ Factory never sets an `hc` terminal name (§6.1) and always addresses a terminal
  "ready_clear": 0}
 ```
 
-`up` is true from the first `up` that passes preflight until `down` stops the last member. `down` records intentionally stopped terminals in `stopped` before removing their records or dropping queued messages. The keeper checks that list under the same lock it uses to settle a definite refusal. A missing or unreadable file withholds settlement until metadata is available again. `ready_clear` is the highest message id at the last ready check that found no work. `up` can rebuild missing or unreadable metadata from the checkout and its terminals.
+`up` is true from the first `up` that passes preflight until `down` stops the last configured member. `down` records intentionally stopped terminals in `stopped` before removing their records or dropping queued messages. The keeper checks that list under the same lock it uses to settle a definite refusal. A missing or unreadable file withholds settlement until metadata is available again. `ready_clear` is the highest message id at the last ready check that found no work. `up` can rebuild missing or unreadable metadata from the checkout and its terminals.
 
 `layout.keeper` names the terminal in the keeper pane. If the keeper is replaced headless, `up` reuses the recorded block and the last `down` removes it.
 
