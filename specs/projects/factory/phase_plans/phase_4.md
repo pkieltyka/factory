@@ -368,8 +368,8 @@ Each step is one commit with its tests green in fake mode; run real mode (`FACTO
 3. `head_of`, `decide`. Proved by the pure tests.
 4. `Box.sending_terms`, `mark_stopped`, `settle_refusal`; `Keeper`: start, tick, deliver, results, recovery, exit rules, pane lines; `cmd_keeper`. Proved by the delivery, result, crash and liveness tests.
 5. `read_beat`, `ensure_keeper`. Proved by the `test_ensure_keeper_*` tests.
-6. `wait_outcomes`, `outcome_lines`, v2 `cmd_say`; the member prompt. Proved by the `say` tests and the real-core test.
-7. Cutover: `print_pending` in v1's `status` and `up`; the removals of §9; v1 test clean-up; `CutoverTests`; `harnesses.toml`.
+6. `wait_outcomes`, `outcome_lines`, v2 `cmd_say`. Proved by the `say` tests and the real-core test. Keep the member prompt and its `--cwd` argument until the public command changes.
+7. Cutover: `print_pending` in v1's `status` and `up`; the removals of §9; the member prompt; v1 test clean-up; `CutoverTests`; `harnesses.toml`.
 8. Docs of §10; measure the sections for architecture.md §4.
 
 Steps 1 and 2 publish everything #169 needs to write against; tell @lead-dev-2 when they are pushed.

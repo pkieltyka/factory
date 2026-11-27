@@ -36,9 +36,9 @@ CLI: `factory.py keeper --state <dir>`. Exit 0 always, including "already runnin
 
 | Held in | What |
 |---|---|
-| memory | `box` (log index and offset); `inflight: dict[recipient, msg id]`; `results: queue.Queue`; `quiet_since`; `op_null_since`; `ready_job`, `ready_next`; last title; last error line and when |
+| memory | `box` (log index and offset); `inflight: dict[recipient, msg id]`; `results: queue.Queue`; withheld results (`unsettled`); `quiet_since`; `op_null_since`; `ready_job`, `ready_next`; last title; last error line and when |
 | the log | Everything that must survive a crash: outcomes, which terminals are briefed, which notes were sent, the last quiet and ready notes ([message_log.md](message_log.md), "Derived facts") |
-| `team.json` | `up` and `ready_clear`: read under `LOCK_SH` each tick; `ready_clear` written under `LOCK_EX` |
+| `team.json` | `up` and `ready_clear`: read under `LOCK_SH` each tick; `ready_clear` written under `LOCK_EX`. `stopped`: explicit stops written by `down` and checked while settling a member's refusal under `LOCK_EX` |
 | labels | `factory.last` per member terminal (shown by `status` and exit notes only); `factory.kind` on the operator |
 | `factory.toml` | Re-read through `Config(root)` when its mtime changes: roster, `quiet_grace`, `ready_check`, `ready_check_every` |
 
@@ -60,8 +60,8 @@ Only the main thread writes the log, `team.json` and labels, and prints. Worker 
 
 1. `flock(keeper.lock, LOCK_EX | LOCK_NB)`. If it is held: emit `keeper already running`, return 0.
 2. Install handlers for SIGINT, SIGTERM and SIGHUP that set `self.stop`. Never read stdin.
-3. Read `team.json`; `log.read(0)` into `box` (full validation). On `LogDamage`: emit the diagnosis, set `self.damaged`; a damaged keeper still beats and ticks but delivers nothing and sends no notes, and retries the full read once a minute.
-4. For every pair whose current outcome is `sending`: `log.out(box, id, to, "unconfirmed", why="keeper restarted during the send")` (§10.10).
+3. Read `team.json`; `log.read_box()` (full validation). If the log cannot be read, emit the diagnosis and set `self.damaged`.
+4. After a successful read, for every pair whose current outcome is `sending`: `log.out(box, id, to, "unconfirmed", why="keeper restarted during the send")` (§10.10).
 5. Write `keeper.beat` (`<pid> <VERSION> <HC_TERMINAL_ID>`); `hc.label(HC_TERMINAL_ID, {"factory.version": VERSION})`; emit `keeper <VERSION> started`.
 6. Loop: `self.tick()`; then `results.get(timeout=TICK)`, putting a result back so the next tick handles it at once. Leave when `self.stop` is set or an exit rule (§8) holds.
 7. On leaving: `hc.kill_children()`; emit `keeper stopping: <why>`; return 0.
@@ -69,14 +69,16 @@ Only the main thread writes the log, `team.json` and labels, and prints. Worker 
 `tick()`, in this order:
 
 1. Touch `keeper.beat`. Every 30 s compare `VERSION` with the script on disk (§8).
-2. Drain `results` and handle each (§4).
+2. Retry withheld results, then drain `results` and handle each (§4). If `team.json` is unreadable or missing, keep beating and withhold dispatch and the team-down rule until it reads again.
 3. `view = team_view(hc, team)`. On `HcDown`: emit `hc unreachable: <detail>` at most once a minute and return.
-4. `box.apply(log.read(box.offset))`. The same refresh runs after every record the keeper itself appends in steps 6 and 7, so the quiet rule sees a member note just added and step 8 sees every note of this tick.
+4. `log.refresh(box)` checks the log's lineage, so a repaired prefix is reread. The same refresh runs after every record the keeper itself appends in steps 6 and 7, so the quiet rule sees a member note just added and step 8 sees every note of this tick.
 5. Track `op_null_since`: set to `now` when `view.operator` exists with a null status and it was None; cleared when the status is not null.
 6. Member notes (§5).
 7. Quiet rule and ready check (§6): may append a note.
 8. Deliver (§3): includes a note appended in step 7, in this same tick.
 9. Title (§7).
+
+A keeper with a failed log read or write keeps its heartbeat and handles results. It pauses dispatch and retries the full read once a minute. After a successful retry it records `unconfirmed` for each `sending` pair with no send in flight, then resumes delivery.
 
 `TICK` is one second, always. One `hc connect` and one `terminal.list` a second is far below 1% of a core; a single period keeps "how long can a state go unseen" a single number (§10).
 
@@ -116,32 +118,33 @@ Applying the action:
 
 | Action | Effect |
 |---|---|
-| `send` | `log.out(box, id, name, "sending", term=term)`; if it returns True (the record is synced): `inflight[name] = id`; `spawn(lambda: self._send(name, msg, term))`. If it raises `NotStored`, nothing is sent: emit the error and set `self.damaged` (the disk is failing). A `sending` record left visible by that failure becomes `unconfirmed` at the next start, with nothing typed |
+| `send` | `log.out(box, id, name, "sending", term=term)`; if it returns True, read the message text from the refreshed box, set `inflight[name] = id`, and start a worker with the recipient, ID, terminal and text bound. If the claim fails to sync, nothing is typed. After recovery a visible but unsynced claim becomes `unconfirmed` |
 | `queue` | `log.out(…, "queued", why=why)` for the head only, and only when `why` differs from its current outcome. With `gone` or `not ready`: the same for every pending pair of that recipient |
 | `drop` | `log.out(…, "dropped", why=why)`; with `stopped by down`, for every pending pair of that recipient |
 | `hold` | nothing; the default `queued (waiting)` stands |
 | `latch` | `hc.label(operator terminal, {"factory.kind": "operator-lost"})`, then as `("queue", "gone")` (§7.4) |
 
-`_send` builds the wire text and calls `hc.send(term, text)` with no timeout, then puts `(name, id, term, result_or_exception)` on `results`. Wire text: `"[from @" + sender + "]\n" + text`, with `"\n"` appended when `text` does not end with one; the sender line is `[from factory]` for notes (§8.1).
+The keeper builds the wire text after claiming the pair: `"[from @" + sender + "]\n" + text`, with `"\n"` appended when `text` does not end with one. The sender line is `[from factory]` for notes (§8.1). `_send` calls `hc.send(term, wire)` with no reply timeout, then puts `(name, id, term, result_or_exception)` on `results`.
 
 The view is at most a few milliseconds old when `hc.send` is called: the "checked right before each send" of §8.2. The known limit (a harness that quits during `draft_wait`) is `hc`'s.
 
 ## 4. Handling a send result
 
-This is the only table that maps a send result to an outcome. Always: remove `name` from `inflight`, then:
+Settled results free the recipient's slot in `inflight`. A withheld result holds the slot.
 
 | Result | Record | Also |
 |---|---|---|
-| `hc` result | `delivered` with `term`, `started`, `turn` | If every recipient of the message is now `delivered` and its `file` is managed: unlink it |
-| `HcError` `blocked` | `queued`, `blocked` | |
-| `HcError` `not_found` or `finished`, recipient is the operator | `queued`, `gone` | `down` never stops the operator, so this is never `dropped` |
-| `HcError` `not_found` or `finished`, recipient is a member | Settled now, from a fresh `team_view`: if a record for `term` still exists, is finished and has no `factory.down`: `queued`, `gone`. Otherwise (`down` removed or marked it): `dropped`, why `stopped by down` | Never deferred: a `down` followed by `up` must not hand the message to the new terminal (§8.5) |
-| `HcDown(sent=False)` | `queued`, `waiting` | Nothing reached `hc`; retried next tick |
-| any other `HcError`; `HcDown(sent=True)` | `unconfirmed`, why = the error text | Final; later messages to that recipient go on |
+| Result with an integer `turn` and a boolean or null `started` (which may be absent) | `delivered` with `term`, `started`, `turn` | If every recipient is now `delivered` and its `file` is managed, unlink it |
+| `HcError` `blocked` | `queued`, `blocked` | Members use the stop check below |
+| `HcError` `not_found` or `finished` | `queued`, `gone` | Members use the stop check below |
+| `HcDown(sent=False)` | `queued`, `waiting` | Members use the stop check below |
+| any other failure or an unexpected result | `unconfirmed`, with the reason | Final. Later messages to that recipient can go on |
+
+For a member's definite refusal, `settle_refusal` checks the claimed terminal against `team.json`'s `stopped` list and appends the outcome under the same directory `LOCK_EX`. An explicit stop produces `dropped (stopped by down)`. A lost terminal with no recorded stop can be retried after its replacement is briefed. If the metadata is unreadable or missing, the keeper withholds settlement and retries each tick. A restart during this wait makes the pair `unconfirmed`.
 
 For a quiet or ready note, every row that would write `queued` writes `dropped`, why `operator could not take it`, instead.
 
-A delivered brief needs no further step: readiness is `box.briefed()`. If `log.out` raises here, the keeper emits the error and sets `self.damaged`; the pair stays `sending` in the log and becomes `unconfirmed` at the next start, which is the truth.
+A delivered brief makes the terminal ready through `box.briefed()`. A failed outcome append enters the log recovery path in §2.
 
 ## 5. Notes about members (§8.4)
 
@@ -258,8 +261,8 @@ Called by `up` (`force=True`), `say`, `brief --send` and `status`.
    - **young**: `k` exists and was created less than `BEAT_STALE` ago (`created_ms / 1000`). It has not had time to prove itself hung. Return its address.
    - **hung**: `k` exists and is neither. `hc.kill(k["address"])`, `hc.rm(k["address"])`: by the terminal ID from the view, never by name or process pattern (v1 #158).
 4. Remove every finished record of kind `keeper` (`hc.rm`).
-5. Start: `hc.run([sys.executable, SCRIPT, "keeper", "--state", str(state)], cwd=root, env={"PATH": os.environ.get("PATH", "")}, labels={"factory.team": team, "factory.kind": "keeper", "factory.dir": str(state), "factory.version": VERSION, "name": "keeper"})`.
-6. Wait up to 5 s for `keeper.beat` to name the new terminal. If the terminal finishes first: `hc.rm` it and raise `Problem("the keeper did not start: <last line of its screen>", "run factory.py status")`.
+5. Start: `hc.run([sys.executable, SCRIPT, "keeper", "--state", str(state)], cwd=root, env=env, labels={"factory.team": team, "factory.kind": "keeper", "factory.dir": str(state), "factory.version": VERSION, "name": "keeper"})`. Pass `PATH` and, when set, `HC_BIN`.
+6. Wait up to `KEEPER_START` (5 s) for `keeper.beat` to name the new terminal. If the terminal finishes first: `hc.rm` it and raise `Problem("the keeper did not start: <last line of its screen>", "run factory.py status")`.
 7. Release `keeper.start`; return the address.
 
 The keeper is always started without a pane. Only `up` gives it one: it adds the returned terminal to the layout in the same edit as the members, whenever that terminal has no block there ([launch_layout.md](launch_layout.md) §6). So a keeper restarted by `say` or `status` runs headless until the next `up`, and a healthy headless keeper gets its pane back on the next `up`.
