@@ -12,8 +12,14 @@
 #                         # guarded keeps Claude Code and Codex behind their own guard. See Permissions in the factory skill's references/cmd_setup.md.
 # worktree_dir = "../<repo>.worktrees"
 
+# quiet_grace = 120       # seconds before a quiet note (30 or more)
+# ready_check = "items=$(awk '/^## / { ready = ($0 == \"## Ready\") } ready && /^- \\[ \\] \\([0-9]+\\)/ { print }' TODO.md) || exit 2; [ -n \"$items\" ] || exit 1; printf '%s\\n' \"$items\""
+# Optional read-only command in your local factory.toml. Exit 0 with output means ready work.
+# Exit 1 or exit 0 with empty output means none. Other exits mean unknown.
+# ready_check_every = 300 # seconds between ready checks (60 or more)
+
 [operator]
-name = "operator"   # the operator agent's @name, pane label and herdr agent name; fixed while the team runs
+name = "operator"   # the operator agent's @name and pane title; fixed while the team runs
 # Setup records this session’s harness, model and thinking in your local factory.toml.
 notes = "Owns architecture, assigns tasks and integrates reviewed work."
 

@@ -139,30 +139,32 @@ Every file below is product (the agents read it). The rule for all of them: dele
 | File | Change |
 |---|---|
 | `skill/SKILL.md` | Description: "in herdr-core (hc)"; commands `setup, up, down, status, brief, say, inbox`. Delete the paragraphs on background and foreground operators, `wait`, acknowledgement, watcher hand-off. "Before launch": require `HC_TERMINAL_ID` (a rodeo pane) and `hc` 0.1.20; no integration check; the operator needs `hc`, the harness config directories, `~/.cache/factory-skill` and any worktree parent. Commands table without `wait`; `down NAME` then `up NAME` replaces `--restart`. Bare `/factory` routing as §5 of the spec. Launch: `up` marks this pane as the operator, adds the `team` tab and the keeper; exit codes 2 and 3. One sentence: "Never start a wait, watcher or background task for Factory: messages are typed into your pane." |
-| `references/leading.md` | Replace "Receive and inspect" with: messages arrive as `[from @name]` and may start a turn or steer the current one; `factory.py inbox [N]` rereads them after compaction; what each `say` outcome means for the sender; `[from factory]` notes are information from Factory, not a teammate. Add the note table below. Rename "Autopilot" to "Autonomous operation": it is the default; keep its stop rules; delete the `herdr notification` line. Update the status table (`starting`, `gone`, keeper and operator lines). |
-| `references/cmd_continue.md` | Commands without `--restart`; after an `hc` restart every member is `gone` and reported interrupted, run `up`; `inbox` replaces `wait --timeout 0`; a member comes back in the conversation it last sent a message from; one that starts in a new conversation says so in `up`'s output and needs its task again; "Change a running member's settings" becomes `down NAME` then `up NAME`, with `--fresh` for a new conversation. |
+| `references/leading.md` | Replace "Receive and inspect" with: messages arrive as `[from @name]` and may start a turn or steer the current one; `factory.py inbox [N]` rereads them after compaction; what each `say` outcome means for the sender; `[from factory]` notes are information from Factory, not a teammate. Add the note table below. Rename "Autopilot" to "Autonomous operation": it is the default; keep its limits and use the stop rules in §8a.3; delete the `herdr notification` line. Update the status table (`starting`, `gone`, keeper and operator lines). |
+| `references/cmd_continue.md` | After an `hc` restart, use `up NAME` for interrupted members you want back. Members stopped by `down` stay stopped until selected. `up` tries compatible saved conversations and reports fresh starts. Summarize open items to the user before reading replies, then reconcile the tracker, inbox and pickup reports before assigning work again. Change member settings with `down NAME` then `up NAME`, with `--fresh` for a new conversation. |
 | `references/cmd_setup.md` | One question added to step 2: whether the keeper may run a read-only ready check, and with which command; it goes in the owner's `factory.toml`, never in `FACTORY.md` or the sample. Permissions: `HC_TERMINAL_SOCKET` replaces `HERDR_SOCKET_PATH`. After `check`: act on the `draft_wait` warning by telling the owner the one line to add to `hc`'s config; never edit it. |
-| `references/pull-requests.md`, `notes.md` | No change. |
+| `references/pull-requests.md` | Describe the bounded CI wait and when to read the forge. |
 | `templates/member-prompt.md` | "herdr pane" → "pane". The send command is `{say} NAME --file {draft}` with `{say}` = `python3 <SCRIPT> say` (no `--cwd`). Replace the outcome sentences with the paragraph below. The last "Reports" paragraph ends with `Report sent to @<requester>` for `delivered`, `sending` or `queued`. |
 | `templates/FACTORY.md` | `## Workflow` becomes the default below (§8a). |
 | `templates/factory.toml` | Operator comment: "pane label" without herdr. Add, commented out, `quiet_grace = 120`, `ready_check_every = 300` and a `ready_check` example line. They stay comments, so `init` never enables a ready check (§8a.2). |
-| `recipes/tasks-todos.md`, `tasks-gh.md` | Each gains a "Ready check" paragraph with one command that prints the ready items and exits 1 when there are none, tested against that tool by the developer who writes it. |
+| `recipes/tasks-todos.md`, `tasks-gh.md` | Each gains a "Ready check" paragraph with one command that prints the ready items, exits 1 when there are none and exits 2 when the tool fails. Test all three cases against that tool. |
 | `harnesses.toml` | [launch_layout.md](launch_layout.md) §1; header comment updated; no `deliver` key until a harness fails §10.4. |
 | `README.md`, `docs/getting-started.md`, `docs/README.md` | Requirements (`hc` and rodeo); no operator modes; `draft_wait`; the keeper pane; what is not handled (§8a.3); the known limit of §8.2. |
 
 Outcome paragraph for `member-prompt.md`:
 
-> Run the send command alone (no `cd &&`, pipe, redirect or trailing `echo`). Factory adds your sender line and prints a message ID and one outcome per recipient. `delivered`: it was typed into their pane. `sending` or `queued`: Factory will finish it; do nothing more and never resend. `unconfirmed` or `dropped`: it may not have arrived; tell {operator} which message and recipient, and resend only when asked. `nothing sent` or `not stored`: fix what the line says, then send again. Factory removes your file once every recipient has the message.
+> Run the send command alone (no `cd &&`, pipe, redirect or trailing `echo`). Factory adds your sender line and prints a message ID and one outcome per recipient. `delivered`: it was typed into their pane. `sending` or `queued`: Factory will finish it; do nothing more and never resend. `unconfirmed` or `dropped`: it may not have arrived; tell {operator} which message and recipient, and resend only when asked. `nothing sent`: nothing was stored. Fix what the line says, then send again. `not stored` or `not confirmed stored`: follow the diagnostic. When it says not to resend, tell {operator}. Factory removes your file once every recipient has the message.
 
-Note table for `leading.md`:
+Note table for `leading.md`.
 
-| Note from `[from factory]` | Do |
+Notes from `[from factory]` describe an observation that may have changed while delivery was held. Check `status`, the tracker and active work before acting.
+
+| Note | Action |
 |---|---|
-| `@x is blocked (…)` | Resolve it if you can; ask the owner when only they can. |
+| `@x is blocked` | Resolve the current block, or ask the owner when only they can. |
 | `@x hit an error` | Reassign, or retry after the provider's delay. |
-| `@x exited` / `was lost` | `factory.py up x`, then give it its task again, or reassign. |
-| `team quiet` | Ask whoever owes you a report. Otherwise take the next ready item. Otherwise end your turn; do not answer the note. |
-| `ready work` | Take the first item it lists, as the workflow says. |
+| Member exit (`exited`, `was killed`, `hc stopped`, `was lost`, or `its harness ended`) | Run `factory.py up NAME` or reassign. Reconcile the pickup report, tracker and inbox before assigning the task again. |
+| `team quiet` | Check who owes a report, then check for ready work. If neither needs action, end your turn without replying. |
+| `ready work` | Read the current tracker and take its next ready item if you can assign it. |
 
 Default `## Workflow` for `templates/FACTORY.md`:
 
@@ -175,11 +177,11 @@ The team works through the ready items on its own. The owner sets direction; the
 | 2. Items | The pm, or the operator without one | Items with acceptance criteria; a current tracker. |
 | 3. Plan | An architect, when the team has one | A plan for the item: interfaces, edge cases, tests, files. Small fixes skip this step. |
 | 4. Build | Developers | Code and tests, following the plan. |
-| 5. Review | The reviewer | A verdict on the exact diff. Fixes until approved; after three rounds on one item the operator decides. |
+| 5. Review | The reviewer | A verdict on the exact diff. Fixes until approved; after two rounds on one item the operator decides. |
 | 6. Integrate | The operator | Confirms the approval and the checks, then integrates and has the tracker updated. |
 | 7. Next | The operator | Takes the next ready item without asking. |
 
-- The operator assigns each step with acceptance criteria and records owner, criteria, branch or commit, verdict and next step in the tracker.
+- The operator assigns each step with acceptance criteria. Only @pm writes the tracker when present. Without @pm, the operator writes it. Record owner, criteria, branch or commit, verdict and next step.
 - One item is in progress at a time. Its tasks may run in parallel when each writer has its own worktree; in a shared checkout only one task writes at a time.
 - Every member reports to whoever assigned its work when it finishes, is blocked, or needs a decision. A member that is rate-limited or stuck says so; the operator reassigns.
 ```
@@ -192,7 +194,7 @@ Depends on: every other component. Used by: `main`.
 
 ## Test plan
 
-- `test_parser_commands`: the eleven commands parse; `wait`, `prompt`, `--restart`, `--no-brief` are rejected; `continue` prints the pointer and exits 2.
+- `test_parser_commands`: the v2 commands parse; retired commands and flags are rejected.
 - `test_resolve_team_from_caller_labels`, `…_from_checkout_when_caller_is_outside`, `…_offline_single_dir`, `…_offline_newest_of_several`; `test_two_cache_homes_share_one_log` (the member's environment has another `XDG_CACHE_HOME`; its `say` lands in the operator's log).
 - One test per row of the `say` refusal table, each asserting exit 2 and that the log is unchanged.
 - `test_say_all_expands_to_live_members_only`; `test_say_names_split_on_commas_and_spaces`; `test_say_to_gone_member_is_queued`.

@@ -212,7 +212,7 @@ It wakes the operator with "ready work" when work appears after a result of no w
 | A member rate-limited, or its model or provider failing | `error` or `blocked` (login) | Note (§8.4) | The operator reassigns, or retries after the provider's delay |
 | A member crashes or is lost | Terminal ended | Note (§8.4); flagged interrupted (§9.3) | The operator runs `up NAME` or reassigns |
 | A message cannot be delivered | `queued` with its reason | §8.5; oldest age in `status` | The keeper delivers it when the reason clears |
-| A review loop | Three rounds on one ticket | Workflow rule in `FACTORY.md` | The operator decides |
+| A review loop | Two rounds on one ticket | Workflow rule in `FACTORY.md` | The operator decides |
 | CI that never finishes | The developer's bounded wait runs out | The developer reports | The operator decides |
 | A decision only the owner can make | The operator asks the owner | The operator carries on with other ready work meanwhile | The owner |
 

@@ -7,6 +7,7 @@ import datetime
 import errno
 import fcntl
 import hashlib
+import inspect
 import io
 import json
 import os
@@ -20,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import tomllib
 import threading
 import time
 import types
@@ -4582,7 +4584,8 @@ class MemberPromptTests(unittest.TestCase):
         prompt = self.env.run("brief", "lead-dev").stdout
         self.assertIn(f"python3 {SCRIPT} say NAME --file", prompt)
         self.assertNotIn("say --cwd", prompt)
-        for word in ("delivered", "sending", "queued", "unconfirmed", "dropped", "nothing sent", "not stored"):
+        for word in ("delivered", "sending", "queued", "unconfirmed", "dropped", "nothing sent", "not stored",
+                     "not confirmed stored"):
             self.assertIn(f"`{word}`", prompt)
         self.assertIn("resend only when asked", prompt)
 
@@ -6689,7 +6692,7 @@ class ConfigTests(unittest.TestCase):
         with Env(team_brief('[operator]\nname = "boss"\nharness = "claude"\n' + team, stock)) as e:
             brief = e.run("brief").stdout
             self.assertIn("# Team brief (from @boss)", brief)
-            self.assertIn("1. The operator assigns tasks", brief)  # the shared brief names the role ...
+            self.assertIn("The operator assigns each step", brief)  # the shared brief names the role ...
             self.assertNotIn("@operator", brief)                   # ... never one person's operator
             e.write_brief(team_brief(team, "## Workflow\n\n{operator} and {name} stay as written.\n"))
             self.assertIn("{operator} and {name} stay as written.", e.run("brief").stdout)  # FACTORY.md is sent as it is
@@ -6882,10 +6885,154 @@ class ListingTests(unittest.TestCase):
         self.assertEqual(factory.listed_models(omp), ["openrouter/z-ai/glm-5.3", "openrouter/z-ai/glm-5.3-flash", "ollama/qwen3:8b"])
 
 
+class SkillTextTests(unittest.TestCase):
+    @staticmethod
+    def pages():
+        root = factory.SKILL.parent
+        return [root / "README.md", *sorted((root / "docs").glob("*.md")),
+                *sorted(factory.SKILL.rglob("*.md")), *sorted(factory.SKILL.rglob("*.toml"))]
+
+    @classmethod
+    def examples(cls):
+        invocation = re.compile(r"^((?:python3\s+)?(?:\S+/)?factory\.py|/factory)\s+([a-z][a-z-]*)\b(.*)")
+        for page in cls.pages():
+            fenced = False
+            for line in page.read_text().splitlines():
+                if line.startswith("```"):
+                    fenced = not fenced
+                    continue
+                spans = [line.split(" #", 1)[0].strip()] if fenced else re.findall(r"`([^`]+)`", line)
+                for span in spans:
+                    if match := invocation.match(span):
+                        yield page, *match.groups()
+
+    @staticmethod
+    def help_text(*args):
+        return subprocess.run([sys.executable, str(SCRIPT), *args, "--help"], text=True,
+                              capture_output=True, check=True).stdout
+
+    def test_no_removed_commands_or_stale_instructions(self):
+        removed = re.compile(
+            r"\bherdr\b(?!-(?:core|app)\b)|\bHERDR_\w+|(?<!\w)(?:factory\.py|/factory)\s+(?:wait|prompt|continue)\b"
+            r"|(?<!\w)--(?:seen|restart|no-brief)\b|\bv1\b", re.IGNORECASE)
+        banner = ("> **This checkout is Factory for herdr-core.** Until v2 ships, install the current release from "
+                  "the [`v1` branch](https://github.com/pkieltyka/factory/tree/v1) (tag `v1.0.0`).")
+        for page in self.pages():
+            for number, line in enumerate(page.read_text().splitlines(), 1):
+                if page == factory.SKILL.parent / "README.md" and line == banner:
+                    continue
+                prose = re.sub(r"https?://[^\s)>`]+", "", line)
+                self.assertIsNone(removed.search(prose), f"{page}:{number}: {line}")
+
+    def test_commands_named_in_the_text_exist(self):
+        commands = set(re.search(r"\{([a-z,-]+)\}", self.help_text())[1].split(","))
+        private = {"keeper", "init", "harnesses", "check"}
+        for page, invocation, command, _ in self.examples():
+            with self.subTest(page=page.name, invocation=invocation, command=command):
+                supported = (commands - private) | {"setup"} if invocation == "/factory" else commands
+                self.assertIn(command, supported)
+
+    def test_flags_named_in_the_text_exist(self):
+        options = {}
+        for page, _, command, tail in self.examples():
+            flags = set(re.findall(r"(?<![\w-])--[a-z][a-z-]*", tail))
+            if not flags:
+                continue
+            if command not in options:
+                options[command] = set(re.findall(r"(?<![\w-])--[a-z][a-z-]*", self.help_text(command)))
+            self.assertFalse(flags - options[command], f"{page}: {command} {tail}")
+
+    def test_status_words_in_leading_are_the_real_ones(self):
+        leading = (factory.SKILL / "references/leading.md").read_text()
+        table = leading.split("| Status | Action |", 1)[1].split("\n\n", 1)[0]
+        states = {"not started", "starting", "idle", "working", "done", "blocked", "error", "gone"}
+        hints = {"first brief N is still", "no confirmed brief", "no pane", "operator: not reachable",
+                 "keeper: not running"}
+        words = {word for row in table.splitlines() if row.startswith("|")
+                 for word in re.findall(r"`([^`]+)`", row.split("|", 2)[1])}
+        self.assertEqual(words, states | hints)
+        source = inspect.getsource(factory.cmd_status) + inspect.getsource(factory._pending_brief_line)
+        for hint in hints - {"first brief N is still"}:
+            self.assertIn(hint, source)
+        self.assertIn("first brief {", source)
+
+    def test_note_table_matches_the_keeper(self):
+        leading = (factory.SKILL / "references/leading.md").read_text()
+        table = leading.split("| Note | Action |", 1)[1].split("\n\n", 1)[0]
+        names = {name.removeprefix("@x ") for row in table.splitlines() if row.startswith("|")
+                 for name in re.findall(r"`([^`]+)`", row.split("|", 2)[1])}
+        producers = {
+            factory.Keeper._episode: {"is blocked", "hit an error"},
+            factory.end_cause: {"exited", "was killed", "hc stopped", "was lost", "its harness ended"},
+            factory.quiet_text: {"team quiet"},
+            factory.Keeper._ready_result: {"ready work"},
+        }
+        self.assertEqual(names, set().union(*producers.values()))
+        for producer, phrases in producers.items():
+            for phrase in phrases:
+                self.assertIn(phrase, inspect.getsource(producer), producer.__name__)
+
+    def test_outcome_words_are_the_real_ones(self):
+        diagnostics = {"nothing sent", "not stored", "not confirmed stored"}
+        for name in ("references/leading.md", "templates/member-prompt.md"):
+            page = (factory.SKILL / name).read_text()
+            for word in set(factory.OUTCOMES) | diagnostics:
+                self.assertIn(f"`{word}`", page, name)
+        for diagnostic in diagnostics:
+            self.assertIn(diagnostic, inspect.getsource(factory.cmd_say))
+
+    def test_template_formation_has_no_active_autonomy_key(self):
+        sample = (factory.SKILL / "templates/factory.toml").read_text()
+        before_tables = sample.split("\n[operator]", 1)[0]
+        parsed = tomllib.loads(sample)
+        for key in ("quiet_grace", "ready_check", "ready_check_every"):
+            with self.subTest(key=key):
+                self.assertNotIn(key, parsed)
+                self.assertRegex(before_tables, rf"(?m)^# {key} = ")
+
+    def test_template_ready_check_command(self):
+        sample = (factory.SKILL / "templates/factory.toml").read_text()
+        setting = next(line[2:] for line in sample.splitlines() if line.startswith("# ready_check = "))
+        command = tomllib.loads(setting)["ready_check"]
+        template = (factory.SKILL / "templates/TODO.md").read_text()
+        item = "- [ ] (7) Check the ready queue"
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "TODO.md"
+            for contents, code, output in (
+                (None, 2, ""),
+                (template, 1, ""),
+                (template.replace("## Backlog", f"## Backlog\n\n{item}"), 1, ""),
+                (template.replace("## Ready", f"## Ready\n\n{item}"), 0, item + "\n"),
+            ):
+                if contents is not None:
+                    path.write_text(contents)
+                with self.subTest(code=code, contents=contents):
+                    result = subprocess.run(["sh", "-c", command], cwd=directory, text=True, capture_output=True)
+                    self.assertEqual((result.returncode, result.stdout), (code, output))
+
+    def test_template_workflow_is_the_spec_default(self):
+        spec = factory.SKILL.parent / "specs/projects/factory/components/cli_skill.md"
+        default = spec.read_text().split("Default `## Workflow` for `templates/FACTORY.md`:", 1)[1]
+        expected = default.split("```markdown", 1)[1].split("```", 1)[0].strip()
+        brief = (factory.SKILL / "templates/FACTORY.md").read_text()
+        workflow = brief.split("## Workflow", 1)[1].split("## Notes", 1)[0].strip()
+        self.assertEqual(workflow, expected)
+        self.assertIn("Only @pm writes the tracker when present. Without @pm, the operator writes it.", workflow)
+
+    def test_team_brief_uses_pane_titles(self):
+        with Env() as env:
+            brief = env.run("brief").stdout
+        self.assertIn("each in its own pane", brief)
+        self.assertIn("their pane's title", brief)
+
+
 class DocumentationTests(unittest.TestCase):
     def test_relative_links_and_headings(self):
         root = factory.SKILL.parent
-        for page in [root / "README.md", *sorted((root / "docs").glob("*.md"))]:
+        pages = [root / "README.md", *sorted((root / "docs").glob("*.md")), factory.SKILL / "SKILL.md"]
+        pages += sorted((factory.SKILL / "references").glob("*.md"))
+        pages += sorted((factory.SKILL / "recipes").glob("*.md"))
+        for page in pages:
             for href in re.findall(r"\]\(([^\s)]+)\)", page.read_text()):
                 link = urlsplit(href)
                 if link.scheme or link.netloc:
@@ -6927,7 +7074,14 @@ class RecipeTests(unittest.TestCase):
                 section = blocks[0][0]
                 self.assertIn(f"`{section}`", setup)
                 self.assertTrue(headings[0].startswith(f"# {section[3:]}: "))
-                self.assertEqual(headings[1:], ["## Needs", "## Check", "## FACTORY.md section", "## Tested with"])
+                expected = ["## Needs", "## Check", "## FACTORY.md section"]
+                if path.name in ("tasks-gh.md", "tasks-todos.md"):
+                    expected.append("## Ready check")
+                    ready_check = path.read_text().split("## Ready check", 1)[1].split("## Tested with", 1)[0]
+                    commands = [span for span in re.findall(r"`([^`]+)`", ready_check)
+                                if span.startswith(("board=", "ids="))]
+                    self.assertEqual(len(commands), 1)
+                self.assertEqual(headings[1:], [*expected, "## Tested with"])
                 self.assertIn(f"(../skill/recipes/{path.name})", overview)
 
 

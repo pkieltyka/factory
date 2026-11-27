@@ -3648,7 +3648,7 @@ def render_team_brief(cfg, members, operator, closing=None):
     L = cfg.operator
     trees = any(m["branch"] for m in members)
     out = [f"# Team brief (from @{operator})", "",
-           f"We are a team of {len(members) + 1} agents, each in its own herdr pane, working on the repo"
+           f"We are a team of {len(members) + 1} agents, each in its own pane, working on the repo"
            f" `{cfg.root}`. This brief lives in `{BRIEF}` at its root.", "",
            "## Roles", "",
            "| Name | Agent | Role |" + (" Works in |" if trees else ""), "|---|---|---|" + ("---|" if trees else "")]
@@ -3671,7 +3671,7 @@ def render_team_brief(cfg, members, operator, closing=None):
     names = ", ".join("`" + m["name"] + "`" for m in members)
     messaging = " Use the standalone `factory.py say` command in your standing instructions to message one or more teammates."
     out += ["", "## Talking to each other", "",
-            f"Everyone has an @name, which is also their herdr pane's name: {names}, and `{operator}` for the operator."
+            f"Everyone has an @name, which is also their pane's title: {names}, and `{operator}` for the operator."
             + messaging,
             "", closing or "That is the whole team brief. No reply needed."]
     return "\n".join(out) + "\n"
