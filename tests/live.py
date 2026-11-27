@@ -628,8 +628,8 @@ class Rodeo:
         """Type through the client, leaving the draft unsubmitted."""
         if "\n" in text or "\r" in text:
             raise ValueError("type takes one line; send Enter separately")
-        for char in text:
-            self.keys("space" if char == " " else char)
+        for char in text:   # hc's key names ignore case: an uppercase letter is shift plus the letter
+            self.keys("space" if char == " " else f"shift+{char.lower()}" if char.isupper() else char)
 
     def _move(self, direction, count):
         for _ in range(count):
@@ -1872,6 +1872,10 @@ class FixtureAdapter:
     def blocked_request(self):
         return "FAKE: blocks_once"
 
+    def draft_request(self, path, literal):
+        """A one-line owner draft that rodeo can type key by key (letters, digits, spaces and ,.-/')."""
+        return f"ACT append {path} {literal}"
+
     def end_request(self):
         return "FAKE: crashes"
 
@@ -1915,6 +1919,10 @@ class RealAdapter(FixtureAdapter):
         return ("Before doing anything else, ask me one multiple-choice question with your question tool, and"
                 " wait for my answer. Do nothing else.")
 
+    def draft_request(self, path, literal):
+        return (f"Append one line containing exactly {literal} to the file {path} with your shell tool,"
+                " then reply done.")
+
     def end_request(self):
         return "Exit your session now: quit this program."
 
@@ -1956,8 +1964,10 @@ class QATeam:
         subprocess.run(["git", "-C", str(self.work), "add", "-A"], check=True)
         subprocess.run(["git", "-C", str(self.work), "-c", "user.name=qa", "-c", "user.email=qa@example.invalid",
                         "-c", "commit.gpgsign=false", "commit", "-q", "-m", "qa"], check=True)
-        self.operator = self.qa.rpc("terminal.run", {"argv": self.adapter.operator_argv(operator),
-                                                     "cwd": str(self.work)})["address"]
+        params = {"argv": self.adapter.operator_argv(operator), "cwd": str(self.work)}
+        if not self.real:
+            params["env"] = {"FAKE_LOG": str(self.dir / "operator-input.jsonl")}   # every input the fake received
+        self.operator = self.qa.rpc("terminal.run", params)["address"]
         self.env = {**self.qa.env, "HC_TERMINAL_ID": self.operator, "HC_BIN": shutil.which(HC) or HC,
                     "PATH": f"{self.bin}:{os.environ.get('PATH', '')}", "XDG_CACHE_HOME": str(self.dir / "cache"),
                     "HOME": str(self.home)}
@@ -2523,7 +2533,67 @@ def case_8(run, role, harness, adapter_class):
         _not_built(run, 8, role, harness, ["quit-during-hold"])
 
 
-CASE_FUNCTIONS = {1: case_1, 2: case_2, 5: case_5, 7: case_7, 8: case_8, 9: case_9, 10: case_10}
+def _operator_tab(team):
+    """Give the QA operator a tab of its own in the layout doc, so rodeo shows it and up adds the team tab in the
+    same space (launch_layout.md §5): prefix+1 is the operator, prefix+2 the team."""
+    space, tab = "sp" + "a" * 32, "tb" + "a" * 32
+    doc = {"spaces": [{"id": space, "name": "qa", "folder": str(team.work), "tabs": [
+        {"id": tab, "name": "operator", "root": {"id": "s" + "a" * 32, "type": "row", "children": [
+            {"id": "p" + "a" * 32, "type": "block", "title": "@operator",
+             "content": {"terminal": team.operator}}]}}]}]}
+    current = team.qa.rpc("doc.get", {"name": "herdr-app"})
+    if current.get("value") is None:
+        team.qa.rpc("doc.set", {"name": "herdr-app", "value": doc, "version": current["version"]})
+        team.qa.rpc("terminal.label", {"terminal": team.operator, "labels": {
+            "herdr.space": space, "herdr.tab": tab, "herdr.seen": "0"}})
+
+
+def case_3(run, role, harness, adapter_class):
+    """draft (phase_8.md §3.3): a report to an idle operator with an unsent owner draft is held; the draft
+    survives byte for byte, then the report is acted on after it. draft-cleared is not built yet."""
+    team, peer = _team_for(adapter_class, role, harness, draft_wait=60)
+    with team:
+        _operator_tab(team)
+        if not _up(team, run, 3, role, harness, [n for n, _ in subcases(3, role)]):
+            return
+        view = _rodeo(team, ["operator", "team"])
+        view.keys("ctrl+b")
+        time.sleep(0.2)
+        view.keys("1")
+        time.sleep(0.8)
+        view.focused_terminal = team.operator
+        name = f"draft-{random.randrange(16 ** 6):06x}.txt"     # relative to the operator's cwd: typeable keys only
+        draft_receipt, literal = team.dir / name, f"MiXeD  case,  punct. {token()}"
+        draft = team.adapter.draft_request(f"../{name}", literal)
+        view.type(draft)
+        time.sleep(1)
+        receipt, tok = team.receipt("report"), token()
+        report = team.dir / "report.md"
+        report.write_text(team.adapter.act_append(receipt, tok))
+        member = team.member("lead-dev")
+        said = team.receipt("member-say")
+        command = f"python3 {shlex.quote(str(team.script))} say operator --file {shlex.quote(str(report))}"
+        team.qa.rpc("terminal.send", {"terminal": member, "text": team.adapter.act_run(said, command)}, timeout=60)
+        log = factory_log(team)
+        claimed = team.until(lambda: any(rec["o"] == "sending" and to == "operator"
+                                         for (ident, to), rec in log.read_box()[1].outcomes.items()), 60)
+        time.sleep(8)                                   # past hc's quiet pause: only the draft can hold it now
+        held = not receipt.exists() and not draft_receipt.exists()
+        view.keys("enter")                              # the owner sends the draft
+        drafted = team.until(lambda: draft_receipt.exists() and draft_receipt.read_text(), 300)
+        acted = team.until(lambda: receipt.exists() and tok in receipt.read_text(), 300)
+        exact = drafted == literal + "\n"
+        proof = {"claimed": bool(claimed), "held_past_8s": held, "draft_exact": exact, "report_acted": bool(acted),
+                 "draft_wait": 60, "peer": peer, "draft_seen": _bounded(drafted), "draft_sent": _bounded(literal)}
+        ok = bool(claimed) and held and exact and bool(acted)
+        run.row(3, "draft", role, harness, "pass" if ok else "fail",
+                "a report is held while the owner has an unsent draft; the draft arrives byte for byte, then the report",
+                proof=proof, reason=None if ok else "see proof")
+        if role == "operator":
+            _not_built(run, 3, role, harness, ["draft-cleared"])
+
+
+CASE_FUNCTIONS = {1: case_1, 2: case_2, 3: case_3, 5: case_5, 7: case_7, 8: case_8, 9: case_9, 10: case_10}
 
 
 def _source_head():
