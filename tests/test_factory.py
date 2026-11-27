@@ -7244,6 +7244,31 @@ class E2EFixtureTests(unittest.TestCase):
             self.assertEqual(e2e.test_run(root), 0)
             self.assertEqual(e2e.test_run(root, ci=True), 0)
 
+    def test_github_seed_pushes_one_orphan_commit_without_changing_master(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            local = e2e.make_local(root, factory.SKILL)
+            e2e.git(local.root, "push", "origin", "main:refs/heads/master")
+            e2e.git(local.origin, "symbolic-ref", "HEAD", "refs/heads/master")
+            remote_master = e2e.git(local.origin, "rev-parse", "master").stdout.strip()
+            github = e2e.GitHubFixture.__new__(e2e.GitHubFixture)
+            github.root = root / "shared"
+            github.root.mkdir()
+            github.base = "qa/fixture/main"
+            github.prefix = "qa/fixture/"
+            github.name = "factory-qa-fixture"
+            github.project = "pkieltyka/42"
+            github.report = live.Qualification("real")
+            github.manifest = {"branches": []}
+            with patch.object(e2e, "QA_URL", str(local.origin.with_suffix(""))):
+                github.seed_repo(factory.SKILL)
+            self.assertEqual(e2e.git(local.origin, "rev-parse", "master").stdout.strip(), remote_master)
+            self.assertEqual(e2e.git(local.origin, "rev-list", "--count", github.base).stdout.strip(), "1")
+            self.assertEqual(github.manifest["branches"][0]["name"], github.base)
+            self.assertIn("--repo pkieltyka/factory-test --project pkieltyka/42", (github.root / "FACTORY.md").read_text())
+            self.assertIn("--project 'pkieltyka/42'", github.ready_command(factory.SKILL))
+            self.assertGreater(e2e.test_run(github.root, ci=True), 0)
+
 
 class E2EJudgeTests(unittest.TestCase):
     revision = "a" * 40
@@ -7445,6 +7470,29 @@ class E2EObserverTests(unittest.TestCase):
                 self.assertEqual(e2e.run(fixture, None, None, None, None), 0)
                 self.assertEqual(json.loads(output.getvalue())["mode"], "fixture")
             rehearsal.assert_called_once()
+
+
+class E2EGitHubEvidenceTests(unittest.TestCase):
+    def test_check_requires_a_real_test_job_completed_before_merge(self):
+        revision = "a" * 40
+        merge = e2e.forge_time("2026-11-27T10:20:00Z")
+        for completion, log, expected in (
+                ("2026-11-27T10:10:00Z", "12:00:00 Ran 3 tests in 0.01s\n", 3),
+                ("2026-11-27T10:10:00Z", "12:00:00 Ran 0 tests in 0.01s\n", 0),
+                ("2026-11-27T10:30:00Z", "12:00:00 Ran 3 tests in 0.01s\n", 0)):
+            with self.subTest(completion=completion, log=log):
+                api = f"repos/{e2e.QA_REPO}/actions"
+                responses = {
+                    f"{api}/runs?head_sha={revision}&status=success": {"workflow_runs": [
+                        {"id": 1, "head_branch": "qa/fixture/7", "head_sha": revision, "name": "Tests"}]},
+                    f"{api}/runs/1/jobs": {"jobs": [
+                        {"id": 4, "name": "tests", "conclusion": "success", "completed_at": completion}]},
+                }
+                forge = e2e.GitHubEvidence.__new__(e2e.GitHubEvidence)
+                forge.repo = types.SimpleNamespace(prefix="qa/fixture/", api=responses.__getitem__,
+                                                   gh=lambda *args, **kwargs: log)
+                forge.checks = {}
+                self.assertEqual(forge.checked(revision, merge), expected)
 
 
 class E2ELocalEvidenceTests(unittest.TestCase):

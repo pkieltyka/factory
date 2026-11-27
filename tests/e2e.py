@@ -1,6 +1,7 @@
 """Scratch repositories and evidence checks for the live autonomy runs."""
 
 from dataclasses import asdict, dataclass, field, replace
+from datetime import datetime
 import importlib.util
 import json
 import os
@@ -13,6 +14,7 @@ import sys
 import tempfile
 import time
 import tomllib
+from urllib.parse import urlencode
 
 
 READY_PERIOD = 60
@@ -52,7 +54,7 @@ class LocalRepo:
 def git(cwd, *args, check=True):
     """Run Git in the fixture, independent of another checkout's environment and user config."""
     env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
-    env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull, GIT_TERMINAL_PROMPT="0")
+    env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull, GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0")
     return subprocess.run(["git", *args], cwd=cwd, env=env, check=check, capture_output=True, text=True, timeout=25)
 
 
@@ -187,6 +189,7 @@ class Evidence:
     moved: int | None = None
     quiet_seconds: float = 0
     ready_seconds: float = float("inf")
+    member_worked_during_silence: bool = False
     rehearsal: bool = False
 
 
@@ -349,6 +352,7 @@ class Observer:
         self.before_claim = {}
         self.developer = None
         self.operator = None
+        self.member_working = False
 
     def stamp(self):
         self.order += 1
@@ -380,11 +384,14 @@ class Observer:
         order = self.stamp()
         records = self.qa.rpc("terminal.list")["terminals"]
         self.developer = self.operator = None
+        self.member_working = False
         for term in records:
             labels = term["labels"]
             if term["state"] != "live" or labels.get("factory.dir") != str(self.state):
                 continue
             kind = labels.get("factory.kind")
+            if kind == "member" and (term.get("status") or {}).get("state") == "working":
+                self.member_working = True
             if kind == "operator":
                 self.operator = term
             elif kind == "keeper" and not self.evidence.loaded:
@@ -442,6 +449,25 @@ class Observer:
 
 
 CODE_PATHS = ("calc", "tests", "ci.sh")
+QA_REPO = "pkieltyka/factory-test"
+QA_OWNER = QA_REPO.split("/")[0]
+QA_URL = f"https://github.com/{QA_REPO}"
+QA_CREDENTIAL = "!gh auth git-credential"
+QA_CI = """name: Tests
+on:
+  push:
+    branches: ['qa/**']
+  pull_request:
+    branches: ['qa/**']
+permissions:
+  contents: read
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: ./ci.sh
+"""
 
 
 def file_items(todo):
@@ -564,6 +590,326 @@ class LocalEvidence:
             git(root, "clone", "--no-local", "--no-checkout", str(origin), ".")
             git(root, "checkout", "--detach", revision)
             return check(root)
+
+
+class GitHubFixture:
+    """Create and inspect only the approved scratch repository, project, and run-named refs."""
+
+    def __init__(self, run, skill, report, empty):
+        self.root = run / "repo"
+        self.root.mkdir()
+        self.report = report
+        self.name = f"factory-qa-{report.data['run_id']}"
+        self.prefix = f"qa/{report.data['run_id']}/"
+        self.base = self.prefix + "main"
+        self.manifest = report.data.setdefault("artifacts", {"repo": QA_REPO, "issues": [], "branches": [], "prs": []})
+        repo = self.api(f"repos/{QA_REPO}")
+        if (repo.get("full_name") != QA_REPO or repo.get("private") is not True or repo.get("default_branch") != "master"
+                or repo.get("has_issues") is not True or repo.get("html_url") != QA_URL):
+            raise RuntimeError("factory-test is not the expected private issue-enabled repository")
+        self.master = self.branch_head("master")
+        self.other_refs = self.refs()
+        self.manifest["master_before"] = self.master
+        project = self.gh("project", "create", "--owner", QA_OWNER, "--title", self.name, "--format", "json")
+        if project.get("title") != self.name or not isinstance(project.get("number"), int) or not project.get("id"):
+            raise RuntimeError("GitHub did not return the new run project's identity")
+        self.project = f"{QA_OWNER}/{project['number']}"
+        self.project_id = project["id"]
+        self.manifest["project"] = {key: project[key] for key in ("id", "number", "url", "title")}
+        self.save_manifest()
+        self.status_field, self.options = self.status_options()
+        self.manifest["status_field"] = self.status_field
+        self.manifest["options"] = self.options
+        self.save_manifest()
+        self.seed_repo(skill)
+        for title, criteria in TASKS:
+            issue = self.api(f"repos/{QA_REPO}/issues", payload={"title": f"[{self.name}] {title}",
+                             "body": f"Factory autonomy fixture: {self.name}\n\nAcceptance criteria: {criteria}\n"})
+            card = {"id": issue["node_id"], "number": issue["number"], "url": issue["html_url"]}
+            self.manifest["issues"].append(card)
+            self.save_manifest()
+            if card["url"] != f"{QA_URL}/issues/{card['number']}":
+                raise RuntimeError("the new issue is outside factory-test")
+            added = self.gh("project", "item-add", str(project["number"]), "--owner", QA_OWNER, "--url", card["url"],
+                            "--format", "json")
+            card["project_item_id"] = added["id"]
+            self.save_manifest()
+            self.set_status(card, "Backlog" if empty else "Todo")
+        self.todos("doctor")
+        expected = {issue["number"]: "Backlog" if empty else "Todo" for issue in self.manifest["issues"]}
+        if self.board() != expected:
+            raise RuntimeError("the freshly created project does not show exactly this run's cards and statuses")
+
+    def gh(self, *args, payload=None, text=False):
+        operation = subprocess.run(["gh", *args], cwd=self.root, env={**os.environ, "GH_HOST": "github.com"},
+                                   input=json.dumps(payload) if payload is not None else None,
+                                   capture_output=True, text=True, timeout=45, check=False)
+        if operation.returncode:
+            raise RuntimeError(f"gh {' '.join(args[:3])}: {operation.stderr.strip()}")
+        return operation.stdout if text else json.loads(operation.stdout)
+
+    def api(self, path, *, payload=None):
+        return self.gh("api", "--method", "GET" if payload is None else "POST", path,
+                       *([] if payload is None else ["--input", "-"]), payload=payload)
+
+    def graphql(self, query, **variables):
+        answer = self.gh("api", "graphql", "--input", "-", payload={"query": query, "variables": variables})
+        if answer.get("errors"):
+            raise RuntimeError(f"GitHub project query failed: {answer['errors'][0]['message']}")
+        return answer["data"]
+
+    def status_options(self):
+        field = self.graphql("""query($project:ID!) { node(id:$project) { ... on ProjectV2 {
+            title public field(name:"Status") { ... on ProjectV2SingleSelectField {
+                id options {id name color description} } } } } }""", project=self.project_id)["node"]
+        if field.get("title") != self.name or field.get("public") is not False or not field.get("field"):
+            raise RuntimeError("the run's project is not the expected private project with a Status field")
+        status = field["field"]
+        options = status["options"]
+        if "Backlog" not in {option["name"] for option in options}:
+            options = [*options, {"name": "Backlog", "color": "GRAY", "description": "Factory QA backlog"}]
+            changed = self.graphql("""mutation($input:UpdateProjectV2FieldInput!) { updateProjectV2Field(input:$input) {
+                projectV2Field { ... on ProjectV2SingleSelectField { id options { id name } } } } }""",
+                input={"fieldId": status["id"], "singleSelectOptions": options})
+            options = changed["updateProjectV2Field"]["projectV2Field"]["options"]
+        by_name = {o["name"]: o["id"] for o in options}
+        if not {"Backlog", "Todo", "In Progress", "Done"} <= by_name.keys():
+            raise RuntimeError("the run's project does not have the four expected statuses")
+        return status["id"], by_name
+
+    def set_status(self, card, status):
+        if card not in self.manifest["issues"] or card["url"] != f"{QA_URL}/issues/{card['number']}":
+            raise RuntimeError("refusing a status write for a card outside this run")
+        self.gh("project", "item-edit", "--id", card["project_item_id"], "--project-id", self.project_id,
+                "--field-id", self.status_field, "--single-select-option-id", self.options[status], text=True)
+
+    def todos(self, *args):
+        result = subprocess.run(["todos", *args, "--repo", QA_REPO, "--project", self.project, "--json", "--fresh"],
+                                cwd=self.root, capture_output=True, text=True, timeout=45, check=False)
+        if result.returncode:
+            raise RuntimeError(f"todos {args[0]}: {result.stderr.strip() or result.stdout.strip()}")
+        return json.loads(result.stdout)
+
+    def board(self):
+        board = self.todos("board")
+        if board.get("truncated") is not False:
+            raise RuntimeError("GitHub project snapshot is incomplete")
+        cards = [(card["number"], column["status"]) for column in board["columns"] for card in column["cards"]]
+        if len(dict(cards)) != len(cards):
+            raise RuntimeError("GitHub project returned duplicate issue numbers")
+        return dict(cards)
+
+    def seed_repo(self, skill):
+        git(self.root, "-c", f"credential.helper={QA_CREDENTIAL}", "clone", "--no-checkout", QA_URL + ".git", ".")
+        git(self.root, "config", "credential.https://github.com.helper", QA_CREDENTIAL)
+        git(self.root, "config", "user.name", "Factory QA")
+        git(self.root, "config", "user.email", "qa@example.invalid")
+        git(self.root, "switch", "--orphan", self.base)
+        write_project(self.root)
+        workflow = self.root / ".github/workflows/test.yml"
+        workflow.parent.mkdir(parents=True)
+        workflow.write_text(QA_CI)
+        (self.root / "FACTORY.md").write_text(self.brief(skill))
+        git(self.root, "add", "--", "FACTORY.md", ".gitignore", "ci.sh", "calc", "tests", ".github")
+        git(self.root, "commit", "-m", f"Seed {self.name}")
+        self.initial = git(self.root, "rev-parse", "HEAD").stdout.strip()
+        git(self.root, "push", "-u", "origin", f"HEAD:refs/heads/{self.base}")
+        self.manifest["branches"].append(self.branch_ref(self.base))
+        self.save_manifest()
+
+    def branch_ref(self, name):
+        return {"name": name, "url": f"{QA_URL}/tree/{name}"}
+
+    def branch_head(self, name):
+        return self.api(f"repos/{QA_REPO}/git/ref/heads/{name}")["object"]["sha"]
+
+    def refs(self):
+        rows = self.api(f"repos/{QA_REPO}/git/matching-refs/heads/")
+        return {row["ref"].removeprefix("refs/heads/"): row["object"]["sha"] for row in rows}
+
+    def save_manifest(self):
+        (self.root.parent / "artifacts.json").write_text(json.dumps(self.manifest, indent=2) + "\n")
+        self.report.checkpoint()
+
+    def brief(self, skill):
+        tasks = (skill / "recipes/tasks-todos.md").read_text().split("```markdown\n", 1)[1].split("```", 1)[0]
+        tasks = (tasks.replace("OWNER/REPO", QA_REPO).replace("BOARD_OWNER/BOARD_NUMBER", self.project)
+                 .replace("READY_COLUMN", "Todo").replace("ACTIVE_COLUMN", "In Progress")
+                 .replace("BACKLOG_COLUMN", "Backlog"))
+        pulls = (skill / "recipes/pull-requests-github.md").read_text().split("```markdown\n", 1)[1].split("```", 1)[0]
+        pulls = (pulls.replace("OWNER/REPO", QA_REPO).replace("BOARD_OWNER/BOARD_NUMBER", self.project)
+                 .replace('owner=OWNER -F repo=REPO', f'owner={QA_OWNER} -F repo=factory-test')
+                 .replace("BASE_BRANCH", self.base).replace("`<user>/<ticket>`", f"`{self.prefix}<issue>`")
+                 .replace("CI_DESCRIPTION", "the `tests` job of the Tests workflow"))
+        brief = (skill / "templates/FACTORY.md").read_text()
+        brief = re.sub(r"(?s)## Tasks\n.*?(?=## Workflow)", tasks + "\n", brief, count=1)
+        brief = brief.replace("## Project\n", "## Project\n\nA small Python calculator used to exercise Factory.\n", 1)
+        brief = re.sub(r"(?m)^\| 6\. Integrate .*", "| 6. Integrate | The operator | Confirms review and CI, then "
+                      "squash-merges the reviewed PR and updates the issue and board. |", brief, count=1)
+        instructions = f"""- This run is scoped to {QA_REPO}, project {self.project}, and Git branches under `{self.prefix}`.
+- Always pass `--repo {QA_REPO} --project {self.project} --json` to `todos` and `--repo {QA_REPO}` to GitHub issue/PR commands.
+- Process the run's Todo issues in ascending issue number. Every assignment, report and verdict names its item as `#N`.
+- Before any code change, write a short issue comment starting `plan:`. Ticket branches are `{self.prefix}<issue>`.
+- The reviewer records approval as `status: approve; item #N; commit <full-sha>`.
+- Confirm the PR merge before closing its issue and moving its own card to Done. The integration branch is not the default.
+
+"""
+        permissions = (f"The owner authorizes pushes and opening/updating PRs only for this run's branches in {QA_REPO}.\n"
+                       f"The owner authorizes squash-merging those PRs only into `{self.base}`.\n"
+                       "Keep the run's branches and project after the run.\n")
+        return brief.replace("## Notes\n", instructions + pulls + "\n" + permissions + "\n## Notes\n", 1)
+
+    def ready_command(self, skill):
+        recipe = (skill / "recipes/tasks-todos.md").read_text()
+        command = next(line.strip("`") for line in recipe.splitlines() if line.startswith("`board=$(todos board"))
+        return command.replace("OWNER/REPO", QA_REPO).replace("BOARD_OWNER/BOARD_NUMBER", self.project).replace(
+            "READY_COLUMN", "Todo")
+
+
+def forge_time(value):
+    return datetime.fromisoformat(value.replace("Z", "+00:00")) if value else None
+
+
+class GitHubEvidence:
+    """Observe the run's board, PR heads and CI, and verify code in a separate checkout."""
+
+    def __init__(self, fixture, observer):
+        self.repo, self.observer = fixture, observer
+        self.inspection = fixture.root.parent / "inspect.git"
+        git(fixture.root.parent, "clone", "--bare", "--no-local", str(fixture.root), str(self.inspection))
+        git(self.inspection, "remote", "add", "forge", QA_URL + ".git")
+        git(self.inspection, "config", "credential.https://github.com.helper", QA_CREDENTIAL)
+        self.head = fixture.initial
+        self.next_forge_read = 0
+        self.previous = ()
+        self.first_merges = {}
+        self.checks = {}
+
+    def collect(self):
+        self.observer.collect()
+        evidence, repo = self.observer.evidence, self.repo
+        branch = git(repo.root, "symbolic-ref", "--quiet", "--short", "HEAD", check=False).stdout.strip()
+        changes = git(repo.root, "status", "--porcelain", "--", *CODE_PATHS).stdout
+        tickets = []
+        for ticket in evidence.tickets:
+            name = repo.prefix + ticket.item[1:]
+            if ticket.changed is None and ((branch == name and changes)
+                    or git(repo.root, "log", "-1", "--format=%H", f"{repo.initial}..refs/heads/{name}",
+                           "--", *CODE_PATHS, check=False).stdout):
+                ticket = replace(ticket, changed=self.observer.stamp())
+            tickets.append(ticket)
+        evidence.tickets = tuple(tickets)
+        if time.monotonic() >= self.next_forge_read:
+            self.refresh_forge()
+            self.previous = evidence.messages
+            self.next_forge_read = time.monotonic() + 8
+
+    def refresh_forge(self):
+        evidence, repo = self.observer.evidence, self.repo
+        project = repo.board()
+        expected = {card["number"] for card in repo.manifest["issues"]}
+        master_now = repo.branch_head("master")
+        repo.manifest["master_after"] = master_now
+        if master_now != repo.master:
+            raise RuntimeError("factory-test master changed during the run")
+        refs = repo.refs()
+        tracking = {name: sha for name, sha in refs.items() if name.startswith(repo.prefix)}
+        outside = {name: sha for name, sha in refs.items() if name not in tracking}
+        repo.manifest["branches"] = [repo.branch_ref(name) for name in sorted(tracking)]
+        evidence.scoped = set(project) == expected and repo.base in tracking and outside == repo.other_refs
+        if not evidence.scoped:
+            raise RuntimeError("the run's project or refs no longer match the fixture")
+        params = urlencode({"state": "all", "base": repo.base, "per_page": 100})
+        prs = repo.api(f"repos/{QA_REPO}/pulls?{params}")
+        by_issue = {}
+        for pr in prs:
+            name = pr["head"]["ref"]
+            if (pr["base"]["ref"] != repo.base or pr["head"]["repo"] is None
+                    or pr["head"]["repo"]["full_name"] != QA_REPO or not name.startswith(repo.prefix)):
+                raise RuntimeError("a pull request into the run's branch has a head outside the fixture")
+            number = name.removeprefix(repo.prefix)
+            if not number.isdecimal() or int(number) not in expected or number in by_issue:
+                raise RuntimeError("pull requests do not match the run's tickets one to one")
+            by_issue[number] = pr
+        repo.manifest["prs"] = [{"id": pr["node_id"], "number": pr["number"], "url": pr["html_url"]} for pr in prs]
+        repo.save_manifest()
+        if tracking[repo.base] != self.head:
+            git(self.inspection, "fetch", "--no-tags", "forge", repo.base)
+            self.head = git(self.inspection, "rev-parse", "FETCH_HEAD").stdout.strip()
+            commits = git(self.inspection, "rev-list", "--first-parent", f"{repo.initial}..{self.head}").stdout.split()
+            evidence.main_code = frozenset(commits)
+            evidence.ci_count = LocalEvidence.verify(self.inspection, self.head, lambda root: test_run(root, ci=True))
+        tickets = []
+        for ticket in evidence.tickets:
+            number = ticket.item[1:]
+            current = replace(ticket, state=project[int(number)])
+            stamp = self.observer.stamp()
+            if current.changed is None and repo.prefix + number in tracking:
+                current = replace(current, changed=stamp)
+            if current.planned is None:
+                comments = repo.api(f"repos/{QA_REPO}/issues/{number}/comments?per_page=100")
+                if any(re.match(r"\s*plan:\s*\S", note["body"], re.I) for note in comments):
+                    current = replace(current, planned=stamp)
+            pr = by_issue.get(number)
+            if pr and pr.get("merged_at"):
+                when, earlier = self.first_merges.setdefault(pr["number"], (stamp, self.previous))
+                if pr.get("merge_commit_sha") in evidence.main_code:
+                    current = self.merge_evidence(current, pr, when, earlier)
+            tickets.append(current)
+        evidence.tickets = tuple(tickets)
+
+    def merge_evidence(self, ticket, pr, stamp, earlier):
+        repo = self.repo
+        revision, squash = pr["head"]["sha"], pr["merge_commit_sha"]
+        parents = git(self.inspection, "show", "-s", "--format=%P", squash).stdout.split()
+        if len(parents) != 1:
+            return ticket
+        merged_at = forge_time(pr["merged_at"])
+        if ticket.integrated is None:
+            candidate = replace(ticket, revision=revision, integrated=stamp)
+            if approval(candidate, earlier) is None:
+                return ticket
+            count = self.checked(revision, merged_at)
+            number = int(ticket.item[1:])
+            index = next(i for i, card in enumerate(repo.manifest["issues"], 1) if card["number"] == number)
+            accepted = LocalEvidence.verify(self.inspection, self.head, lambda root: accepts(root, index))
+            ticket = replace(candidate, branch_proof=True, introduced=frozenset({squash}), accepted=accepted,
+                             checked_revision=revision, test_count=count, timely_check=count > 0)
+        if ticket.closed is None and ticket.state == "Done":
+            number = int(ticket.item[1:])
+            issue = repo.api(f"repos/{QA_REPO}/issues/{number}")
+            card = next(card for card in repo.manifest["issues"] if card["number"] == number)
+            status = repo.graphql("""query($id:ID!) { node(id:$id) { ... on ProjectV2Item {
+                fieldValueByName(name:"Status") { ... on ProjectV2ItemFieldSingleSelectValue { name updatedAt } }
+                } } }""", id=card["project_item_id"])["node"]["fieldValueByName"]
+            closed_at = forge_time(issue.get("closed_at"))
+            done_at = forge_time(status.get("updatedAt")) if status else None
+            if closed_at and done_at and status["name"] == "Done" and min(closed_at, done_at) > merged_at:
+                ticket = replace(ticket, closed=self.observer.stamp())
+        return ticket
+
+    def checked(self, revision, merged_at):
+        if revision in self.checks:
+            return self.checks[revision]
+        repo = self.repo
+        runs = repo.api(f"repos/{QA_REPO}/actions/runs?head_sha={revision}&status=success")["workflow_runs"]
+        count = 0
+        for run in runs:
+            if (run["head_sha"] != revision or run["name"] != "Tests"
+                    or not (run.get("head_branch") or "").startswith(repo.prefix)):
+                continue
+            jobs = repo.api(f"repos/{QA_REPO}/actions/runs/{run['id']}/jobs")["jobs"]
+            for job in jobs:
+                done = forge_time(job.get("completed_at"))
+                if job["name"] != "tests" or job["conclusion"] != "success" or not done or not done < merged_at:
+                    continue
+                log = repo.gh("api", f"repos/{QA_REPO}/actions/jobs/{job['id']}/logs", text=True)
+                count = max((int(n) for n in re.findall(r"\bRan ([0-9]+) tests? in ", log)), default=0)
+                if count:
+                    self.checks[revision] = count
+                    return count
+        self.checks[revision] = count
+        return count
 
 
 def add_arguments(parser):
@@ -801,7 +1147,8 @@ def collect_run(collector, observer, move, deadline, checkpoint):
     """Observe a real team, injecting only the specified faults or empty-board move."""
     evidence = observer.evidence
     quiet_since = moved_at = None
-    last_summary = None
+    last_checkpoint = 0
+    last_observation = None
     while True:
         collector.collect()
         now = time.monotonic()
@@ -810,6 +1157,8 @@ def collect_run(collector, observer, move, deadline, checkpoint):
             quiet = next((m for m in evidence.messages if is_note(m, "quiet") and m.delivered is not None), None)
             if quiet and quiet_since is None:
                 quiet_since = now
+            if quiet_since is not None and evidence.moved is None and observer.member_working:
+                evidence.member_worked_during_silence = True
             if quiet_since is not None and evidence.moved is None and now - quiet_since >= SILENCE_SECONDS:
                 evidence.quiet_seconds = now - quiet_since
                 evidence.moved = observer.stamp()
@@ -825,9 +1174,10 @@ def collect_run(collector, observer, move, deadline, checkpoint):
                 observer.trigger(kill=True)
         rows = judge(evidence)
         summary = tuple(r["status"] for r in rows)
-        if summary != last_summary:
+        observation = summary, observer.offset
+        if observation != last_observation or now - last_checkpoint >= 30:
             checkpoint(rows)
-            last_summary = summary
+            last_observation, last_checkpoint = observation, now
         if all(status in {"pass", "measured"} for status in summary) or not evidence.within_budget:
             return rows
         time.sleep(0.25)
@@ -835,7 +1185,7 @@ def collect_run(collector, observer, move, deadline, checkpoint):
 
 def evidence_result(observer, rows, started):
     evidence = observer.evidence
-    return {"rows": rows, "cutoff_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    result = {"rows": rows, "cutoff_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "elapsed_seconds": round(time.monotonic() - started, 2),
             "faults": [asdict(fault) for fault in (evidence.interrupt, evidence.kill) if fault is not None],
             "messages": [{"id": msg.ident, "kind": msg.kind, "sender": msg.sender, "recipient": msg.recipient,
@@ -844,6 +1194,11 @@ def evidence_result(observer, rows, started):
                           "items": [ticket.item for ticket in evidence.tickets if names_item(msg, ticket.item)]}
                          for msg in evidence.messages],
             "log_offset": observer.offset, "owner_inputs": evidence.prompts}
+    if evidence.empty:
+        result.update(quiet_seconds=round(evidence.quiet_seconds, 2), moved=evidence.moved,
+                      member_worked_during_silence=evidence.member_worked_during_silence,
+                      ready_seconds=round(evidence.ready_seconds, 2) if evidence.ready_seconds != float("inf") else None)
+    return result
 
 
 def run_real(args, live):
@@ -851,10 +1206,11 @@ def run_real(args, live):
     report = live.Qualification("real", args.json, versions=live._versions())
     result = report.data
     result.update(tracker=args.tracker, empty=args.empty, status="not_run")
-    budget = args.budget if args.budget is not None else 45 if args.empty else 60
+    github = args.tracker == "github"
+    budget = args.budget if args.budget is not None else 45 if args.empty else 120 if github else 60
     members = {"lead-dev": args.developer, "reviewer": args.reviewer}
-    if args.tracker != "file":
-        result["detail"] = "GitHub fixture is not available yet"
+    if github and any(shutil.which(command) is None for command in ("gh", "todos", "jq")):
+        result["detail"] = "the GitHub workspace needs gh, todos and jq"
         return result
     if set(members.values()) - set(live.QUALIFY_HARNESSES):
         result["detail"] = "choose developer and reviewer harnesses from the qualification table"
@@ -872,17 +1228,22 @@ def run_real(args, live):
             agents.append((section, harness, model))
             report.profile(role, harness, model=model, version=team.adapter.version(harness),
                            thinking=None if role == "operator" else "medium")
-        fixture = make_local(team.dir, team.skill, empty=args.empty)
-        write_formation(fixture.root, ready_command(team.skill), agents, worktree=True)
-        result["fixture"] = {"root": str(fixture.root), "initial": fixture.initial, "developer_worktree": True}
+        if github:
+            fixture = GitHubFixture(team.dir, team.skill, report, args.empty)
+            ready = fixture.ready_command(team.skill)
+        else:
+            fixture = make_local(team.dir, team.skill, empty=args.empty)
+            ready = ready_command(team.skill)
+        write_formation(fixture.root, ready, agents, worktree=not github)
+        result["fixture"] = {"root": str(fixture.root), "initial": fixture.initial, "developer_worktree": not github}
         return fixture.root
 
     fixture = None
     try:
         with live.QATeam(live.RealAdapter, args.operator, members, setup=setup,
                          operator_model=args.operator_model) as team:
-            if not live._operator_start(team, report, 0, "operator", args.operator, ["startup"],
-                                        trust_directories={"lead-dev": fixture.developer}):
+            trust_directories = None if github else {"lead-dev": fixture.developer}
+            if not live._operator_start(team, report, 0, "operator", args.operator, ["startup"], trust_directories):
                 result["detail"] = result["rows"][0]["reason"]
                 return result
             result["operator_start"] = team.operator_start
@@ -892,12 +1253,19 @@ def run_real(args, live):
             # This process can have another cache base. The operator and members share the QA cache.
             state = (pathlib.Path(team.env["XDG_CACHE_HOME"]) / "factory-skill"
                      / factory.team_key(fixture.root) / team.qa.id[:8])
-            evidence = Evidence(tuple(Ticket(f"({n})") for n in range(1, 2 if args.empty else 4)), empty=args.empty)
+            if github:
+                items = [f"#{item['number']}" for item in fixture.manifest["issues"]]
+            else:
+                items = [f"({n})" for n in range(1, 2 if args.empty else 4)]
+            evidence = Evidence(tuple(Ticket(item) for item in items), empty=args.empty, github=github)
             observer = Observer(team.qa, factory, state, evidence)
-            collector = LocalEvidence(fixture, observer)
+            collector = GitHubEvidence(fixture, observer) if github else LocalEvidence(fixture, observer)
 
             def move():
-                move_file_item(fixture.root, "(1)", "Ready")
+                if github:
+                    fixture.set_status(fixture.manifest["issues"][0], "Todo")
+                else:
+                    move_file_item(fixture.root, "(1)", "Ready")
 
             def checkpoint(rows):
                 result.update(evidence_result(observer, rows, started))
@@ -926,7 +1294,8 @@ def run_real(args, live):
                         result["teardown"] = {"exit": code, "output": live._bounded(out)}
                 except (OSError, subprocess.SubprocessError) as error:
                     result["teardown"] = {"error": str(error)}
-    except (live.NotRun, live.HcDown, live.HcError, OSError, subprocess.SubprocessError) as error:
+    except (live.NotRun, live.HcDown, live.HcError, OSError, RuntimeError, ValueError, KeyError,
+            subprocess.SubprocessError) as error:
         result.update(status="not_run", detail=str(error))
     return result
 
@@ -939,5 +1308,8 @@ def run(args, core, rodeo, skill, hc, live=None):
     payload = json.dumps(result, indent=2) + "\n"
     if args.json:
         args.json.write_text(payload)
+        if "artifacts" in result:
+            manifest = {**result["artifacts"], "trust_entries": result.get("trust_entries", [])}
+            args.json.with_suffix(".artifacts.json").write_text(json.dumps(manifest, indent=2) + "\n")
     sys.stdout.write(payload)
     return {"pass": 0, "fail": 1, "not_run": 2}[result["status"]]
