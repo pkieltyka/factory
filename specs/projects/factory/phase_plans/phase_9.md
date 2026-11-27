@@ -112,6 +112,8 @@ Target: the private `pkieltyka/factory-test` (verified: private, default branch 
 
 **`FACTORY.md`**: Project; `## Tasks` from `recipes/tasks-todos.md` with the run's repository and project and the columns `Todo`, `In Progress` and `Backlog`; `## Workflow` from the template with step 6 replaced as the pull-request recipe says, plus the project lines of §4 (the plan is an issue comment that starts `plan:`; the item's name is its issue number `#N`; a verdict names `#N` and the pull request's head commit), and one more: after a confirmed merge, close the issue and set its card to Done yourself, because a merge into a branch that is not the default closes nothing; `## Pull requests` from `recipes/pull-requests-github.md` with `BASE_BRANCH = qa/<run_id>/main`, ticket branches `qa/<run_id>/<ticket>`, and both standing permissions written out. Shared checkout: no member has a worktree.
 
+Record review discoveries in comments on the related seeded issues. The project scope check requires the original three cards throughout the trial.
+
 **Pass rows**: the per-run rows of §4, and per issue `#N` with `R` the pull request's head named by the approving verdict:
 
 | Row (per issue) | Evidence |

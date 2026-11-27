@@ -779,7 +779,9 @@ class GitHubFixture:
         tasks = (skill / "recipes/tasks-todos.md").read_text().split("```markdown\n", 1)[1].split("```", 1)[0]
         tasks = (tasks.replace("OWNER/REPO", QA_REPO).replace("BOARD_OWNER/BOARD_NUMBER", self.project)
                  .replace("READY_COLUMN", "Todo").replace("ACTIVE_COLUMN", "In Progress")
-                 .replace("BACKLOG_COLUMN", "Backlog"))
+                 .replace("who records them in BACKLOG_COLUMN.",
+                          "who records them in comments on the related seeded issues. "
+                          "Use only the three seeded issues and their existing project cards."))
         pulls = (skill / "recipes/pull-requests-github.md").read_text().split("```markdown\n", 1)[1].split("```", 1)[0]
         pulls = (pulls.replace("OWNER/REPO", QA_REPO).replace("BOARD_OWNER/BOARD_NUMBER", self.project)
                  .replace('owner=OWNER -F repo=REPO', f'owner={QA_OWNER} -F repo=factory-test')

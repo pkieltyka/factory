@@ -7314,7 +7314,11 @@ class E2EFixtureTests(unittest.TestCase):
             self.assertEqual(e2e.git(local.origin, "rev-parse", "master").stdout.strip(), remote_master)
             self.assertEqual(e2e.git(local.origin, "rev-list", "--count", github.base).stdout.strip(), "1")
             self.assertEqual(github.manifest["branches"][0]["name"], github.base)
-            self.assertIn("--repo pkieltyka/factory-test --project pkieltyka/42", (github.root / "FACTORY.md").read_text())
+            brief = (github.root / "FACTORY.md").read_text()
+            self.assertIn("--repo pkieltyka/factory-test --project pkieltyka/42", brief)
+            self.assertIn("records them in comments on the related seeded issues", brief)
+            self.assertIn("Use only the three seeded issues and their existing project cards", brief)
+            self.assertNotIn("who records them in Backlog", brief)
             self.assertIn("--project 'pkieltyka/42'", github.ready_command(factory.SKILL))
             self.assertGreater(e2e.test_run(github.root, ci=True), 0)
 
