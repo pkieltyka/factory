@@ -122,7 +122,7 @@ v1's table, then the `hc` line and warning from [hc_client.md](hc_client.md).
 
 ## 3. `Config` additions
 
-Top-level keys of `factory.toml` accepted in addition to v1's (`user`, `permissions`, `worktree_dir`, `operator`, `members`):
+Additional optional settings in `factory.toml`:
 
 | Key | Type | Check | Default |
 |---|---|---|---|
@@ -203,7 +203,7 @@ Depends on: every other component. Used by: `main`.
 - `test_say_from_operator_accepts_text`; `test_say_keeps_text_exact`.
 - `test_status_table_and_lines`: every line of the sample for a scripted team; `test_status_shows_loaded_version_and_path`; `test_status_prints_table_when_log_damaged`; `test_status_counts_uncommitted_entries`; `test_status_reports_headless_keeper`; `test_status_leaves_stopped_team_stopped`.
 - `test_brief_prints_and_brief_name_prints_instructions`; `test_brief_send_closing_depends_on_ready`; `test_brief_send_refuses_not_running`.
-- `test_config_accepts_new_keys`, `test_config_rejects_bad_quiet_grace`, `test_v1_formation_loads_unchanged` (v1's sample file).
+- `test_config_accepts_new_keys`, `test_config_rejects_bad_quiet_grace`, `test_current_sample_uses_default_ready_check_settings`.
 - `test_init_sample_has_no_active_ready_check`: the template's `ready_check` is a comment.
 - v1's `DocumentationTests`, `RecipeTests` and `InstalledCopyTests` kept, with the command list and file names updated: every command named in `SKILL.md` and the references exists in the parser, and none of `wait`, `--seen`, `--restart`, `herdr` appears in `skill/`.
 - `test_member_prompt_has_no_cwd_and_names_outcomes`.

@@ -2839,9 +2839,7 @@ def model_codex(checker, model, harness):
 
 
 def argv_codex(m, prompt_file, sess):
-    # Codex has no way to read developer instructions from a file, and the full text would not fit the line
-    # macOS lets herdr type into a shell. So the system level carries one line that names the file, and the
-    # full text arrives in the member's first message.
+    # Developer instructions point Codex to the private file with its full standing instructions.
     pointer = (f"You are @{m['name']}, the {m['role']} on a team of coding agents. Your standing instructions are in"
                f" {prompt_file}. Read that file before your first task, and again whenever your context was"
                " compacted or you are unsure of the rules.")
@@ -2878,8 +2876,7 @@ def model_opencode(checker, model, harness):
 
 
 def argv_opencode(m, prompt_file, sess):
-    # The interface herdr can watch has no model flag, so the model comes from inline config in the pane's
-    # environment. --standalone: OpenCode's shared background server ignores a client's own config.
+    # Read model configuration from the terminal's environment. The shared server ignores a client's config.
     model = m["model"] + (f"#{m['thinking']}" if m["thinking"] != "default" else "")
     argv = ["--standalone"] + (sess["args"] if sess else [])
     return argv, {"OPENCODE_CONFIG_CONTENT": json.dumps({"model": model})}

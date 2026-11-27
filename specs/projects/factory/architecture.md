@@ -278,7 +278,7 @@ Decided on 26 November 2026, and built into this design:
 | 1 | After a skill update the keeper finishes its sends and re-executes itself in place (`os.execv`) |
 | 2 | A member's conversation is learned from its harness's environment variable, recorded by each `say` it runs; launch flags are kept where they help; a member with no recorded conversation starts fresh with a notice (spec §9.4, already updated) |
 | 3 | A seventh status word, `starting`, for a live member that has not reported yet |
-| 4 | Three optional `factory.toml` keys (`quiet_grace`, `ready_check`, `ready_check_every`), with a v1 back-port that accepts and ignores them |
+| 4 | Three optional `factory.toml` keys (`quiet_grace`, `ready_check`, `ready_check_every`) |
 | 5 | Message text is limited to 64 KiB |
 | 6 | `down` stops a member that has no recorded conversation and `up` says it starts fresh; `down` stops nobody when sessions cannot be written |
 | 7 | About 2,200 lines is a target, not a cap; delivery only between turns (`busy`) is not built until a harness fails §10.4 |

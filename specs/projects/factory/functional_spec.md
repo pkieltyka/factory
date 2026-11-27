@@ -15,7 +15,6 @@ Goals:
 - The team runs autonomously and continuously through ready work, and is never silent for long without the operator being told (§8a).
 - The team shows up in `hc`'s clients, rodeo for one, because Factory writes its panes into the `herdr-app` layout doc.
 - Fewer commands, fewer files and less script than v1, keeping v1's tested guarantees where they still apply.
-- v1's `FACTORY.md` and `factory.toml` work unchanged.
 
 Non-goals for v2.0: remote machines (`hc` machine links); the team dashboard (#2); project knowledge (#62); automatic recovery of interrupted work (§9.3 detects and reports only); herdr 0.9.5 (that is v1, on the `v1` branch).
 
@@ -57,7 +56,7 @@ A harness counts as supported only when its OSC 7501 reports pass §10.1. One kn
 
 ## 4. Configuration
 
-- `FACTORY.md` and `factory.toml` keep v1's schema and meaning; a v1 file is a valid v2 file. If v2 needs a change, it is back-ported to v1.
+- `FACTORY.md` carries the team brief and `factory.toml` carries the local formation.
 - `factory.toml.sample` stays the project's portable suggestion; `init` copies it.
 - Harness facts (model discovery, launch, resume and permission arguments) stay declarative, carried over from v1 and rechecked against installed versions.
 - Runtime state (message log and queue, saved native session IDs) lives outside the repository, per team, readable only by the owner.
