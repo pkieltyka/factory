@@ -311,6 +311,9 @@ class View:
     def terminal(self, name: str) -> dict | None:
         return self._live.get(name)
 
+    def member_terminals(self) -> list[dict]:
+        return [record for record in self._live.values() if record["labels"].get("factory.kind") == "member"]
+
     def finished(self, name: str) -> dict | None:
         return None if name in self._live else self._finished.get(name)
 
@@ -2254,22 +2257,22 @@ def _tab_terminals(tab):
     return {term for block in _pane_blocks(tab["root"]) if (term := block["content"].get("terminal"))}
 
 
-def resolve_tab(doc, layout, view, me, root):
+def resolve_tab(doc, layout, view, me):
     """Find the existing team tab before proposing a new one in the operator's space."""
     me_labels = me["labels"]
     operator_tab = me_labels.get("herdr.tab")
-    members = [record for record in view._live.values() if record["labels"].get("factory.kind") == "member"]
+    members = view.member_terminals()
     if view.keeper:
         members.append(view.keeper)
     chosen, most = None, 0
     for space, tab in _layout_tabs(doc):
         ident = tab["id"]
-        present = _tab_terminals(tab)
-        if ident == operator_tab or me["address"] in present:
-            continue
         if ident == layout.get("tab"):
             chosen = space, tab
             break
+        present = _tab_terminals(tab)
+        if ident == operator_tab or me["address"] in present:
+            continue
         count = sum(record["address"] in present or record["labels"].get("herdr.tab") == ident for record in members)
         if count > most:
             chosen, most = (space, tab), count
@@ -2281,21 +2284,23 @@ def resolve_tab(doc, layout, view, me, root):
     for ident in (me_labels.get("herdr.space"), layout.get("space")):
         if ident in spaces:
             return ident, new_id("tb"), ident == layout.get("space") and layout.get("made_space", False)
-    ident = new_id("sp")
-    doc["spaces"].append({"id": ident, "name": "", "folder": str(root), "tabs": []})
-    return ident, new_id("tb"), True
+    return new_id("sp"), new_id("tb"), True
 
 
-def add_panes(doc, space, tab, panes, keeper=None):
+def add_panes(doc, space, tab, panes, keeper=None, *, folder=None):
     have = blocks(doc)
-    target = next((node for area in doc["spaces"] if area["id"] == space for node in area["tabs"]
-                   if node["id"] == tab), None)
+    area = next((area for area in doc["spaces"] if area["id"] == space), None)
+    target = next((node for node in area["tabs"] if node["id"] == tab), None) if area else None
     for terminal, title in panes:
         if terminal in have:
             continue
         block = {"id": new_id("p"), "type": "block", "title": title, "content": {"terminal": terminal}}
         if target is None:
-            area = next(area for area in doc["spaces"] if area["id"] == space)
+            if area is None:
+                if folder is None:
+                    raise KeyError(f"no layout space {space}")
+                area = {"id": space, "name": "", "folder": str(folder), "tabs": []}
+                doc["spaces"].append(area)
             target = {"id": tab, "name": "team", "root": {"id": new_id("s"), "type": "row", "children": []}}
             area["tabs"].append(target)
         root = target["root"]
@@ -2379,6 +2384,57 @@ def edit_layout(hc, change):
         if attempt < CAS_TRIES:
             time.sleep(0.05 * attempt)
     return "another client kept changing it"
+
+
+def _place_team(cfg, state, hc, team, me, keeper, replacements):
+    """Place headless team terminals and reuse blocks for replacements, after a successful CAS."""
+    try:
+        view = team_view(hc, team)
+        layout = read_team(state).get("layout", {})
+    except (Problem, HcDown, HcError) as error:
+        print(f"layout not updated ({error}): run factory.py up again to place the team", file=sys.stderr)
+        return
+    panes = {record["address"]: f"@{name}" for name in cfg.members if (record := view.terminal(name))}
+    if keeper:
+        panes[keeper] = "keeper"
+    if not isinstance(layout, dict):
+        layout = {}
+    saved_layout, placed = None, {}
+
+    def change(doc):
+        nonlocal saved_layout, placed
+        saved_layout, placed = None, {}
+        swaps = dict(replacements)
+        if layout.get("keeper") and keeper:
+            swaps[layout["keeper"]] = keeper
+        changed = [new for old, new in swaps.items() if new in panes and swap_terminal(doc, old, new)]
+        space, tab, made = resolve_tab(doc, layout, view, me)
+        have = blocks(doc)
+        adds = [(terminal, title) for terminal, title in panes.items() if terminal not in have]
+        if adds:
+            add_panes(doc, space, tab, adds, keeper, folder=cfg.root)
+            changed.extend(terminal for terminal, _ in adds)
+        if any(area["id"] == space and target["id"] == tab for area, target in _layout_tabs(doc)):
+            saved_layout = {"space": space, "tab": tab, "made_space": made}
+            if keeper and where(doc, keeper):
+                saved_layout["keeper"] = keeper
+        placed = {terminal: where(doc, terminal) for terminal in changed}
+        return bool(changed)
+
+    reason = edit_layout(hc, change)
+    if reason is not None:
+        print(f"layout not updated ({reason}): run factory.py up again to place the team", file=sys.stderr)
+        return
+    if saved_layout is not None and saved_layout != layout:
+        try:
+            update_team(state, layout=saved_layout)
+        except (Problem, OSError, LogDamage) as error:
+            print(f"layout placed, but team.json was not updated: {error}", file=sys.stderr)
+    for terminal, (space, tab) in placed.items():
+        try:
+            hc.label(terminal, {"herdr.space": space, "herdr.tab": tab})
+        except (HcDown, HcError) as error:
+            print(f"warning: could not label the placed terminal {terminal}: {error}", file=sys.stderr)
 
 
 def wait_outcomes(log, ident, recipients, offset, timeout=SAY_WAIT):
@@ -3599,12 +3655,14 @@ def _up(cfg, args, hc, team, operator, state, names, me_id):
     if not was_live:
         print("\n".join(pending_lines(state, operator)))
     try:
-        ensure_keeper(cfg, state, hc, view, force=True)   # also when every member runs: delivery comes back
+        keeper = ensure_keeper(cfg, state, hc, view, force=True)   # also when every member runs: delivery comes back
     except (Problem, HcDown, HcError, OSError, LogDamage) as error:
         stop_with(f"the keeper could not start: {error}. No member was started.", 3)
     if not plans:
+        _place_team(cfg, state, hc, team, me, keeper, {})
         return
     failed, fixes = {}, {}                           # fixes: a member's fix when it is neither up nor brief --send
+    replacements = {}
     for m in plans:
         if m["branch"]:
             err = ensure_worktree(cfg, m)
@@ -3647,8 +3705,12 @@ def _up(cfg, args, hc, team, operator, state, names, me_id):
             sess["notice"] = f"@{m['name']} starts in a new conversation: none was recorded for it"
         if sess["notice"]:
             print(sess["notice"])
-        if start(m, sess) is not None and old is not None:
+        record = start(m, sess)
+        if record is not None and old is not None:
+            replacements[old["address"]] = record["address"]
             _remove_record(hc, old)                  # the new terminal exists before the old record goes
+
+    _place_team(cfg, state, hc, team, me, keeper, replacements)
 
     def ready_group(names_now):
         group = {n: (starts[n][2], TABLE[starts[n][0]["harness"]].get("dialogs", [])) for n in names_now}
@@ -3657,11 +3719,16 @@ def _up(cfg, args, hc, team, operator, state, names, me_id):
     ready = ready_group(list(starts))
     ended = ("exited", "was stopped", "ended")
     retry = [n for n, why in ready.items() if why and starts[n][1]["resume"] and why.startswith(ended)]
+    replacements = {}
     for n in retry:
         m, _, record = starts.pop(n)
         print(f"@{n}: its saved conversation could not be resumed ({ready.pop(n)}); starting fresh")
-        if start(m, session_plan(m, state, None, True)) is not None:
+        fresh = start(m, session_plan(m, state, None, True))
+        if fresh is not None:
+            replacements[record["address"]] = fresh["address"]
             _remove_record(hc, record)
+    if replacements:
+        _place_team(cfg, state, hc, team, me, keeper, replacements)
     ready.update(ready_group([n for n in retry if n in starts]))
     for n, why in ready.items():
         if why:
