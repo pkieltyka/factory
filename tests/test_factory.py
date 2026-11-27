@@ -2968,6 +2968,24 @@ class QuietTests(TeamCase):
         self.assertEqual(self.outcome(note, "operator")["o"], "dropped")
         self.assertEqual(self.fake.sent(self.operator), [])
 
+    def test_a_note_goes_to_the_operator_the_fresh_view_names(self):
+        real = factory.Keeper._quiet
+
+        def quiet_then_move(keeper, view, now):
+            real(keeper, view, now)
+            self.hc.label(self.operator, {"factory.kind": "operator-lost"})   # a new operator pane took over
+            self.moved = self.terminal("operator", kind="operator")[0]
+        self.run_for(10)
+        self.clock.sleep(1000)
+        with patch.object(factory.Keeper, "_quiet", quiet_then_move):
+            self.keeper.tick()
+        self.run_jobs()
+        self.keeper.tick()
+        note = self.quiet_notes()[0]["id"]
+        outcome = self.outcome(note, "operator")
+        self.assertEqual((outcome["o"], outcome["term"]), ("delivered", self.moved))
+        self.assertEqual(self.fake.sent(self.operator), [])
+
     def test_a_quiet_note_no_longer_true_at_hand_off_is_dropped(self):
         self.fake.set_status(self.operator, "blocked", "question")
         self.run_for(130)
@@ -3084,6 +3102,28 @@ class ReadyCheckTests(TeamCase):
         job()
         self.keeper.tick()
         self.assertEqual(self.records("ready"), [])
+        self.assertNotIn("ready_clear", factory.read_team(self.state_dir))
+
+    def test_a_failed_config_load_ends_the_interval(self):
+        self.run_for(220)
+        self.assertEqual(len(self.records("ready")), 1)                    # a report stands
+        for _ in range(20):
+            self.clock.sleep(10)
+            self.keeper.tick()
+            if self.keeper.ready_job is not None:
+                break
+            self.run_jobs()
+        job = self.jobs.pop()
+        conf = self.root / "factory.toml"
+        stamp = conf.stat().st_mtime_ns
+        aside = conf.rename(self.root / "factory.toml.aside")
+        self.keeper.tick()
+        self.assertTrue(self.keeper._cfg_failed)
+        aside.rename(conf)
+        os.utime(conf, ns=(stamp, stamp))                                  # back unchanged: the same stamp
+        self.board.write_text("")                                          # the old check says none
+        job()
+        self.keeper.tick()
         self.assertNotIn("ready_clear", factory.read_team(self.state_dir))
 
     def test_a_late_result_for_another_interval_is_dropped(self):

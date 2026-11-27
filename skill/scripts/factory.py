@@ -2138,7 +2138,7 @@ class Keeper:
         q = self.box.quiet_note()
         told = q is not None and not rearmed(q, view, self.box, self.cfg)
         self._told = told
-        if not quiet_now(view, self.box, self.cfg, wall, now, self.inflight, self.op_null_since):
+        if self._cfg_failed or not quiet_now(view, self.box, self.cfg, wall, now, self.inflight, self.op_null_since):
             self.quiet_since = self._quiet_sample = self.ready_next = self._ready_done = None
             self._told = False
             return
@@ -2224,14 +2224,17 @@ class Keeper:
         self.emit(f"{stamp} #{ident} note: ready work")
 
     def _still_true(self, msg, view, now):
-        """For a quiet or ready note about to be handed off: whether it still says something true, from team.json,
-        the team view and the log read again now, not from what this tick saw earlier."""
+        """For a quiet or ready note about to be handed off: (still true, the fresh view to route it by), from
+        team.json, the team view and the log read again now, not from what this tick saw earlier."""
         try:
             team = read_team(self.state)
             view = team_view(self.hc, self.team["team"])
             self.log.refresh(self.box)
         except (Problem, HcDown, HcError, LogDamage, OSError):
-            return False
+            return False, None
+        return self._true_in(msg, view, team, now), view
+
+    def _true_in(self, msg, view, team, now):
         operator = view.operator
         if (team.get("up") is not True or operator is None or operator.get("status") is None
                 or operator["status"]["state"] == "blocked"):
@@ -2293,8 +2296,13 @@ class Keeper:
                 self._record(old, name, "dropped", why="superseded")
             if msg is None:
                 continue
-            still = self._still_true(msg, view, now) if _quiet_or_ready_note(msg) else True
-            action, *detail = decide(name, msg, view, self.box, self.cfg, now, self.op_null_since, still)
+            route = view
+            if _quiet_or_ready_note(msg):            # judged and routed by the same fresh view (the operator may move)
+                still, fresh = self._still_true(msg, view, now)
+                route = fresh or view
+            else:
+                still = True
+            action, *detail = decide(name, msg, route, self.box, self.cfg, now, self.op_null_since, still)
             if action == "hold":
                 continue
             if action == "latch":
