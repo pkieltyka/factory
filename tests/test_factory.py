@@ -1,8 +1,4 @@
-"""Tests for factory.py with fake herdr and harnesses, plus an optional private hc core.
-
-Two test classes touch real tools and skip when they cannot: HerdrContract reads the installed herdr's API
-schema, and LiveFlags (FACTORY_LIVE=1, outside any sandbox) greps each installed harness's --help for the
-flags factory.py passes."""
+"""Factory tests with fake harnesses and a fake or private real hc core."""
 import importlib.util
 import concurrent.futures
 import contextlib
@@ -1038,147 +1034,6 @@ class FakeAgentTests(HcBackend, unittest.TestCase):
         self.assertTrue(all(entry["at"] > 0 for entry in map(json.loads, log.read_text().splitlines())))
 
 
-FAKE_HERDR = textwrap.dedent(r'''
-    #!/usr/bin/env python3
-    # A herdr stand-in. Like herdr: `pane list` carries labels but no agent names, `agent list` carries names
-    # but no labels; a pane keeps its label but loses its agent_session when its agent exits; a prompt to a
-    # blocked agent is refused; errors are JSON on stderr with exit status 1.
-    import json, os, sys, textwrap
-    path = os.environ["FAKE_HERDR"]
-    s = json.load(open(path))
-    s["calls"].append(sys.argv[1:])
-    a = sys.argv[1:]
-    panes = s["panes"]
-    def save(): json.dump(s, open(path, "w"))
-    def out(result):
-        save(); print(json.dumps({"id": "1", "result": result})); sys.exit(0)
-    def fail(code, message=""):
-        save(); print(json.dumps({"id": "1", "error": {"code": code, "message": message}}), file=sys.stderr); sys.exit(1)
-    def find(target):
-        return panes.get(target) or next((p for p in panes.values() if p.get("agent") and p.get("name") == target), None)
-    def view(p, kind):
-        hide = {"pane": ("name", "rect"), "agent": ("label", "rect")}[kind]
-        return {k: v for k, v in p.items() if k not in hide}
-    def opt(name):
-        return a[a.index(name) + 1] if name in a else None
-    def new_pane(tab, rect):
-        s["next"] += 1
-        pid = f"w1:p{s['next']}"
-        panes[pid] = {"pane_id": pid, "tab_id": tab, "workspace_id": "w1", "label": None, "agent_status": "unknown",
-                      "foreground_cwd": opt("--cwd"), "cwd": opt("--cwd"), "rect": rect, "env": [a[i + 1] for i, x in enumerate(a) if x == "--env"]}
-        return panes[pid]
-    if a == ["integration", "status"]:
-        if os.environ.get("FAKE_INTEGRATION_FAIL"):
-            fail("status_failed", "cannot read integration status")
-        current = "\n".join(f"{h}: current (v1) (/hooks/{h})"
-                            for h in ("claude", "codex", "pi", "omp", "opencode", "antigravity-cli"))
-        save(); print(os.environ.get("FAKE_INTEGRATION_STATUS", current)); sys.exit(0)
-    if a[:2] == ["agent", "list"]:
-        if os.environ.get("FAKE_ROSTER_FAIL"):
-            fail("roster_failed")
-        change = s.get("on_second_poll")
-        if change:
-            s["polls"] = s.get("polls", 0) + 1
-            if s["polls"] == 2:
-                target = next(k for k, p in panes.items() if p.get("label") == change["name"])
-                if change.get("close"):
-                    del panes[target]
-                elif change.get("exit"):
-                    panes[target].update(agent=None, name=None, agent_status="unknown", agent_session=None)
-                else:
-                    panes[target]["agent_status"] = change["status"]
-
-        out({"type": "agent_list", "agents": [view(p, "agent") for p in panes.values() if p.get("agent")]})
-    if a[:2] == ["agent", "get"]:
-        if os.environ.get("FAKE_GET_FAIL"):
-            fail("PermissionDenied", "Operation not permitted: socket blocked")
-        p = find(a[2])
-        out({"type": "agent_info", "agent": view(p, "agent")}) if p and p.get("agent") else fail("agent_not_found")
-    if a[:2] == ["agent", "rename"]:
-        find(a[2])["name"] = a[3]; out({"type": "agent_info", "agent": view(find(a[3]), "agent")})
-    if a[:2] == ["pane", "list"]:
-        out({"type": "pane_list", "panes": [view(p, "pane") for p in panes.values()]})
-    if a[:2] == ["pane", "get"]:
-        p = panes.get(a[2])
-        out({"type": "pane_info", "pane": view(p, "pane")}) if p else fail("pane_not_found")
-    if a[:2] == ["pane", "close"]:
-        if a[2] == os.environ.get("FAKE_CLOSE_FAIL"):
-            fail("close_refused", "could not close pane")
-        del panes[a[2]]
-        change = s.pop("after_close", None)
-        if change:
-            panes[change["pane"]].update(change["fields"])
-        out({"type": "pane_closed"})
-    if a[:2] == ["pane", "rename"]:
-        panes[a[2]]["label"] = None if a[3] == "--clear" else a[3]; out({"type": "pane_info", "pane": view(panes[a[2]], "pane")})
-    if a[:2] == ["tab", "rename"]:
-        s["tabs"][a[2]] = a[3]; out({"type": "tab_info", "tab": {"tab_id": a[2], "label": a[3]}})
-    if a[:2] == ["tab", "create"]:
-        tab = f"w1:t{len(s['tabs']) + 1}"
-        s["tabs"][tab] = opt("--label")
-        out({"type": "tab_created", "tab": {"tab_id": tab, "label": opt("--label")},
-             "root_pane": view(new_pane(tab, {"x": 0, "y": 0, "width": 200, "height": 50}), "pane")})
-    if a[:2] == ["pane", "split"]:
-        r = panes[a[2]]["rect"]
-        if opt("--direction") == "right":
-            r["width"] //= 2; new = {**r, "x": r["x"] + r["width"]}
-        else:
-            r["height"] //= 2; new = {**r, "y": r["y"] + r["height"]}
-        out({"type": "pane_info", "pane": view(new_pane(panes[a[2]]["tab_id"], new), "pane")})
-    if a[:2] == ["pane", "layout"]:
-        tab = panes[opt("--pane")]["tab_id"]
-        out({"type": "pane_layout", "layout": {"tab_id": tab, "panes": [
-            {"pane_id": p["pane_id"], "rect": p["rect"]} for p in panes.values() if p["tab_id"] == tab]}})
-    if a[:2] == ["pane", "process-info"]:
-        p = panes[opt("--pane")]
-        procs = p.get("procs")  # a test's own foreground processes; else the harness as factory started it
-        if procs is None:
-            start = next((c for c in reversed(s["calls"]) if c[:2] == ["agent", "start"] and c[c.index("--pane") + 1] == p["pane_id"]), None)
-            procs = [{"pid": 1, "name": p["agent"], "argv": [p["agent"], *start[start.index("--") + 1:]]}] if start and p.get("agent") else []
-        out({"type": "pane_process_info", "process_info": {"pane_id": p["pane_id"], "foreground_processes": procs}})
-    if a[:2] == ["pane", "read"]:
-        asks = panes[a[2]].get("dialog", [""])[0]
-        if width := int(os.environ.get("FAKE_DIALOG_WRAP", "0")):  # a narrow pane wraps the question
-            asks = "\n".join(textwrap.wrap(asks, width))
-        save(); print(f"...\n{asks}  [{a[2]}]"); sys.exit(0)  # plain text, like herdr
-    if a[:2] == ["pane", "send-keys"]:
-        if os.environ.get("FAKE_DIALOG_STUCK"):
-            fail("input_failed", "keypress was not delivered")
-        if panes[a[2]].pop("dialog", [0, 0])[1] == a[3:]:  # the keys that accept
-            panes[a[2]]["agent_status"] = "idle"
-        out({"type": "ok"})
-    if a[:2] == ["agent", "start"]:
-        name, kind, pane = a[2], opt("--kind"), opt("--pane")
-        how = dict(x.split(":")[::-1] for x in os.environ.get("FAKE_START_FAIL", "").split(",") if x).get(name)
-        if panes[pane].get("agent"):
-            fail("pane_busy")
-        if how == "dead":
-            fail("timeout", "agent did not appear")
-        panes[pane].update(agent=kind, name=name, agent_status="idle" if how in (None, "banner") else "blocked")
-        if how == "dialog":  # a first-run question the harness table knows
-            panes[pane]["dialog"] = {
-                "codex": ["> 1. Trust and continue  2. Back", ["enter"]],
-                "agy": ["Do you trust the contents of this project?\n> Yes, I trust this folder", ["enter"]],
-            }.get(kind, ["> No, exit\n  Yes, I trust this folder", ["down", "enter"]])
-            if os.environ.get("FAKE_DIALOG_TEXT"):  # a question the harness table does not know
-                panes[pane]["dialog"][0] = os.environ["FAKE_DIALOG_TEXT"]
-            if kind == "codex" or os.environ.get("FAKE_DIALOG_WRAP"):  # herdr 0.9.5 calls Codex, and agy in a
-                panes[pane]["agent_status"] = how = "idle"  # narrow pane, ready while its trust question is up
-        if how in ("blocked", "banner", "dialog"):  # a banner clears by itself: the agent is idle a moment later
-            fail("agent_not_ready", "agent is waiting on a dialog")
-        out({"type": "agent_started", "agent": view(panes[pane], "agent")})
-    if a[:2] == ["agent", "prompt"]:
-        p = find(a[2])
-        if not p or not p.get("agent"):
-            fail("agent_not_found")
-        if p.get("label") == os.environ.get("FAKE_UNCONFIRMED"):
-            out({})  # herdr returned without confirming the submission
-        if p.get("agent_status") == "blocked" or p.get("label") in os.environ.get("FAKE_PROMPT_FAIL", "").split(","):
-            fail("agent_blocked", "agent is waiting on an approval")
-        out({"type": "agent_prompted", "agent": view(p, "agent")})
-    fail("unexpected", " ".join(a))
-''').lstrip()
-
 # pi prints a table of configured models, filtered by the query like pi does.
 FAKE_PI = textwrap.dedent(r'''
     #!/usr/bin/env python3
@@ -1309,8 +1164,7 @@ UI = formation({n: CATALOG_MEMBERS[n] for n in ("lead-dev", "frontend-dev", "rev
 
 
 class Env:
-    """A temp repo with a ten-role fixture brief by default, a fake herdr, fake harnesses,
-    a Codex model cache, and the operator (a claude agent) in pane w1:p1 of tab w1:t1."""
+    """A temporary repo with a fixture brief, fake hc and harness binaries, and a Codex model cache."""
 
     def __init__(self, brief=CATALOG, harnesses=factory.HARNESSES, models=MODELS, git=False):
         self.tmp = tempfile.TemporaryDirectory()
@@ -1325,24 +1179,18 @@ class Env:
         bin_ = self.root / "bin"
         bin_.mkdir()
         (bin_ / "python3").symlink_to(sys.executable)
-        scripts = {"herdr": FAKE_HERDR, "pi": FAKE_PI, "omp": FAKE_OMP, "opencode": FAKE_OPENCODE, "agy": FAKE_AGY,
+        scripts = {"pi": FAKE_PI, "omp": FAKE_OMP, "opencode": FAKE_OPENCODE, "agy": FAKE_AGY,
                    "claude": "#!/bin/sh\n", "codex": "#!/bin/sh\n"}
         for name, body in scripts.items():
-            if name == "herdr" or name in harnesses:
+            if name in harnesses:
                 (bin_ / name).write_text(body)
                 (bin_ / name).chmod(0o755)
-        self.fake = self.root / "herdr.json"
-        operator = {"pane_id": "w1:p1", "tab_id": "w1:t1", "workspace_id": "w1", "label": None, "agent": "claude",
-                "name": None, "agent_status": "working", "rect": {"x": 0, "y": 0, "width": 200, "height": 50}}
-        self.write_fake({"calls": [], "next": 1, "tabs": {"w1:t1": "1"}, "panes": {"w1:p1": operator}})
         hc_dir = self.root / "hc"
         hc_dir.mkdir()
         self.env = {**{key: value for key, value in os.environ.items() if not key.startswith("HC_")},
                     "HC_BIN": str(pathlib.Path(fake_hc.__file__).resolve()), "FAKE_HC_DIR": str(hc_dir),
-                    "HERDR_BIN": str(bin_ / "herdr"), "FAKE_HERDR": str(self.fake),
-                    "HERDR_ENV": "1", "HERDR_PANE_ID": "w1:p1", "HERDR_TAB_ID": "w1:t1", "HERDR_WORKSPACE_ID": "w1",
                     "PATH": str(bin_), "HOME": str(self.home), "XDG_CACHE_HOME": str(self.root / "cache"),
-                    "FAKE_MODELS": models, "FACTORY_SETTLE": "0.2"}
+                    "FAKE_MODELS": models}
         self.env.pop("CODEX_HOME", None)
         if git:  # a real repo with one commit, for worktrees
             (bin_ / "git").symlink_to(GIT)
@@ -1357,12 +1205,6 @@ class Env:
         (self.repo / "factory.toml").write_text(head + "\n")
         (self.repo / "FACTORY.md").write_text(body)
 
-    def write_fake(self, s):
-        self.fake.write_text(json.dumps(s))
-
-    def fake_state(self):
-        return json.loads(self.fake.read_text())
-
     def run(self, *args, check=True, cwd=None, **env):
         command = list(args)
         command[1:1] = ["--cwd", str(cwd or self.repo)]
@@ -1372,41 +1214,6 @@ class Env:
             raise AssertionError(p.stderr + p.stdout)
         return p
 
-    def calls(self, *prefix):
-        return [c for c in self.fake_state()["calls"] if c[:len(prefix)] == list(prefix)]
-
-    def starts(self):
-        return {c[2]: c for c in self.calls("agent", "start")}
-
-    def prompts(self):
-        return [(c[2], c[3]) for c in self.calls("agent", "prompt")]
-
-    def pane_of(self, name):
-        return next(p for p in self.fake_state()["panes"].values() if p.get("label") == name)
-
-    def update(self, pane_label, **fields):
-        fs = self.fake_state()
-        next(p for p in fs["panes"].values() if p.get("label") == pane_label).update(fields)
-        self.write_fake(fs)
-
-    def set_session(self, name, ref):
-        self.update(name, agent_session=ref)
-
-    def kill(self, *names):
-        """Members' agents exit. Like herdr, their panes keep the label and lose the session reference;
-        a command that looked at the team before (here: status) has noted the session."""
-        self.run("status")
-        fs = self.fake_state()
-        for p in fs["panes"].values():
-            if p.get("label") in names:
-                p.update(agent=None, name=None, agent_status="unknown", agent_session=None)
-        self.write_fake(fs)
-
-    def close(self, *names):
-        fs = self.fake_state()
-        fs["panes"] = {k: p for k, p in fs["panes"].items() if p.get("label") not in names}
-        self.write_fake(fs)
-
     def __enter__(self):
         return self
 
@@ -1414,16 +1221,8 @@ class Env:
         self.tmp.cleanup()
 
 
-def native(call):
-    return call[call.index("--") + 1:]
-
-
 def flag(args, name):
     return args[args.index(name) + 1]
-
-
-def kind(call):
-    return flag(call, "--kind")
 
 
 class UpTests(unittest.TestCase):
@@ -1590,8 +1389,8 @@ class UpTests(unittest.TestCase):
             self.assertIn("must be one of full, guarded", e.run("check", "pm", check=False).stderr)
 
 
-    def test_claude_socket_settings_in_the_qualified_environment(self):
-        with patch.object(factory.sys, "platform", "linux"):
+    def test_full_claude_allows_unix_sockets_without_a_specific_socket(self):
+        with patch.dict(os.environ, {"HC_TERMINAL_SOCKET": ""}):
             full = json.loads(factory.claude_settings("full", "/s/messages/x"))["sandbox"]
             self.assertEqual(full["network"], {"allowAllUnixSockets": True})
             guarded = json.loads(factory.claude_settings("guarded", "/s/messages/x"))["sandbox"]
@@ -1607,7 +1406,8 @@ class UpTests(unittest.TestCase):
                 self.assertEqual(p.returncode, 2)
                 self.assertIn("unrecognized arguments", p.stderr)
             self.assertEqual((e.repo / "factory.toml").read_bytes(), original)
-            self.assertEqual(e.starts(), {})
+            with fake_hc.state_at(e.env["FAKE_HC_DIR"]) as state:
+                self.assertEqual(state["received"], [])
 
 
 @unittest.skipUnless(GIT, "git is not installed")
@@ -6194,7 +5994,7 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, r"unknown top-level key.*ready_checks"):
             self.load_config("ready_checks = 10\n")
 
-    def test_v1_sample_loads_unchanged(self):
+    def test_current_sample_uses_default_ready_check_settings(self):
         cfg = self.load_config((factory.SKILL / "templates/factory.toml").read_text())
         self.assertEqual((cfg.quiet_grace, cfg.ready_check, cfg.ready_every), (120, None, 300))
 
@@ -6666,46 +6466,6 @@ class GateFixtureTests(unittest.TestCase):
             for repo, cache in zip(fixtures, caches):
                 self.assertEqual((repo / "preserve-me").read_text(), "previous fixture")
                 self.assertEqual((cache / "sessions.jsonl").read_text(), "previous fixture session")
-
-
-class HerdrContract(unittest.TestCase):
-    """The fields factory.py reads must exist where it reads them. The fake above follows the same split."""
-
-    @unittest.skipUnless(shutil.which("herdr"), "herdr is not installed")
-    def test_agy_member_kind(self):
-        help_text = subprocess.run(["herdr", "agent"], capture_output=True, text=True)
-        self.assertRegex(help_text.stderr + help_text.stdout, r"kinds: [^\n]*\bagy\b")
-
-    def test_pane_and_agent_records(self):
-        if not shutil.which("herdr"):
-            self.skipTest("herdr is not installed")
-        p = subprocess.run(["herdr", "api", "schema", "--json"], capture_output=True, text=True)
-        if p.returncode:
-            self.skipTest("herdr api schema is not available")
-        defs = {}
-
-        def walk(o):
-            if isinstance(o, dict):
-                defs.update(o.get("$defs", {}))
-                for v in o.values():
-                    walk(v)
-            elif isinstance(o, list):
-                for v in o:
-                    walk(v)
-        walk(json.loads(p.stdout))
-        pane, agent = defs["PaneInfo"]["properties"], defs["AgentInfo"]["properties"]
-        for field in ("pane_id", "tab_id", "label", "agent", "agent_status", "agent_session"):
-            self.assertIn(field, pane)
-        self.assertNotIn("name", pane)  # which is why Team reads `agent list` as well
-        for field in ("pane_id", "name", "agent"):
-            self.assertIn(field, agent)
-        self.assertEqual(set(defs["AgentSessionInfo"]["properties"]), {"agent", "kind", "source", "value"})
-        self.assertIn("text", defs["PaneReadResult"]["properties"])
-        self.assertIn("foreground_processes", defs["PaneProcessInfo"]["properties"])
-        self.assertLessEqual({"name", "argv"}, set(defs["PaneProcessInfoProcess"]["properties"]))
-        self.assertEqual(set(defs["ErrorBody"]["properties"]), {"code", "message"})
-        for params, field in (("TabCreateParams", "env"), ("PaneSplitParams", "env"), ("AgentStartParams", "args")):
-            self.assertIn(field, defs[params]["properties"])
 
 
 @unittest.skipUnless(os.environ.get("FACTORY_LIVE"), "set FACTORY_LIVE=1 (outside any sandbox) to check real harness flags")
