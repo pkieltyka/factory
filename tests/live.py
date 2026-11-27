@@ -2029,6 +2029,10 @@ class FixtureAdapter:
     def act_run(self, path, command):
         return f"ACT run {path} {command}"
 
+    def act_alone(self, command):
+        """The fake runs it as ACT run does (it has no sandbox); its receipt is thrown away."""
+        return f"ACT run {self.team.dir / 'alone-receipt.txt'} {command}"
+
     def blocked_request(self):
         return "FAKE: blocks_once"
 
@@ -2092,6 +2096,13 @@ class RealAdapter(FixtureAdapter):
     def act_run(self, path, command):
         return (f"Using your shell tool, run exactly this command: {command}; echo \"exit $?\" >> {path}"
                 " Then reply with the single word done.")
+
+    def act_alone(self, command):
+        """One command in its own tool call, nothing added: how a member runs say (a guarded Claude Code's
+        sandbox exempts exactly 'python3 <script> say *', which a compound line does not match; case 9 at
+        3321bfc)."""
+        return (f"Using your shell tool, run exactly this one command, by itself in its own tool call, with nothing"
+                f" added before or after it: {command} Then reply with the single word done.")
 
     def blocked_request(self):
         return ("Before doing anything else, ask me one multiple-choice question with your question tool, and"
@@ -2537,6 +2548,21 @@ def _trust_entries(run, team, directories=None):
     run.checkpoint()
 
 
+def _member_says_alone(team, text, timeout=300):
+    """The member runs say by itself, as its standing instructions say; the driver sees it in the log. -> the
+    message ID, or None."""
+    body = team.dir / f"report-{random.randrange(16 ** 6):06x}.md"
+    body.write_text(text)
+    command = f"python3 {shlex.quote(str(team.script))} say operator --file {shlex.quote(str(body))}"
+    team.send(team.member("lead-dev"), team.adapter.act_alone(command))
+    log = factory_log(team)
+
+    def found():
+        return next((rec["id"] for rec in log.read_box()[0]
+                     if rec["t"] == "msg" and rec.get("from") == "lead-dev" and rec.get("text") == text), None)
+    return team.until(found, timeout) or None
+
+
 def _member_says(team, text, timeout=300, record=None):
     """Have the member itself run say to the operator through its own tool, with text in a file."""
     member = team.member("lead-dev")
@@ -2754,12 +2780,12 @@ def case_9(run, role, harness, adapter_class):
         team.qa.rpc("terminal.kill", {"terminal": old})
         gone = team.until(lambda: team.get(old)["state"] == "finished", 30)
         receipt, tok = team.receipt("operator"), token()
-        said = _member_says(team, team.adapter.act_append(receipt, tok))
+        said = _member_says_alone(team, team.adapter.act_append(receipt, tok))   # the say by itself, as members do
         new = team.until(team.keeper, 60)
         acted = team.until(lambda: receipt.exists() and tok in receipt.read_text(), 300)
-        proof = {"old_keeper_finished": bool(gone), "new_keeper": bool(new) and new != old, "member_say": said,
+        proof = {"old_keeper_finished": bool(gone), "new_keeper": bool(new) and new != old, "member_say_id": said,
                  "guarded_args": harness_table()[harness]["permissions"]["guarded"], "peer": peer}
-        ok = bool(gone) and bool(new) and new != old and bool(acted) and "exit 0" in (said or "")
+        ok = bool(gone) and bool(new) and new != old and bool(acted) and said is not None
         run.row(9, "guarded", role, harness, "pass" if ok else "fail",
                 "a guarded member's say reaches hc, restarts the keeper and is acted on", proof=proof,
                 reason=None if ok else "the keeper did not restart or the operator did not act")
@@ -4511,6 +4537,7 @@ def qualify(target, role=None, cases=None, json_path=None, fixture=False):
 PROOF_NEEDED = {(1, "startup-dialog"): ("seen",), (2, "idle-report"): ("turn_completed",),
                 (2, "operator-commands"): ("member_briefed",), (4, "owner-interrupt"): ("next-delivery", "trials"),
                 (5, "blocked"): ("action_count",), (6, "operator-switch"): ("switched",), (6, "resume"): ("replaced",),
+                (9, "guarded"): ("member_say_id",),     # a compound say's "exit 0" may have run unsandboxed
                 (6, "member-switch"): ("switched",), (10, "idle-latency"): ("trials",)}
 
 def _cycled(proof):
