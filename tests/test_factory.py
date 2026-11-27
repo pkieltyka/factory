@@ -1734,6 +1734,22 @@ class DeliveryDecisionTests(unittest.TestCase):
         self.assertEqual(factory.decide("boss", {"kind": "say"}, view("boss", "working", "codex"), self.box, boss, 10,
                                         None), ("queue", "busy"))
 
+    def test_omp_gets_messages_between_turns_in_both_roles(self):
+        """@operator's decision (#175, omp operator case 7 at 1be599e): a report arriving while omp worked replaced
+        an earlier, independent one. omp joins Codex; pi, which passed two-senders, still steers."""
+        def view(name, state, app, kind):
+            record = self.terminal(name, state, kind=kind)
+            record["status"]["app"] = app
+            return factory.View([record])
+        self.briefed()
+        for name, kind, address in (("operator", "operator", "t-operator"), ("lead-dev", "member", "t-lead-dev")):
+            for state, app, expected in (("working", "omp", ("queue", "busy")),
+                                         ("idle", "omp", ("send", address, "idle")),
+                                         ("done", "omp", ("send", address)), ("working", "pi", ("send", address))):
+                with self.subTest(name=name, state=state, app=app):
+                    self.assertEqual(factory.decide(name, {"kind": "say"}, view(name, state, app, kind), self.box,
+                                                    self.cfg, 10, None), expected)
+
     def test_a_codex_member_gets_messages_between_turns_too(self):
         """@operator's decision (#173, Codex member case 7 two-senders at a65a1fe): the rule holds in both roles,
         after a member's own rows (not started, gone, starting, not ready, blocked); other members still steer."""

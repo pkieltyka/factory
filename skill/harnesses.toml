@@ -80,6 +80,7 @@ never = []
 prompt = "file"
 session = "dir"             # LC-6 (db85120): --session-dir=<state>/sessions/<member>-omp, resumed with --continue
 resume_model = "provider"
+deliver = "idle"   # keeper.md §9, both roles: a working omp dropped an earlier report for a later one (#175)
 
 [omp.permissions]   # omp's stricter modes ask before every command, a message to a teammate included
 full = ["--approval-mode", "yolo"]
