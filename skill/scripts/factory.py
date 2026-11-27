@@ -3378,6 +3378,12 @@ def _up(cfg, args, hc, team, operator, state, names, me_id):
         box = log.read_box()[1]
     except (LogDamage, OSError) as error:
         stop_with(f"the message log cannot be read: {error}")
+    unfinished = sorted({r["labels"].get("factory.member") for r in hc.list(team)
+                         if r["labels"].get("factory.down") and r["labels"].get("factory.kind") == "member"}
+                        & set(names))
+    if unfinished:                                   # a stop not recorded yet: a replacement could get its messages
+        stop_with("the last stop of " + ", ".join("@" + n for n in unfinished) + " was not recorded; run"
+                  " factory.py down " + " ".join(unfinished) + " first")
     targets = [n for n in names if view.state(n) in ("not started", "gone")]
     running = [n for n in names if n not in targets]
     if running:
@@ -3395,18 +3401,18 @@ def _up(cfg, args, hc, team, operator, state, names, me_id):
             print(interrupted_line(m["name"], old, box))
     if not was_live:
         print("\n".join(pending_lines(state, operator)))
+    try:
+        ensure_keeper(cfg, state, hc, view, force=True)   # also when every member runs: delivery comes back
+    except (Problem, HcDown, HcError, OSError, LogDamage) as error:
+        stop_with(f"the keeper could not start: {error}. No member was started.", 3)
     if not plans:
         return
-    failed = {}
+    failed, fixes = {}, {}                           # fixes: a member's fix when it is neither up nor brief --send
     for m in plans:
         if m["branch"]:
             err = ensure_worktree(cfg, m)
             if err:
                 failed[m["name"]] = err
-    try:
-        ensure_keeper(cfg, state, hc, view, force=True)
-    except (Problem, HcDown, HcError, OSError) as error:
-        stop_with(f"the keeper could not start: {error}. No member was started.", 3)
     newest, skipped = saved_sessions(state)
     if skipped:
         print(f"skipped {skipped} damaged entries in {state / SESSIONS}")
@@ -3443,7 +3449,8 @@ def _up(cfg, args, hc, team, operator, state, names, me_id):
         return await_ready(hc, group, timeout=args.timeout) if group else {}
 
     ready = ready_group(list(starts))
-    retry = [n for n, why in ready.items() if why and starts[n][1]["resume"] and why.startswith(("exited", "was"))]
+    ended = ("exited", "was stopped", "ended")
+    retry = [n for n, why in ready.items() if why and starts[n][1]["resume"] and why.startswith(ended)]
     for n in retry:
         m, _, record = starts.pop(n)
         print(f"@{n}: its saved conversation could not be resumed ({ready.pop(n)}); starting fresh")
@@ -3463,8 +3470,15 @@ def _up(cfg, args, hc, team, operator, state, names, me_id):
         try:
             ident, offset, warning = log.add(operator, [n], message_for(cfg, m, roster, operator, closing),
                                              kind="brief")
-        except (LogDamage, NotStored, OSError) as error:
-            failed[n] = f"its brief was not stored: {error}"
+        except NotStored as error:
+            failed[n] = f"its brief was not stored: {error.detail}"
+            continue
+        except LogDamage as error:
+            failed[n], fixes[n] = f"its brief was not stored: {error}", "repair the log, then factory.py up"
+            continue
+        except OSError as error:                     # the storage outcome is unknown: never a second brief
+            failed[n] = f"its brief may be stored: {error}"
+            fixes[n] = f"factory.py inbox --for {n}, and factory.py status"
             continue
         if warning:
             print(f"warning: brief {ident}: {warning}", file=sys.stderr)
@@ -3475,13 +3489,17 @@ def _up(cfg, args, hc, team, operator, state, names, me_id):
         try:
             outcome = wait_outcomes(log, ident, [n], offset, max(0.0, deadline - time.monotonic()))[n]
         except (LogDamage, OSError) as error:
-            failed[n] = f"brief {ident} is stored; its outcome could not be read ({error}). Run factory.py status."
+            failed[n] = f"brief {ident} is stored; its outcome could not be read ({error})"
+            fixes[n] = "factory.py status"
             continue
         lines, confirmed = _brief_lines(n, ident, outcome)
         print("\n".join(lines))
-        if outcome["o"] in ("sending", "queued"):
-            failed[n] = f"brief {ident} is not delivered yet"      # the keeper owns it: never a second brief
-        if confirmed and outcome.get("term") == record["address"]:
+        if outcome["o"] in ("sending", "queued"):        # the keeper owns it: never a second brief
+            failed[n], fixes[n] = f"brief {ident} is not delivered yet", "factory.py status"
+        elif confirmed and outcome.get("term") != record["address"]:
+            confirmed = False
+            failed[n] = f"brief {ident} went to another terminal ({outcome.get('term')})"
+        if confirmed:
             fact = _launch_fact(m, state, sess)
             if fact:
                 try:
@@ -3500,10 +3518,10 @@ def _up(cfg, args, hc, team, operator, state, names, me_id):
         except (LogDamage, NotStored, OSError) as error:
             print(f"warning: the news of who joined was not stored: {error}", file=sys.stderr)
     if failed:
-        ended = ("exited", "was stopped", "ended", "could not be watched")
+        ended += ("could not be watched",)
         for n, why in failed.items():
-            if why.endswith("is not delivered yet"):
-                fix = "factory.py status"
+            if n in fixes:
+                fix = fixes[n]
             elif n in starts and not why.startswith(ended):
                 fix = f"factory.py brief --send {n}"              # it runs; it has no confirmed brief
             else:
@@ -3531,9 +3549,41 @@ def cmd_down(args):
         os.close(lock)
 
 
+def _stop(hc, log, state, name, record):
+    """One terminal of a member: factory.down, kill, the stop record, rm. -> whether its stop is recorded."""
+    address = record["address"]
+    try:
+        if record["state"] == "live":
+            hc.label(address, {"factory.down": "1"})   # before the kill: the keeper drops, not requeues
+            hc.kill(address)
+    except HcError as error:
+        if error.kind != "finished":
+            print(f"@{name} ({address}) could not be stopped: {error}")
+            return False
+    except HcDown as error:
+        print(f"@{name} ({address}) could not be stopped: {error}")
+        return False
+    try:
+        mark_stopped(state, [address], log.read_box()[1])
+    except (Problem, ValueError, OSError, LogDamage) as error:
+        print(f"@{name} stopped, but the stop could not be recorded ({error}); its record {address} is kept."
+              f" Run factory.py down {name} again.")
+        return False
+    try:
+        hc.rm(address)
+    except (HcError, HcDown) as error:
+        if not (isinstance(error, HcError) and error.kind == "not_found"):
+            print(f"@{name}'s record {address} could not be removed ({error}); run factory.py down {name} again")
+    return True
+
+
 def _down(cfg, hc, team, state, names):
     me_id = os.environ["HC_TERMINAL_ID"]
-    view = team_view(hc, team)
+    try:
+        records = hc.list(team)
+    except (HcDown, HcError) as error:
+        stop_with(f"hc is not reachable: {error}")
+    view = View(records)
     if view.operator is None or view.operator["address"] != me_id:
         stop_with("run down from the operator's pane")
     problem = sessions_writable(state)
@@ -3542,41 +3592,18 @@ def _down(cfg, hc, team, state, names):
         return 1
     log, code, stopped = open_log(state), 0, {}
     for name in names:
-        record = view.terminal(name) or view.finished(name)
-        if record is None:
+        current = view.terminal(name) or view.finished(name)
+        earlier = [r for r in records if r["state"] == "finished" and r["labels"].get("factory.down")
+                   and r["labels"].get("factory.kind") == "member" and r["labels"].get("factory.member") == name]
+        if current is None and not earlier:
             print(f"@{name} was not running")
             continue
-        address, word = record["address"], view.state(name)
-        try:
-            if record["state"] == "live":
-                hc.label(address, {"factory.down": "1"})   # before the kill: the keeper drops, not requeues
-                hc.kill(address)
-        except HcError as error:
-            if error.kind != "finished":
-                print(f"@{name} ({address}) could not be stopped: {error}")
+        word = view.state(name) if current is not None else "stopped"
+        for record in [r for r in (current, *earlier) if r is not None]:   # an earlier down's unfinished stop too
+            if _stop(hc, log, state, name, record):
+                stopped[name] = word
+            else:
                 code = 1
-                continue
-        except HcDown as error:
-            print(f"@{name} ({address}) could not be stopped: {error}")
-            code = 1
-            continue
-        try:
-            mark_stopped(state, [address], log.read_box()[1])
-        except (Problem, ValueError, OSError, LogDamage) as error:
-            print(f"@{name} stopped, but the stop could not be recorded ({error}); its record {address} is kept."
-                  f" Run factory.py down {name} again.")
-            code = 1
-            continue
-        try:
-            hc.rm(address)
-        except HcError as error:
-            if error.kind != "not_found":
-                print(f"@{name}'s record {address} could not be removed: {error}")
-                code = 1
-        except HcDown as error:
-            print(f"@{name}'s record {address} could not be removed: {error}")
-            code = 1
-        stopped[name] = word
     if stopped:
         try:
             box = log.read_box()[1]
@@ -3588,7 +3615,11 @@ def _down(cfg, hc, team, state, names):
             queued, code = {n: 0 for n in stopped}, 1
         for name, word in stopped.items():
             print(f"stopped @{name} (was {word}); {queued[name]} queued messages dropped")
-    after = team_view(hc, team)
+    try:
+        after = team_view(hc, team)
+    except (HcDown, HcError) as error:
+        print(f"could not check whether any member still runs: {error}")
+        return 1
     if not any(after.terminal(n) or after.finished(n) for n in cfg.members):
         try:
             update_team(state, up=False)
@@ -3597,7 +3628,6 @@ def _down(cfg, hc, team, state, names):
             code = 1
         print("run factory.py up to bring members back")
     return code
-
 
 def cmd_status(args):
     hc = Hc()
@@ -3611,11 +3641,9 @@ def cmd_status(args):
         stop_with(f"{error.what}; {error.fix}")
     view, operator = View(records), cfg.operator["name"]
     print(f"factory {VERSION} ({SCRIPT}), hc {'.'.join(map(str, hc.version))}, team {team}")
-    box, damage = None, None
-    try:
+    box = None                                       # unreadable: pending_lines prints the diagnosis
+    with contextlib.suppress(LogDamage, OSError, Problem):
         box = open_log(state).read_box()[1]
-    except (LogDamage, OSError, Problem) as error:
-        damage = str(error)
     rows = [("Member", "Role", "Harness", "Model", "Thinking", "State", "Turn", "Terminal")]
     o = cfg.operator
     for name, role, harness, model, thinking in (
@@ -3636,8 +3664,10 @@ def cmd_status(args):
         print(f"keeper: not running ({error})")
     else:
         beat = read_beat(state) if keeper else None
-        if keeper is None or beat is None:
+        if keeper is None:
             print("keeper: not running")
+        elif beat is None:
+            print(f"keeper: starting ({keeper}), no pane")
         else:
             version = "" if beat[1] == VERSION else f", replacing itself (it runs {beat[1]})"
             print(f"keeper: running, version {beat[1]}, last loop {int(beat[3])} s ago, no pane{version}")
@@ -3657,8 +3687,6 @@ def cmd_status(args):
         size = 0
     if size > 64 * 1024 * 1024:
         print(f"warning: the message log is {size // (1024 * 1024)} MiB ({pathlib.Path(state) / Log.LOG})")
-    if damage:
-        print(damage)
 
 
 def _brief_preview(cfg, name, state):
@@ -3734,12 +3762,16 @@ def _brief_send(args, names):
         if warning:
             print(f"warning: brief {ident}: {warning}", file=sys.stderr)
         sent[name] = (ident, offset)
+    wait = SAY_WAIT
     try:
-        ensure_keeper(cfg, state, hc, view)
+        if ensure_keeper(cfg, state, hc, view) is None:
+            print("warning: the team is stopped; the briefs are stored and wait for factory.py up.", file=sys.stderr)
+            wait = 0
     except (Problem, HcDown, HcError, OSError, LogDamage) as error:
         print(f"warning: the keeper is not running ({error}); the briefs are stored. Run factory.py status.",
               file=sys.stderr)
-    deadline = time.monotonic() + SAY_WAIT
+        wait = 0                                     # read each outcome once, without waiting for nobody
+    deadline = time.monotonic() + wait
     for name, (ident, offset) in sent.items():
         try:
             outcome = wait_outcomes(log, ident, [name], offset, max(0.0, deadline - time.monotonic()))[name]

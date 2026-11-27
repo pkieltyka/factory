@@ -2105,6 +2105,53 @@ class TeamCommandTests(TeamCase):
         self.assertIn("Then run: factory.py status", err)
         self.assertNotIn("brief --send", err)
 
+    def test_up_with_everyone_running_still_starts_the_keeper(self):
+        self.cmd(self.operator, "up", "lead-dev")
+        calls = []
+        with patch.object(factory, "ensure_keeper", lambda *args, **kwargs: calls.append(kwargs) or "keeper"):
+            code, out, _ = self.cmd(self.operator, "up", "lead-dev")
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, [{"force": True}])
+
+    def test_up_never_asks_for_a_second_brief_when_storage_or_outcome_is_unknown(self):
+        with patch.object(factory.Log, "add", side_effect=OSError("disk gone")):
+            code, _, err = self.cmd(self.operator, "up", "lead-dev")
+        self.assertEqual(code, 3)
+        self.assertIn("its brief may be stored: disk gone", err)
+        self.assertNotIn("brief --send", err)
+        with patch.object(factory, "wait_outcomes", side_effect=OSError("cannot read")):
+            code, _, err = self.cmd(self.operator, "up", "reviewer")
+        self.assertEqual(code, 3)
+        self.assertIn("is stored; its outcome could not be read (cannot read). Then run: factory.py status", err)
+
+    def test_an_unrecorded_stop_is_finished_by_the_next_down_and_blocks_up(self):
+        self.cmd(self.operator, "up", "lead-dev")
+        term = self.member_terms()["lead-dev"]
+        with patch.object(factory, "mark_stopped", side_effect=OSError("no space")):
+            code, out, _ = self.cmd(self.operator, "down", "lead-dev")
+        self.assertEqual(code, 1)
+        self.assertIn(f"its record {term} is kept. Run factory.py down lead-dev again.", out)
+        code, _, err = self.cmd(self.operator, "up", "lead-dev")
+        self.assertEqual(code, 2)
+        self.assertIn("the last stop of @lead-dev was not recorded; run factory.py down lead-dev first", err)
+        code, out, err = self.cmd(self.operator, "down", "lead-dev")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("stopped @lead-dev (was stopped)", out)
+        self.assertEqual(factory.read_team(self.state_dir)["stopped"], [term])
+        self.assertNotIn(term, [r["address"] for r in self.hc.list(self.team)])
+        self.assertEqual(self.cmd(self.operator, "up", "lead-dev")[0], 0)
+
+    def test_brief_send_does_not_wait_for_a_missing_keeper(self):
+        self.cmd(self.operator, "up", "lead-dev")
+        with patch.object(factory, "ensure_keeper", side_effect=factory.Problem("no keeper", "fix")), \
+                patch.object(factory, "wait_outcomes", wraps=lambda log, i, r, o, timeout: {r[0]: {"o": "queued",
+                                                                                                  "why": "waiting"}}
+                             ) as waited:
+            code, _, err = self.cmd(self.operator, "brief", "--send", "lead-dev")
+        self.assertEqual(code, 1)
+        self.assertIn("the keeper is not running (no keeper)", err)
+        self.assertEqual(waited.call_args.args[4], 0.0)
+
     def test_a_trust_dialog_without_keys_is_left_to_the_owner(self):
         self.assertEqual(factory.TABLE["agy"]["dialogs"], [["Do you trust the contents of this project?", []]])
         self.env.write_brief(formation({"pm": {"harness": "agy"}}))
@@ -2185,7 +2232,7 @@ class TeamCommandTests(TeamCase):
         self.assertIn("@reviewer interrupted: exited (code 1)", out)
         self.assertIn("pending: @operator 1", out)
         self.assertIn("read them with: factory.py inbox --for operator", out)
-        self.assertIn("keeper: not running", out)
+        self.assertIn("keeper: starting (keeper), no pane", out)          # no heartbeat yet
         self.assertIn("operator: reachable", out)
         self.assertIn("@reviewer gone: run `factory.py up reviewer` to bring them back.", out)
 
@@ -2211,6 +2258,85 @@ class TeamCommandTests(TeamCase):
         code, _, err = self.cmd(self.operator, "brief", "--send", "pm")
         self.assertEqual(code, 2)
         self.assertIn("not running: @pm", err)
+
+
+@real_only
+class IntegratedTeamTests(TeamCase):
+    """phase_5a.md §5: check, up, say, status, down and up again from the real command entry points, on the private
+    real core, with a real keeper and fake OSC agents standing in for Codex."""
+
+    def setUp(self):
+        super().setUp()
+        bin_ = self.directory / "bin"
+        bin_.mkdir()
+        agent = pathlib.Path(__file__).resolve().with_name("fake_agent.py")
+        codex = bin_ / "codex"                       # any arguments: the fake agent takes none of Codex's
+        codex.write_text(f"#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(agent))} reports\n")
+        codex.chmod(0o755)
+        self.enterContext(patch.dict(os.environ, {"PATH": f"{bin_}:{os.environ.get('PATH', '')}",
+                                                  "HOME": self.env.env["HOME"]}))
+        self.operator = self.hc.run([sys.executable, str(agent), "reports"], str(self.directory), {}, {})["address"]
+        self.addCleanup(self.remove, self.operator)
+        self.state(self.operator, "idle")
+        self.addCleanup(self.stop_everything)
+
+    def stop_everything(self):
+        for record in self.hc.list(self.team):
+            self.remove(record["address"])
+
+    def cmd(self, *argv):
+        out, err, code = io.StringIO(), io.StringIO(), 0
+        with (patch.dict(os.environ, {"HC_TERMINAL_ID": self.operator, "HC_BIN": self.hc.bin}),
+              patch.object(factory, "HC", self.hc.bin),
+              contextlib.redirect_stdout(out), contextlib.redirect_stderr(err)):
+            try:
+                factory.main([*argv, "--cwd", str(self.root)] if argv[0] != "say" else list(argv))
+            except SystemExit as error:
+                code = error.code or 0
+        return code, out.getvalue(), err.getvalue()
+
+    def members(self):
+        return {r["labels"]["factory.member"]: r["address"] for r in self.hc.list(self.team)
+                if r["labels"].get("factory.kind") == "member" and r["state"] == "live"}
+
+    def test_a_team_runs_end_to_end(self):
+        code, out, err = self.cmd("check", "lead-dev", "reviewer")
+        self.assertEqual(code, 0, out + err)
+        code, out, err = self.cmd("up", "lead-dev", "reviewer")
+        self.assertEqual(code, 0, out + err)
+        for name in ("lead-dev", "reviewer"):
+            self.assertRegex(out, rf"@{name}: brief \d+ delivered")
+        first = self.members()
+        _, box = self.log.read_box()
+        self.assertEqual(box.briefed(), set(first.values()))
+        code, out, err = self.cmd("say", "lead-dev", "a task")
+        self.assertEqual(code, 0, out + err)
+        self.assertRegex(out, r"message \d+\n@lead-dev: delivered\n")
+        task = int(out.split()[1])
+        code, out, _ = self.cmd("up")                              # a second up leaves live members alone
+        self.assertIn("already running: @lead-dev, @reviewer", out)
+        self.assertEqual(self.members(), first)
+        code, out, err = self.cmd("status")
+        self.assertEqual(code, 0, err)
+        self.assertRegex(out, r"@lead-dev +lead-dev +codex +gpt-6-astra +high +idle")
+        self.assertIn("keeper: running", out)
+        self.assertIn("operator: reachable", out)
+        self.assertFalse(any(k.startswith("herdr.") for r in self.hc.list(self.team) for k in r["labels"]))
+        code, out, err = self.cmd("down", "lead-dev")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("stopped @lead-dev (was idle)", out)
+        self.assertEqual(set(self.members()), {"reviewer"})
+        keeper = factory.team_view(self.hc, self.team).keeper["address"]
+        code, out, err = self.cmd("down")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("run factory.py up to bring members back", out)
+        self.until(lambda: self.hc.get(keeper)["state"] == "finished", "the keeper's exit after the last down")
+        code, out, err = self.cmd("up", "lead-dev")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("@lead-dev starts in a new conversation: none was recorded for it", out)
+        _, box = self.log.read_box()
+        self.assertEqual(sum(1 for m in box.msgs.values() if m["kind"] == "brief" and m["to"] == ["lead-dev"]), 2)
+        self.assertEqual(box.outcome(task, "lead-dev")["o"], "delivered")      # the team's history persists
 
 
 class KeeperTests(TeamCase):
