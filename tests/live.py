@@ -620,6 +620,7 @@ class Rodeo:
         self.record = drv.rpc("terminal.run", {"argv": argv, "cwd": str(qa.dir), "env": env,
                                                "size": {"cols": cols, "rows": rows}})
         self.term = self.record["address"]
+        self.size = cols, rows
         self.focused_terminal = None
 
     def keys(self, *names):
@@ -631,6 +632,20 @@ class Rodeo:
             raise ValueError("type takes one line; send Enter separately")
         for char in text:   # hc's key names ignore case: an uppercase letter is shift plus the letter
             self.keys("space" if char == " " else f"shift+{char.lower()}" if char.isupper() else char)
+
+    def paste(self, text, submit=True):
+        """Paste text through the client as the owner's terminal would (bracketed, through an attach, whose
+        input counts as a person's keys), then Enter; any characters, newlines included."""
+        attach = Attach(self.drv, self.term, cols=self.size[0], rows=self.size[1])
+        try:
+            time.sleep(0.5)
+            attach.type(b"\x1b[200~" + text.encode() + b"\x1b[201~")
+            if submit:
+                time.sleep(0.5)
+                attach.type(b"\r")
+            time.sleep(0.5)
+        finally:
+            attach.close()
 
     def _move(self, direction, count):
         for _ in range(count):
@@ -2284,6 +2299,8 @@ def case_2(run, role, harness, adapter_class):
     names = [n for n, _ in subcases(2, role)]
     team, peer = _team_for(adapter_class, role, harness)
     with team:
+        if role == "operator":
+            _operator_tab(team)
         if not _up(team, run, 2, role, harness, names):
             return
         receipt, tok = team.receipt("operator"), token()
@@ -2307,13 +2324,19 @@ def case_2(run, role, harness, adapter_class):
         message = shlex.quote(team.adapter.act_append(member_receipt, tok2))
         commands = [f"{py} status", f"{py} inbox", f"{py} say lead-dev {message}", f"{py} up"]
         prompt = "\n".join(team.adapter.act_run(exits, command) for command in commands)
-        team.send(team.operator, prompt)
+        view = _rodeo(team, ["operator", "team"])        # the owner's first prompt, pasted through rodeo
+        view.keys("ctrl+b")
+        time.sleep(0.2)
+        view.keys("1")
+        time.sleep(0.8)
+        view.focused_terminal = team.operator
+        view.paste(prompt)
         lines = team.until(lambda: exits.exists() and len(exits.read_text().split()) >= 8 and exits.read_text(), 600)
         codes = [line for line in (lines or "").splitlines() if line.startswith("exit")]
         reached = bool(codes == ["exit 0"] * 4         # the member acts on its own turn, after say has returned
                        and team.until(lambda: member_receipt.exists() and tok2 in member_receipt.read_text(), 300))
         proof = {"exits": codes, "member_acted": reached,
-                 "prompted_by": "hc terminal.send; typing this first prompt through rodeo is not built yet"}
+                 "prompted_by": "the owner's paste and Enter through rodeo (prefix+1, the operator tab)"}
         ok = codes == ["exit 0"] * 4 and reached
         run.row(2, "operator-commands", role, harness, "pass" if ok else "fail",
                 "the operator runs status, inbox, say and up through its own tool; the say reaches the member",
