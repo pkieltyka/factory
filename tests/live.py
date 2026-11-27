@@ -3053,9 +3053,10 @@ def case_6(run, role, harness, adapter_class):
         idle()
         time.sleep(2)
         launch = relaunch()
-        idle()
-        got = recall()
         cycled = launch["down_exit"] == 0 and launch["up_exit"] == 0 and launch["replaced"]
+        if cycled:
+            idle()
+        got = recall() if cycled else None
         ok = cycled and got == first[::-1]
         run.row(6, "resume", role, harness, "pass" if ok else "fail",
                 "down then up starts a new terminal that reopens the member's conversation: it recalls a word from"
@@ -3074,8 +3075,14 @@ def case_6(run, role, harness, adapter_class):
         _member_says(team, "switched")                   # its next say sees the new conversation's ID
         time.sleep(2)
         launch = relaunch()
+        fresh = team.member("lead-dev")
+        if judge_member_switch(switched, launch, True) != "pass":   # the cycle failed: no terminal to ask
+            run.row(6, "member-switch", role, harness, judge_member_switch(switched, launch, True),
+                    "after a native switch, down then up replaces the terminal", proof=dict(launch, switched=switched),
+                    reason=why if not switched else "down or up failed, or the same terminal stayed")
+            return
         idle()
-        argv = " ".join(team.get(team.member("lead-dev")).get("argv") or [])
+        argv = " ".join(team.get(fresh).get("argv") or [])
         launch["resumed_conversation"] = ("launch" if before and before in argv       # the ID the new terminal's argv
                                           else "switched" if after and after in argv else "neither")   # carries
         launch["ids"] = {"launch": _alias(before), "switched": _alias(after)}
@@ -3201,6 +3208,7 @@ def case_4(run, role, harness, adapter_class):
                     else:
                         view.focus("@lead-dev")
                     keys = team.adapter.interrupt_keys(harness)
+                    pending_at_esc = second not in _lines(work) and team.state(subject) == "working"
                     view.keys(*keys)
                     esc_at = time.monotonic()
                     watch = {}
@@ -3225,7 +3233,9 @@ def case_4(run, role, harness, adapter_class):
                     proof["after_esc"] = look(screen)
                     # on screen at all: in the input or in the transcript, which a screen cannot tell apart
                     proof["second_on_screen_after_esc"] = second in screen
-                    proof["precondition"] = bool(delivered) and proof["pending_before_esc"]
+                    proof["pending_and_working_at_esc"] = pending_at_esc
+                    proof["precondition"] = (bool(delivered) and proof["working_when_delivered"]
+                                             and proof["pending_before_esc"] and pending_at_esc)
                 if trial == "next-delivery":                # touch nothing: the keeper's next delivery
                     while time.monotonic() - esc_at < 65:    # past the QA core's draft_wait (60 s) since Esc
                         time.sleep(1)
@@ -3453,9 +3463,11 @@ def qualify(target, role=None, cases=None, json_path=None, fixture=False):
             first_row = len(run.data["rows"])
             try:
                 function(run, role_, harness, adapter_class)
-            except NotRun as why:
+            except NotRun as why:                         # only the rows the case did not get to (@reviewer)
                 for name, _ in subcases(case, role_):
-                    run.row(case, name, role_, harness, "not_run", f"case {case} {name}", reason=str(why))
+                    if not any(r["subcase"] == name and r["case"] == case and r["role"] == role_
+                               and r["harness"] == harness for r in run.data["rows"]):
+                        run.row(case, name, role_, harness, "not_run", f"case {case} {name}", reason=str(why))
             except (RuntimeError, HcError, HcDown, OSError, subprocess.SubprocessError) as error:
                 for name, _ in subcases(case, role_):
                     if not any(r["subcase"] == name and r["case"] == case and r["role"] == role_
@@ -3478,6 +3490,14 @@ PROOF_NEEDED = {(1, "startup-dialog"): ("seen",), (2, "idle-report"): ("turn_com
                 (5, "blocked"): ("action_count",), (6, "operator-switch"): ("switched",), (6, "resume"): ("replaced",),
                 (6, "member-switch"): ("switched",), (10, "idle-latency"): ("trials",)}
 
+def _cycled(proof):
+    return proof.get("down_exit") == 0 and proof.get("up_exit") == 0 and proof.get("replaced") is True
+
+
+# A stored pass is judged again by today's rule where its proof holds the facts (@reviewer): an older proof with
+# switched but no successful replacement stays unproved.
+REJUDGE = {(6, "resume"): _cycled, (6, "member-switch"): lambda p: p.get("switched") is True and _cycled(p)}
+
 REPORT_BEGIN, REPORT_END = "<!-- qualify report: generated, do not edit -->", "<!-- end of generated report -->"
 
 
@@ -3491,16 +3511,19 @@ def _commit_rank(head):
 
 
 def report(paths, out):
-    """For each role, harness, case and subcase keep the row of the newest run (by source head, then time) and
-    write one Markdown report per harness plus trust-entries.md; text outside the generated block is kept."""
+    """For each role, harness, case and subcase keep the row of the newest attempt (by UTC, then source head) and
+    write one Markdown report per harness plus trust-entries.md; text outside the generated block is kept, and
+    trust entries already listed stay listed (a partial import must not drop one the owner still has to remove)."""
     runs, chosen, trust, older = [], {}, set(), {}
     paths = [*paths, *sorted(str(p) for p in (ROOT / "docs" / "qualification" / "imported").glob("*.json"))]
     for path in dict.fromkeys(paths):
         data = json.loads(pathlib.Path(path).read_text())
         if not isinstance(data, dict) or data.get("mode") != "real" or "rows" not in data:
             continue                                  # a check's results, or a fixture run
+        if data.get("run_id") and data["run_id"] in {r.get("run_id") for r in runs}:
+            continue                                  # the same run imported twice (§1)
         runs.append(data)
-        rank = (_commit_rank(data.get("source_head")), data.get("utc") or "")
+        rank = (data.get("utc") or "", _commit_rank(data.get("source_head")))   # newest attempt by UTC (§1)
         for entry in data.get("trust_entries", []):
             trust.add((entry["harness"], entry["file"], entry["directory"]))
         for row in data["rows"]:
@@ -3545,6 +3568,8 @@ def report(paths, out):
                 needed = PROOF_NEEDED.get((case, subcase))
                 if status == "pass" and needed and not any(key in proof for key in needed):
                     status = "unproved (an older driver's weaker check)"
+                elif status == "pass" and (case, subcase) in REJUDGE and not REJUDGE[(case, subcase)](proof):
+                    status = "unproved (its proof does not meet today's check)"
                 text = str(row.get("observed") or row.get("reason") or "")
                 false = [k for k, v in proof.items() if v is False]
                 if row.get("reason") == "see proof" and false:   # name what the proof found false
@@ -3581,8 +3606,11 @@ def report(paths, out):
                "Claude Code and Codex may record per-directory trust for each QA scratch project",
                "(@operator's decision, phase_8.md §2). Every entry a run may have added, for the owner to remove:", "",
                "| Harness | File | Directory |", "|---|---|---|"]
+    listed = out / "trust-entries.md"
+    if listed.exists():
+        trust |= set(re.findall(r"^\| (\S+) \| `([^`]+)` \| `([^`]+)` \|$", listed.read_text(), re.M))
     entries += [f"| {h} | `{f}` | `{d}` |" for h, f, d in sorted(trust)]
-    (out / "trust-entries.md").write_text("\n".join(entries) + "\n")
+    listed.write_text("\n".join(entries) + "\n")
     return written + [str(out / "trust-entries.md")]
 
 
@@ -3605,6 +3633,7 @@ def main(argv=None):
     rep.add_argument("evidence", nargs="+", help="qualify --json files from real runs")
     rep.add_argument("--out", default=str(ROOT / "docs" / "qualification"))
     args = parser.parse_args(argv)
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))   # cleanup (with-blocks, atexit) runs on SIGTERM too
     if args.command == "report":
         for path in report(args.evidence, args.out):
             print(path)
@@ -3616,7 +3645,6 @@ def main(argv=None):
             parser.exit(2, f"qualify: {error}\n")
         print(json.dumps(evidence, indent=2))
         sys.exit(code)
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
     if args.command == "smoke":
         try:
             smoke()
