@@ -2457,7 +2457,7 @@ class TeamCommandTests(TeamCase):
         self.assertIn("@reviewer interrupted: exited (code 1)", out)
         self.assertIn("pending: @operator 1", out)
         self.assertIn("read them with: factory.py inbox --for operator", out)
-        self.assertIn("keeper: starting (keeper), no pane", out)          # no heartbeat yet
+        self.assertIn("keeper: starting (keeper)\n", out)                  # placed, no heartbeat yet
         self.assertIn("operator: reachable", out)
         self.assertIn("@reviewer gone: run `factory.py up reviewer` to bring them back.", out)
 
@@ -2471,6 +2471,35 @@ class TeamCommandTests(TeamCase):
         code, out, err = self.cmd(None, "brief", "reviewer")             # the team's state exists: real paths
         self.assertNotIn("paths are final", err)
         self.assertIn(str(self.state_dir / "messages" / "reviewer"), out)
+
+    def test_status_reports_unplaced_terminals_and_an_unconfirmed_brief(self):
+        self.assertEqual(self.cmd(self.operator, "up", "lead-dev")[0], 0)
+        reviewer = self.terminal("reviewer")[0]
+        starting = self.terminal("frontend-dev", status=None)[0]
+        code, out, err = self.cmd(self.operator, "status")
+        self.assertEqual(code, 0, err)
+        self.assertIn("no pane: @frontend-dev, @reviewer (run factory.py up)", out)
+        self.assertIn("@reviewer has no confirmed brief: run factory.py brief --send reviewer", out)
+        self.assertNotIn("@frontend-dev has no confirmed brief", out)
+        self.assertNotIn("@lead-dev has no confirmed brief", out)
+        self.assertIsNone(factory.where(self.hc.doc_get()[0], reviewer))
+        self.assertIsNone(factory.where(self.hc.doc_get()[0], starting))
+        with patch.object(factory, "ensure_keeper", return_value="replacement"):
+            code, out, err = self.cmd(self.operator, "status")
+        self.assertEqual(code, 0, err)
+        self.assertIn("keeper: starting (replacement), no pane (run factory.py up)", out)
+
+    def test_status_survives_a_malformed_doc_and_a_damaged_log(self):
+        self.assertEqual(self.cmd(self.operator, "up", "lead-dev")[0], 0)
+        self.terminal("reviewer")
+        self.hc.doc_set({"unexpected": []}, self.hc.doc_get()[1])
+        with self.log.path.open("ab") as f:
+            f.write(b"invalid\n")
+        code, out, err = self.cmd(self.operator, "status")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("message log needs repair:", out)
+        self.assertNotIn("no pane", out)
+        self.assertNotIn("has no confirmed brief", out)
 
     def test_brief_send_closes_by_whether_the_terminal_was_briefed(self):
         self.cmd(self.operator, "up", "lead-dev")

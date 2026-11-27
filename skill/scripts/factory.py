@@ -3984,19 +3984,37 @@ def cmd_status(args):
         if view.state(name) == "gone":
             print(interrupted_line(name, view.terminal(name) or view.finished(name), box))
     print("\n".join(pending_lines(state, operator)))
+    keeper, keeper_error = None, None
     try:
         keeper = ensure_keeper(cfg, state, hc, view)
     except (Problem, HcDown, HcError, OSError, LogDamage) as error:
-        print(f"keeper: not running ({error})")
+        keeper_error = error
+    panes = None
+    with contextlib.suppress(HcDown, HcError, KeyError, TypeError, AttributeError):
+        doc, _ = hc.doc_get()
+        panes = {} if doc is None else blocks(doc)
+    if keeper_error is not None:
+        print(f"keeper: not running ({keeper_error})")
+    elif keeper is None:
+        print("keeper: not running")
     else:
-        beat = read_beat(state) if keeper else None
-        if keeper is None:
-            print("keeper: not running")
-        elif beat is None:
-            print(f"keeper: starting ({keeper}), no pane")
+        beat = read_beat(state)
+        pane_hint = ", no pane (run factory.py up)" if panes is not None and keeper not in panes else ""
+        if beat is None or beat[2] != keeper:
+            print(f"keeper: starting ({keeper}){pane_hint}")
         else:
             version = "" if beat[1] == VERSION else f", replacing itself (it runs {beat[1]})"
-            print(f"keeper: running, version {beat[1]}, last loop {int(beat[3])} s ago, no pane{version}")
+            print(f"keeper: running, version {beat[1]}, last loop {int(beat[3])} s ago{version}{pane_hint}")
+    live_members = {name: record["address"] for name in cfg.members if (record := view.terminal(name))}
+    if panes is not None:
+        headless = [f"@{name}" for name, term in live_members.items() if term not in panes]
+        if headless:
+            print(f"no pane: {', '.join(headless)} (run factory.py up)")
+    if box is not None:
+        briefed = box.briefed()
+        for name, term in live_members.items():
+            if term not in briefed and view.state(name) != "starting":
+                print(f"@{name} has no confirmed brief: run factory.py brief --send {name}")
     reachable = view.operator is not None and view.operator.get("status") is not None
     print("operator: reachable" if reachable else "operator: not reachable: run factory.py up in the operator's pane")
     for word, hint in (("blocked", "blocked: waiting on an approval or a question."),
