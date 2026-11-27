@@ -2398,6 +2398,7 @@ class IntegratedTeamTests(TeamCase):
         code, out, _ = self.cmd("up")                              # a second up leaves live members alone
         self.assertIn("already running: @lead-dev, @reviewer", out)
         self.assertEqual(self.members(), first)
+        self.state(first["lead-dev"], "idle")                         # the fake agent's turn for the task ends
         code, out, err = self.cmd("status")
         self.assertEqual(code, 0, err)
         self.assertRegex(out, r"@lead-dev +lead-dev +codex +gpt-6-astra +high +idle")
