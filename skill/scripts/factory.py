@@ -3550,32 +3550,27 @@ def cmd_down(args):
 
 
 def _stop(hc, log, state, name, record):
-    """One terminal of a member: factory.down, kill, the stop record, rm. -> (stop recorded, every step done)."""
+    """factory.down and the kill, then the stop record (launch_layout.md §6). The terminal record stays until the
+    queue sweep has run: while it carries factory.down, up will not replace the member. -> whether it is recorded."""
     address = record["address"]
     try:
+        hc.label(address, {"factory.down": "1"})      # before the kill: the keeper drops, not requeues
         if record["state"] == "live":
-            hc.label(address, {"factory.down": "1"})   # before the kill: the keeper drops, not requeues
             hc.kill(address)
     except HcError as error:
         if error.kind != "finished":
             print(f"@{name} ({address}) could not be stopped: {error}")
-            return False, False
+            return False
     except HcDown as error:
         print(f"@{name} ({address}) could not be stopped: {error}")
-        return False, False
+        return False
     try:
         mark_stopped(state, [address], log.read_box()[1])
     except (Problem, ValueError, OSError, LogDamage) as error:
         print(f"@{name} stopped, but the stop could not be recorded ({error}); its record {address} is kept."
               f" Run factory.py down {name} again.")
-        return False, False
-    try:
-        hc.rm(address)
-    except (HcError, HcDown) as error:
-        if not (isinstance(error, HcError) and error.kind == "not_found"):
-            print(f"@{name}'s record {address} could not be removed ({error}); run factory.py down {name} again")
-            return True, False
-    return True, True
+        return False
+    return True
 
 
 def _down(cfg, hc, team, state, names):
@@ -3591,7 +3586,7 @@ def _down(cfg, hc, team, state, names):
     if problem:
         print(f"sessions cannot be saved ({problem}): members left running")
         return 1
-    log, code, stopped = open_log(state), 0, {}
+    log, code, stopped, recorded = open_log(state), 0, {}, []
     for name in names:
         current = view.terminal(name) or view.finished(name)
         earlier = [r for r in records if r["state"] == "finished" and r["labels"].get("factory.down")
@@ -3601,10 +3596,10 @@ def _down(cfg, hc, team, state, names):
             continue
         word = view.state(name) if current is not None else "stopped"
         for record in [r for r in (current, *earlier) if r is not None]:   # an earlier down's unfinished stop too
-            recorded, done = _stop(hc, log, state, name, record)
-            if recorded:
-                stopped[name] = word                 # its queue is swept even when its record stays
-            if not done:
+            if _stop(hc, log, state, name, record):
+                stopped[name] = word
+                recorded.append((name, record["address"]))
+            else:
                 code = 1
     if stopped:
         try:
@@ -3613,10 +3608,19 @@ def _down(cfg, hc, team, state, names):
                       for n in stopped}
             log.drop_queued(box, list(stopped), why="stopped by down")
         except (LogDamage, OSError, NotStored) as error:
-            print(f"queued messages to the stopped members were not dropped: {error}")
-            queued, code = {n: 0 for n in stopped}, 1
+            print(f"queued messages to the stopped members were not dropped ({error}); their records are kept."
+                  f" Run factory.py down {' '.join(stopped)} again.")
+            return 1
         for name, word in stopped.items():
             print(f"stopped @{name} (was {word}); {queued[name]} queued messages dropped")
+        for name, address in recorded:               # only now: the swept stop no longer needs its gate
+            try:
+                hc.rm(address)
+            except (HcError, HcDown) as error:
+                if not (isinstance(error, HcError) and error.kind == "not_found"):
+                    print(f"@{name}'s record {address} could not be removed ({error}); run factory.py down"
+                          f" {name} again")
+                    code = 1
     try:
         after = team_view(hc, team)
     except (HcDown, HcError) as error:

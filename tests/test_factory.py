@@ -2153,6 +2153,23 @@ class TeamCommandTests(TeamCase):
         self.assertIn("could not be removed (", out)
         self.assertIn("stopped @lead-dev (was idle); 1 queued messages dropped", out)
 
+    def test_a_failed_sweep_keeps_the_records_so_up_waits(self):
+        self.cmd(self.operator, "up", "lead-dev")
+        term = self.member_terms()["lead-dev"]
+        ident = self.add("lead-dev", "for later")
+        with patch.object(factory.Log, "drop_queued", side_effect=OSError("disk full")):
+            code, out, _ = self.cmd(self.operator, "down", "lead-dev")
+        self.assertEqual(code, 1)
+        self.assertIn("their records are kept. Run factory.py down lead-dev again.", out)
+        self.assertIn(term, [r["address"] for r in self.hc.list(self.team)])
+        self.assertEqual(self.cmd(self.operator, "up", "lead-dev")[0], 2)          # no replacement yet
+        code, out, err = self.cmd(self.operator, "down", "lead-dev")
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(self.outcome(ident)["o"], "dropped")
+        self.assertNotIn(term, [r["address"] for r in self.hc.list(self.team)])
+        self.assertEqual(self.cmd(self.operator, "up", "lead-dev")[0], 0)
+        self.assertFalse(any("for later" in text for text in self.fake.sent(self.member_terms()["lead-dev"])))
+
     def test_brief_send_does_not_wait_for_a_missing_keeper(self):
         self.cmd(self.operator, "up", "lead-dev")
         with patch.object(factory, "ensure_keeper", side_effect=factory.Problem("no keeper", "fix")), \
