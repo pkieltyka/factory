@@ -40,6 +40,13 @@ import tomllib
 import uuid
 
 SCRIPT = pathlib.Path(__file__).resolve()
+
+
+def factory_command(*args):
+    """A Factory command an agent can run as printed: python3 and this script's absolute path, shell-quoted (#173 pi
+    case 8: a bare factory.py from a keeper note was not found, and with factory and factory2 installed side by side
+    it can name another copy). Prose keeps the name factory.py."""
+    return shlex.join(["python3", str(SCRIPT), *map(str, args)])
 SKILL = SCRIPT.parent.parent
 TABLE = tomllib.loads((SKILL / "harnesses.toml").read_text())  # harness -> its data
 HARNESSES = tuple(TABLE)
@@ -393,7 +400,8 @@ class Config:
         if missing and require:
             refuse_dangling_links(self.root)
             raise SystemExit(f"no {' or '.join(missing)} in {self.root} or above. Run `/factory2 setup`, or"
-                             f" `factory.py init`, which writes what is missing and copies the project's {SAMPLE} to"
+                             f" `{factory_command('init')}`, which writes what is missing and copies the"
+                             f" project's {SAMPLE} to"
                              f" {CONF} if there is one.")
         try:
             self.team = tomllib.loads(self.conf_file.read_text()) if self.conf_file.is_file() else {}
@@ -538,7 +546,8 @@ def resolve_listed(model, listed, harness):
                " ~/.omp/agent/models.yml.",
         "opencode": "Connect a provider that serves it in OpenCode (`/connect` in the TUI, or providers in opencode.json).",
     }.get(harness, "")
-    raise Problem(f"{harness} has no model {base} configured", fix + " `factory.py harnesses` lists what it can use.")
+    raise Problem(f"{harness} has no model {base} configured",
+                  fix + f" `{factory_command('harnesses')}` lists what it can use.")
 
 
 
@@ -580,7 +589,7 @@ class LogDamage(Exception):
     def __init__(self, path, line, reason):
         where = f", line {line}" if line else ""
         super().__init__(f"message log needs repair: {path}{where}: {reason}. Nothing was written."
-                         " Repair or move the file, then run factory.py up.")
+                         f" Repair or move the file, then run {factory_command('up')}.")
         self.path, self.line, self.reason = path, line, reason
 
 
@@ -1498,7 +1507,7 @@ def open_log(state):
     raw = os.fspath(state)
     path = pathlib.Path(raw)
     if lexical_path(raw) != raw or len(path.parents) < 3 or path.parent.parent.name != "factory-skill":
-        raise Problem(f"{state} is not a Factory state directory", "run factory.py up")
+        raise Problem(f"{state} is not a Factory state directory", f"run {factory_command('up')}")
     return Log(path, base=path.parents[2])
 
 
@@ -1528,7 +1537,7 @@ def _read_team_file(state, directory):
         _validate_team(team)
         return team
     except (OSError, ValueError) as error:
-        raise Problem(f"{state}/team.json cannot be read: {error}", "run factory.py up") from error
+        raise Problem(f"{state}/team.json cannot be read: {error}", f"run {factory_command('up')}") from error
 
 
 def read_team(state):
@@ -1537,7 +1546,7 @@ def read_team(state):
         with log.locked(exclusive=False) as directory:
             return _read_team_file(log.state, directory)
     except (LogDamage, OSError) as error:
-        raise Problem(f"{log.state}/team.json cannot be read: {error}", "run factory.py up") from error
+        raise Problem(f"{log.state}/team.json cannot be read: {error}", f"run {factory_command('up')}") from error
 
 
 def _write_team_file(directory, team):
@@ -1573,7 +1582,7 @@ def mark_stopped(state, terms, box):
     with log.locked(exclusive=True) as directory:
         team = _read_team_file(log.state, directory)
         if not team:
-            raise Problem(f"no team.json in {log.state}", "run factory.py up")
+            raise Problem(f"no team.json in {log.state}", f"run {factory_command('up')}")
         log._refresh(box)
         claimed = box.sending_terms()
         keep = [term for term in team.get("stopped", []) if term in claimed]
@@ -1593,7 +1602,7 @@ def settle_refusal(log, box, ident, to, term, why):
     with log.locked(exclusive=True) as directory:
         team = _read_team_file(log.state, directory)
         if not team:
-            raise Problem(f"no team.json in {log.state}", "run factory.py up")
+            raise Problem(f"no team.json in {log.state}", f"run {factory_command('up')}")
         log._refresh(box)
         current = box.outcome(ident, to)
         if current["o"] != "sending" or current["term"] != term:
@@ -1629,7 +1638,7 @@ def _offline_state(cfg):
                         except FileNotFoundError:
                             continue
                         if not stat.S_ISREG(info.st_mode):
-                            raise Problem(f"not a regular file: {state / filename}", "run factory.py up")
+                            raise Problem(f"not a regular file: {state / filename}", f"run {factory_command('up')}")
                         candidates.append((priority, -info.st_mtime_ns, state))
                         break
                 finally:
@@ -1637,7 +1646,7 @@ def _offline_state(cfg):
         finally:
             os.close(directory)
     except OSError as error:
-        raise Problem(f"cannot inspect {parent}: {error}", "run factory.py up") from error
+        raise Problem(f"cannot inspect {parent}: {error}", f"run {factory_command('up')}") from error
     if not candidates:
         return None
     state = min(candidates)[2]
@@ -1657,7 +1666,7 @@ def state_for(cfg, hc):
         if label:
             state = open_log(label).state
             if state.parent.name != key or state.name != hc.core[:8]:
-                raise Problem(f"{state} does not match this checkout and hc core", "run factory.py up")
+                raise Problem(f"{state} does not match this checkout and hc core", f"run {factory_command('up')}")
             return state
     return state_dir(cfg.root, hc.core)
 
@@ -1676,23 +1685,23 @@ def resolve_team(args, hc):
         key, label = labels.get("factory.team"), labels.get("factory.dir")
         if key and label:
             if not isinstance(key, str) or not isinstance(label, str):
-                raise Problem("this pane has invalid Factory labels", "run factory.py up")
+                raise Problem("this pane has invalid Factory labels", f"run {factory_command('up')}")
             state = open_log(label).state
             team = read_team(state)
             if not team:
-                raise Problem(f"no team.json in {state}", "run factory.py up")
+                raise Problem(f"no team.json in {state}", f"run {factory_command('up')}")
             if (team["team"] != key or state.parent.name != key or state.name != team["core"][:8]
                     or not os.path.isabs(team["root"])):
-                raise Problem(f"this pane's labels do not match {state}/team.json", "run factory.py up")
+                raise Problem(f"this pane's labels do not match {state}/team.json", f"run {factory_command('up')}")
             if team["core"] != hc.core:
-                raise Problem("this pane's hc is another core than the team's", "run factory.py up")
+                raise Problem("this pane's hc is another core than the team's", f"run {factory_command('up')}")
             hc.expect_core = team["core"]
             try:
                 cfg = Config(team["root"])
             except SystemExit as error:
-                raise Problem(str(error), "run factory.py up") from error
+                raise Problem(str(error), f"run {factory_command('up')}") from error
             if team_key(cfg.root) != key:
-                raise Problem(f"this pane's checkout does not match {state}/team.json", "run factory.py up")
+                raise Problem(f"this pane's checkout does not match {state}/team.json", f"run {factory_command('up')}")
             return cfg, state, caller
     cfg = Config(getattr(args, "cwd", None) or os.getcwd())
     return cfg, state_for(cfg, hc), caller
@@ -1731,7 +1740,7 @@ def pending_lines(state, operator, now=None):
         parts.append(f"@{name} {len(messages)} (oldest {age}, {reason})")
     lines = ["pending: " + ("; ".join(parts) if parts else "none")]
     if operator in pairs:
-        lines.append(f"read them with: factory.py inbox --for {operator}")
+        lines.append(f"read them with: {factory_command('inbox', '--for', operator)}")
     if box.uncommitted:
         noun = "entry" if box.uncommitted == 1 else "entries"
         lines.append(f"log: {box.uncommitted} uncommitted {noun} (never delivered)")
@@ -1987,9 +1996,9 @@ class Keeper:
         try:
             team = read_team(self.state)
             if not team:
-                raise Problem(f"no team.json in {self.state}", "run factory.py up")
+                raise Problem(f"no team.json in {self.state}", f"run {factory_command('up')}")
             if team["team"] != self.state.parent.name or team["core"][:8] != self.state.name:
-                raise Problem(f"{self.state}/team.json does not match its directory", "run factory.py up")
+                raise Problem(f"{self.state}/team.json does not match its directory", f"run {factory_command('up')}")
         except Problem as error:
             self._report("team", f"team.json: {error}")
             return False
@@ -2292,7 +2301,7 @@ class Keeper:
             last = self.box.last_to(name, sender=self.cfg.operator["name"])
             if last:
                 text += f" Its last message from you was #{last['id']}."
-            return {"what": "exit", "about": name, "term": address}, text + f" Run: factory.py up {name}"
+            return {"what": "exit", "about": name, "term": address}, text + f" Run: {factory_command('up', name)}"
         if status is None or status["state"] not in ("blocked", "error"):
             return None
         detail = f": {status['msg']}" if status.get("msg") else ""
@@ -2494,7 +2503,7 @@ def _take_keeper_start(lock):
             return
         except BlockingIOError:
             if time.monotonic() >= deadline:
-                raise Problem("another command is starting the keeper", "run factory.py status") from None
+                raise Problem("another command is starting the keeper", f"run {factory_command('status')}") from None
             time.sleep(0.1)
 
 
@@ -2512,12 +2521,13 @@ def _wait_for_beat(state, hc, terminal):
             except HcError as error:
                 if error.kind != "not_found":
                     raise
-                raise Problem("the keeper did not start: terminal disappeared", "run factory.py status") from error
+                raise Problem("the keeper did not start: terminal disappeared",
+                              f"run {factory_command('status')}") from error
             if finished:
                 lines = [line.strip() for line in hc.read(terminal).splitlines() if line.strip()]
                 hc.rm(terminal)
                 raise Problem(f"the keeper did not start: {lines[-1] if lines else 'terminal exited'}",
-                              "run factory.py status")
+                              f"run {factory_command('status')}")
             next_poll = now + 1
         if now - begin >= KEEPER_START:
             return terminal
@@ -2528,13 +2538,13 @@ def ensure_keeper(cfg, state, hc, view, force=False):
     """Return this team's keeper terminal, starting it headless if it is missing or stale."""
     team = read_team(state)
     if not team:
-        raise Problem(f"no team.json in {state}", "run factory.py up")
+        raise Problem(f"no team.json in {state}", f"run {factory_command('up')}")
     log = open_log(state)
     if not force and team.get("up") is not True and not log.read_box()[1].pending(cfg.operator["name"]):
         return None
     directory = log.open_dir(create=False)
     if directory is None:
-        raise Problem(f"no state directory: {state}", "run factory.py up")
+        raise Problem(f"no state directory: {state}", f"run {factory_command('up')}")
     with contextlib.ExitStack() as resources:
         resources.callback(os.close, directory)
         lock = private_open("keeper.start", os.O_CREAT | os.O_RDWR, dir_fd=directory)
@@ -2762,7 +2772,7 @@ def _place_team(cfg, state, hc, team, me, keeper, replacements):
         view = team_view(hc, team)
         layout = read_team(state).get("layout", {})
     except (Problem, HcDown, HcError) as error:
-        print(f"layout not updated ({error}): run factory.py up again to place the team", file=sys.stderr)
+        print(f"layout not updated ({error}): run {factory_command('up')} again to place the team", file=sys.stderr)
         return
     panes = {record["address"]: f"@{name}" for name in cfg.members if (record := view.terminal(name))}
     if keeper:
@@ -2793,7 +2803,7 @@ def _place_team(cfg, state, hc, team, me, keeper, replacements):
 
     reason = edit_layout(hc, change)
     if reason is not None:
-        print(f"layout not updated ({reason}): run factory.py up again to place the team", file=sys.stderr)
+        print(f"layout not updated ({reason}): run {factory_command('up')} again to place the team", file=sys.stderr)
         return
     if saved_layout is not None and saved_layout != layout:
         try:
@@ -2982,7 +2992,7 @@ def cmd_say(args):
                   file=sys.stderr)
         sys.exit(2)
     except OSError as error:
-        print(f"not confirmed stored: {error}. Do not resend; check factory.py inbox.", file=sys.stderr)
+        print(f"not confirmed stored: {error}. Do not resend; check {factory_command('inbox')}.", file=sys.stderr)
         sys.exit(1)
 
     print(f"message {ident}", flush=True)
@@ -2991,17 +3001,18 @@ def cmd_say(args):
     timeout = SAY_WAIT
     try:
         if ensure_keeper(cfg, state, hc, view) is None:
-            print(f"warning: the team is stopped. Message {ident} is stored and waits for factory.py up.",
+            print(f"warning: the team is stopped. Message {ident} is stored and waits for {factory_command('up')}.",
                   file=sys.stderr)
             timeout = 0
     except (Problem, HcDown, HcError, LogDamage, OSError) as error:
         print(f"warning: the keeper is not running ({error}). Message {ident} is stored and will be delivered once"
-              " it runs; run factory.py status.", file=sys.stderr)
+              f" it runs; run {factory_command('status')}.", file=sys.stderr)
         timeout = 0
     try:
         outcomes = wait_outcomes(log, ident, names, offset, timeout)
     except (LogDamage, OSError) as error:
-        print(f"message {ident} is stored; its outcome could not be read: {error}. Do not resend; run factory.py inbox.",
+        print(f"message {ident} is stored; its outcome could not be read: {error}. Do not resend;"
+              f" run {factory_command('inbox')}.",
               file=sys.stderr)
         sys.exit(1)
     lines, code = outcome_lines(outcomes, operator, sender)
@@ -3017,7 +3028,7 @@ def cmd_inbox(args):
     try:
         cfg, state, caller = find_team(args)
         if state is None:
-            raise Problem(f"no team state for {cfg.root}", "run factory.py up")
+            raise Problem(f"no team state for {cfg.root}", f"run {factory_command('up')}")
         labels = caller.get("labels", {}) if caller else {}
         if args.for_name is not None:
             name = args.for_name.lstrip("@")
@@ -3116,7 +3127,8 @@ class Checker:
         if not shutil.which(harness):
             raise Problem(f"{harness} is not installed (not on PATH)", TABLE[harness]["install"])
         if not model:
-            raise Problem("no model set", f"Set `model` for this member in {CONF}; `factory.py harnesses` lists"
+            raise Problem("no model set", f"Set `model` for this member in {CONF};"
+                                          f" `{factory_command('harnesses')}` lists"
                                           " what this machine can use.")
         never = TABLE[harness].get("never", [])
         if thinking in never:
@@ -3659,7 +3671,7 @@ def await_ready(hc, started, timeout=LAUNCH_TIMEOUT, clock=time, ready=("idle",)
                     text, keys = asked
                     if not keys:
                         outcome[name] = ("waits on its trust dialog: accept it in its pane, then run:"
-                                         f" factory.py brief --send {name}")
+                                         f" {factory_command('brief', '--send', name)}")
                     elif text not in answered[name] and seen.get(name) == text:
                         hc.keys(address, keys)       # on its second poll: a harness that just drew it may not read yet
                         answered[name].add(text)
@@ -3845,7 +3857,8 @@ def cmd_init(args):
     tracked = git("ls-files", "--error-unmatch", CONF)
     if tracked and tracked.returncode == 0:
         print(f"note: git already tracks {CONF}, and .gitignore does not change that. `git rm --cached {CONF}` stops it.")
-    print(f"Edit {BRIEF} (project, workflow, where tasks are tracked) and {CONF} (your members), then run `factory.py check`.")
+    print(f"Edit {BRIEF} (project, workflow, where tasks are tracked) and {CONF} (your members), then run"
+          f" `{factory_command('check')}`.")
 
 
 def cmd_harnesses(args):
@@ -4097,10 +4110,10 @@ def _brief_lines(name, ident, outcome):
         return [f"@{name}: brief {ident} delivered"], True
     if o in ("sending", "queued"):
         why = f" ({outcome['why']})" if o == "queued" else ""
-        return [f"@{name}: brief {ident} is still {o}{why}; the keeper delivers it when it can. Run factory.py"
-                " status."], False
+        return [f"@{name}: brief {ident} is still {o}{why}; the keeper delivers it when it can. Run"
+                f" {factory_command('status')}."], False
     return [f"@{name}: brief {ident} {o} ({outcome.get('why')}): check @{name}'s pane, then run"
-            f" factory.py brief --send {name}"], False
+            f" {factory_command('brief', '--send', name)}"], False
 
 
 def _pending_brief_line(box, name):
@@ -4126,7 +4139,7 @@ def cmd_up(args):
     cfg = cfg_of(args)
     names = selected_names(cfg, args.names)
     if not names:
-        raise SystemExit(f"no members in {CONF}; add one, then run `factory.py up`")
+        raise SystemExit(f"no members in {CONF}; add one, then run `{factory_command('up')}`")
     if args.timeout <= 0:
         stop_with("--timeout must be a positive number of seconds")
     me_id = os.environ.get("HC_TERMINAL_ID")
@@ -4138,7 +4151,8 @@ def cmd_up(args):
     except HcDown as error:
         stop_with(f"hc is not reachable: {error}")
     except Problem as error:
-        stop_with(f"{error.what}. Correct or clear that terminal's factory.dir label, then run factory.py up again.")
+        stop_with(f"{error.what}. Correct or clear that terminal's factory.dir label, then run"
+                  f" {factory_command('up')} again.")
     hc.expect_core = hc.core
     lock = lifecycle_lock(state)
     try:
@@ -4158,7 +4172,8 @@ def _up(cfg, args, hc, team, operator, state, names, me_id):
     except Problem:
         current = None                               # unreadable: rebuilt below, after preflight
     if current and (current["team"] != team or current["core"] != hc.core or current["root"] != str(cfg.root)):
-        stop_with(f"{state}/team.json belongs to another checkout or hc core; remove it, then run factory.py up")
+        stop_with(f"{state}/team.json belongs to another checkout or hc core; remove it, then run"
+                  f" {factory_command('up')}")
     log = open_log(state)
     try:
         box = log.read_box()[1]
@@ -4168,8 +4183,8 @@ def _up(cfg, args, hc, team, operator, state, names, me_id):
                          if r["labels"].get("factory.down") and r["labels"].get("factory.kind") == "member"}
                         & set(names))
     if unfinished:                                   # a stop not recorded yet: a replacement could get its messages
-        stop_with("the last stop of " + ", ".join("@" + n for n in unfinished) + " was not recorded; run"
-                  " factory.py down " + " ".join(unfinished) + " first")
+        stop_with("the last stop of " + ", ".join("@" + n for n in unfinished) + " was not recorded; run "
+                  + factory_command("down", *unfinished) + " first")
     targets = [n for n in names if view.state(n) in ("not started", "gone")]
     running = [n for n in names if n not in targets]
     if running:
@@ -4233,7 +4248,7 @@ def _up(cfg, args, hc, team, operator, state, names, me_id):
             except (OSError, LogDamage, Problem) as error:
                 _remove_record(hc, record)           # an unrecorded fresh launch could let an old conversation back
                 failed[m["name"]] = f"its fresh launch could not be recorded ({error}), so up stopped it"
-                again = f"factory.py up {m['name']}" + (" --fresh" if args.fresh else "")
+                again = factory_command("up", m["name"], *(["--fresh"] if args.fresh else []))
                 fixes[m["name"]] = f"fix {state / SESSIONS}, then {again}"
                 return None
         starts[m["name"]] = (m, sess, record)
@@ -4295,11 +4310,11 @@ def _up(cfg, args, hc, team, operator, state, names, me_id):
             failed[n] = f"its brief was not stored: {error.detail}"
             continue
         except LogDamage as error:
-            failed[n], fixes[n] = f"its brief was not stored: {error}", "repair the log, then factory.py up"
+            failed[n], fixes[n] = f"its brief was not stored: {error}", f"repair the log, then {factory_command('up')}"
             continue
         except OSError as error:                     # the storage outcome is unknown: never a second brief
             failed[n] = f"its brief may be stored: {error}"
-            fixes[n] = f"factory.py inbox --for {n}, and factory.py status"
+            fixes[n] = f"{factory_command('inbox', '--for', n)}, and {factory_command('status')}"
             continue
         if warning:
             print(f"warning: brief {ident}: {warning}", file=sys.stderr)
@@ -4311,12 +4326,12 @@ def _up(cfg, args, hc, team, operator, state, names, me_id):
             outcome = wait_outcomes(log, ident, [n], offset, max(0.0, deadline - time.monotonic()))[n]
         except (LogDamage, OSError) as error:
             failed[n] = f"brief {ident} is stored; its outcome could not be read ({error})"
-            fixes[n] = "factory.py status"
+            fixes[n] = factory_command("status")
             continue
         lines, confirmed = _brief_lines(n, ident, outcome)
         print("\n".join(lines))
         if outcome["o"] in ("sending", "queued"):        # the keeper owns it: never a second brief
-            failed[n], fixes[n] = f"brief {ident} is not delivered yet", "factory.py status"
+            failed[n], fixes[n] = f"brief {ident} is not delivered yet", factory_command("status")
         elif confirmed and outcome.get("term") != record["address"]:
             confirmed = False
             failed[n] = f"brief {ident} went to another terminal ({outcome.get('term')})"
@@ -4338,9 +4353,9 @@ def _up(cfg, args, hc, team, operator, state, names, me_id):
             if n in fixes:
                 fix = fixes[n]
             elif n in starts and not why.startswith(ended):
-                fix = f"factory.py brief --send {n}"              # it runs; it has no confirmed brief
+                fix = factory_command("brief", "--send", n)              # it runs; it has no confirmed brief
             else:
-                fix = f"factory.py up {n}"
+                fix = factory_command("up", n)
             print(f"@{n} is not ready: {why}. Then run: {fix}", file=sys.stderr)
         sys.exit(3)
 
@@ -4383,7 +4398,7 @@ def _stop(hc, log, state, name, record):
         mark_stopped(state, [address], log.read_box()[1])
     except (Problem, ValueError, OSError, LogDamage) as error:
         print(f"@{name} stopped, but the stop could not be recorded ({error}); its record {address} is kept."
-              f" Run factory.py down {name} again.")
+              f" Run {factory_command('down', name)} again.")
         return False
     return True
 
@@ -4437,7 +4452,7 @@ def _down(cfg, hc, team, state, names):
             log.drop_queued(box, list(stopped), why="stopped by down")
         except (LogDamage, OSError, NotStored) as error:
             print(f"queued messages to the stopped members were not dropped ({error}); their records are kept."
-                  f" Run factory.py down {' '.join(stopped)} again.")
+                  f" Run {factory_command('down', *stopped)} again.")
             return 1
         for name, word in stopped.items():
             print(f"stopped @{name} (was {word}); {queued[name]} queued messages dropped")
@@ -4446,8 +4461,8 @@ def _down(cfg, hc, team, state, names):
                 hc.rm(address)
             except (HcError, HcDown) as error:
                 if not (isinstance(error, HcError) and error.kind == "not_found"):
-                    print(f"@{name}'s record {address} could not be removed ({error}); run factory.py down"
-                          f" {name} again")
+                    print(f"@{name}'s record {address} could not be removed ({error}); run"
+                          f" {factory_command('down', name)} again")
                     code = 1
     try:
         after = hc.list(team)
@@ -4471,7 +4486,7 @@ def _down(cfg, hc, team, state, names):
         except (Problem, ValueError, OSError, LogDamage) as error:
             print(f"the team could not be marked down: {error}")
             code = 1
-        print("run factory.py up to bring members back")
+        print(f"run {factory_command('up')} to bring members back")
     return code
 
 
@@ -4519,7 +4534,7 @@ def cmd_status(args):
         print("keeper: not running")
     else:
         beat = read_beat(state)
-        pane_hint = ", no pane (run factory.py up)" if panes is not None and keeper not in panes else ""
+        pane_hint = f", no pane (run {factory_command('up')})" if panes is not None and keeper not in panes else ""
         if beat is None or beat[2] != keeper:
             print(f"keeper: starting ({keeper}){pane_hint}")
         else:
@@ -4529,20 +4544,21 @@ def cmd_status(args):
     if panes is not None:
         headless = [f"@{name}" for name, term in live_members.items() if term not in panes]
         if headless:
-            print(f"no pane: {', '.join(headless)} (run factory.py up)")
+            print(f"no pane: {', '.join(headless)} (run {factory_command('up')})")
     if box is not None:
         briefed = box.briefed()
         for name, term in live_members.items():
             if term not in briefed and view.state(name) not in ("starting", "gone"):
                 pending = _pending_brief_line(box, name)
-                print(pending or f"@{name} has no confirmed brief: run factory.py brief --send {name}")
+                print(pending or f"@{name} has no confirmed brief: run {factory_command('brief', '--send', name)}")
     reachable = view.operator is not None and view.operator.get("status") is not None
-    print("operator: reachable" if reachable else "operator: not reachable: run factory.py up in the operator's pane")
+    print("operator: reachable" if reachable
+          else f"operator: not reachable: run {factory_command('up')} in the operator's pane")
     for word, hint in (("blocked", "blocked: waiting on an approval or a question."),
-                       ("gone", "gone: run `factory.py up {names}` to bring them back.")):
+                       ("gone", "gone: run `{command}` to bring them back.")):
         hit = [n for n in cfg.members if view.state(n) == word]
         if hit:
-            print(f"{', '.join('@' + n for n in hit)} " + hint.format(names=" ".join(hit)))
+            print(f"{', '.join('@' + n for n in hit)} " + hint.format(command=factory_command("up", *hit)))
     for stray in view.strays:
         print(f"stray: {stray['address']} is another terminal for @{stray['labels'].get('factory.member')};"
               " Factory does not use it")
@@ -4557,7 +4573,7 @@ def cmd_status(args):
 def _brief_preview(cfg, name, state):
     p = plan(cfg, name, state)
     if state is None:
-        print("paths are final after factory.py up", file=sys.stderr)
+        print(f"paths are final after {factory_command('up')}", file=sys.stderr)
     print(f"# @{p['name']} ({p['role']}) on {p['harness']} {p['model']}, thinking {p['thinking']}\n")
     print(member_prompt(p, cfg.operator["name"], cfg))
 
@@ -4627,7 +4643,7 @@ def _brief_send_locked(cfg, state, hc, me, names):
         else:                                        # its first brief: only once it is ready and past its dialogs
             pending = _pending_brief_line(box, name)
             if pending:
-                print(f"{pending}; run factory.py status")
+                print(f"{pending}; run {factory_command('status')}")
                 code = 1
                 continue
             # done as well as idle: a replacement that already answered its unconfirmed brief rests in done
@@ -4652,10 +4668,11 @@ def _brief_send_locked(cfg, state, hc, me, names):
     wait = SAY_WAIT
     try:
         if ensure_keeper(cfg, state, hc, view) is None:
-            print("warning: the team is stopped; the briefs are stored and wait for factory.py up.", file=sys.stderr)
+            print(f"warning: the team is stopped; the briefs are stored and wait for {factory_command('up')}.",
+                  file=sys.stderr)
             wait = 0
     except (Problem, HcDown, HcError, OSError, LogDamage) as error:
-        print(f"warning: the keeper is not running ({error}); the briefs are stored. Run factory.py status.",
+        print(f"warning: the keeper is not running ({error}); the briefs are stored. Run {factory_command('status')}.",
               file=sys.stderr)
         wait = 0                                     # read each outcome once, without waiting for nobody
     deadline = time.monotonic() + wait

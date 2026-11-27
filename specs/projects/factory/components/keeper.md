@@ -179,11 +179,11 @@ Note texts (`<msg>` is `status.msg` when the harness gave one):
 ```
 @lead-dev is blocked (permission): <msg>. It needs an answer in its pane.
 @lead-dev hit an error: <msg>.
-@lead-dev exited (code 1) while working. Its last message from you was #41. Run: factory.py up lead-dev
-@lead-dev was lost (hc stopped) while idle. Run: factory.py up lead-dev
+@lead-dev exited (code 1) while working. Its last message from you was #41. Run: python3 /path/to/skill/scripts/factory.py up lead-dev
+@lead-dev was lost (hc stopped) while idle. Run: python3 /path/to/skill/scripts/factory.py up lead-dev
 ```
 
-"while <word>" is the `factory.last` label; "#41" is `box.last_to(name, sender=operator)`.
+"while <word>" is the `factory.last` label; "#41" is `box.last_to(name, sender=operator)`. The command is `factory_command("up", name)`: python3 and the running script's absolute path, shell-quoted. Every runnable command Factory prints for an agent is rendered this way: notes, refusal and retry hints, exit-3 recovery lines, the pending-inbox pointer and status lines. Prose still says `factory.py` (#173: an operator that had not read FACTORY.md ran a bare `factory.py up` and went searching, and a bare name can pick another installed copy).
 
 ## 6. Team-quiet rule and ready check (§8a)
 

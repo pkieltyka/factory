@@ -394,7 +394,9 @@ class Core:
     def installed_seen(self, roots=(), harness_of=lambda record: None):
         """The owner's after-the-fact check: every installed factory.py path that appears in the screen of one of
         this core's terminals, or in a Claude Code or Codex transcript whose working directory is under one of
-        roots. -> [(harness or None, what was seen)], bounded; [] for an unprotected core."""
+        roots. A transcript's path counts as run when it is in the command of an actual shell call (tool_calls'
+        pairing); anywhere else, a search's output or a screen, it was only seen (@operator, #173 pi member case 8
+        at a198b9c). -> [(harness or None, what was seen, run)], runs first, bounded; [] for an unprotected core."""
         needles = installed_needles(self.installed)
         if not needles:
             return []
@@ -405,14 +407,21 @@ class Core:
             except (HcError, HcDown):
                 continue
             flat = "".join(text.split())                 # a screen wraps long paths
-            hits.update((harness_of(record), f"{record['address']} screen: {n}") for n in needles if n in flat)
+            hits.update((harness_of(record), f"{record['address']} screen: {n}", False) for n in needles if n in flat)
         for harness, path in qa_transcripts(roots, labelled=True):
             try:
-                flat = "".join(path.read_text(errors="replace").split())
+                raw = path.read_text(errors="replace")
             except OSError:
                 continue
-            hits.update((harness, f"{path.name}: {n}") for n in needles if n in flat)
-        return [(h, _bounded(text)) for h, text in sorted(hits, key=lambda hit: hit[1])[:10]]
+            flat = "".join(raw.split())
+            commands = ["".join(command.split()) for command, _ in tool_calls(raw)]
+            for n in needles:
+                if any(n in command for command in commands):
+                    hits.add((harness, f"{path.name}: ran {n}", True))
+                elif n in flat:
+                    hits.add((harness, f"{path.name}: {n}", False))
+        ordered = sorted(hits, key=lambda hit: (not hit[2], hit[1]))
+        return [(h, _bounded(text), run) for h, text, run in ordered[:10]]
 
     def start(self):
         out = subprocess.run([HC, "server", "start", "--json"], env=self.start_env,
@@ -1368,11 +1377,13 @@ def harness_version(name):
 
 
 def split_seen(seen, exempt=()):
-    """(failures, observations): a sighting fails where the harness's skill discovery was switched off (or the
-    harness is unknown), and is only recorded for one without a switch or exempt from it (the owner's decision)."""
+    """(failures, observations): an installed script that was run fails where the harness's skill discovery was
+    switched off (or the harness is unknown). A run by one without a switch or exempt from it, and a path only seen
+    in output or on a screen, are recorded (the owner's decisions; @operator for seen-only, #173)."""
     off = [h for h in SKILLS_SWITCH if h not in exempt]
-    failed = [text for harness, text in seen if harness is None or harness in off]
-    return failed, [f"{harness}: {text}" for harness, text in seen if harness is not None and harness not in off]
+    fails = [run and (harness is None or harness in off) for harness, _, run in seen]
+    failed = [text for (_, text, _), fail in zip(seen, fails) if fail]
+    return failed, [f"{harness}: {text}" for (harness, text, _), fail in zip(seen, fails) if not fail]
 
 
 def lc_harness(record):
@@ -1398,7 +1409,7 @@ def harness_check(name, harnesses, body):
                 if observed:
                     result["installed_factory_observed"] = observed
                 if failed:            # discovery was off for that harness: the check fails whatever it observed
-                    result.update(result="fail: an installed Factory script appeared in a QA terminal or transcript",
+                    result.update(result="fail: an installed Factory script was run in a QA transcript",
                                   installed_factory_seen=failed)
     except NotRun as why:
         if "installed_factory_seen" not in result:
@@ -4813,8 +4824,8 @@ def _file_evidence(run, first_row):
         if EVIDENCE.get("installed_factory_observed"):   # a harness with no switch: recorded, not failed
             row["installed_factory_observed"] = EVIDENCE["installed_factory_observed"]
         if installed:          # the owner's rule was broken: the case fails whatever it observed
-            row.update(status="fail", reason=_bounded("an installed Factory script appeared in a QA terminal or"
-                                                      f" transcript: {installed}"))
+            row.update(status="fail", reason=_bounded(f"an installed Factory script was run in a QA transcript:"
+                                                      f" {installed}"))
             row["installed_factory_seen"] = installed
         if touched and row["status"] == "pass":
             row.update(status="not_run", reason=_bounded(f"a settings file changed during the case: {touched}"))
