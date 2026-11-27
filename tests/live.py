@@ -3494,15 +3494,21 @@ def case_5(run, role, harness, adapter_class):
                 " message delivered and acted on exactly once after the answer", proof=proof, reason=reason)
 
 
-def factory_log(team):
-    """The team's message log, read-only, from the private copy of Factory (phase_8.md §1)."""
+def factory_module(script):
+    """The private copy of Factory as a module, loaded once (phase_8.md §1)."""
     import importlib.util
-    spec = importlib.util.spec_from_file_location("factory_under_test", team.script)
     module = sys.modules.get("factory_under_test")
     if module is None:
+        spec = importlib.util.spec_from_file_location("factory_under_test", script)
         module = importlib.util.module_from_spec(spec)
         sys.modules["factory_under_test"] = module
         spec.loader.exec_module(module)
+    return module
+
+
+def factory_log(team):
+    """The team's message log, read-only, from the private copy of Factory (phase_8.md §1)."""
+    module = factory_module(team.script)
     state = next((r["labels"]["factory.dir"] for r in team.qa.rpc("terminal.list", {"all": True})["terminals"]
                   if (r.get("labels") or {}).get("factory.dir")), None)
     if state is None:
@@ -4031,9 +4037,8 @@ def between_turns(harness, role):
 
 def _app_selects(app):
     """Whether a live status app selects between-turns delivery in the table (keeper.md §9's lookup)."""
-    table = harness_table()
-    harness = app if app in table else next((k for k, t in table.items() if app and t.get("status_app") == app), None)
-    return table.get(harness or "", {}).get("deliver") == "idle"
+    harness = factory_module(ROOT / "skill" / "scripts" / "factory.py").harness_for_app(app)   # Factory's own lookup
+    return harness_table().get(harness or "", {}).get("deliver") == "idle"
 
 
 def _ask_later(team, role, text):

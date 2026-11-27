@@ -5,7 +5,7 @@
 - **Tested:** codex-cli 0.172.0, model gpt-6.2-astra, on hc 0.1.20 and rodeo 0.2.1, Linux, 2026-11-27. The partner in each team is Claude Code.
 - **Configured mode:** the full preset (`--dangerously-bypass-approvals-and-sandbox`). Case 9 uses the guarded preset.
 - **Session strategy:** `session_env = CODEX_THREAD_ID`, `session_follow = false`. LC-12 shows the child's thread ID differs from the parent's, so following stays off.
-- **Mid-turn:** a message to a working Codex member steers the current turn (case 4 mid-turn). As operator, the steering pass at 4954e2f is kept as history. From 539acb1 Factory types to a working Codex operator only between turns, and that row is unresolved until a between-turns run proves it.
+- **Mid-turn, history:** before 0ace3a9 a message to a working Codex member steered its current turn: case 4 mid-turn's steering pass at a65a1fe, and the two-senders failure at a65a1fe, where one of two reports in one turn was ignored. As operator, the steering pass at 4954e2f is kept as history too. Factory now types to a working Codex only between turns, in both roles: from 539acb1 as operator, from 0ace3a9 as member. The member rows are unresolved until the between-turns runs prove them.
 
 ## Findings
 
