@@ -1,14 +1,22 @@
 """Scratch repositories and evidence checks for the live autonomy runs."""
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, replace
+import importlib.util
+import json
 import os
 import pathlib
 import re
+import shlex
+import shutil
 import subprocess
 import sys
+import tempfile
+import time
 import tomllib
 
 
+READY_PERIOD = 60
+SILENCE_SECONDS = 15 * 60
 TASKS = (
     ("Add calc.clamp(x, lo, hi)", "Clamp a value to the inclusive bounds, and add tests."),
     ("Add calc.mean(xs)", "Return the arithmetic mean, raise ValueError for empty input, and add tests."),
@@ -101,14 +109,18 @@ def make_local(run, skill, *, empty=False):
 def test_run(root, *, ci=False):
     """Return a test count only when CI really ran unittest and succeeded."""
     command = ["./ci.sh"] if ci else [sys.executable, "-m", "unittest", "discover", "-s", "tests"]
-    result = subprocess.run(command, cwd=root, capture_output=True, text=True, timeout=30)
+    result = subprocess.run(command, cwd=root, env=fixture_env(root), capture_output=True, text=True, timeout=30)
     count = re.search(r"(?m)^Ran ([0-9]+) tests? in ", result.stderr + "\n" + result.stdout)
     return int(count[1]) if result.returncode == 0 and count is not None else 0
 
 
 def accepts(root, item):
-    return subprocess.run([sys.executable, "-c", ACCEPTANCE[item - 1]], cwd=root, capture_output=True,
+    return subprocess.run([sys.executable, "-c", ACCEPTANCE[item - 1]], cwd=root, env=fixture_env(root), capture_output=True,
                           timeout=30).returncode == 0
+
+
+def fixture_env(root):
+    return {"PATH": os.environ["PATH"], "HOME": str(root), "PYTHONDONTWRITEBYTECODE": "1"}
 
 
 @dataclass(frozen=True)
@@ -125,6 +137,7 @@ class Message:
     delivered: int | None = None
     terminal: str | None = None
     turn: int | None = None
+    started: bool | None = None
     outcome: str = "queued"
 
 
@@ -191,13 +204,12 @@ def assignment(message, item):
 
 
 def working_assignment(message, item, terminal, before_claim):
-    """The receipt can be written after the reported working turn began."""
+    """hc advances the turn counter when it leaves working, not when a turn begins."""
     if not assignment(message, item) or message.terminal != terminal["address"] or before_claim is None:
         return False
     turn = terminal.get("turn")
     return (terminal.get("state") == "live" and (terminal.get("status") or {}).get("state") == "working"
-            and type(turn) is int and type(message.turn) is int and turn == before_claim + 1
-            and message.turn in (before_claim, turn))
+            and type(turn) is int and message.started is True and turn == message.turn == before_claim)
 
 
 def should_interrupt(message, ticket, terminal, before_claim, *, fired=False, reported=False):
@@ -272,10 +284,13 @@ def empty_rows(evidence):
     ready = [msg for msg in evidence.messages if is_note(msg, "ready") and msg.recipient == "operator"
              and ordered(evidence.moved, msg.committed, msg.delivered)]
     one_quiet = len(quiet) == 1 and ordered(quiet[0].committed, quiet[0].delivered, evidence.moved)
-    silence = one_quiet and evidence.quiet_seconds >= 15 * 60 and not any(
+    silence = one_quiet and evidence.quiet_seconds >= SILENCE_SECONDS and not any(
         msg.sender == "factory" and ordered(quiet[0].delivered, msg.committed, evidence.moved)
         for msg in evidence.messages)
-    ready_note = len(ready) == 1 and evidence.ready_seconds <= 120
+    ready_item = item.item.removeprefix("#") if evidence.github else f"- [ ] {item.item} "
+    ready_note = (len(ready) == 1 and evidence.ready_seconds <= 2 * READY_PERIOD
+                  and any(line == ready_item if evidence.github else line.startswith(ready_item)
+                          for line in ready[0].text.splitlines()[1:]))
     taken = ready_note and item.state in {"In progress", "In Progress", "Done"} and any(
         assignment(msg, item.item) and ordered(ready[0].delivered, msg.delivered) for msg in evidence.messages)
     return [row("one-quiet-note", one_quiet), row("silence", silence), row("ready-note", ready_note),
@@ -313,3 +328,459 @@ def judge(evidence):
                      interrupt_row(evidence, evidence.tickets[0]), kill_row(evidence, evidence.tickets[1])))
     rows.append(row("within-budget", evidence.within_budget and all(r["status"] in {"pass", "measured"} for r in rows)))
     return rows
+
+
+class Observer:
+    """Read the private core and append-only log between launch and evidence cut-off."""
+
+    def __init__(self, qa, factory, state, evidence):
+        self.qa, self.factory, self.state, self.evidence = qa, factory, state, evidence
+        self.log = factory.open_log(state)
+        self.offset = self.order = 0
+        self.records = {}
+        self.pairs = {}
+        self.baselines = {}
+        self.before_claim = {}
+        self.developer = None
+        self.operator = None
+
+    def stamp(self):
+        self.order += 1
+        return self.order
+
+    def collect(self):
+        records, self.offset = self.log.read(self.offset)
+        for rec in records:
+            ident = rec["id"]
+            order = self.stamp()
+            if rec["t"] == "msg":
+                self.records[ident] = rec
+            elif rec["t"] == "ok":
+                original = self.records[ident]
+                for recipient in original["to"]:
+                    self.pairs[ident, recipient] = Message(
+                        ident, original["from"], recipient, original["text"], order,
+                        original["kind"], original.get("meta", {}))
+            elif rec["t"] == "out":
+                key = ident, rec["to"]
+                pair = self.pairs[key]
+                outcome, terminal = rec["o"], rec.get("term")
+                if outcome == "sending" and terminal in self.baselines:
+                    self.before_claim[key] = self.baselines[terminal]
+                self.pairs[key] = replace(pair, outcome=outcome, terminal=terminal, turn=rec.get("turn"),
+                                          started=rec.get("started"),
+                                          delivered=order if outcome == "delivered" else None)
+        self.evidence.messages = tuple(self.pairs.values())
+        order = self.stamp()
+        records = self.qa.rpc("terminal.list")["terminals"]
+        self.developer = self.operator = None
+        for term in records:
+            labels = term["labels"]
+            if term["state"] != "live" or labels.get("factory.dir") != str(self.state):
+                continue
+            kind = labels.get("factory.kind")
+            if kind == "operator":
+                self.operator = term
+            elif kind == "keeper" and not self.evidence.loaded:
+                beat = self.factory.read_beat(self.state)
+                self.evidence.loaded = bool(beat and beat[1:3] == (self.factory.VERSION, term["address"])
+                                            and labels.get("factory.version") == self.factory.VERSION
+                                            and term["argv"][1:3] == [str(self.factory.SCRIPT), "keeper"])
+            elif kind == "member" and labels.get("factory.member") == "lead-dev":
+                self.evidence.recovered.setdefault(term["address"], order)
+                status = (term.get("status") or {}).get("state")
+                if status in {"idle", "done"}:
+                    self.baselines[term["address"]] = term["turn"]
+                if self.developer is None or term["created_ms"] > self.developer["created_ms"]:
+                    self.developer = term
+        return records
+
+    def trigger(self, *, kill=False):
+        term = self.developer
+        if term is None:
+            return False
+        evidence = self.evidence
+        ticket = evidence.tickets[1 if kill else 0]
+        msg = next((msg for msg in reversed(evidence.messages) if assignment(msg, ticket.item)), None)
+        if msg is None:
+            return False
+        baseline = self.before_claim.get((msg.ident, msg.recipient))
+        if kill:
+            pending = any(p.recipient == "lead-dev" and p.outcome in {"sending", "queued"} for p in self.pairs.values())
+            if not should_kill(msg, ticket, term, baseline, evidence.tickets[0].integrated,
+                               fired=evidence.kill is not None, pending=pending):
+                return False
+        else:
+            reported = any(p.sender == "lead-dev" and names_item(p, ticket.item) and p.committed > msg.committed
+                           for p in self.pairs.values())
+            if not should_interrupt(msg, ticket, term, baseline, fired=evidence.interrupt is not None, reported=reported):
+                return False
+        address = term["address"]
+        # Recheck the address and turn immediately before the mutation.
+        current = self.qa.rpc("terminal.get", {"terminal": address})
+        if not working_assignment(msg, ticket.item, current, baseline):
+            return False
+        fault = Fault(ticket.item, address, current["turn"], msg.delivered, self.stamp(), self.offset)
+        if kill:
+            result = self.qa.rpc("terminal.kill", {"terminal": address})
+            if result["state"] != "finished" or result.get("reason") != "killed":
+                raise RuntimeError("hc did not confirm a kill of the assigned terminal")
+            evidence.kill = fault
+        else:
+            result = self.qa.rpc("terminal.interrupt", {"terminal": address})
+            if result["outcome"] != "stopped":
+                raise RuntimeError(f"interrupt on the assigned terminal returned {result['outcome']}")
+            evidence.interrupt = fault
+        return True
+
+
+CODE_PATHS = ("calc", "tests", "ci.sh")
+
+
+def file_items(todo):
+    """Read item state and its own body from the scratch tracker."""
+    items = {}
+    pattern = re.compile(r"(?m)^- \[([ x])\] (\(\d+\)) .*(?:\n    .*)*")
+    for section in re.split(r"(?m)^## ", todo)[1:]:
+        name, _, body = section.partition("\n")
+        for match in pattern.finditer(body):
+            item = match[2]
+            if item in items:
+                items[item] = ("duplicate", "")
+            else:
+                items[item] = (name if name != "Done" or match[1] == "x" else "invalid", match[0])
+    return items
+
+
+class LocalEvidence:
+    """Match tracker records to the developer branch, approved revision and remote integration."""
+
+    def __init__(self, fixture, observer):
+        self.repo, self.observer = fixture, observer
+        self.head = fixture.initial
+        self.branch_tips = set()
+        self.last_messages = ()
+        self.merges = {}
+
+    def collect(self):
+        previous = self.last_messages
+        self.observer.collect()
+        evidence, repo = self.observer.evidence, self.repo
+        self.last_messages = evidence.messages
+        order = self.observer.stamp()
+        local = file_items(git(repo.root, "show", "HEAD:TODO.md").stdout)
+        branch = git(repo.root, "rev-parse", "--verify", "refs/heads/qa/lead-dev", check=False)
+        tip = branch.stdout.strip() if branch.returncode == 0 else None
+        root_tip = git(repo.root, "rev-parse", "HEAD").stdout.strip()
+        remote = git(repo.origin, "rev-parse", "main").stdout.strip()
+        if remote != self.head:
+            self.integrate(remote, previous)
+        if tip:
+            self.branch_tips.add(tip)
+        working = False
+        if repo.developer.is_dir():
+            working = bool(git(repo.developer, "status", "--porcelain", "--", *CODE_PATHS).stdout
+                           or (tip and git(repo.root, "log", "-1", "--format=%H", f"{root_tip}..{tip}",
+                                           "--", *CODE_PATHS).stdout))
+        closed = file_items(git(repo.origin, "show", "main:TODO.md").stdout)
+        tickets = []
+        for ticket in evidence.tickets:
+            state, body = local.get(ticket.item, ("missing", ""))
+            if ticket.planned is None and re.search(r"(?m)^    \* plan:\s+\S", body):
+                ticket = replace(ticket, planned=order)
+            if ticket.changed is None and state == "In progress" and working:
+                ticket = replace(ticket, changed=order)
+            committed_state, record = closed.get(ticket.item, ("missing", ""))
+            merge = self.merges.get(ticket.item, "")
+            names_merge = merge and any(merge.startswith(sha) for sha in re.findall(r"\b[a-f0-9]{7,40}\b", record))
+            if committed_state == "Done" and names_merge and ticket.closed is None:
+                after_merge = git(repo.origin, "log", "-1", "--format=%H", f"{merge}..{remote}", "--", "TODO.md")
+                if after_merge.stdout:
+                    ticket = replace(ticket, closed=self.observer.stamp())
+            tickets.append(replace(ticket, state=committed_state if committed_state == "Done" else state))
+        evidence.tickets = tuple(tickets)
+
+    def integrate(self, remote, previous_messages):
+        evidence = self.observer.evidence
+        repo = self.repo
+        new = git(repo.origin, "rev-list", "--first-parent", "--reverse", f"{self.head}..{remote}").stdout.split()
+        for commit in new:
+            parents = git(repo.origin, "show", "-s", "--format=%P", commit).stdout.split()
+            if not parents:
+                continue
+            paths = git(repo.origin, "diff", "--name-only", parents[0], commit, "--", *CODE_PATHS).stdout.splitlines()
+            if not paths:
+                continue
+            evidence.main_code = evidence.main_code | {commit}
+            revision = parents[1] if len(parents) == 2 else commit
+            if (revision not in self.branch_tips or len(parents) > 2
+                    or git(repo.origin, "diff", "--name-only", revision, commit, "--", *CODE_PATHS).stdout):
+                continue
+            order = self.observer.stamp()
+            introduced = frozenset(git(repo.origin, "rev-list", f"{self.head}..{revision}").stdout.split()) | {commit}
+            tickets = list(evidence.tickets)
+            for n, ticket in enumerate(tickets):
+                if ticket.integrated is not None:
+                    continue
+                candidate = replace(ticket, revision=revision, integrated=order)
+                if approval(candidate, previous_messages) is None:
+                    continue
+                count = self.verify(repo.origin, revision, test_run)
+                self.merges[ticket.item] = commit
+                tickets[n] = replace(candidate, checked_revision=revision, test_count=count, branch_proof=True,
+                                     introduced=introduced,
+                                     accepted=self.verify(repo.origin, remote, lambda root: accepts(root, n + 1)))
+            evidence.tickets = tuple(tickets)
+        evidence.ci_count = self.verify(repo.origin, remote, lambda root: test_run(root, ci=True))
+        self.head = remote
+
+    @staticmethod
+    def verify(origin, revision, check):
+        with tempfile.TemporaryDirectory(dir=origin.parent, prefix="verify-") as directory:
+            root = pathlib.Path(directory)
+            git(root, "clone", "--no-local", "--no-checkout", str(origin), ".")
+            git(root, "checkout", "--detach", revision)
+            return check(root)
+
+
+def add_arguments(parser):
+    parser.add_argument("--tracker", choices=("file", "github"), required=True)
+    parser.add_argument("--operator", choices=("claude", "codex"), default="claude")
+    parser.add_argument("--developer", default="codex")
+    parser.add_argument("--reviewer", default="claude")
+    for role in ("operator", "developer", "reviewer"):
+        parser.add_argument(f"--{role}-model")
+    parser.add_argument("--budget", type=float, metavar="MIN")
+    parser.add_argument("--empty", action="store_true")
+    parser.add_argument("--rehearse", action="store_true")
+    parser.add_argument("--json", type=pathlib.Path)
+
+
+def write_formation(root, ready, agents, *, worktree):
+    lines = ['user = "qa"', "quiet_grace = 30", f"ready_check_every = {READY_PERIOD}",
+             f"ready_check = {json.dumps(ready)}"]
+    for section, harness, model in agents:
+        lines.extend((f"\n[{section}]", f"harness = {json.dumps(harness)}", f"model = {json.dumps(model)}",
+                      'thinking = "medium"'))
+        if worktree and section == "members.lead-dev":
+            lines.extend(("worktree = true",))
+    if worktree:
+        lines.insert(1, 'worktree_dir = "../worktrees"')
+    (root / "factory.toml").write_text("\n".join(lines) + "\n")
+
+
+def load_factory(skill):
+    spec = importlib.util.spec_from_file_location("autonomy_factory", skill / "scripts/factory.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def move_file_item(root, item, section, field=None):
+    path = root / "TODO.md"
+    text = path.read_text()
+    _, record = file_items(text)[item]
+    text = text.replace(record, "", 1)
+    record = record.strip()
+    if section == "Done":
+        record = record.replace("- [ ]", "- [x]", 1)
+    if field:
+        record += "\n    * " + field
+    text = text.replace(f"## {section}\n", f"## {section}\n\n{record}\n", 1)
+    path.write_text(text)
+    git(root, "add", "--", "TODO.md")
+    git(root, "commit", "-m", f"Record {item} in {section}")
+
+
+def implement_fixture(root, number):
+    path = root / "calc/__init__.py"
+    before = path.read_text()
+    if number == 1:
+        after = before + "\n\ndef clamp(x, lo, hi):\n    return max(lo, min(x, hi))\n"
+    elif number == 2:
+        after = before + "\n\ndef mean(xs):\n    if not xs:\n        raise ValueError('empty')\n    return sum(xs) / len(xs)\n"
+    else:
+        after = before.replace("    if text.startswith('+'):\n        raise ValueError('leading plus')\n", "")
+    path.write_text(after)
+    test = root / "tests/test_calc.py"
+    example = ("self.assertEqual(calc.clamp(4, 0, 2), 2)", "self.assertEqual(calc.mean([1, 3]), 2)",
+               "self.assertEqual(calc.parse_int('+2'), 2)")[number - 1]
+    with test.open("a") as stream:
+        stream.write(f"\n    def test_item_{number}(self):\n        import calc\n        {example}\n")
+
+
+def fake_harness(run):
+    bin_dir, codex = run / "bin", run / "codex"
+    bin_dir.mkdir()
+    codex.mkdir()
+    (codex / "models_cache.json").write_text(json.dumps({"models": [{"slug": "qa-fixture",
+        "supported_reasoning_levels": [{"effort": "medium"}]}]}))
+    agent = [sys.executable, str(pathlib.Path(__file__).with_name("fake_agent.py")), "reports"]
+    wrapper = bin_dir / "codex"
+    wrapper.write_text(f"#!/bin/sh\nexport FAKE_INTERRUPT=1\nexec {shlex.join(agent)}\n")
+    wrapper.chmod(0o755)
+    return agent, {"PATH": f"{bin_dir}:{os.environ['PATH']}", "CODEX_HOME": str(codex),
+                   "XDG_CACHE_HOME": str(run / "cache")}
+
+
+def wait_for(collect, predicate, deadline, description):
+    while time.monotonic() < deadline:
+        collect()
+        result = predicate()
+        if result:
+            return result
+        time.sleep(0.2)
+    raise RuntimeError(f"timed out waiting for {description}")
+
+
+class Rehearsal:
+    """Script the model-free path while exercising the real commands and evidence reads."""
+
+    def __init__(self, fixture, observer, operator, env, deadline):
+        self.root, self.observer, self.operator, self.env = fixture.root, observer, operator, env
+        self.fixture, self.deadline = fixture, deadline
+        self.local = LocalEvidence(fixture, observer)
+        self.evidence = observer.evidence
+
+    def factory(self, *args, member=None, allow=(0,)):
+        self.evidence.factory_commands += 1
+        env = {**self.env, "HC_TERMINAL_ID": member or self.operator}
+        result = subprocess.run([sys.executable, str(self.observer.factory.SCRIPT), *args], cwd=self.root,
+                                env=env, text=True, capture_output=True, timeout=35)
+        if result.returncode not in allow or "unconfirmed" in result.stdout:
+            raise RuntimeError(f"factory {args[0]} exited {result.returncode}: {result.stdout}{result.stderr}")
+        return result.stdout
+
+    def wait_for(self, predicate, description):
+        return wait_for(self.local.collect, predicate, self.deadline, description)
+
+    def note(self, what, after):
+        return next((msg for msg in self.evidence.messages if is_note(msg, what) and ordered(after, msg.delivered)), None)
+
+    def plan(self, number):
+        item = f"({number})"
+        move_file_item(self.root, item, "In progress", "plan: implement the requested function and test its edge cases")
+        self.local.collect()
+        return item
+
+    def integrate(self, number, item):
+        developer = self.fixture.developer
+        implement_fixture(developer, number)
+        self.local.collect()
+        git(developer, "add", "--", "calc", "tests")
+        git(developer, "commit", "-m", f"Implement item {item}")
+        revision = git(developer, "rev-parse", "HEAD").stdout.strip()
+        self.local.collect()
+        reviewer = next(term for term in self.observer.qa.rpc("terminal.list")["terminals"]
+                        if term["labels"].get("factory.member") == "reviewer"
+                        and term["labels"].get("factory.dir") == str(self.observer.state))
+        draft = self.observer.state / "messages/reviewer" / f"approval-{number}.txt"
+        draft.write_text(f"status: approve; item {item}; commit {revision}\n")
+        self.factory("say", "operator", "--file", str(draft), member=reviewer["address"])
+        self.wait_for(lambda: any(msg.sender == "reviewer" and revision in msg.text and msg.delivered is not None
+                                  for msg in self.evidence.messages), "review receipt")
+        if not test_run(developer, ci=True):
+            raise RuntimeError(f"CI failed at the reviewed revision for {item}")
+        git(self.root, "merge", "--no-ff", "-m", f"Integrate item {item}", revision)
+        merged = git(self.root, "rev-parse", "HEAD").stdout.strip()
+        move_file_item(self.root, item, "Done", f"work: {merged}")
+        git(self.root, "push", "origin", "main")
+        self.local.collect()
+
+    def normal(self):
+        self.wait_for(lambda: self.observer.developer and self.evidence.loaded, "candidate keeper and developer")
+        item = self.plan(1)
+        self.factory("say", "lead-dev", f"Implement {item}\nFAKE: works_forever")
+        self.wait_for(self.observer.trigger, "first assignment working turn")
+        self.wait_for(lambda: self.note("quiet", self.evidence.interrupt.order), "quiet note after interrupt")
+        self.factory("say", "lead-dev", f"What remains on {item}?\nFAKE: reports")
+        self.integrate(1, item)
+        item = self.plan(2)
+        self.factory("say", "lead-dev", f"Implement {item}\nFAKE: works_forever")
+        self.wait_for(lambda: self.observer.trigger(kill=True), "second assignment working turn")
+        self.wait_for(lambda: self.note("exit", self.evidence.kill.order), "exit note after kill")
+        self.factory("up", "lead-dev")
+        self.wait_for(lambda: any(msg.kind == "brief" and msg.recipient == "lead-dev"
+                                  and msg.terminal != self.evidence.kill.terminal
+                                  and ordered(self.evidence.kill.order, msg.delivered)
+                                  for msg in self.evidence.messages), "replacement brief")
+        self.integrate(2, item)
+        item = self.plan(3)
+        self.factory("say", "lead-dev", f"Implement {item}")
+        self.integrate(3, item)
+
+    def empty(self):
+        self.wait_for(lambda: self.note("quiet", 0), "one quiet note")
+        start = time.monotonic()
+        self.wait_for(lambda: time.monotonic() - start >= SILENCE_SECONDS, "15 minutes of quiet")
+        self.evidence.quiet_seconds = time.monotonic() - start
+        self.evidence.moved = self.observer.stamp()
+        start = time.monotonic()
+        move_file_item(self.root, "(1)", "Ready")
+        ready = self.wait_for(lambda: self.note("ready", self.evidence.moved), "ready note after owner move")
+        self.evidence.ready_seconds = time.monotonic() - start
+        self.plan(1)
+        self.factory("say", "lead-dev", "Implement (1)")
+        self.wait_for(lambda: any(assignment(msg, "(1)") and ordered(ready.delivered, msg.delivered)
+                                  for msg in self.evidence.messages), "assignment of the moved ticket")
+
+
+def rehearse(args, core, rodeo, skill, hc):
+    result = {"mode": "fixture", "tracker": "file", "empty": args.empty}
+    budget = args.budget if args.budget is not None else 45 if args.empty else 60
+    with tempfile.TemporaryDirectory(prefix="factory-qa-rehearsal-") as path:
+        run = pathlib.Path(path)
+        copy = run / "skill"
+        shutil.copytree(skill, copy)
+        factory = load_factory(copy)
+        fixture = make_local(run, copy, empty=args.empty)
+        agent, env = fake_harness(run)
+        env["HC_BIN"] = hc
+        write_formation(fixture.root, ready_command(copy), [
+            ("operator", "codex", "qa-fixture"), ("members.lead-dev", "codex", "qa-fixture"),
+            ("members.reviewer", "codex", "qa-fixture"),
+        ], worktree=True)
+        with core("e2eqa", config="notes = false\ndraft_wait = 0\n", extra_env=env) as qa, core("e2edrv") as drv:
+            term = qa.rpc("terminal.run", {"argv": agent, "cwd": str(fixture.root)})["address"]
+            state = pathlib.Path(env["XDG_CACHE_HOME"]) / "factory-skill" / factory.team_key(fixture.root) / qa.id[:8]
+            evidence = Evidence(tuple(Ticket(f"({n})") for n in range(1, 2 if args.empty else 4)),
+                                empty=args.empty, rehearsal=True)
+            observer = Observer(qa, factory, state, evidence)
+            started = time.monotonic()
+            driver = Rehearsal(fixture, observer, term, {**qa.env, **env}, started + budget * 60)
+            view = None
+            try:
+                driver.factory("up")
+                view = rodeo(qa, drv)
+                if not view.wait_for(["team", "@lead-dev", "@reviewer", "keeper"]):
+                    raise RuntimeError("the scratch team did not render in rodeo")
+                (driver.empty if args.empty else driver.normal)()
+                evidence.within_budget = time.monotonic() <= driver.deadline
+            except (RuntimeError, subprocess.SubprocessError, factory.LogDamage) as error:
+                result["error"] = str(error)
+            finally:
+                faults = [asdict(fault) for fault in (evidence.interrupt, evidence.kill) if fault is not None]
+                result.update(rows=judge(evidence), faults=faults, elapsed_seconds=round(time.monotonic() - started, 2),
+                              factory_version=factory.VERSION, hc_version=qa.hello()["version"])
+                if view is not None:
+                    view.close()
+                try:
+                    driver.factory("down", allow=(0, 1, 2))
+                except (RuntimeError, subprocess.SubprocessError) as error:
+                    result["teardown_error"] = str(error)
+    result["status"] = ("pass" if "error" not in result and "teardown_error" not in result and
+                        all(r["status"] in {"pass", "measured"} for r in result["rows"]) else "fail")
+    return result
+
+
+def run(args, core, rodeo, skill, hc):
+    if args.rehearse:
+        result = rehearse(args, core, rodeo, skill, hc)
+    else:
+        result = {"mode": "real", "tracker": args.tracker, "empty": args.empty, "status": "not_run",
+                  "detail": "The real runs use Phase 8's authenticated harness adapter."}
+    payload = json.dumps(result, indent=2) + "\n"
+    if args.json:
+        args.json.write_text(payload)
+    sys.stdout.write(payload)
+    return {"pass": 0, "fail": 1, "not_run": 2}[result["status"]]

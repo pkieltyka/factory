@@ -10,6 +10,7 @@ only after server.status names that id, so the owner's sessions are never reache
     python3 tests/live.py check lc2|lc3|lc4|lc6|lc7|lc12|login [--json PATH]   # real harnesses, the owner's login
     python3 tests/live.py fixtures [--out tests/hc_fixtures.json]
     python3 tests/live.py smoke
+    python3 tests/live.py e2e --tracker file|github [--operator claude|codex] [--empty] [--rehearse]
 """
 
 import argparse
@@ -4376,6 +4377,11 @@ def main(argv=None):
     rep = sub.add_parser("report", help="write docs/qualification/<harness>.md from qualify --json evidence")
     rep.add_argument("evidence", nargs="+", help="qualify --json files from real runs")
     rep.add_argument("--out", default=str(ROOT / "docs" / "qualification"))
+    if __package__:
+        from . import e2e
+    else:
+        import e2e
+    e2e.add_arguments(sub.add_parser("e2e"))
     args = parser.parse_args(argv)
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))   # cleanup (with-blocks, atexit) runs on SIGTERM too
     if args.command == "report":
@@ -4389,6 +4395,17 @@ def main(argv=None):
             parser.exit(2, f"qualify: {error}\n")
         print(json.dumps(evidence, indent=2))
         sys.exit(code)
+    if args.command == "e2e":
+        if args.rehearse and args.tracker != "file":
+            parser.error("the rehearsal uses the file tracker")
+        if args.budget is not None and not 0 < args.budget < float("inf"):
+            parser.error("--budget must be positive and finite")
+        if args.rehearse and not RODEO:
+            parser.exit(2, "rodeo not found (set RODEO_BIN)\n")
+        try:
+            return e2e.run(args, Core, Rodeo, ROOT / "skill", shutil.which(HC) or HC)
+        except (RuntimeError, HcError, HcDown, subprocess.SubprocessError) as error:
+            parser.exit(1, f"FAIL {error}\n")
     if args.command == "smoke":
         try:
             smoke()
@@ -4409,4 +4426,4 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

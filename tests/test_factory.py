@@ -1,4 +1,5 @@
 """Factory tests with fake harnesses and a fake or private real hc core."""
+import argparse
 import importlib.util
 import concurrent.futures
 import contextlib
@@ -7243,10 +7244,10 @@ class E2EJudgeTests(unittest.TestCase):
         names = ("#31", "#32", "#33") if github else ("(1)", "(2)", "(3)")
         first, second, _ = names
         messages = [
-            self.message(1, "operator", "lead-dev", f"Assign {first}", 10, terminal="t2", turn=3),
+            self.message(1, "operator", "lead-dev", f"Assign {first}", 10, terminal="t2", turn=3, started=True),
             self.message(2, "factory", "operator", "team quiet", 15, kind="note", meta={"what": "quiet"}),
             self.message(3, "operator", "lead-dev", f"What remains on {first}?", 17),
-            self.message(4, "operator", "lead-dev", f"Assign {second}", 50, terminal="t2", turn=5),
+            self.message(4, "operator", "lead-dev", f"Assign {second}", 50, terminal="t2", turn=5, started=True),
             self.message(5, "factory", "operator", "@lead-dev was killed", 55,
                          kind="note", meta={"what": "exit", "term": "t2"}),
             self.message(6, "operator", "lead-dev", "Pick up your work", 60, kind="brief", terminal="t4"),
@@ -7335,7 +7336,8 @@ class E2EJudgeTests(unittest.TestCase):
     def test_empty_board_requires_silence_and_pickup_of_the_moved_item(self):
         sample = e2e.Evidence((e2e.Ticket("(1)", state="In progress"),), (
             self.message(1, "factory", "operator", "team quiet", 2, kind="note", meta={"what": "quiet"}),
-            self.message(2, "factory", "operator", "ready work", 12, kind="note", meta={"what": "ready"}),
+            self.message(2, "factory", "operator", "ready work:\n- [ ] (1) Fix calc", 12, kind="note",
+                         meta={"what": "ready"}),
             self.message(3, "operator", "lead-dev", "Assign (1)", 14),
         ), loaded=True, prompts=1, within_budget=True, empty=True, moved=10, quiet_seconds=900, ready_seconds=63)
         self.assertTrue(all(r["status"] == "pass" for r in e2e.judge(sample)))
@@ -7344,6 +7346,9 @@ class E2EJudgeTests(unittest.TestCase):
             self.assertEqual(self.status(replace(sample, messages=(*sample.messages, other)), name), "fail")
         self.assertEqual(self.status(replace(sample, quiet_seconds=899), "silence"), "fail")
         self.assertEqual(self.status(replace(sample, ready_seconds=121), "ready-note"), "fail")
+        note = replace(sample.messages[1], text="ready work:\n- [ ] (2) Fix calc")
+        self.assertEqual(self.status(replace(sample, messages=(sample.messages[0], note, sample.messages[2])),
+                                     "ready-note"), "fail")
         other = replace(sample.messages[2], text="Assign (2)")
         self.assertEqual(self.status(replace(sample, messages=(*sample.messages[:2], other)), "item-taken", "(1)"), "fail")
         waiting = replace(sample.tickets[0], state="Ready")
@@ -7354,21 +7359,68 @@ class E2EJudgeTests(unittest.TestCase):
         first, second, _ = sample.tickets
         term = {"address": "t2", "state": "live", "turn": 3, "status": {"state": "working"}}
         receipt = sample.messages[0]
-        self.assertTrue(e2e.should_interrupt(receipt, first, term, 2))
-        self.assertTrue(e2e.should_interrupt(replace(receipt, turn=2), first, term, 2))
+        self.assertTrue(e2e.should_interrupt(receipt, first, term, 3))
         for msg, terminal, turn, options in (
-            (receipt, term, 3, {}), (receipt, {**term, "turn": 6}, 2, {}),
-            (replace(receipt, terminal="t3"), term, 2, {}), (replace(receipt, kind="brief"), term, 2, {}),
-            (replace(receipt, text="@reviewer joined"), term, 2, {}),
-            (receipt, term, 2, {"fired": True}), (receipt, term, 2, {"reported": True}),
+            (receipt, term, 2, {}), (receipt, {**term, "turn": 4}, 3, {}),
+            (replace(receipt, terminal="t3"), term, 3, {}), (replace(receipt, kind="brief"), term, 3, {}),
+            (replace(receipt, text="@reviewer joined"), term, 3, {}), (replace(receipt, started=False), term, 3, {}),
+            (receipt, term, 3, {"fired": True}), (receipt, term, 3, {"reported": True}),
         ):
             self.assertFalse(e2e.should_interrupt(msg, first, terminal, turn, **options))
         term["turn"] = 5
         receipt = sample.messages[3]
-        self.assertTrue(e2e.should_kill(receipt, second, term, 4, first.integrated))
+        self.assertTrue(e2e.should_kill(receipt, second, term, 5, first.integrated))
         for options in ({"fired": True}, {"pending": True}):
-            self.assertFalse(e2e.should_kill(receipt, second, term, 4, first.integrated, **options))
-        self.assertFalse(e2e.should_kill(receipt, second, term, 4, receipt.delivered))
+            self.assertFalse(e2e.should_kill(receipt, second, term, 5, first.integrated, **options))
+        self.assertFalse(e2e.should_kill(receipt, second, term, 5, receipt.delivered))
+
+
+class E2EObserverTests(unittest.TestCase):
+    def test_observation_uses_only_log_and_core_reads(self):
+        state = pathlib.Path("/scratch/factory-skill/team/core")
+        idle = {"address": "t5", "state": "live", "turn": 4, "created_ms": 5, "status": {"state": "idle"},
+                "labels": {"factory.dir": str(state), "factory.kind": "member", "factory.member": "lead-dev"}}
+        working = {**idle, "status": {"state": "working"}}
+        records = [
+            {"t": "msg", "id": 1, "from": "operator", "to": ["lead-dev"], "kind": "say", "text": "Start (1)"},
+            {"t": "ok", "id": 1},
+            {"t": "out", "id": 1, "to": "lead-dev", "o": "sending", "term": "t5"},
+            {"t": "out", "id": 1, "to": "lead-dev", "o": "delivered", "term": "t5", "turn": 4, "started": True},
+        ]
+        log = types.SimpleNamespace(read=lambda offset: ([], 100) if offset == 0 else (records, 400))
+        states = iter((idle, working))
+
+        def read_core(method):
+            self.assertEqual(method, "terminal.list")
+            return {"terminals": [next(states)]}
+
+        evidence = e2e.Evidence((e2e.Ticket("(1)"),))
+        obs = e2e.Observer(types.SimpleNamespace(rpc=read_core), types.SimpleNamespace(open_log=lambda _: log),
+                           state, evidence)
+        with patch.object(e2e.subprocess, "run", side_effect=AssertionError("observer ran a command")):
+            obs.collect()
+            obs.collect()
+        receipt, = evidence.messages
+        self.assertEqual(obs.before_claim[(1, "lead-dev")], 4)
+        self.assertEqual(obs.offset, 400)
+        self.assertTrue(e2e.should_interrupt(receipt, evidence.tickets[0], working, 4))
+
+    def test_rehearsal_and_real_output_stay_distinct(self):
+        parser = argparse.ArgumentParser()
+        e2e.add_arguments(parser)
+        real = parser.parse_args(["--tracker", "github", "--empty", "--operator", "codex"])
+        fixture = parser.parse_args(["--tracker", "file", "--rehearse"])
+        self.assertTrue(real.empty)
+        self.assertEqual(real.operator, "codex")
+        with patch.object(e2e, "rehearse", return_value={"mode": "fixture", "status": "pass"}) as rehearsal:
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(e2e.run(real, None, None, None, None), 2)
+                self.assertEqual(json.loads(output.getvalue())["mode"], "real")
+            rehearsal.assert_not_called()
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(e2e.run(fixture, None, None, None, None), 0)
+                self.assertEqual(json.loads(output.getvalue())["mode"], "fixture")
+            rehearsal.assert_called_once()
 
 
 class SkillTextTests(unittest.TestCase):
