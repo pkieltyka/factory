@@ -6585,6 +6585,9 @@ class QualifyJudgeTests(unittest.TestCase):
         owner = [["Do you trust the contents of this project?", []]]
         self.assertEqual(live.judge_dialog(owner, owner[0][0], False)[0], "pass")
         self.assertEqual(live.judge_dialog(owner, owner[0][0], True)[0], "fail")
+        self.assertEqual(live.judge_dialog(owner, None, True, suppressed=True)[0], "pass")   # agy's argument, verified
+        self.assertEqual(live.judge_dialog(owner, None, True)[0], "not_run")      # no prompt alone proves nothing
+        self.assertEqual(live.judge_dialog(owner, None, False, suppressed=True)[0], "not_run")
 
     def test_blocked(self):
         note = {"about": "lead-dev", "term": "t3", "outcome": "delivered"}

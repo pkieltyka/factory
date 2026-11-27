@@ -2309,11 +2309,12 @@ def _up(team, run, case, role, harness, names):
         return False
     waiting = [name for name in team.members                 # members past their startup before any case sends
                if not team.until(lambda: team.member(name) and team.state(team.member(name)) in READY, 180)]
-    quiet = _team_quiet(team, hold=8, timeout=300)    # the startup reports handled before any case samples
+    quiet = _team_quiet(team, hold=8, timeout=600)    # the startup reports handled: a real operator's turn on a
+    # ready report can run for minutes (a Codex operator stayed working over 300 s in OpenCode's batch)
     team.ready_states = {"operator": team.state(team.operator), "quiet_after_up": quiet,
                          **{name: team.state(team.member(name)) for name in team.members if team.member(name)}}
     if quiet is None:
-        waiting = waiting or ["the team (not quiet for 8 s within 300 s)"]
+        waiting = waiting or ["the team (not quiet for 8 s within 600 s)"]
     if waiting:
         for name in names:
             run.row(case, name, role, harness, "not_run", f"case {case} {name}",
@@ -2391,7 +2392,7 @@ def judge_latency(trials):
     return "pass", observed, None
 
 
-def judge_dialog(declared, seen, ready):
+def judge_dialog(declared, seen, ready, suppressed=False):
     """declared: the table's [text, keys] dialogs; seen: the declared text observed on the subject's screen during
     this fresh start, or None; ready: the start finished. A known prompt answered by Factory passes once the start
     finishes; an owner-only prompt (no keys) passes when it is left. A declared dialog that never showed proves
@@ -2400,6 +2401,9 @@ def judge_dialog(declared, seen, ready):
     if seen is None:
         if not declared:
             return "pass", "no startup dialog declared; none of the known prompts appeared", None
+        if ready and suppressed and not any(keys.values()):   # a launch argument avoids it (agy, LC-7): verified
+            return "pass", "the owner-only dialog was avoided: the launch trusts exactly this folder, the start" \
+                " finished and the member acted", None
         return "not_run", None, "the declared dialog did not appear in this start"
     if keys.get(seen):
         if ready:
@@ -2621,15 +2625,30 @@ def case_1(run, role, harness, adapter_class):
             settled = start.get("settled") or ""
             observed_dialog = (start.get("answered") or [None])[0] or (
                 settled[len("dialog: "):] if settled.startswith("dialog: ") else None)
-        status, observed, reason = judge_dialog(declared, observed_dialog, bool(ready))
-        run.row(1, "startup-dialog", role, harness, status,
-                "a declared startup dialog is seen and answered on its second poll, or left to the owner; none is"
-                " invented", observed=observed, reason=reason,
-                proof={"declared": [text for text, _ in declared], "seen": observed_dialog,
-                       "start_finished": bool(ready),
-                       "handled_by": "the driver's operator watcher, as up does" if role == "operator" else "up",
-                       "mode": team.adapter.mode})
+
+        def dialog_row(acted):
+            suppressed = False
+            if role == "member" and ready and team.member("lead-dev"):
+                record = team.get(team.member("lead-dev"))       # the effective argv and the folder it runs in
+                argv = record.get("argv") or []
+                at = argv.index("--settings") if "--settings" in argv else None
+                try:
+                    trusted = json.loads(argv[at + 1]).get("trustedWorkspaces") if at is not None else None
+                except (ValueError, IndexError):
+                    trusted = None
+                folder = str(record.get("cwd"))          # a fresh scratch folder, and exactly the one trusted
+                suppressed = bool(acted) and trusted == [folder] and folder.startswith(str(team.dir))
+            status, observed, reason = judge_dialog(declared, observed_dialog, bool(ready), suppressed)
+            run.row(1, "startup-dialog", role, harness, status,
+                    "a declared startup dialog is seen and answered on its second poll, or left to the owner; none is"
+                    " invented", observed=observed, reason=reason,
+                    proof={"declared": [text for text, _ in declared], "seen": observed_dialog,
+                           "suppressed": suppressed, "start_finished": bool(ready),
+                           "handled_by": "the driver's operator watcher, as up does" if role == "operator" else "up",
+                           "mode": team.adapter.mode})
+
         if not ready:
+            dialog_row(False)
             run.row(1, "states", role, harness, "not_run", "case 1 states", reason="the team did not come up")
             return
         subject = _subject(team, role)
@@ -2654,6 +2673,7 @@ def case_1(run, role, harness, adapter_class):
         run.row(1, "states", role, harness, "pass" if ok else "fail",
                 "idle, working through a real tool action, idle again with the turn advanced", proof=proof,
                 reason=None if ok else "the states or the action were not as expected")
+        dialog_row(proof["action"] == "exit 0")
 
 
 def case_7(run, role, harness, adapter_class):
@@ -3990,7 +4010,13 @@ def cross_owner_pane(run, fixture):
         team.qa.rpc("doc.set", {"name": "herdr-app", "value": value, "version": doc["version"]})
         team.qa.rpc("terminal.label", {"terminal": owner.address, "labels": {
             "herdr.space": value["spaces"][0]["id"], "herdr.tab": tab["id"], "herdr.seen": "0"}})
+        team.until(lambda: "ready" in team.qa.rpc("terminal.read", {"terminal": owner.address, "lines": 0})
+                   .get("text", ""), 30)                  # the owner's program reads input before the seed is typed
         team.qa.rpc("terminal.keys", {"terminal": owner.address, "keys": list(seed)})
+        if not team.until(lambda: seed in owner.text(), 30):
+            run.row("cross", "owner-pane", "system", "system", "not_run", "the owner-pane cross case",
+                    reason="the owner's pane never recorded its seed text")
+            return
         steps = []
 
         def owner_block():
