@@ -1840,6 +1840,8 @@ class TeamCommandTests(TeamCase):
         newest = factory.saved_sessions(self.state_dir)[0]
         self.assertEqual({n: (e["term"], e["how"]) for n, e in newest.items()},
                          {n: (t, "new") for n, t in terms.items()})
+        for name, term in terms.items():                               # the launch's model, for say's sessions
+            self.assertEqual(self.hc.get(term)["labels"].get("factory.model"), newest[name]["model"])
         self.assertTrue(factory.read_team(self.state_dir)["up"])
         runs = self.fake.calls("terminal.run")
         self.assertTrue(all(not any(k.startswith("herdr.") for k in r["params"]["labels"]) for r in runs))
@@ -6061,6 +6063,29 @@ class SessionTests(unittest.TestCase):
         self.assertEqual([(e["term"], e["how"], e["value"]) for e in self.lines()],
                          [("t1", "new", None), ("t1", "env", "thread-a"), ("t2", "env", "thread-c")])
 
+    def test_a_say_keeps_the_model_its_launch_resolved(self):
+        """Phase 8 on a real pi member: up resolved openai/gpt-6-astra to openrouter/openai/gpt-6-astra, the say's
+        entry wrote the formation's model, and the next up's provider check started it fresh. Two down/up cycles,
+        each resumed by ID with no launch entry for the new terminal (@lead-dev), keep resuming."""
+        resolved = self.m("pi-dev", model="openrouter/openai/gpt-6-astra")
+
+        def say(term, value, model=resolved["model"]):
+            return factory.record_session(self.cfg, self.state, "pi-dev", term, {"PI_SESSION_ID": value}, model=model)
+        with patch.dict(factory.TABLE["pi"], resume_model="provider"):
+            factory.launch_entry(self.state, resolved, "t3", "new", None)      # a fresh launch
+            say("t3", "pi-1")
+            for term in ("t4", "t5"):                                           # resumed by ID: no entry for term
+                entry = factory.saved_sessions(self.state)[0]["pi-dev"]
+                self.assertTrue(factory.compatible(entry, resolved))
+                self.assertTrue(factory.session_plan(resolved, self.state, entry, fresh=False)["resume"])
+                say(term, "pi-1")
+            self.assertEqual({e["model"] for e in self.lines()}, {"openrouter/openai/gpt-6-astra"})
+            factory.launch_entry(self.state, resolved, "t6", "new", None)
+            say("t6", "pi-2", model=None)                                       # no label: its launch's entry
+            self.assertEqual(self.lines()[-1]["model"], "openrouter/openai/gpt-6-astra")
+            say("t9", "pi-3", model=None)                                       # neither: the formation's
+            self.assertEqual(self.lines()[-1]["model"], "openai/gpt-6-astra")
+
     def test_a_fresh_launch_ends_the_previous_conversation(self):
         m = self.m("codex-dev")
         self.record("codex-dev", "t1", "thread-a")
@@ -6378,7 +6403,8 @@ class StartMemberTests(unittest.TestCase):
         self.assertEqual(run["argv"], ["/opt/bin/claude", *argv])
         self.assertEqual((run["cwd"], run["env"]), (m["dir"], {"PATH": self.path, **env}))
         self.assertEqual(run["labels"], {"factory.team": factory.team_key(self.cfg.root), "factory.kind": "member",
-                                         "factory.member": name, "factory.dir": str(self.state), "name": "@" + name})
+                                         "factory.member": name, "factory.dir": str(self.state), "name": "@" + name,
+                                         "factory.model": m["model"]})      # a resume by ID too: say's sessions
         self.assertTrue(run["no_parent"])
         self.assertFalse(any(k.startswith("herdr.") for k in record["labels"]))
 
