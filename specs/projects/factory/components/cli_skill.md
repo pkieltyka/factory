@@ -107,14 +107,14 @@ operator: reachable
 - Rows: the operator, then every configured member in `factory.toml` order. `Turn` and `Terminal` are empty when there is no live terminal (a `gone` member shows its finished record's ID).
 - `pending`: per recipient, the count of pending pairs, the age of the oldest, and its current reason; `pending: none` otherwise.
 - `keeper`: `running`, `not running`, `hung (last loop <n> s ago), restarted`, or `running version <v>, replacing itself`; `status` calls `ensure_keeper` first (which leaves a stopped team stopped). A keeper with no pane adds `, no pane (run factory.py up)`.
-- `no pane: @x, @y (run factory.py up)` lists live members missing from the layout. For a live member past startup with no delivered first brief, print `@x has no confirmed brief: run factory.py brief --send x`. A layout read failure suppresses pane hints. A damaged log suppresses brief hints.
+- `no pane: @x, @y (run factory.py up)` lists live members missing from the layout. For a live member past startup with no delivered first brief, show the pending first brief’s ID and outcome when one exists. Otherwise print `@x has no confirmed brief: run factory.py brief --send x`. A layout read failure suppresses pane hints. A damaged log suppresses brief hints.
 - When the log holds uncommitted entries: `log: <n> uncommitted entries (never delivered)`.
 - `operator`: `reachable`, or `not reachable: run factory.py up in the operator's pane`.
 - Then v1's hint lines for `blocked` and `gone` members, any `strays`, the log-size warning above 64 MiB, and a `LogDamage` diagnosis if the log cannot be read (the table is still printed).
 
 ### `brief`
 
-`brief` prints `render_team_brief` for the configured roster. `brief NAME` prints the header line and `member_prompt` (v1's `prompt`). `brief --send [all | names]`: each named member must be live (`not running: …`, exit 2); one `log.add(operator, [name], message_for(...), kind="brief")` per member, closing with `No reply needed.` for a member whose terminal is in `box.briefed()` and with the ready or pickup request for one that is not (§9.6); then wait and print like `say`.
+`brief` prints `render_team_brief` for the configured roster. `brief NAME` prints the header line and `member_prompt` (v1's `prompt`). `brief --send [all | names]`: each named member must be live (`not running: …`, exit 2); one `log.add(operator, [name], message_for(...), kind="brief")` per member, closing with `No reply needed.` for a member whose terminal is in `box.briefed()` and with the ready or pickup request for one that is not (§9.6); then wait and print like `say`. A pending first brief is reported by ID and outcome with exit 1 for that member. The command holds the same lifecycle lock as `up` and `down` through session settlement.
 
 ### `check`
 

@@ -2200,7 +2200,7 @@ class TeamCommandTests(TeamCase):
         self.addCleanup(os.close, lock)
         code, _, err = self.cmd(self.operator, "up")
         self.assertEqual(code, 2)
-        self.assertIn("another up or down is running for this team", err)
+        self.assertIn("another up, down or brief --send is running for this team", err)
         self.assertFalse(self.fake.calls("terminal.run"))
 
     def test_a_failed_preflight_changes_nothing(self):
@@ -2683,6 +2683,64 @@ class TeamCommandTests(TeamCase):
         code, _, err = self.cmd(self.operator, "brief", "--send", "pm")
         self.assertEqual(code, 2)
         self.assertIn("not running: @pm", err)
+
+    def test_status_and_brief_send_keep_a_pending_first_brief(self):
+        self.assertEqual(self.cmd(self.operator, "up", "lead-dev")[0], 0)
+        term = self.terminal("reviewer")[0]
+        first, _, _ = self.log.add("operator", ["reviewer"], "original startup brief", kind="brief")
+        for pending in ("queued (waiting)", "sending"):
+            with self.subTest(pending=pending):
+                if pending == "sending":
+                    self.keeper.tick()                         # the original worker has not typed anything yet
+                    self.assertEqual(len(self.jobs), 1)
+                before = self.log.path.read_bytes()
+                code, out, err = self.cmd(self.operator, "status")
+                self.assertEqual(code, 0, out + err)
+                self.assertIn(f"@reviewer: first brief {first} is still {pending}", out)
+                self.assertNotIn("run factory.py brief --send reviewer", out)
+                code, out, err = self.cmd(self.operator, "brief", "--send", "reviewer")
+                self.assertEqual(code, 1, out + err)
+                self.assertIn(f"@reviewer: first brief {first} is still {pending}", out)
+                self.assertEqual(self.log.path.read_bytes(), before)
+                self.assertFalse(self.fake.sent(term))
+        self.deliver()
+        self.assertEqual(self.outcome(first, "reviewer")["o"], "delivered")
+        self.assertEqual(len(self.fake.sent(term)), 1)
+        self.assertIn("original startup brief", self.fake.sent(term)[0])
+        code, out, err = self.cmd(self.operator, "brief", "--send", "reviewer")
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(len(self.fake.sent(term)), 2)
+        self.assertTrue(self.fake.sent(term)[1].rstrip().endswith("No reply needed."))
+
+    def test_brief_settlement_cannot_overlap_a_fresh_replacement(self):
+        self.assertEqual(self.cmd(self.operator, "up", "lead-dev")[0], 0)
+        old = self.terminal("frontend-dev")[0]
+        self.launch_fact(old, "id", "old-session", model="claude-opus-5-5")
+        real = factory.settle_launches
+        fresh = ("up", "frontend-dev", "--fresh")
+
+        def interleave(cfg, state, hc, view, box):
+            self.assertEqual(view.terminal("frontend-dev")["address"], old)
+            self.assertIn(old, box.briefed())
+            self.fake.finish(old)
+            code, out, err = self.cmd(self.operator, *fresh)
+            self.assertEqual(code, 2, out + err)
+            self.assertIn("another up, down or brief --send is running for this team", err)
+            self.assertFalse(self.fake.calls("terminal.rm"))
+            return real(cfg, state, hc, view, box)
+
+        with patch.dict(factory.TABLE["claude"], session="id"):
+            with patch.object(factory, "settle_launches", interleave):
+                code, out, err = self.cmd(self.operator, "brief", "--send", "frontend-dev")
+            self.assertEqual(code, 0, out + err)
+            self.assertEqual(factory.saved_sessions(self.state_dir)[0]["frontend-dev"]["value"], "old-session")
+            code, out, err = self.cmd(self.operator, *fresh)
+        self.assertEqual(code, 0, out + err)
+        entry = factory.saved_sessions(self.state_dir)[0]["frontend-dev"]
+        self.assertEqual(entry["term"], self.member_terms()["frontend-dev"])
+        self.assertNotEqual(entry["term"], old)
+        self.assertEqual(entry["how"], "id")
+        self.assertNotEqual(entry["value"], "old-session")
 
 
 @real_only

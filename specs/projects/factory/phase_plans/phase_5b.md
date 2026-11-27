@@ -128,7 +128,7 @@ One `hc.doc_get()` and `blocks(doc)`, read only. A failure to read the doc, or a
 
 - The keeper line ends with `, no pane (run factory.py up)` when the keeper is live and has no block (cli_skill.md §2).
 - New line, when any live member has no block: `no pane: @x, @y (run factory.py up)`.
-- New hint line, for each live member whose terminal is not in `box.briefed()` and that is not `starting`: `@x has no confirmed brief: run factory.py brief --send x`. This is the visible half of the `not ready` queue reason.
+- For each live member past `starting` without a delivered first brief, show the pending brief ID and outcome when one exists. Otherwise print `@x has no confirmed brief: run factory.py brief --send x`. A manual brief request for a pending first brief also reports it and exits 1 for that member.
 
 ## 5. The launch fact and `settle_launches`
 
@@ -150,14 +150,14 @@ def settle_launches(cfg, state, hc, view, box) -> tuple[dict[str, str], list[str
 
    For each configured member, take its live terminal, or with none its newest finished record (`view.finished(name)`: a member that was started or briefed and then exited still owes its entries, and `hc` accepts a label change on a finished record). When that record carries `factory.launch`, with `m = {"name": name, "harness": fact["harness"], "model": fact["model"]}` (the launch as it was started, not today's plan):
 
-   1. **Invalidate.** If `fact["fresh"]`: `launch_entry(state, m, address, "new", None)`. Normally #169 already wrote it at start and this does nothing; it is the second line for a fresh terminal left without its entry, whether or not a brief was ever delivered. `new` must never land after an entry for the same terminal, and that is decided where the journal is locked: `launch_entry`'s `decide` gains one condition, so it skips when the member's newest entry is for this terminal and that entry is `env`, or `how` is `"new"`, or `(how, value)` is the same. `settle_launches` reads no snapshot of the journal: a `brief --send` running beside it (it does not hold `up.lock`) cannot slip an upgrade in between.
+   1. **Invalidate.** If `fact["fresh"]`: `launch_entry(state, m, address, "new", None)`. Normally #169 already wrote it at start and this does nothing; it is the second line for a fresh terminal left without its entry, whether or not a brief was ever delivered. `new` must never land after an entry for the same terminal, and that is decided where the journal is locked: `launch_entry`'s `decide` gains one condition, so it skips when the member's newest entry is for this terminal and that entry is `env`, or `how` is `"new"`, or `(how, value)` is the same. `settle_launches` reads no separate snapshot of the journal. The locked write sees any session entry recorded by the member’s `say`.
    2. **Upgrade.** If `fact["how"]` is `id` or `dir` and the address is in `box.briefed()`: `launch_entry(state, m, address, fact["how"], fact["value"])`.
    3. **Clear.** When nothing more is owed (`how` is `new`, or step 2 has run): `hc.label(address, {"factory.launch": ""})`. An `id` or `dir` fact whose terminal is not briefed yet keeps its label.
 
    A label that is not a JSON object with a `how` of `id`, `dir` or `new`, a boolean `fresh`, a string `harness`, a `model` that is a string or null (a member with no model in `factory.toml` has none), and a string `value` for `id` and `dir`, is a warning and is left alone. The two failures differ: a `launch_entry` that raises puts the member in the first result and leaves the label, so the entry is still owed; a label that cannot be cleared is only a warning, because the journal already has the entry and the next call clears it.
 3. **Callers.**
    - `up` calls it twice, each time with a `team_view` and a full box read at that moment (a `LogDamage` there is one warning and the call is skipped). **First** right after `mark_operator` and before `saved_sessions` is read, any `session_plan` is made or any old record is removed (step 10): a brief that arrived after an earlier `up`'s wait is saved before this launch is planned. Else a late-briefed pi or omp member starts over, and a Codex or agy member started with `--fresh` would reopen the conversation from before it. A member in the first result of that call is **not restarted in this run**: its old record and label stay, it is reported as `@x: its conversation could not be saved (<why>); not restarted. Then run: factory.py up x`, and `up` exits 3 for it; planning from the entry before it would resume the wrong conversation. **Second** after this run's brief wait, in place of step 14, for all members and not only the ones it started; here an unsaved member is one stderr line (`@x: its conversation could not be saved yet: <why>`) and no exit-code change, since a later call still owes it.
-   - `brief --send` calls it after its wait, with the same stderr line and no exit-code change.
+   - `brief --send` calls it after its wait, with the same stderr line and no exit-code change. It holds `up.lock` from the first terminal and log snapshot through settlement to serialize with replacement and stop.
    - `down` calls it after its session-storage preflight and before it stops anyone: a selected member in the first result is **left as it is**: a live one keeps running and an already finished one keeps its record (no `hc.rm`, so the label that still owes the entry is not lost). It is reported as `sessions cannot be saved (<why>): @x left running` (or `… @x's record kept`), and `down` exits 1 after stopping the others (functional_spec.md §9.4).
 
 No ID or folder is saved before a brief is delivered, as launch_layout.md §3 requires; only `new`, which names no conversation, is saved earlier.
@@ -255,7 +255,7 @@ Each step is one commit, green in fake mode; real mode before review.
 - Leftovers are printed beside `pending_lines` under `if not was_live` (line 3418).
 - `_down`: `settle_launches` after `sessions_writable` (line 3610) and before the stop loop; the layout edit after the `after` view is read (line 3650), with the keeper IDs added on the branch that sets `up=False`.
 - `cmd_status` prints `no pane` unconditionally in its keeper lines (3701, 3704); make it depend on the doc.
-- `_brief_send` gets its `settle_launches` call after its outcome loop (line 3815). It does not hold `up.lock`, which is why `launch_entry` decides under the journal's lock (§5).
+- `_brief_send` gets its `settle_launches` call after its outcome loop (line 3815). Its lifecycle lock prevents stale settlement after a replacement. The journal lock separately protects writes from concurrent `say` (§5).
 
 Risks and gaps:
 - **Stale blocks Factory cannot see.** If the owner removes a member's terminal record by hand, or a `down` could not update the layout, a block with a dead terminal stays until a client removes it or the owner closes it. Factory does not guess which blocks are its own.

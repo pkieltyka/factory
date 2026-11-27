@@ -74,7 +74,7 @@ state  = <cache base>/factory-skill/<team>/<core.id[:8]>/   # mode 0700; cache b
 | (the state directory) | The team lock: `flock` on its no-follow descriptor for `log.jsonl`, `log.check`, `team.json` and `sessions.jsonl`; no lock file (message_log.md §Locking). It must be on a local filesystem; a failed lock names the path and the original error and suggests a local `XDG_CACHE_HOME` | — |
 | `log.jsonl` | Messages, commit records and outcomes | `say`, `up`, `brief`, `down`, keeper |
 | `log.check` | Checkpoint proving the log unchanged since the last validated append | every log writer |
-| `up.lock` | `flock` held by `up` and `down` for their whole run | — |
+| `up.lock` | `flock` held across `up`, `down` and `brief --send` | — |
 | `keeper.start` | `flock` serializing keeper starts | — |
 | `sessions.jsonl` | Saved native sessions, append-only, one entry per line, under the team lock | `say` (members), `up`, `down`, `brief --send` |
 | `keeper.lock` | `flock` held for the keeper's lifetime | keeper |

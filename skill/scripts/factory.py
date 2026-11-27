@@ -3571,8 +3571,7 @@ def mark_operator(cfg, hc, team, me, view, state):
 
 
 def lifecycle_lock(state):
-    """<state>/up.lock, held for a whole up or down (no other team lock is held meanwhile): its descriptor.
-    Exits 2 when another up or down holds it."""
+    """Hold <state>/up.lock across up, down or a manual brief, including launch fact settlement. Returns its fd."""
     try:
         directory = open_log(state).open_dir(create=True)
     except (OSError, Problem) as error:
@@ -3585,7 +3584,7 @@ def lifecycle_lock(state):
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         os.close(fd)
-        stop_with("another up or down is running for this team")
+        stop_with("another up, down or brief --send is running for this team")
     return fd
 
 
@@ -3692,6 +3691,13 @@ def _brief_lines(name, ident, outcome):
                 " status."], False
     return [f"@{name}: brief {ident} {o} ({outcome.get('why')}): check @{name}'s pane, then run"
             f" factory.py brief --send {name}"], False
+
+
+def _pending_brief_line(box, name):
+    for msg, _ in reversed(box.pending(name)):
+        if msg["kind"] == "brief":
+            return f"@{name}: first brief {msg['id']} is still {outcome_word(box.outcome(msg['id'], name))}"
+    return None
 
 
 def _remove_record(hc, record):
@@ -4111,7 +4117,8 @@ def cmd_status(args):
         briefed = box.briefed()
         for name, term in live_members.items():
             if term not in briefed and view.state(name) != "starting":
-                print(f"@{name} has no confirmed brief: run factory.py brief --send {name}")
+                pending = _pending_brief_line(box, name)
+                print(pending or f"@{name} has no confirmed brief: run factory.py brief --send {name}")
     reachable = view.operator is not None and view.operator.get("status") is not None
     print("operator: reachable" if reachable else "operator: not reachable: run factory.py up in the operator's pane")
     for word, hint in (("blocked", "blocked: waiting on an approval or a question."),
@@ -4159,14 +4166,27 @@ def _brief_send(args, names):
     hc = Hc()
     try:
         cfg, state, me = resolve_team(args, hc)
-        team = team_key(cfg.root)
-        view = team_view(hc, team)
     except HcDown as error:
         stop_with(f"hc is not reachable: {error}")
     except Problem as error:
         stop_with(f"{error.what}; {error.fix}")
+    if me is None or me["labels"].get("factory.kind") != "operator":
+        stop_with("run brief --send from the operator's pane")
+    lock = lifecycle_lock(state)
+    try:
+        return _brief_send_locked(cfg, state, hc, me, names)
+    finally:
+        os.close(lock)
+
+
+def _brief_send_locked(cfg, state, hc, me, names):
+    team = team_key(cfg.root)
+    try:
+        view = team_view(hc, team)
+    except (HcDown, HcError) as error:
+        stop_with(f"hc is not reachable: {error}")
     operator = cfg.operator["name"]
-    if view.operator is None or me is None or view.operator["address"] != me["address"]:
+    if view.operator is None or view.operator["address"] != me["address"]:
         stop_with("run brief --send from the operator's pane")
     every = names in ([], ["all"])
     names = [n for n in cfg.members if view.terminal(n) is not None] if every else selected_names(cfg, names)
@@ -4188,6 +4208,11 @@ def _brief_send(args, names):
         if record["address"] in briefed:
             closing = "No reply needed."
         else:                                        # its first brief: only once it is ready and past its dialogs
+            pending = _pending_brief_line(box, name)
+            if pending:
+                print(f"{pending}; run factory.py status")
+                code = 1
+                continue
             why = await_ready(hc, {name: (record, TABLE[m["harness"]].get("dialogs", []))}, timeout=5)[name]
             if why:
                 print(f"@{name} is not ready: {why}")

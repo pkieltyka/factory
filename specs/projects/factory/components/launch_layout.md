@@ -106,7 +106,7 @@ A fresh launch writes a `new` entry before its first brief. The label `factory.l
 
 `settle_launches` reads the live record for each member, or its newest finished record. It restores a missing `new` entry for a fresh terminal, then saves the ID or folder once the log confirms delivery of its first brief. A settled record's launch label is cleared. A corrupt label or a failed label clear is reported as a warning. `launch_entry` decides under the journal lock: it never replaces an `env` entry from the same terminal, repeats an identical entry, or appends `new` after another entry for that terminal.
 
-`up` settles late briefs before reading sessions for a restart, and checks again with a fresh view and log after waiting for briefs. `brief --send` checks after its wait. A failed save leaves the label in place. `up` skips restarting a member whose old fact could not be saved, exits 3 and names the member. `down` first checks that the journal can be appended to and synced. Then it settles launch facts before stopping members, leaving a member running or keeping its finished record when its entry cannot be saved, with exit 1.
+`up` settles late briefs before reading sessions for a restart, and checks again with a fresh view and log after waiting for briefs. `brief --send` holds the lifecycle lock through its wait and check, so `up` cannot replace a terminal between the snapshot and the journal write. A failed save leaves the label in place. `up` skips restarting a member whose old fact could not be saved, exits 3 and names the member. `down` first checks that the journal can be appended to and synced. Then it settles launch facts before stopping members, leaving a member running or keeping its finished record when its entry cannot be saved, with exit 1.
 
 A switch inside a harness after its last `say` is outside this recovery path.
 
@@ -180,7 +180,7 @@ After a successful edit, `up` labels added or swapped terminals with their actua
 
 1. `Config`; the selected plans.
 2. `hc` answers and is new enough; `HC_TERMINAL_ID` is set.
-3. The state directory: an existing team terminal's `factory.dir`, else the computed path; create it private if missing. Take `<state>/up.lock` with `LOCK_EX | LOCK_NB`; if held: exit 2, `another up or down is running for this team`. Names are reserved by this lock, not by labels.
+3. The state directory: an existing team terminal's `factory.dir`, else the computed path; create it private if missing. Take `<state>/up.lock` with `LOCK_EX | LOCK_NB`; if held: exit 2, `another up, down or brief --send is running for this team`. Names are reserved by this lock, not by labels.
 4. **Under the lock:** `me = hc.get(HC_TERMINAL_ID)`; `view = team_view`; `check_operator`. Both are read now, not before the lock, so a caller that waited behind another `up` sees the operator that `up` just marked and is refused instead of demoting it.
 5. To start: selected members whose state is `not started` or `gone`. Preflight `checked()` on those: exit 2.
 6. `mark_operator`; write `team.json` (`root`, `team`, `core`, `up: true`). Settle launch facts before reading saved sessions, including on a running team.
