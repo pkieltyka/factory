@@ -46,4 +46,4 @@ Run `factory.py check`. Resolve each failure without substituting unapproved mod
 
 - Members default to `full`, intended for a safe sandbox/VM. Claude uses bypass-permissions while retaining inherited sandbox settings; Codex disables approvals and its sandbox; pi/omp/OpenCode allow unattended commands. `guarded` uses Claude auto mode or Codex's workspace sandbox with automatic review; it changes nothing for the others.
 - Factory has no guarded mode for agy. Both permission levels use `--mode accept-edits` and the session-only `always-proceed` preset without a sandbox. In agy 1.5.12 a command matching an explicit Ask rule ran without approval, and a command matching Deny was blocked.
-- Full Claude members permit Unix sockets inside an inherited sandbox: all sockets on Linux, `HC_TERMINAL_SOCKET` on macOS (all sockets if absent). Guarded exempts standalone `factory.py say` for sending messages. Unknown startup questions and higher-level policy can still block.
+- Full Claude members permit Unix sockets inside an inherited sandbox. Guarded exempts standalone `factory.py say` for sending messages. Unknown startup questions and higher-level policy can still block.
