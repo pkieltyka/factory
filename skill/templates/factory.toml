@@ -19,7 +19,7 @@
 # ready_check_every = 300 # seconds between ready checks (60 or more)
 
 [operator]
-name = "operator"   # the operator agent's @name, pane title; fixed while the team runs
+name = "operator"   # the operator agent's @name and pane title; fixed while the team runs
 # Setup records this session’s harness, model and thinking in your local factory.toml.
 notes = "Owns architecture, assigns tasks and integrates reviewed work."
 

@@ -56,6 +56,8 @@ Approve `status`, `inbox` or `say` separately as needed. Run each command standa
 
 From the project directory, run `rodeo --session first-factory`. Start your signed-in harness in its pane and enter `/factory setup` using the spelling for your harness. Give the operator your goal, the available harnesses and the work you want ready. For a first team, use the built-in `TODO.md` tracker and the reviewer's own review. [Default team](README.md#the-team)
 
+To turn off prompt suggestions for your Claude Code operator, set `"promptSuggestionEnabled": false` in your own `.claude/settings.local.json` in this project.
+
 Commit the shared brief `FACTORY.md` and suggested formation `factory.toml.sample`. Setup adds your local `factory.toml` to `.gitignore`.
 
 ## Launch

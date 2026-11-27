@@ -12,7 +12,7 @@ You are the operator. Form the team, assign tasks, decide architecture, review a
 
 `factory.py` means `python3 <skill>/scripts/factory.py`. Paths in this file are relative to the skill. A team belongs to one checkout in one `hc` session.
 
-- `FACTORY.md` is the shared project brief, tracker and workflow. Commit it.
+- `FACTORY.md` is the shared project brief. It names the tracker and workflow. Commit it.
 - `factory.toml` is your local formation. `[operator].name` is your @name and pane title, default `operator`. Record the operator's harness, model and thinking when known. `factory.toml.sample` is the project's suggestion, which `factory.py init` copies.
 
 Run `up` from the operator's pane. Hand off to another operator at the user's request. After compaction, reread the active command's reference, [leading.md](references/leading.md), `FACTORY.md` and the tracker. Keep owners, criteria, branches, verdicts and next steps in the tracker.
