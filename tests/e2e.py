@@ -917,7 +917,15 @@ class GitHubEvidence:
                 done = forge_time(job.get("completed_at"))
                 if job["name"] != "tests" or job["conclusion"] != "success" or not done or not done < merged_at:
                     continue
-                log = repo.gh("run", "view", "--repo", QA_REPO, "--job", str(job["id"]), "--log", text=True)
+                try:
+                    log = repo.gh("run", "view", "--repo", QA_REPO, "--job", str(job["id"]), "--log", text=True)
+                except RuntimeError as error:
+                    if "pass --allow-escape-sequences" not in str(error):
+                        raise
+                    # The raw response is captured, never printed. The installed gh accepts this flag on api.
+                    log = repo.gh("api", "--allow-escape-sequences", f"repos/{QA_REPO}/actions/jobs/{job['id']}/logs",
+                                  text=True)
+                log = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", log)
                 count = max((int(n) for n in re.findall(r"\bRan ([0-9]+) tests? in ", log)), default=0)
                 if count:
                     self.checks[revision] = count

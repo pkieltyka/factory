@@ -7507,11 +7507,13 @@ class E2EGitHubEvidenceTests(unittest.TestCase):
     def test_check_requires_a_real_test_job_completed_before_merge(self):
         revision = "a" * 40
         merge = e2e.forge_time("2026-11-27T10:20:00Z")
-        for completion, log, expected in (
-                ("2026-11-27T10:10:00Z", "12:00:00 Ran 3 tests in 0.01s\n", 3),
-                ("2026-11-27T10:10:00Z", "12:00:00 Ran 0 tests in 0.01s\n", 0),
-                ("2026-11-27T10:30:00Z", "12:00:00 Ran 3 tests in 0.01s\n", 0)):
-            with self.subTest(completion=completion, log=log):
+        for completion, log_reads, expected in (
+                ("2026-11-27T10:10:00Z", ["12:00:00 Ran 3 tests in 0.01s\n"], 3),
+                ("2026-11-27T10:10:00Z", ["12:00:00 Ran 0 tests in 0.01s\n"], 0),
+                ("2026-11-27T10:30:00Z", [], 0),
+                ("2026-11-27T10:10:00Z", [RuntimeError("pass --allow-escape-sequences to output it anyway"),
+                                          "12:00:00 \x1b[32mRan \x1b[1m5\x1b[0m tests in 0.01s\n"], 5)):
+            with self.subTest(completion=completion, log_reads=log_reads):
                 api = f"repos/{e2e.QA_REPO}/actions"
                 responses = {
                     f"{api}/runs?head_sha={revision}&status=success": {"workflow_runs": [
@@ -7522,13 +7524,12 @@ class E2EGitHubEvidenceTests(unittest.TestCase):
                 forge = e2e.GitHubEvidence.__new__(e2e.GitHubEvidence)
                 forge.repo = types.SimpleNamespace(prefix="qa/fixture/", api=responses.__getitem__, gh=None)
                 forge.checks = {}
-                with patch.object(forge.repo, "gh", return_value=log) as read_logs:
+                with patch.object(forge.repo, "gh", side_effect=log_reads) as read_logs:
                     self.assertEqual(forge.checked(revision, merge), expected)
-                if completion < "2026-11-27T10:20:00Z":
-                    read_logs.assert_called_once_with("run", "view", "--repo", e2e.QA_REPO, "--job", "4", "--log",
-                                                      text=True)
-                else:
-                    read_logs.assert_not_called()
+                expected_reads = [call("run", "view", "--repo", e2e.QA_REPO, "--job", "4", "--log", text=True)]
+                if len(log_reads) == 2:
+                    expected_reads.append(call("api", "--allow-escape-sequences", f"{api}/jobs/4/logs", text=True))
+                self.assertEqual(read_logs.call_args_list, expected_reads if log_reads else [])
 
 
 class E2ELocalEvidenceTests(unittest.TestCase):
