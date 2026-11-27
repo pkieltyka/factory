@@ -2656,7 +2656,7 @@ def case_1(run, role, harness, adapter_class):
 
 
 def case_7(run, role, harness, adapter_class):
-    """suffix and multiline; the rest of case 7 is not built yet (phase_8.md §3.7)."""
+    """suffix, multiline, two-senders, pending-restart and upgrade; held-quiet is not built yet (§3.7)."""
     team, peer = _team_for(adapter_class, role, harness)
     with team:
         if not _up(team, run, 7, role, harness, ["suffix", "multiline"]):
@@ -2698,7 +2698,120 @@ def case_7(run, role, harness, adapter_class):
                 "a long multi-line message: the markers at its beginning, middle and end acted on in order",
                 proof={"bytes": len(text.encode()), "order": [marks.index(m) for m in order]},
                 reason=None if ok else "a marker was missing or out of order")
-        _not_built(run, 7, role, harness, ["two-senders", "pending-restart", "held-quiet", "upgrade"])
+    _case_7_two_senders(run, role, harness, adapter_class)
+    _case_7_pending_restart(run, role, harness, adapter_class)
+    _case_7_upgrade(run, role, harness, adapter_class)
+    _not_built(run, 7, role, harness, ["held-quiet"])
+
+
+def _case_7_two_senders(run, role, harness, adapter_class):
+    """two-senders (phase_8.md §3.7): two senders say to one recipient at the same moment; both IDs are acted on
+    exactly once, in the order the log committed them. A second member is the other sender."""
+    peer = _peer(role, harness)
+    operator, member = (harness, peer) if role == "operator" else (peer, harness)
+    if adapter_class is FixtureAdapter:
+        member = "codex"
+    team = QATeam(adapter_class, operator, {"lead-dev": member, "reviewer": member})
+    with team:
+        if not _up(team, run, 7, role, harness, ["two-senders"]):
+            return
+        recipient = "operator" if role == "operator" else "lead-dev"
+        senders = (["lead-dev", "reviewer"] if role == "operator" else ["operator", "reviewer"])
+        receipt, toks = team.receipt("two"), {s: token() for s in senders}
+        start, outs = threading.Barrier(len(senders)), {}
+
+        def send(sender):
+            body = _note(team, team.adapter.act_append(receipt, toks[sender]))
+            terminal = None if sender == "operator" else team.member(sender)
+            start.wait(timeout=30)
+            outs[sender] = team.call("say", recipient, "--file", str(body), terminal=terminal, timeout=120)
+        threads = [threading.Thread(target=send, args=(s,), daemon=True) for s in senders]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=180)
+        team.until(lambda: receipt.exists() and all(t in receipt.read_text() for t in toks.values()), 300)
+        time.sleep(10)                                   # time for a duplicate to show
+        lines = _lines(receipt)
+        ids = {s: (int(m.group(1)) if (m := _say_id(outs.get(s, (1, ""))[1])) else None) for s in senders}
+        log = factory_log(team)
+        outcomes = {s: _outcome(log, _say_id(outs.get(s, (1, ""))[1]), recipient) for s in senders}
+        counts = {s: lines.count(toks[s]) for s in senders}
+        acted = [s for t in lines for s in senders if t == toks[s]]
+        committed = sorted((i, s) for s, i in ids.items() if i is not None)
+        ok = (all(c == 1 for c in counts.values()) and None not in ids.values()
+              and acted == [s for _, s in committed] and all((o or ("",))[0] == "delivered" for o in outcomes.values()))
+        run.row(7, "two-senders", role, harness, "pass" if ok else "fail",
+                "two senders at once to one recipient: both acted on exactly once, in committed order",
+                proof={"senders": senders, "ids": ids, "outcomes": outcomes, "counts": counts, "acted_order": acted,
+                       "peer": peer}, reason=None if ok else "a message was missing, repeated or out of order")
+
+
+def _case_7_pending_restart(run, role, harness, adapter_class):
+    """pending-restart (phase_8.md §3.7): work queued on a blocked recipient survives a keeper restart; after the
+    owner answers through rodeo each stored ID is acted on once, and the member's blocked episode has one note."""
+    team, peer = _team_for(adapter_class, role, harness)
+    with team:
+        if role == "operator":
+            _operator_tab(team)
+        if not _up(team, run, 7, role, harness, ["pending-restart"]):
+            return
+        subject = _subject(team, role)
+        recipient = "operator" if role == "operator" else "lead-dev"
+        _ask(team, role, team.adapter.blocked_request())
+        if not team.until(lambda: team.state(subject) == "blocked", 300):
+            run.row(7, "pending-restart", role, harness, "not_run", "case 7 pending-restart",
+                    reason=f"the {recipient} never reported blocked (last {team.state(subject)})")
+            return
+        log = factory_log(team)
+
+        def say(tok):
+            body = _note(team, team.adapter.act_append(receipt, tok))
+            terminal = team.member("lead-dev") if role == "operator" else None
+            return _say_id(team.call("say", recipient, "--file", str(body), terminal=terminal, timeout=60)[1])
+
+        def notes():
+            return [m["id"] for m in log.read_box()[1].msgs.values() if m["kind"] == "note"
+                    and (m.get("meta") or {}).get("what", "").startswith("blocked")]
+        receipt, toks = team.receipt("restart"), [token(), token()]
+        first = say(toks[0])
+        team.until(lambda: _outcome(log, first, recipient) == ("queued", "blocked"), 30)
+        if role == "member":
+            team.until(lambda: notes(), 60)
+        notes_before = notes()
+        old = team.keeper()
+        team.qa.rpc("terminal.kill", {"terminal": old})
+        gone = team.until(lambda: team.get(old)["state"] == "finished", 30)
+        second = say(toks[1])                            # this say starts a new keeper
+        new = team.until(team.keeper, 60)
+        team.until(lambda: _outcome(log, second, recipient) == ("queued", "blocked"), 30)
+        time.sleep(10)
+        notes_after_restart = notes()
+        typed = receipt.exists()
+        view = _rodeo(team, ["operator", "team"] if role == "operator" else ["team", "@lead-dev"])
+        view.keys("ctrl+b")
+        time.sleep(0.2)
+        view.keys("1")
+        time.sleep(0.8)
+        if role == "operator":
+            view.focused_terminal = team.operator
+        else:
+            view.focus("@lead-dev")
+        view.keys("enter")                               # the owner answers
+        team.until(lambda: all(t in _lines(receipt) for t in toks), 300)
+        time.sleep(15)
+        counts = [_lines(receipt).count(t) for t in toks]
+        finals = [_outcome(log, ident, recipient) for ident in (first, second)]
+        one_note = role == "operator" or len(notes_after_restart) == 1 == len(notes_before)
+        ok = (bool(gone) and bool(new) and new != old and not typed and counts == [1, 1] and one_note
+              and all((f or ("",))[0] == "delivered" for f in finals))
+        run.row(7, "pending-restart", role, harness, "pass" if ok else "fail",
+                "work queued on a blocked recipient across a keeper restart: each stored ID acted on once after the"
+                " answer, and one note for the episode", proof={
+                    "keeper_replaced": bool(new) and new != old, "typed_while_blocked": typed, "counts": counts,
+                    "final_outcomes": finals, "notes": {"before": len(notes_before), "after": len(notes_after_restart)}
+                    if role == "member" else "not applicable: notes are about members", "peer": peer},
+                reason=None if ok else "see proof")
 
 
 def case_10(run, role, harness, adapter_class):
@@ -3323,10 +3436,63 @@ def case_4(run, role, harness, adapter_class):
             " owner's next line, each intact", observed=observed, proof=proof, reason=None if ok else "see proof")
 
 
+def _upgrade(team, peer):
+    """The other-version trial (phase_8.md §4) on a team that is up: with a send held by the owner's draft, a second
+    valid copy of the script is installed atomically at the same path. The old send finishes, the keeper restarts in
+    the same pane, and a message queued after that is delivered once by the new image without a wakeup.
+    -> (ok, proof)."""
+    keeper = team.keeper()
+    old = hashlib.sha1(team.script.read_bytes()).hexdigest()[:12]
+    view = _rodeo(team, ["operator", "team"])
+    view.keys("ctrl+b")
+    time.sleep(0.2)
+    view.keys("1")
+    time.sleep(0.8)
+    view.focused_terminal = team.operator
+    name = f"draft-{random.randrange(16 ** 6):06x}.txt"          # the owner's draft holds the first send
+    draft_receipt, literal = team.dir / name, f"owner draft {token()}"
+    view.type(team.adapter.draft_request(f"../{name}", literal))
+    time.sleep(1)
+    first, tok1 = team.receipt("first"), token()
+    _member_says(team, team.adapter.act_append(first, tok1))
+    log = factory_log(team)
+    held = team.until(lambda: next((ident for (ident, to), rec in log.read_box()[1].outcomes.items()
+                                    if rec["o"] == "sending" and to == "operator"), None), 120)
+    text = team.script.read_text()                               # a second valid copy, comment-only change
+    staged = team.script.with_name(".factory.py.new")
+    staged.write_text(text + f"\n# qualification other-version {token()}\n")
+    os.replace(staged, team.script)
+    new = hashlib.sha1(team.script.read_bytes()).hexdigest()[:12]
+
+    def keeper_screen():
+        return "".join(team.qa.rpc("terminal.read", {"terminal": keeper, "lines": 0}).get("text", "").split())
+    draining = team.until(lambda: f"keeper{new}installed" in keeper_screen(), 90)
+    still_held = not first.exists()
+    view.keys("enter")                                           # the owner sends the draft: the send finishes
+    finished = team.until(lambda: first.exists() and tok1 in first.read_text(), 300)
+    restarted = team.until(lambda: "keeperrestarting:newFactoryversion" in keeper_screen(), 120)
+    time.sleep(3)
+    second, tok2 = team.receipt("second"), token()
+    _member_says(team, team.adapter.act_append(second, tok2))
+    acted = team.until(lambda: second.exists() and tok2 in second.read_text(), 300)
+    time.sleep(10)
+    keepers = [r["address"] for r in team.qa.rpc("terminal.list", {"all": False})["terminals"]
+               if (r.get("labels") or {}).get("factory.kind") == "keeper"]
+    first_outcome = log.read_box()[1].outcome(held, "operator") if held else {}
+    proof = {"old_version": old, "new_version": new, "keeper_before": keeper, "keepers_after": keepers,
+             "held_send_id": held, "held_send_outcome": [first_outcome.get("o"), first_outcome.get("why")],
+             "draining_seen": bool(draining), "still_held_while_draining": still_held,
+             "old_send_finished": bool(finished), "restart_seen": bool(restarted),
+             "new_message_count": second.read_text().split().count(tok2) if second.exists() else 0,
+             "draft_exact": draft_receipt.exists() and draft_receipt.read_text() == literal + "\n", "peer": peer}
+    ok = (old != new and keepers == [keeper] and bool(held) and bool(draining) and still_held and bool(finished)
+          and first_outcome.get("o") == "delivered" and bool(restarted) and bool(acted)
+          and proof["new_message_count"] == 1)
+    return ok, proof
+
+
 def cross_other_version(run, fixture):
-    """other-version (phase_8.md §4): with the keeper alive and a send held by the owner's draft, a second valid
-    copy of the script is installed atomically at the same path. The old send finishes, the keeper restarts in the
-    same pane, and a message queued after that is delivered once by the new image without a wakeup."""
+    """other-version (phase_8.md §4), once for the system: on fake agents, since the case is Factory's."""
     adapter_class = FixtureAdapter if fixture else RealAdapter
     team, peer = _team_for(adapter_class, "operator", "codex" if fixture else "claude", draft_wait=60)
     with team:
@@ -3335,57 +3501,25 @@ def cross_other_version(run, fixture):
             run.row("cross", "other-version", "system", "system", "not_run", "the other-version cross case",
                     reason="the team did not come up")
             return
-        keeper = team.keeper()
-        old = hashlib.sha1(team.script.read_bytes()).hexdigest()[:12]
-        view = _rodeo(team, ["operator", "team"])
-        view.keys("ctrl+b")
-        time.sleep(0.2)
-        view.keys("1")
-        time.sleep(0.8)
-        view.focused_terminal = team.operator
-        name = f"draft-{random.randrange(16 ** 6):06x}.txt"          # the owner's draft holds the first send
-        draft_receipt, literal = team.dir / name, f"owner draft {token()}"
-        view.type(team.adapter.draft_request(f"../{name}", literal))
-        time.sleep(1)
-        first, tok1 = team.receipt("first"), token()
-        _member_says(team, team.adapter.act_append(first, tok1))
-        log = factory_log(team)
-        held = team.until(lambda: next((ident for (ident, to), rec in log.read_box()[1].outcomes.items()
-                                        if rec["o"] == "sending" and to == "operator"), None), 120)
-        text = team.script.read_text()                               # a second valid copy, comment-only change
-        staged = team.script.with_name(".factory.py.new")
-        staged.write_text(text + f"\n# qualification other-version {token()}\n")
-        os.replace(staged, team.script)
-        new = hashlib.sha1(team.script.read_bytes()).hexdigest()[:12]
-        def keeper_screen():
-            return "".join(team.qa.rpc("terminal.read", {"terminal": keeper, "lines": 0}).get("text", "").split())
-        draining = team.until(lambda: f"keeper{new}installed" in keeper_screen(), 90)
-        still_held = not first.exists()
-        view.keys("enter")                                           # the owner sends the draft: the send finishes
-        finished = team.until(lambda: first.exists() and tok1 in first.read_text(), 300)
-        restarted = team.until(lambda: "keeperrestarting:newFactoryversion" in keeper_screen(), 120)
-        time.sleep(3)
-        second, tok2 = team.receipt("second"), token()
-        _member_says(team, team.adapter.act_append(second, tok2))
-        acted = team.until(lambda: second.exists() and tok2 in second.read_text(), 300)
-        time.sleep(10)
-        keepers = [r["address"] for r in team.qa.rpc("terminal.list", {"all": False})["terminals"]
-                   if (r.get("labels") or {}).get("factory.kind") == "keeper"]
-        first_outcome = log.read_box()[1].outcome(held, "operator") if held else {}
-        proof = {"old_version": old, "new_version": new, "keeper_before": keeper, "keepers_after": keepers,
-                 "held_send_id": held, "held_send_outcome": [first_outcome.get("o"), first_outcome.get("why")],
-                 "draining_seen": bool(draining), "still_held_while_draining": still_held,
-                 "old_send_finished": bool(finished), "restart_seen": bool(restarted),
-                 "new_message_count": second.read_text().split().count(tok2) if second.exists() else 0,
-                 "draft_exact": draft_receipt.exists() and draft_receipt.read_text() == literal + "\n",
-                 "agents": "fake agents (the case is Factory's, not a harness's)" if fixture else "real", "peer": peer}
-        ok = (old != new and keepers == [keeper] and bool(held) and bool(draining) and still_held and bool(finished)
-              and first_outcome.get("o") == "delivered" and bool(restarted) and bool(acted)
-              and proof["new_message_count"] == 1)
+        ok, proof = _upgrade(team, peer)
+        proof["agents"] = "fake agents (the case is Factory's, not a harness's)" if fixture else "real"
         run.row("cross", "other-version", "system", "system", "pass" if ok else "fail",
                 "a new script under a live keeper: the held send finishes, the keeper restarts in its pane, the next"
                 " message is delivered once by the new image", proof=proof, reason=None if ok else "see proof")
 
+
+def _case_7_upgrade(run, role, harness, adapter_class):
+    """upgrade (phase_8.md §3.7): the other-version mechanism with this profile as operator or member."""
+    team, peer = _team_for(adapter_class, role, harness, draft_wait=60)
+    with team:
+        _operator_tab(team)
+        if not _up(team, run, 7, role, harness, ["upgrade"]):
+            return
+        ok, proof = _upgrade(team, peer)
+        run.row(7, "upgrade", role, harness, "pass" if ok else "fail",
+                "a new Factory version under a live keeper while this profile works: the held send finishes, the"
+                " keeper restarts in its pane, and the next message is delivered once by the new image",
+                proof=proof, reason=None if ok else "see proof")
 
 CROSS_FUNCTIONS = {"other-version": cross_other_version}
 
