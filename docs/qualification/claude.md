@@ -4,7 +4,7 @@
 
 - **Tested:** Claude Code 2.1.332, model claude-fable-5-2, on hc 0.1.20 and rodeo 0.2.1, Linux, 2026-11-27. The partner in each team is Codex.
 - **Configured mode:** the full preset (`--permission-mode bypassPermissions`). Case 9 uses the guarded preset (`--permission-mode auto`).
-- **Session strategy:** `session_env = CLAUDE_CODE_SESSION_ID`, `session_follow = false`. LC-3 passed on its rerun (assigned ID stored and resumed). LC-12 shows the child's ID equals the parent's.
+- **Session strategy:** `session_env = CLAUDE_CODE_SESSION_ID`, `session_follow = true` (@operator's decision, spec §9.4). LC-3 passed on its rerun (assigned ID stored and resumed). LC-12 at db85120 shows a sub-agent's ID equals the parent's, so Factory follows a /clear from the member's next say. Case 6 needs a rerun on this build.
 - **Mid-turn (case 4), per run:**
   - As operator: queued for the next turn (670dd76).
   - As member: queued for the next turn at 670dd76; steered the current turn at 4954e2f.

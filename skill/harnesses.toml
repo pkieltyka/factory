@@ -28,7 +28,7 @@ thinking = ["low", "medium", "high", "xhigh", "max"]
 never = ["max"]
 prompt = "file"
 session_env = "CLAUDE_CODE_SESSION_ID"
-session_follow = false   # LC-3 (an assigned --session-id) and LC-12 not shown yet
+session_follow = true    # LC-3 and LC-12 (db85120): a sub-agent's say carries the parent's ID, so follow a switch
 
 # Both questions start on "No, exit". The bypass warning is normally skipped by a setting `up` passes.
 dialogs = [["Yes, I trust this folder", ["down", "enter"]], ["Yes, I accept", ["down", "enter"]]]

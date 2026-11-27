@@ -100,12 +100,15 @@ Verified facts about `hc` and `rodeo`, collected on isolated private cores (neve
   - A UUID4 session ID is rejected (`finished (code 1): at ["sessionID"]`).
   - A `ses_`-prefixed ID starts, is stored and reopens with recall.
   - `OPENCODE_SESSION_ID` equals the ID. After `/new` it no longer does, so `session_follow` stays false.
-- **LC-6, pi 1.6.1 and omp 19.2.1: fail.** For both harnesses, neither of the two member directories stored anything (`stored=false` on the first and the second fresh launch), and `continue` held nothing. pi's `PI_SESSION_ID` was not set.
+- **LC-6, pi 1.6.1 and omp 19.2.1: pass** at db85120 on the real HOME (@lead-dev, lc6-db85120-pinned.json). The models were pinned to the ones the qualification uses: pi openrouter/openai/gpt-6-astra, omp openai-codex/gpt-6-astra.
+  - Both harnesses stored the conversation in each member directory, a second fresh launch recalled nothing, and `--continue` reopened that directory's own newest conversation (t2 for a, t3 for b). pi's `PI_SESSION_ID` was set.
+  - pi's default provider refused the connection (ECONNREFUSED after three attempts), so that run was stopped and left no verdict.
+  - Superseded: the earlier fail, where nothing was stored in either directory, consistent with omp's default model having no openrouter key. Factory does not yet use `--session-dir` with `--continue` (launch_layout.md §4 names it for pi and omp). omp still starts fresh, and pi resumes by `PI_SESSION_ID`.
   - Consequence: neither directory/continue route can be enabled. pi's case 6 resume fails at 670dd76, consistent with this (see pi.md).
 - **LC-7, agy 1.5.18: not counted.** The baseline showed the trust dialog, and the session-only `--settings` suppressed it. But the run used the owner's real settings roots, and agy wrote under `~/.gemini/antigravity-cli/` during it.
   - phase_8.md §4 requires mutable trust state to be isolated before launch, so this LC-7 run does not count. It is to be rerun under an isolated HOME overlay.
 - **LC-12, Claude Code, Codex and agy: pass** at db85120 on the real HOME (@lead-dev, lc12-db85120.json). Each harness started to idle, and its parent and an actual child each ran with the parent's ID present.
-  - Claude Code: the child's ID equals the parent's. That is the positive evidence `session_follow` needs. Turning it on changes what a resume opens after a switch, so it is left false here for @operator to decide (with a member-switch rerun on that build).
+  - Claude Code: the child's ID equals the parent's. That is the positive evidence `session_follow` needs, and @operator turned it on for Claude Code (spec §9.4). Case 6 is rerun on that build.
   - Codex and agy: the child's ID differs, so `session_follow = false` stays.
   - The stat-only check found no changed agy settings or trust file. The earlier partial run (agy's child and parent never ran, at 325223a) is superseded.
 
