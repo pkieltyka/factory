@@ -3053,11 +3053,17 @@ def _say_id(out):
 
 
 def case_8(run, role, harness, adapter_class):
-    """dead-member, operator-gone and same-pane; unconfirmed-brief and quit-during-hold are not built yet
-    (phase_8.md §3.8)."""
+    """dead-member, operator-gone and same-pane in one team, unconfirmed-brief in its own; quit-during-hold is not
+    built yet (phase_8.md §3.8)."""
+    _case_8_main(run, role, harness, adapter_class)
+    if role == "member":
+        _case_8_unconfirmed_brief(run, role, harness, adapter_class)
+
+
+def _case_8_main(run, role, harness, adapter_class):
     team, peer = _team_for(adapter_class, role, harness, operator_shell=role == "operator")
     with team:
-        names = [n for n, _ in subcases(8, role)]
+        names = [n for n, _ in subcases(8, role) if n != "unconfirmed-brief"]
         if not _up(team, run, 8, role, harness, names):
             return
         log = factory_log(team)
@@ -3069,7 +3075,7 @@ def case_8(run, role, harness, adapter_class):
             if not ended:
                 run.row(8, "dead-member", role, harness, "not_run", "case 8 dead-member",
                         reason=f"the member's terminal is {team.get(member)['state']} after terminal.kill")
-                _not_built(run, 8, role, harness, ["unconfirmed-brief", "quit-during-hold"])
+                _not_built(run, 8, role, harness, ["quit-during-hold"])
                 return
             receipt, tok = team.receipt("dead"), token()
             code, out = team.call("say", "lead-dev", team.adapter.act_append(receipt, tok), timeout=60)
@@ -3088,7 +3094,7 @@ def case_8(run, role, harness, adapter_class):
             run.row(8, "dead-member", role, harness, "pass" if ok else "fail",
                     "a member whose harness ended gets nothing typed; up brings a new terminal that gets the message",
                     proof=proof, reason=None if ok else "see proof")
-            _not_built(run, 8, role, harness, ["unconfirmed-brief", "quit-during-hold"])
+            _not_built(run, 8, role, harness, ["quit-during-hold"])
             return
         operator = team.operator
         # operator-gone: the harness stops reporting in an open pane; messages queue until up.
@@ -3131,6 +3137,76 @@ def case_8(run, role, harness, adapter_class):
                 proof={"same_terminal": same, "say": out.strip().splitlines()[-1:], "acted": bool(acted2)},
                 reason=None if ok2 else "see proof")
         _not_built(run, 8, role, harness, ["quit-during-hold"])
+
+
+def _case_8_unconfirmed_brief(run, role, harness, adapter_class):
+    """unconfirmed-brief (phase_8.md §3.8): the keeper is killed (SIGKILL) with a replacement terminal's first brief
+    claimed and not yet receipted. On recovery the brief is unconfirmed, an ordinary message is held not ready, and
+    it is delivered once only after a new brief --send is delivered. No log row is written by the driver."""
+    team, peer = _team_for(adapter_class, role, harness)
+    with team:
+        if not _up(team, run, 8, role, harness, ["unconfirmed-brief"]):
+            return
+        log = factory_log(team)
+        module = sys.modules["factory_under_test"]
+        old = team.member("lead-dev")
+        team.qa.rpc("terminal.kill", {"terminal": old})
+        team.until(lambda: team.get(old)["state"] == "finished", 60)
+        hit = {}
+
+        def interrupt():                                  # watch for the new terminal's brief claim, then kill
+            deadline = time.monotonic() + 240
+            while time.monotonic() < deadline and "id" not in hit:
+                records, box = log.read_box()
+                for (ident, to), rec in box.outcomes.items():
+                    msg = box.msgs.get(ident) or {}
+                    if (to == "lead-dev" and msg.get("kind") == "brief" and rec["o"] == "sending"
+                            and rec.get("term") not in (None, old)):
+                        beat = module.read_beat(log.state)
+                        if beat and team.get(beat[2]).get("pid") == beat[0]:
+                            os.kill(beat[0], signal.SIGKILL)
+                            hit.update(id=ident, term=rec["term"], keeper=beat[2])
+                        break
+                time.sleep(0.05)
+        watcher = threading.Thread(target=interrupt, daemon=True)
+        watcher.start()
+        relaunch = threading.Thread(target=lambda: hit.update(up=team.call("up", "lead-dev", timeout=240)[0]),
+                                    daemon=True)
+        relaunch.start()
+        watcher.join(timeout=250)
+        if "id" not in hit:
+            run.row(8, "unconfirmed-brief", role, harness, "not_run", "case 8 unconfirmed-brief",
+                    reason="the new terminal's brief was never seen claimed, so the keeper was not interrupted")
+            return
+        team.until(lambda: team.get(hit["keeper"])["state"] == "finished", 30)
+        relaunch.join(timeout=250)
+        receipt, tok = team.receipt("after-brief"), token()
+        code, out = team.call("say", "lead-dev", team.adapter.act_append(receipt, tok), timeout=60)   # a keeper again
+        ordinary = _say_id(out)
+        team.until(lambda: _outcome(log, ordinary, "lead-dev") == ("queued", "not ready"), 60)
+        brief = log.read_box()[1].outcome(hit["id"], "lead-dev")
+        held = _outcome(log, ordinary, "lead-dev")
+        time.sleep(10)
+        early = tok in _lines(receipt)
+        send_code, _ = team.call("brief", "--send", "lead-dev", timeout=240)
+        team.until(lambda: tok in _lines(receipt), 300)
+        time.sleep(10)
+        count = _lines(receipt).count(tok)
+        box = log.read_box()[1]
+        briefs = sorted(i for i, m in box.msgs.items() if m.get("kind") == "brief" and "lead-dev" in m["to"])
+        new_brief = next((i for i in briefs if i > hit["id"]), None)
+        order = [(r["id"], r["o"]) for r in log.read_box()[0] if r["t"] == "out" and r["to"] == "lead-dev"
+                 and r["o"] == "delivered" and r["id"] in (new_brief, int(ordinary.group(1)) if ordinary else None)]
+        delivered_after_brief = [i for i, _ in order] == [new_brief, int(ordinary.group(1))] if ordinary else False
+        ok = (brief.get("o") == "unconfirmed" and held == ("queued", "not ready") and not early and send_code == 0
+              and count == 1 and delivered_after_brief)
+        run.row(8, "unconfirmed-brief", role, harness, "pass" if ok else "fail",
+                "an interrupted first brief is unconfirmed; an ordinary message waits not ready and is delivered once,"
+                " after a new brief --send", proof={
+                    "brief_id": hit["id"], "brief_outcome": [brief.get("o"), brief.get("why")], "held": held,
+                    "acted_before_new_brief": early, "brief_send_exit": send_code, "new_brief_id": new_brief,
+                    "delivery_order": order, "action_count": count, "peer": peer},
+                reason=None if ok else "see proof")
 
 
 def _operator_tab(team):
