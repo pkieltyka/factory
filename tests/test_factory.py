@@ -32,8 +32,9 @@ from urllib.parse import unquote, urlsplit
 from unittest.mock import call, patch
 
 if __package__:
-    from . import fake_hc, live
+    from . import e2e, fake_hc, live
 else:
+    import e2e
     import fake_hc
     import live
 
@@ -7206,6 +7207,28 @@ class ListingTests(unittest.TestCase):
                "│ z-ai/glm-5.3       │      1M │\n│ z-ai/glm-5.3-flash │      1M │\n└─────┴─────┘\n"
                "ollama (1)\n┌─────┬─────┐\n│ model    │ context │\n├─────┼─────┤\n│ qwen3:8b │    128K │\n└─────┴─────┘\n")
         self.assertEqual(factory.listed_models(omp), ["openrouter/z-ai/glm-5.3", "openrouter/z-ai/glm-5.3-flash", "ollama/qwen3:8b"])
+
+
+class E2EFixtureTests(unittest.TestCase):
+    def test_local_tracker_fixture(self):
+        command = e2e.ready_command(factory.SKILL)
+        for empty, count in ((False, 3), (True, 0)):
+            with self.subTest(empty=empty), tempfile.TemporaryDirectory() as directory:
+                fixture = e2e.make_local(pathlib.Path(directory), factory.SKILL, empty=empty)
+                self.assertEqual(e2e.git(fixture.origin, "rev-parse", "main").stdout.strip(), fixture.initial)
+                self.assertGreater(e2e.test_run(fixture.root, ci=True), 0)
+                self.assertFalse(any(e2e.accepts(fixture.root, item) for item in range(1, 4)))
+                ready = subprocess.run(["sh", "-c", command], cwd=fixture.root, capture_output=True, text=True)
+                self.assertEqual(ready.returncode, 0 if count else 1)
+                self.assertEqual(len(ready.stdout.splitlines()), count)
+
+    def test_empty_successful_suite_does_not_count(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            e2e.write_project(root)
+            (root / "tests/test_calc.py").unlink()
+            self.assertEqual(e2e.test_run(root), 0)
+            self.assertEqual(e2e.test_run(root, ci=True), 0)
 
 
 class SkillTextTests(unittest.TestCase):

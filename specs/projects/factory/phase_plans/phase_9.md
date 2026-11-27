@@ -185,7 +185,6 @@ Risks and gaps:
 - **GitHub latency and rate limits** can exceed the budget without any fault of Factory's; such a run is `not_run` for the rows it could not reach, and repeated.
 - **Cost and time**: three real runs of up to two hours, plus reruns.
 
-| Question | Owner |
-|---|---|
-| May the driver create a user-level project named `factory-qa-<run_id>` for each GitHub run and leave it, with the issues, pull requests and branches, listed in the manifest for the owner? Nothing is deleted by this phase. | @operator |
-| Members at `full` permissions in the throwaway repository, as the product's default: accepted for these runs? | @operator |
+Decided by @operator on 27 November 2026; no question is open:
+- Each GitHub run may create a user-level project board named `factory-qa-<run_id>`; it is left in place and listed in the run's manifest. The owner authorized the board and the mock tickets.
+- Members run at the product's default `full` permissions, only in the throwaway repository and in the private `factory-test` repository, under the same owner-state rules as #173.
