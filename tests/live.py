@@ -3091,21 +3091,30 @@ def case_2(run, role, harness, adapter_class):
 
 
 def judge_handoff(f):
-    """operator-handoff (phase_10.md §2), from the observed facts: the operator committed the assignment to the
-    member, which acted once; the operator was seen working on it and then ready at a higher turn; and a quiet
-    note committed after the owner's request was delivered to that same operator terminal after its turn ended.
-    -> (status, reason). Polling (never ready again) and an earlier quiet note fail."""
+    """operator-handoff (phase_10.md §2), from the observed facts: the operator committed the assignment and it was
+    delivered to the briefed member's terminal, which acted once and sent nothing back; the operator was seen
+    working and then ready at a higher turn in a sample taken before the note was first seen delivered; and a quiet
+    note committed after the assignment was delivered to that same operator terminal, into a turn at or after the
+    end. -> (status, reason). Polling, an earlier note, a member reply, another terminal fail (@lead-dev)."""
     if not f.get("assignment_id"):
         return "fail", "the operator did not assign the member within the window"
+    delivery = f.get("assignment_delivery") or {}
+    if delivery.get("o") != "delivered" or delivery.get("term") != f.get("member"):
+        return "fail", "the assignment was not delivered to the briefed member's terminal"
     if f.get("action_count") != 1:
         return "fail", f"the member acted {f.get('action_count')} times, not once"
+    if f.get("member_replies"):
+        return "fail", "a member reply reached the operator before the quiet note: the note did not wake it"
     if not f.get("worked") or not f.get("ended_turn"):
         return "fail", "the operator kept working after the assignment (polling or waiting instead of ending its turn)"
     note = f.get("quiet_note") or {}
     if not note or not note.get("new"):
-        return "fail", "no quiet note committed after the owner's request"
+        return "fail", "no quiet note committed after the assignment"
     if note.get("term") != f.get("operator") or note.get("o") != "delivered" or not note.get("after_turn_end"):
         return "fail", "the quiet note was not delivered to the operator's terminal after its turn ended"
+    if not isinstance(note.get("turn"), int) or not isinstance(f.get("turn_at_end"), int) \
+            or note["turn"] < f["turn_at_end"]:
+        return "fail", "the quiet note's receipt is from before the operator's turn ended"
     return "pass", None
 
 
@@ -3122,7 +3131,6 @@ def _operator_handoff(run, harness, adapter_class):
                     reason="the team was not quiet before the owner's request")
             return
         log = factory_log(team)
-        before = max((rec["id"] for rec in log.read_box()[0] if rec["t"] == "msg"), default=0)
         receipt, tok = team.receipt("handoff"), token()
         prompt = team.adapter.handoff_request(team, receipt, tok)
         view = _rodeo(team, ["operator"])
@@ -3132,13 +3140,14 @@ def _operator_handoff(run, harness, adapter_class):
         time.sleep(0.8)
         view.focused_terminal = team.operator
         turn_at_request = team.get(team.operator)["turn"]
+        before = max((rec["id"] for rec in log.read_box()[0] if rec["t"] == "msg"), default=0)
         view.paste(prompt)                       # the last human input
         start = time.monotonic()
-        facts = {"operator": team.operator, "turn_at_request": turn_at_request, "worked": False,
-                 "ended_turn": False, "peer": peer}
-        ended_at = None
+        facts = {"operator": team.operator, "member": team.member("lead-dev"), "turn_at_request": turn_at_request,
+                 "worked": False, "ended_turn": False, "peer": peer}
         deadline = start + 600                   # up to five minutes after the assignment (below)
         while time.monotonic() < deadline:
+            ended_before = facts["ended_turn"]   # a turn end seen in an earlier sample than this snapshot
             records, box = log.read_box()
             if not facts.get("assignment_id"):
                 facts["assignment_id"] = next((r["id"] for r in records if r["t"] == "msg" and r["id"] > before
@@ -3146,27 +3155,29 @@ def _operator_handoff(run, harness, adapter_class):
                                                and tok in (r.get("text") or "") and r["id"] in box.msgs), None)
                 if facts["assignment_id"]:
                     deadline = min(deadline, time.monotonic() + 300)
-            state, turn = team.state(team.operator), team.get(team.operator)["turn"]
+            sample = team.get(team.operator)     # one record per sample: its state and turn together
+            state, turn = (sample.get("status") or {}).get("state"), sample.get("turn")
             if state == "working":
                 facts["worked"] = True
             if facts["assignment_id"] and facts["worked"] and state in READY and turn > turn_at_request \
-                    and ended_at is None:
-                ended_at, facts["ended_turn"], facts["turn_at_end"] = time.monotonic(), True, turn
-            # only a quiet note committed after the assignment counts, delivered once the operator's turn had ended
+                    and not facts["ended_turn"]:
+                facts["ended_turn"], facts["turn_at_end"] = True, turn
             after = facts.get("assignment_id") or 10 ** 9
             note = next((r for r in records if r["t"] == "msg" and r["id"] > after and r.get("kind") == "note"
                          and (r.get("meta") or {}).get("what") == "quiet" and r.get("to") == ["operator"]), None)
             if note and box.outcome(note["id"], "operator")["o"] == "delivered" and _lines(receipt).count(tok):
                 outcome = box.outcome(note["id"], "operator")
-                facts["quiet_note"] = {"id": note["id"], "new": True, "o": "delivered",
-                                       "term": outcome.get("term"), "after_turn_end": ended_at is not None}
+                facts["quiet_note"] = {"id": note["id"], "new": True, "o": "delivered", "term": outcome.get("term"),
+                                       "turn": outcome.get("turn"), "after_turn_end": ended_before}
+                facts["member_replies"] = [r["id"] for r in records if r["t"] == "msg" and after < r["id"] < note["id"]
+                                           and r.get("from") == "lead-dev" and "operator" in (r.get("to") or [])]
                 break
             time.sleep(0.5)
+        box = log.read_box()[1]
+        if facts.get("assignment_id"):
+            outcome = box.outcome(facts["assignment_id"], "lead-dev")
+            facts["assignment_delivery"] = {"o": outcome.get("o"), "term": outcome.get("term")}
         facts["action_count"] = _lines(receipt).count(tok)
-        facts["earlier_quiet_notes"] = [r["id"] for r in log.read_box()[0]
-                                        if r["t"] == "msg" and r.get("kind") == "note"
-                                        and (r.get("meta") or {}).get("what") == "quiet"
-                                        and r["id"] < (facts.get("assignment_id") or 10 ** 9)]
         status, reason = judge_handoff(facts)
         run.row(2, "operator-handoff", "operator", harness, status,
                 "after assigning work that ends without a report, the operator ends its turn and Factory's quiet note"
@@ -3294,8 +3305,9 @@ def case_1(run, role, harness, adapter_class):
 
         def dialog_row(acted):
             suppressed = False
-            if role == "member" and ready and team.member("lead-dev"):
-                record = team.get(team.member("lead-dev"))       # the effective argv and the folder it runs in
+            terminal = team.member("lead-dev") if role == "member" else team.operator   # the subject (phase_10.md)
+            if ready and terminal:
+                record = team.get(terminal)                       # the effective argv and the folder it runs in
                 argv = record.get("argv") or []
                 at = argv.index("--settings") if "--settings" in argv else None
                 try:
@@ -3320,11 +3332,14 @@ def case_1(run, role, harness, adapter_class):
         subject = _subject(team, role)
         receipt = team.receipt("states")
         before = team.get(subject)
-        states = [(before.get("status") or {}).get("state")]
+        states, app = [(before.get("status") or {}).get("state")], None
         _ask(team, role, team.adapter.act_run(receipt, "sleep 4"))
         deadline = time.monotonic() + 300
         while time.monotonic() < deadline and not (receipt.exists() and "exit" in receipt.read_text()):
-            state = team.state(subject)
+            record = team.get(subject)
+            state = (record.get("status") or {}).get("state")
+            if state == "working" and app is None:       # the live root status.app while it works
+                app = (record.get("status") or {}).get("app") or ""
             if state != states[-1]:
                 states.append(state)
             time.sleep(0.25)
@@ -3333,12 +3348,17 @@ def case_1(run, role, harness, adapter_class):
         after = team.get(subject)
         proof = {"states": states, "turn": [before.get("turn"), after.get("turn")],
                  "action": receipt.read_text().strip() if receipt.exists() else None,
-                 "ready_after_up": getattr(team, "ready_states", None)}
+                 "ready_after_up": getattr(team, "ready_states", None), "subject": subject, "working_app": app}
         ok = (states[0] in READY and "working" in states and states[-1] in READY
               and after.get("turn", 0) > before.get("turn", 0) and proof["action"] == "exit 0")
-        run.row(1, "states", role, harness, "pass" if ok else "fail",
+        # a new operator's live app must be its own table key: Factory's between-turns rule selects by it, and the
+        # formation's fallback cannot show which harness hc observed (phase_10.md §2)
+        app_required = team.real and role == "operator" and harness in ("pi", "omp", "opencode", "agy")
+        app_ok = not app_required or app == harness
+        run.row(1, "states", role, harness, "pass" if ok and app_ok else "fail",
                 "idle, working through a real tool action, idle again with the turn advanced", proof=proof,
-                reason=None if ok else "the states or the action were not as expected")
+                reason=None if ok and app_ok else "the states or the action were not as expected" if not ok
+                else f"the working operator reported app {app!r}, not its table key {harness!r}")
         dialog_row(proof["action"] == "exit 0")
 
 

@@ -7563,14 +7563,19 @@ class QualifyFrameworkTests(unittest.TestCase):
         from before it, one to another terminal or before the turn ended."""
         import live
         good = {"assignment_id": 3, "action_count": 1, "worked": True, "ended_turn": True, "operator": "t1",
-                "quiet_note": {"id": 4, "new": True, "o": "delivered", "term": "t1", "after_turn_end": True}}
+                "member": "t3", "assignment_delivery": {"o": "delivered", "term": "t3"}, "member_replies": [],
+                "turn_at_end": 2,
+                "quiet_note": {"id": 4, "new": True, "o": "delivered", "term": "t1", "turn": 2, "after_turn_end": True}}
         self.assertEqual(live.judge_handoff(good), ("pass", None))
         note = good["quiet_note"]
         for broken, why in (({"ended_turn": False}, "kept working"), ({"quiet_note": None}, "no quiet note"),
                             ({"quiet_note": {**note, "new": False}}, "no quiet note"),
                             ({"quiet_note": {**note, "term": "t9"}}, "not delivered"),
                             ({"quiet_note": {**note, "after_turn_end": False}}, "not delivered"),
-                            ({"action_count": 2}, "2 times"), ({"assignment_id": None}, "did not assign")):
+                            ({"action_count": 2}, "2 times"), ({"assignment_id": None}, "did not assign"),
+                            ({"member_replies": [4]}, "member reply"),
+                            ({"assignment_delivery": {"o": "delivered", "term": "t9"}}, "briefed member"),
+                            ({"quiet_note": {**note, "turn": 1}}, "before the operator's turn ended")):
             status, reason = live.judge_handoff({**good, **broken})
             self.assertEqual(status, "fail", broken)
             self.assertIn(why, reason)
