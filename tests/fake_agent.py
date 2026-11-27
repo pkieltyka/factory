@@ -11,7 +11,7 @@ import sys
 import time
 import tty
 
-SCRIPTS = ("reports", "forgets", "works_forever", "blocks", "crashes", "silent", "dialog")
+SCRIPTS = ("reports", "forgets", "works_forever", "blocks", "blocks_once", "crashes", "silent", "dialog")
 START, END = b"\x1b[200~", b"\x1b[201~"
 CONTROL = re.compile(rb"[\x1b\r\n]")
 
@@ -109,6 +109,8 @@ def main():
         if waiting:
             if not text:
                 waiting = False
+                if script == "blocks_once":   # answered: back to ordinary turns
+                    script = "reports"
                 report("idle")
             continue
         for line in text.splitlines():
@@ -123,7 +125,7 @@ def main():
         report("working")
         if script == "crashes":
             return 1
-        if script == "blocks":
+        if script in ("blocks", "blocks_once"):
             report("blocked", "permission")
             waiting = True
             continue

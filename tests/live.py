@@ -1868,6 +1868,9 @@ class FixtureAdapter:
     def act_run(self, path, command):
         return f"ACT run {path} {command}"
 
+    def blocked_request(self):
+        return "FAKE: blocks_once"
+
 
 class RealAdapter(FixtureAdapter):
     """Real harnesses with the owner's own login, started normally (@lead-dev-3's runs; phase_8.md §2)."""
@@ -1896,6 +1899,10 @@ class RealAdapter(FixtureAdapter):
     def act_run(self, path, command):
         return (f"Using your shell tool, run exactly this command: {command}; echo \"exit $?\" >> {path}"
                 " Then reply with the single word done.")
+
+    def blocked_request(self):
+        return ("Before doing anything else, ask me one multiple-choice question with your question tool, and"
+                " wait for my answer. Do nothing else.")
 
 
 class QATeam:
@@ -1976,6 +1983,9 @@ class QATeam:
         return self.dir / f"receipt-{name}-{random.randrange(16 ** 6):06x}.txt"
 
     def close(self):
+        if getattr(self, "view", None) is not None:
+            self.view.close()
+            self.drv.stop()
         self.qa.stop()
         shutil.rmtree(self.dir, ignore_errors=True)
 
@@ -2344,7 +2354,78 @@ def _note(team, text):
     return path
 
 
-CASE_FUNCTIONS = {1: case_1, 2: case_2, 7: case_7, 9: case_9, 10: case_10}
+def _rodeo(team, titles):
+    """rodeo on a driver core, viewing the QA core's team tab once its titles render; closed with the team."""
+    if getattr(team, "view", None) is None:
+        team.drv = Core("qualifydrv")
+        team.view = Rodeo(team.qa, team.drv)
+        team.view.focused_terminal = None
+        if team.view.wait_for(titles, timeout=30) is None:
+            raise NotRun(f"rodeo did not show {titles}")
+        time.sleep(1)
+    return team.view
+
+
+def case_5(run, role, harness, adapter_class):
+    """blocked (phase_8.md §3.5): nothing typed while blocked, one note, the queued message delivered once after
+    the owner answers through rodeo, with no Factory command between."""
+    team, peer = _team_for(adapter_class, role, harness)
+    with team:
+        if not _up(team, run, 5, role, harness, ["blocked"]):
+            return
+        member = team.member("lead-dev")
+        team.call("say", "lead-dev", team.adapter.blocked_request(), timeout=60)
+        if not team.until(lambda: team.state(member) == "blocked", 300):
+            run.row(5, "blocked", role, harness, "not_run", "a blocked member", reason=f"@lead-dev never reported"
+                    f" blocked (last {team.state(member)}); a prompt could not be elicited in this mode")
+            return
+        receipt, tok = team.receipt("blocked"), token()
+        code, out = team.call("say", "lead-dev", team.adapter.act_append(receipt, tok), timeout=60)
+        ident = re.search(r"^message (\d+)$", out, re.M)
+        log = factory_log(team)
+        queued = team.until(lambda: _outcome(log, ident, "lead-dev") == ("queued", "blocked"), 30) if ident else None
+        notes = [m for m in log.read_box()[1].msgs.values()
+                 if m["kind"] == "note" and (m.get("meta") or {}).get("what", "").startswith("blocked")]
+        typed_while_blocked = receipt.exists()
+        view = _rodeo(team, ["team", "@lead-dev"])
+        view.keys("ctrl+b")
+        time.sleep(0.2)
+        view.keys("1")
+        time.sleep(0.5)
+        view.focus("@lead-dev")
+        view.keys("enter")                         # the owner answers the prompt
+        acted = team.until(lambda: receipt.exists() and tok in receipt.read_text(), 300)
+        final = _outcome(log, ident, "lead-dev") if ident else None
+        proof = {"queued": bool(queued), "notes": len(notes), "typed_while_blocked": typed_while_blocked,
+                 "outcome_after": final, "acted": bool(acted), "peer": peer}
+        ok = bool(queued) and len(notes) == 1 and not typed_while_blocked and acted and final and final[0] == "delivered"
+        run.row(5, "blocked", role, harness, "pass" if ok else "fail",
+                "blocked: nothing typed, one note, the queued message delivered and acted on once after the answer",
+                proof=proof, reason=None if ok else "see proof")
+
+
+def factory_log(team):
+    """The team's message log, read-only, from the private copy of Factory (phase_8.md §1)."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("factory_under_test", team.script)
+    module = sys.modules.get("factory_under_test")
+    if module is None:
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["factory_under_test"] = module
+        spec.loader.exec_module(module)
+    state = next(r["labels"]["factory.dir"] for r in team.qa.rpc("terminal.list", {"all": True})["terminals"]
+                 if (r.get("labels") or {}).get("factory.dir"))
+    return module.open_log(state)
+
+
+def _outcome(log, ident, name):
+    if not ident:
+        return None
+    record = log.read_box()[1].outcome(int(ident[1]), name)
+    return record["o"], record.get("why")
+
+
+CASE_FUNCTIONS = {1: case_1, 2: case_2, 5: case_5, 7: case_7, 9: case_9, 10: case_10}
 
 
 def _source_head():
