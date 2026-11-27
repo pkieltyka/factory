@@ -3184,7 +3184,8 @@ def _case_7_two_senders(run, role, harness, adapter_class):
                        and team.state(subject) in ("idle", "done"), 300)
             authorized.update(outcome=_outcome(factory_log(team), ident, recipient) if ident else None,
                               state=team.state(subject), receipt_empty=not (receipt.exists() and receipt.read_text()))
-            if authorized["outcome"] != ("delivered", None) or not authorized["receipt_empty"]:
+            if (authorized["outcome"] != ("delivered", None) or authorized["state"] not in ("idle", "done")
+                    or not authorized["receipt_empty"]):     # settled: delivered, idle or done (@lead-dev at 8428e8a)
                 run.row(7, "two-senders", role, harness, "not_run", "case 7 two-senders",
                         proof={"authorized": authorized}, reason="the assignment was not delivered and settled"
                         " with the receipt empty")
