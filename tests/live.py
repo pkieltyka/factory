@@ -4044,7 +4044,7 @@ def _ask_later(team, role, text):
     def ask():
         if role == "member":
             code, out = team.call("say", "lead-dev", text, timeout=600)
-            box.update(out=out, code=code)
+            box.update(out=out, code=code, done=True)     # the say has returned (@lead-dev: busy-mode gates)
         else:
             box.update(_member_says(team, text, timeout=600) or {"id": None}, done=True)   # this job's own
     thread = threading.Thread(target=ask, daemon=True)
