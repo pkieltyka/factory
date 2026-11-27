@@ -2701,6 +2701,66 @@ class IntegratedTeamTests(TeamCase):
         return {r["labels"]["factory.member"]: r["address"] for r in self.hc.list(self.team)
                 if r["labels"].get("factory.kind") == "member" and r["state"] == "live"}
 
+    def new_operator(self, name):
+        term, log = self.launch("reports", name=name)
+        self.hc.label(term, {"factory.team": "", "factory.kind": "", "factory.member": ""})
+        return term, log
+
+    def test_new_operator_adopts_team_tab_and_queue(self):
+        code, out, err = self.cmd("up", "lead-dev", "reviewer")
+        self.assertEqual(code, 0, out + err)
+        members = self.members()
+        saved = factory.read_team(self.state_dir)["layout"]
+        doc, version = self.hc.doc_get()
+        term, log = self.new_operator("replacement-operator")
+        op_space = LayoutTests.space("another-space", LayoutTests.tab("operator-home", LayoutTests.pane(term)))
+        doc["spaces"].append(op_space)
+        self.hc.doc_set(doc, version)
+        self.hc.label(term, {"herdr.space": "another-space", "herdr.tab": "operator-home"})
+        self.hc.kill(self.operator)
+        self.until(lambda: self.hc.get(self.operator)["state"] == "finished", "old operator to finish")
+        first = self.add("operator", "first queued report")
+        second = self.add("operator", "second queued report")
+        self.assertEqual([m["id"] for m, _ in self.log.read_box()[1].pending("operator")], [first, second])
+        before = self.hc.doc_get()
+        self.operator = term
+        code, out, err = self.cmd("up", "lead-dev", "reviewer")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("already running: @lead-dev, @reviewer", out)
+        self.assertEqual(self.members(), members)
+        self.assertEqual(self.hc.doc_get(), before)
+        self.assertEqual(factory.read_team(self.state_dir)["layout"], saved)
+        receipts = factory.wait_outcomes(self.log, second, ["operator"], 0, timeout=15)
+        self.assertEqual((receipts["operator"]["o"], receipts["operator"]["term"]), ("delivered", term))
+        self.assertEqual(self.outcome(first, "operator")["term"], term)
+        self.assertEqual([text.splitlines()[-1] for text in self.inputs(term, log)],
+                         ["first queued report", "second queued report"])
+
+    def test_two_teams_have_separate_tabs_and_stops(self):
+        code, out, err = self.cmd("up", "lead-dev")
+        self.assertEqual(code, 0, out + err)
+        home = self.members()["lead-dev"]
+        first_doc, _ = self.hc.doc_get()
+        other_root = self.directory / "another-checkout"
+        other_root.mkdir()
+        for name in ("factory.toml", "FACTORY.md"):
+            (other_root / name).write_bytes((self.root / name).read_bytes())
+        term, _ = self.new_operator("other-team-operator")
+        with patch.object(self, "root", other_root), patch.object(self, "operator", term):
+            other_team = factory.team_key(other_root)
+            self.addCleanup(lambda: [self.remove(r["address"]) for r in self.hc.list(other_team)])
+            code, out, err = self.cmd("up", "lead-dev")
+            self.assertEqual(code, 0, out + err)
+            other_members = factory.team_view(self.hc, other_team)
+            other = other_members.terminal("lead-dev")["address"]
+            both, _ = self.hc.doc_get()
+            self.assertEqual(factory.where(both, home), factory.where(first_doc, home))
+            self.assertNotEqual(factory.where(both, home), factory.where(both, other))
+            code, out, err = self.cmd("down", "lead-dev")
+            self.assertEqual(code, 0, out + err)
+            self.assertEqual(self.hc.doc_get()[0], first_doc)
+        self.assertEqual(self.hc.get(home)["state"], "live")
+
     def test_a_team_runs_end_to_end(self):
         code, out, err = self.cmd("check", "lead-dev", "reviewer")
         self.assertEqual(code, 0, out + err)
