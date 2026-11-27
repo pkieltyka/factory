@@ -968,6 +968,25 @@ class HcBackendTests(HcBackend, HcAssertions, unittest.TestCase):
                          (term, "server_stop", self.team))
 
 
+class FakeAgentInputTests(unittest.TestCase):
+    """The fake agent's input parser, read boundaries aside (@reviewer)."""
+
+    def lines(self, *chunks):
+        spec = importlib.util.spec_from_file_location("fake_agent_parser",
+                                                      pathlib.Path(__file__).resolve().with_name("fake_agent.py"))
+        agent = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(agent)
+        feed = iter(chunks)
+        with patch.object(agent, "read_input", lambda: next(feed, b"")):
+            return list(agent.submitted_lines())
+
+    def test_ctrl_d_quits_wherever_the_read_ends_but_not_inside_a_paste(self):
+        self.assertEqual(self.lines(b"abc\x04"), ["\x04"])
+        self.assertEqual(self.lines(b"ab", b"c\x04"), ["\x04"])
+        self.assertEqual(self.lines(b"\x1b[200~a\x04b\x1b[201~\r"), ["a\x04b"])
+        self.assertEqual(self.lines(b"ab\x7fc\r"), ["ac"])
+
+
 @real_only
 class FakeAgentTests(HcBackend, unittest.TestCase):
     def launch_with_reply(self, script):
@@ -6686,15 +6705,32 @@ class QualifyReportTests(unittest.TestCase):
             data = json.loads(pathlib.Path(later).read_text())
             data["rows"].append(stale)
             pathlib.Path(later).write_text(json.dumps(data))
+            old_esc = {"case": 4, "subcase": "owner-interrupt", "role": "member", "harness": "codex", "status": "pass",
+                       "proof": {t: {"working_when_delivered": False, "holds": True}
+                                 for t in ("next-delivery", "owner-line")}}
+            data = json.loads(pathlib.Path(later).read_text())
+            data["rows"].append(old_esc)
+            pathlib.Path(later).write_text(json.dumps(data))
             live.report([first, later], out)
-            self.assertIn("| 6 | member-switch | unproved (its proof does not meet today's check)",
-                          (out / "codex.md").read_text())
+            text = (out / "codex.md").read_text()
+            self.assertIn("| 6 | member-switch | unproved (its proof does not meet today's check)", text)
+            self.assertIn("| 4 | owner-interrupt | unproved (its proof does not meet today's check)", text)
             live.report([later], out)                                     # a partial import: only b's evidence
             trust = (out / "trust-entries.md").read_text()
             self.assertIn("/tmp/factory-qa-a/work", trust)
             self.assertIn("/tmp/factory-qa-b/work", trust)
             live.report([first, later], out)                              # importing again changes nothing
             self.assertEqual((out / "trust-entries.md").read_text(), trust)
+            early = json.loads(pathlib.Path(later).read_text())          # two checkpoints of one run (@reviewer)
+            early.update(run_id="r1", utc="2026-11-27T03:00:00Z")
+            final = json.loads(json.dumps(early))
+            final["utc"] = "2026-11-27T03:10:00Z"
+            final["rows"].append({"case": 3, "subcase": "draft", "role": "member", "harness": "codex",
+                                  "status": "fail", "reason": "late row", "proof": {}})
+            (tmp / "early.json").write_text(json.dumps(early))
+            (tmp / "final.json").write_text(json.dumps(final))
+            live.report([str(tmp / "early.json"), str(tmp / "final.json")], out)
+            self.assertIn("| 3 | draft | fail | late row", (out / "codex.md").read_text())
 
 
 class QualifyFrameworkTests(unittest.TestCase):

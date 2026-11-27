@@ -14,7 +14,7 @@ import tty
 
 SCRIPTS = ("reports", "forgets", "works_forever", "blocks", "blocks_once", "crashes", "quits", "silent", "dialog")
 START, END = b"\x1b[200~", b"\x1b[201~"
-CONTROL = re.compile(rb"[\x1b\r\n]")
+CONTROL = re.compile(rb"[\x1b\r\n\x04]")
 PUSHBACK = bytearray()   # input that arrived while a tool ran, read before the terminal again
 
 
@@ -65,9 +65,6 @@ def submitted_lines(interruptible=False):
     paste = False
     echo = bool(os.environ.get("FAKE_ECHO"))
     while chunk := read_input():
-        if chunk == b"\x04":                    # Ctrl+D: handled at once, like a harness's quit key
-            yield "\x04"
-            continue
         incoming += chunk
         if echo:   # show the unsubmitted input, as a harness's composer would
             os.write(1, b"\r\x1b[K> " + bytes(pending) + CONTROL.sub(b" ", incoming))
@@ -97,6 +94,9 @@ def submitted_lines(interruptible=False):
                     yield None
                     continue
                 break
+            elif incoming[:1] == b"\x04":            # Ctrl+D outside a paste: quit at once, wherever it falls
+                incoming = incoming[1:]
+                yield "\x04"
             elif incoming[:1] == b"\x1b":
                 pending.append(incoming[0])
                 incoming = incoming[1:]
