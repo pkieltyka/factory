@@ -2199,6 +2199,188 @@ def ensure_keeper(cfg, state, hc, view, force=False):
         return _wait_for_beat(log.state, hc, terminal)
 
 
+# ================================================================ layout (launch_layout.md §5)
+
+def new_id(prefix):
+    return prefix + uuid.uuid4().hex
+
+
+def _layout_tabs(doc):
+    spaces = doc["spaces"]
+    if not isinstance(spaces, list):
+        raise TypeError("layout spaces must be a list")
+    for space in spaces:
+        if not isinstance(space["id"], str) or not isinstance(space["tabs"], list):
+            raise TypeError("invalid layout space")
+        for tab in space["tabs"]:
+            if not isinstance(tab["id"], str) or tab["root"]["type"] == "block":
+                raise TypeError("invalid layout tab")
+            yield space, tab
+
+
+def _pane_blocks(node):
+    if not isinstance(node["id"], str) or not isinstance(node["type"], str):
+        raise TypeError("invalid layout node")
+    if node["type"] == "block":
+        content = node["content"]
+        if not isinstance(content, dict) or ("terminal" in content and not isinstance(content["terminal"], str)):
+            raise TypeError("invalid pane content")
+        yield node
+        return
+    children = node["children"]
+    if not isinstance(children, list):
+        raise TypeError("layout children must be a list")
+    for child in children:
+        yield from _pane_blocks(child)
+
+
+def blocks(doc):
+    """Map terminal IDs to their blocks anywhere in the layout."""
+    return {terminal: block for _, tab in _layout_tabs(doc) for block in _pane_blocks(tab["root"])
+            if (terminal := block["content"].get("terminal"))}
+
+
+def where(doc, terminal):
+    """The actual space and tab containing terminal, or None."""
+    if terminal is None:
+        return None
+    for space, tab in _layout_tabs(doc):
+        if any(block["content"].get("terminal") == terminal for block in _pane_blocks(tab["root"])):
+            return space["id"], tab["id"]
+    return None
+
+
+def _tab_terminals(tab):
+    return {term for block in _pane_blocks(tab["root"]) if (term := block["content"].get("terminal"))}
+
+
+def resolve_tab(doc, layout, view, me, root):
+    """Find the existing team tab before proposing a new one in the operator's space."""
+    me_labels = me["labels"]
+    operator_tab = me_labels.get("herdr.tab")
+    members = [record for record in view._live.values() if record["labels"].get("factory.kind") == "member"]
+    if view.keeper:
+        members.append(view.keeper)
+    chosen, most = None, 0
+    for space, tab in _layout_tabs(doc):
+        ident = tab["id"]
+        present = _tab_terminals(tab)
+        if ident == operator_tab or me["address"] in present:
+            continue
+        if ident == layout.get("tab"):
+            chosen = space, tab
+            break
+        count = sum(record["address"] in present or record["labels"].get("herdr.tab") == ident for record in members)
+        if count > most:
+            chosen, most = (space, tab), count
+    if chosen:
+        space, tab = chosen
+        made = space["id"] == layout.get("space") and layout.get("made_space", False)
+        return space["id"], tab["id"], made
+    spaces = {space["id"]: space for space in doc["spaces"]}
+    for ident in (me_labels.get("herdr.space"), layout.get("space")):
+        if ident in spaces:
+            return ident, new_id("tb"), ident == layout.get("space") and layout.get("made_space", False)
+    ident = new_id("sp")
+    doc["spaces"].append({"id": ident, "name": "", "folder": str(root), "tabs": []})
+    return ident, new_id("tb"), True
+
+
+def add_panes(doc, space, tab, panes, keeper=None):
+    have = blocks(doc)
+    target = next((node for area in doc["spaces"] if area["id"] == space for node in area["tabs"]
+                   if node["id"] == tab), None)
+    for terminal, title in panes:
+        if terminal in have:
+            continue
+        block = {"id": new_id("p"), "type": "block", "title": title, "content": {"terminal": terminal}}
+        if target is None:
+            area = next(area for area in doc["spaces"] if area["id"] == space)
+            target = {"id": tab, "name": "team", "root": {"id": new_id("s"), "type": "row", "children": []}}
+            area["tabs"].append(target)
+        root = target["root"]
+        if root["type"] != "row":
+            root = target["root"] = {"id": new_id("s"), "type": "row", "children": [root]}
+        children = root["children"]
+        columns = [i for i, child in enumerate(children)
+                   if keeper is None or child["type"] != "block" or child["content"].get("terminal") != keeper]
+        if terminal == keeper:
+            block["size"] = {"weight": 0.4}
+            children.append(block)
+        elif len(columns) < 3:
+            children.insert(columns[-1] + 1 if columns else 0, block)
+        else:
+            index = min(columns, key=lambda i: sum(1 for _ in _pane_blocks(children[i])))
+            child = children[index]
+            if child["type"] == "column":
+                child["children"].append(block)
+            else:
+                children[index] = {"id": new_id("s"), "type": "column", "children": [child, block]}
+        have[terminal] = block
+
+
+def _remove_blocks(node, terminals, *, root=False):
+    """Return the remaining node and whether a block was removed below it."""
+    if node["type"] == "block":
+        return (None, True) if node["content"].get("terminal") in terminals else (node, False)
+    children, changed = [], False
+    for child in node["children"]:
+        kept, removed = _remove_blocks(child, terminals)
+        if kept is not None:
+            children.append(kept)
+        changed |= removed
+    if changed:
+        if not root and len(children) < 2:
+            return (children[0] if children else None), True
+        node["children"] = children
+    return node, changed
+
+
+def remove_panes(doc, layout, terminals):
+    terminals = {term for term in terminals if term is not None}
+    for space, tab in list(_layout_tabs(doc)):
+        root, _ = _remove_blocks(tab["root"], terminals, root=True)
+        if tab["id"] != layout.get("tab") or any(_pane_blocks(root)):
+            continue
+        space["tabs"].remove(tab)
+        if space["id"] == layout.get("space") and layout.get("made_space") and not space["tabs"]:
+            doc["spaces"].remove(space)
+
+
+def swap_terminal(doc, old, new):
+    have = blocks(doc)
+    if old not in have or new in have:
+        return False
+    have[old]["content"]["terminal"] = new
+    return True
+
+
+def edit_layout(hc, change):
+    """Apply a layout edit by compare-and-set, recomputing it after each conflict."""
+    for attempt in range(1, CAS_TRIES + 1):
+        try:
+            value, version = hc.doc_get()
+            doc = {"spaces": []} if value is None else value
+            blocks(doc)  # validate the document before the callback can edit it
+            if not change(doc):
+                return None
+        except (KeyError, TypeError, AttributeError):
+            return "the herdr-app doc has an unexpected shape"
+        except (HcDown, HcError) as error:
+            return str(error)
+        try:
+            hc.doc_set(doc, version)
+            return None
+        except HcDown as error:
+            return str(error)
+        except HcError as error:
+            if error.kind != "conflict":
+                return str(error)
+        if attempt < CAS_TRIES:
+            time.sleep(0.05 * attempt)
+    return "another client kept changing it"
+
+
 def wait_outcomes(log, ident, recipients, offset, timeout=SAY_WAIT):
     """Follow only this message from its commit, without rereading the log prefix."""
     box = Box.for_message(log.path, ident, recipients, offset)

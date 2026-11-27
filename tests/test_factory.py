@@ -14,6 +14,7 @@ import io
 import json
 import os
 import pathlib
+import random
 import re
 import shlex
 import shutil
@@ -3320,6 +3321,261 @@ class CliTests(TeamCase):
         self.until(lambda: self.inputs(member, log) == ["[from @operator]\nreal keeper\n"], "keeper delivery")
         factory.update_team(self.state_dir, up=False)
         self.until(lambda: self.hc.get(terminal)["state"] == "finished", "keeper shutdown")
+
+
+class LayoutTests(unittest.TestCase):
+    @staticmethod
+    def pane(terminal, **extra):
+        return {"id": f"pane-{terminal}", "type": "block", "content": {"terminal": terminal}, **extra}
+
+    @staticmethod
+    def split(ident, *children, kind="row"):
+        return {"id": ident, "type": kind, "children": list(children)}
+
+    def tab(self, ident, *children):
+        return {"id": ident, "name": ident, "root": self.split(f"root-{ident}", *children)}
+
+    @staticmethod
+    def space(ident, *tabs):
+        return {"id": ident, "tabs": list(tabs)}
+
+    @staticmethod
+    def member(address, **labels):
+        return {"address": address, "state": "live", "created_ms": 0,
+                "labels": {"factory.kind": "member", "factory.member": address, **labels}}
+
+    def setup_layout(self, count=0, *, keeper=None):
+        doc = {"spaces": [self.space("space")]}
+        panes = [(f"t{i}", f"@member-{i}") for i in range(count)]
+        if keeper:
+            panes.append((keeper, "keeper"))
+        factory.add_panes(doc, "space", "team", panes, keeper)
+        return doc
+
+    @staticmethod
+    def children(doc):
+        return doc["spaces"][0]["tabs"][0]["root"]["children"]
+
+    def test_new_tab_root_is_a_row(self):
+        doc = self.setup_layout(1)
+        tab = doc["spaces"][0]["tabs"][0]
+        self.assertEqual((tab["id"], tab["name"], tab["root"]["type"]), ("team", "team", "row"))
+        self.assertEqual([(node["title"], node["content"]) for node in self.children(doc)],
+                         [("@member-0", {"terminal": "t0"})])
+        self.assertEqual(factory.where(doc, "t0"), ("space", "team"))
+        self.assertIsNone(factory.where(doc, "absent"))
+
+    def test_three_members_three_columns(self):
+        doc = self.setup_layout(3)
+        self.assertEqual([p["content"]["terminal"] for p in self.children(doc)], ["t0", "t1", "t2"])
+
+    def test_fourth_member_stacks_in_first_column(self):
+        doc = self.setup_layout(4)
+        first, *other = self.children(doc)
+        self.assertEqual(first["type"], "column")
+        self.assertEqual([p["content"]["terminal"] for p in first["children"]], ["t0", "t3"])
+        self.assertEqual([p["content"]["terminal"] for p in other], ["t1", "t2"])
+
+    def test_nine_members_three_by_three(self):
+        doc = self.setup_layout(9)
+        self.assertEqual([[p["content"]["terminal"] for p in column["children"]] for column in self.children(doc)],
+                         [["t0", "t3", "t6"], ["t1", "t4", "t7"], ["t2", "t5", "t8"]])
+
+    def test_keeper_pane_last_and_narrow_across_edits(self):
+        doc = self.setup_layout(0, keeper="keeper")
+        factory.add_panes(doc, "space", "team", [("t1", "@one"), ("t2", "@two")], keeper="keeper")
+        self.assertEqual([p["content"]["terminal"] for p in self.children(doc)], ["t1", "t2", "keeper"])
+        last = self.children(doc)[-1]
+        self.assertEqual((last["title"], last["size"]), ("keeper", {"weight": 0.4}))
+        factory.add_panes(doc, "space", "team", [("t3", "@three"), ("t4", "@four")], keeper="keeper")
+        self.assertIs(self.children(doc)[-1], last)
+
+    def test_owner_restructured_root_is_wrapped_not_changed(self):
+        old = self.split("owner-root", self.pane("owner"), kind="column")
+        doc = {"spaces": [self.space("space", {"id": "team", "root": old})]}
+        factory.add_panes(doc, "space", "team", [("t1", "@one")])
+        self.assertIs(self.children(doc)[0], old)
+        self.assertEqual(old["children"], [self.pane("owner")])
+
+    def test_fourth_pane_wraps_an_owner_made_row(self):
+        owner_row = self.split("nested", self.pane("owner"))
+        other_columns = [self.split(key, self.pane(key + "-1"), self.pane(key + "-2"), kind="column")
+                         for key in ("second", "third")]
+        doc = {"spaces": [self.space("space", self.tab("team", owner_row, *other_columns))]}
+        factory.add_panes(doc, "space", "team", [("new", "@new")])
+        column = self.children(doc)[0]
+        self.assertEqual(column["type"], "column")
+        self.assertIs(column["children"][0], owner_row)
+        self.assertEqual(owner_row["children"], [self.pane("owner")])
+        self.assertEqual(column["children"][1]["content"], {"terminal": "new"})
+
+    def test_remove_prunes_empty_and_collapses_only_changed_nonroot_containers(self):
+        one = self.split("one", self.pane("t0"), self.pane("owner"), kind="column")
+        empty = self.split("empty", self.split("nested", self.pane("t1"), kind="column"))
+        untouched = self.split("untouched", self.pane("other"), kind="column")
+        tab = self.tab("team", one, empty, untouched)
+        root = tab["root"]
+        doc = {"spaces": [self.space("space", tab)]}
+        factory.remove_panes(doc, {"tab": "team"}, ["t0", "t1"])
+        self.assertEqual(root["children"], [self.pane("owner"), untouched])
+        self.assertIs(tab["root"], root)
+
+    def test_last_member_removes_only_the_tracked_tab_and_its_own_empty_space(self):
+        for made in (False, True):
+            with self.subTest(made=made):
+                other = self.space("other-space", self.tab("other"))
+                team = self.space("space", self.tab("team", self.pane("t1")))
+                doc = {"spaces": [team, other]}
+                factory.remove_panes(doc, {"space": "space", "tab": "team", "made_space": made}, ["t1"])
+                self.assertEqual(doc["spaces"], [other] if made else [team, other])
+                self.assertEqual(team["tabs"], [])
+
+    def test_owner_added_block_keeps_team_tab_when_members_stop(self):
+        owner = {"id": "tool", "type": "block", "content": {"tool": "files"}}
+        tab = self.tab("team", owner)
+        doc = {"spaces": [self.space("space", tab)]}
+        factory.add_panes(doc, "space", "team", [("t1", "@one")])
+        factory.remove_panes(doc, {"space": "space", "tab": "team", "made_space": True}, ["t1", None])
+        self.assertEqual(self.children(doc), [owner])
+
+    def test_remove_panes_only_empties_the_team_tab(self):
+        owner_tab = self.tab("owner-tab", self.pane("moved"))
+        team = self.tab("team", self.pane("t1"))
+        doc = {"spaces": [self.space("space", team, owner_tab)]}
+        factory.remove_panes(doc, {"space": "space", "tab": "team", "made_space": True}, ["t1", "moved"])
+        self.assertEqual(doc["spaces"][0]["tabs"], [owner_tab])
+        self.assertEqual(owner_tab["root"]["children"], [])
+
+    def test_missing_block_is_not_an_error_and_existing_blocks_are_not_duplicated(self):
+        doc = self.setup_layout(1)
+        original = json.dumps(doc)
+        factory.remove_panes(doc, {"tab": "team"}, ["t999"])
+        factory.add_panes(doc, "space", "another-tab", [("t0", "@duplicate")])
+        self.assertEqual(json.dumps(doc), original)
+        self.assertFalse(factory.swap_terminal(doc, "t999", "t0"))
+
+    def test_swap_terminal_keeps_position_and_uses_actual_tab(self):
+        block = self.pane("old", title="@owner-moved", size={"weight": 2})
+        target = self.tab("owner-tab", self.split("stack", block, kind="column"))
+        doc = {"spaces": [self.space("team-space", self.tab("team", self.pane("other"))),
+                          self.space("owner-space", target)]}
+        self.assertFalse(factory.swap_terminal(doc, "old", "other"))
+        self.assertTrue(factory.swap_terminal(doc, "old", "new"))
+        self.assertIs(factory.blocks(doc)["new"], block)
+        self.assertEqual(block, {**self.pane("old"), "content": {"terminal": "new"},
+                                 "title": "@owner-moved", "size": {"weight": 2}})
+        self.assertEqual(factory.where(doc, "new"), ("owner-space", "owner-tab"))
+
+    def test_root_stays_container_across_adds_and_removals(self):
+        doc = self.setup_layout()
+        rng = random.Random(170)
+        live = set()
+        for _ in range(60):
+            term = f"t{rng.randrange(12)}"
+            if term in live:
+                factory.remove_panes(doc, {"tab": "team"}, [term])
+                live.remove(term)
+            else:
+                factory.add_panes(doc, "space", "team", [(term, term)])
+                live.add(term)
+            self.assertEqual(set(factory.blocks(doc)), live)
+            if live:
+                self.assertEqual(doc["spaces"][0]["tabs"][0]["root"]["type"], "row")
+
+    def test_resolve_tab_prefers_saved_tab_in_the_space_that_holds_it(self):
+        doc = {"spaces": [self.space("team-space", self.tab("team")),
+                          self.space("op-space", self.tab("op-tab", self.pane("operator")))]}
+        me = {"address": "operator", "labels": {"herdr.space": "op-space", "herdr.tab": "op-tab"}}
+        actual = factory.resolve_tab(doc, {"space": "team-space", "tab": "team", "made_space": True},
+                                     factory.View([]), me, pathlib.Path("/src"))
+        self.assertEqual(actual, ("team-space", "team", True))
+
+    def test_resolve_tab_counts_distinct_terminals_and_excludes_operator_tabs(self):
+        doc = {"spaces": [self.space("space", self.tab("operator-actual", self.pane("operator"), self.pane("t1")),
+                                     self.tab("operator-labelled", self.pane("t2"), self.pane("t3")),
+                                     self.tab("one", self.pane("t4")), self.tab("team", self.pane("t5"), self.pane("t6")))]}
+        me = {"address": "operator", "labels": {"herdr.tab": "operator-labelled", "herdr.space": "space"}}
+        view = factory.View([self.member(f"t{i}", **({"herdr.tab": "one"} if i == 4 else {})) for i in range(1, 7)])
+        self.assertEqual(factory.resolve_tab(doc, {}, view, me, pathlib.Path("/src")), ("space", "team", False))
+        self.assertEqual(factory.resolve_tab(doc, {"tab": "one"}, view, me, pathlib.Path("/src")),
+                         ("space", "one", False))
+
+    def test_resolve_tab_can_recover_from_labels_and_propose_without_adding_tab(self):
+        doc = {"spaces": [self.space("space", self.tab("existing"))]}
+        me = {"address": "operator", "labels": {"herdr.space": "space"}}
+        view = factory.View([self.member("t1", **{"herdr.tab": "existing"})])
+        self.assertEqual(factory.resolve_tab(doc, {}, view, me, pathlib.Path("/src")), ("space", "existing", False))
+        space, tab, made = factory.resolve_tab(doc, {}, factory.View([]), me, pathlib.Path("/src"))
+        self.assertEqual((space, made), ("space", False))
+        self.assertTrue(tab.startswith("tb"))
+        self.assertEqual([t["id"] for t in doc["spaces"][0]["tabs"]], ["existing"])
+        fresh = {"spaces": []}
+        space, tab, made = factory.resolve_tab(fresh, {}, view, me, pathlib.Path("/src"))
+        self.assertTrue(made)
+        self.assertEqual(fresh, {"spaces": [{"id": space, "name": "", "folder": "/src", "tabs": []}]})
+
+    @fake_only
+    def test_edit_layout_retries_with_a_new_document_after_conflict(self):
+        clock = unittest.mock.Mock(wraps=time)
+        with FakeHc() as fake, patch.object(factory, "time", clock):
+            hc = factory.Hc()
+            initial = {"spaces": [self.space("space", self.tab("team", self.pane("old")))]}
+            hc.doc_set(initial, 0)
+            wrote = []
+
+            def change(doc):
+                wrote.append(factory.where(doc, "old"))
+                if len(wrote) == 1:
+                    moved = {"spaces": [self.space("elsewhere", self.tab("moved", self.pane("old"), self.pane("owner")))]}
+                    hc.doc_set(moved, 1)
+                return factory.swap_terminal(doc, "old", "new")
+
+            self.assertIsNone(factory.edit_layout(hc, change))
+            current, version = hc.doc_get()
+            self.assertEqual(wrote, [("space", "team"), ("elsewhere", "moved")])
+            self.assertEqual(factory.where(current, "new"), ("elsewhere", "moved"))
+            self.assertIn("owner", factory.blocks(current))
+            self.assertEqual(version, 3)
+            self.assertEqual(len(fake.calls("doc.set")), 4)
+            clock.sleep.assert_called_once_with(0.05)
+
+    @fake_only
+    def test_edit_layout_gives_up_after_its_last_conflict(self):
+        clock = unittest.mock.Mock(wraps=time)
+        clock.sleep.return_value = None
+        with FakeHc() as fake, patch.object(factory, "time", clock):
+            hc = factory.Hc()
+            fake.doc_conflicts(factory.CAS_TRIES)
+            self.assertEqual(factory.edit_layout(hc, lambda doc: True), "another client kept changing it")
+            self.assertEqual(len(fake.calls("doc.set")), factory.CAS_TRIES)
+            self.assertEqual(clock.sleep.call_count, factory.CAS_TRIES - 1)
+
+    @fake_only
+    def test_edit_layout_refuses_an_unexpected_doc(self):
+        bad_layouts = ([], {}, {"spaces": [self.space("s", {"id": "t", "root": {"id": "r", "type": "row"}})]})
+        with FakeHc() as fake:
+            hc = factory.Hc()
+            for malformed in bad_layouts:
+                with self.subTest(malformed=malformed):
+                    _, version = hc.doc_get()
+                    hc.doc_set(malformed, version)
+                    count = len(fake.calls("doc.set"))
+                    edit = unittest.mock.Mock(return_value=True)
+                    self.assertEqual(factory.edit_layout(hc, edit), "the herdr-app doc has an unexpected shape")
+                    edit.assert_not_called()
+                    self.assertEqual(len(fake.calls("doc.set")), count)
+
+    @fake_only
+    def test_edit_layout_skips_write_for_noop_and_reports_transport_errors(self):
+        with FakeHc() as fake:
+            hc = factory.Hc()
+            self.assertIsNone(factory.edit_layout(hc, lambda doc: False))
+            self.assertFalse(fake.calls("doc.set"))
+        for method, error in (("doc_get", factory.HcDown(False, "core unavailable")),
+                              ("doc_set", factory.HcError("invalid_params", "cannot edit"))):
+            with self.subTest(method=method), patch.object(hc, "doc_get", return_value=(None, 0)):
+                with patch.object(hc, method, side_effect=error):
+                    self.assertEqual(factory.edit_layout(hc, lambda doc: True), str(error))
 
 
 class TeamLookupTests(unittest.TestCase):
