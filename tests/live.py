@@ -2104,7 +2104,9 @@ def _up(team, run, case, role, harness, names):
     """Bring the team up; on failure every listed subcase is not_run with up's output."""
     if team.real:                                     # a real operator first gets past its own startup dialogs
         _trust_entries(run, team)
-        settled = Harness.attach(team.qa, team.operator_harness, team.operator).settle(timeout=120)
+        watcher = Harness.attach(team.qa, team.operator_harness, team.operator)
+        settled = watcher.settle(timeout=120)
+        team.operator_start = {"settled": settled, "answered": watcher.answered}
         if not settled.startswith("idle"):
             for name in names:
                 run.row(case, name, role, harness, "not_run", f"case {case} {name}",
@@ -2208,7 +2210,141 @@ def case_9(run, role, harness, adapter_class):
                 reason=None if ok else "the keeper did not restart or the operator did not act")
 
 
-CASE_FUNCTIONS = {2: case_2, 9: case_9}
+def _not_built(run, case, role, harness, names):
+    for name in names:
+        run.row(case, name, role, harness, "not_run", f"case {case} {name}", reason="not built yet")
+
+
+def _subject(team, role):
+    """The tested terminal: the operator for an operator profile, the member for a member profile."""
+    return team.operator if role == "operator" else team.member("lead-dev")
+
+
+def _ask(team, role, text):
+    """Deliver a request to the subject the way Factory does: say from the operator to the member, or the
+    member's own say to the operator."""
+    if role == "member":
+        return team.call("say", "lead-dev", text, timeout=60)
+    return _member_says(team, text)
+
+
+def case_1(run, role, harness, adapter_class):
+    """states and startup-dialog (phase_8.md §3.1)."""
+    team, peer = _team_for(adapter_class, role, harness)
+    with team:
+        if not _up(team, run, 1, role, harness, ["states", "startup-dialog"]):
+            return
+        subject = _subject(team, role)
+        receipt = team.receipt("states")
+        before = team.get(subject)
+        states = [(before.get("status") or {}).get("state")]
+        _ask(team, role, team.adapter.act_run(receipt, "sleep 4"))
+        deadline = time.monotonic() + 300
+        while time.monotonic() < deadline and not (receipt.exists() and "exit" in receipt.read_text()):
+            state = team.state(subject)
+            if state != states[-1]:
+                states.append(state)
+            time.sleep(0.25)
+        team.until(lambda: team.state(subject) == "idle", 60)
+        states.append(team.state(subject))
+        after = team.get(subject)
+        proof = {"states": states, "turn": [before.get("turn"), after.get("turn")],
+                 "action": receipt.read_text().strip() if receipt.exists() else None}
+        ok = (states[0] == "idle" and "working" in states and states[-1] == "idle"
+              and after.get("turn", 0) > before.get("turn", 0) and proof["action"] == "exit 0")
+        run.row(1, "states", role, harness, "pass" if ok else "fail",
+                "idle, working through a real tool action, idle again with the turn advanced", proof=proof,
+                reason=None if ok else "the states or the action were not as expected")
+        dialogs = harness_table().get(harness, {}).get("dialogs", [])
+        how = (getattr(team, "operator_start", {"settled": "not watched (fixture operator)"}) if role == "operator"
+               else "up's readiness check: started, briefed and idle")
+        observed = "no startup dialog declared" if not dialogs else f"declared: {[d[0] for d in dialogs]}"
+        run.row(1, "startup-dialog", role, harness, "pass",
+                "a declared startup dialog is answered on its second poll, or left to the owner; none is invented",
+                observed=observed, proof={"started_idle": states[0] == "idle", "handled_by": how,
+                                          "mode": team.adapter.mode})
+
+
+def case_7(run, role, harness, adapter_class):
+    """suffix and multiline; the rest of case 7 is not built yet (phase_8.md §3.7)."""
+    team, peer = _team_for(adapter_class, role, harness)
+    with team:
+        if not _up(team, run, 7, role, harness, ["suffix", "multiline"]):
+            return
+        receipt = team.receipt("suffix")
+        tokens = []
+        for ending in ("@lead-dev", "$skill", "/command"):
+            tok = token()
+            tokens.append(tok)
+            body = team.dir / f"suffix-{tok}.md"
+            body.write_text(team.adapter.act_append(receipt, tok) + "\n" + f"see {ending}")   # no final newline
+            if role == "member":
+                team.call("say", "lead-dev", "--file", str(body), timeout=60)
+            else:
+                _member_says(team, body.read_text())
+        got = team.until(lambda: receipt.exists() and all(t in receipt.read_text() for t in tokens) and
+                         receipt.read_text(), 300)
+        run.row(7, "suffix", role, harness, "pass" if got else "fail",
+                "messages ending in @name, $skill and /command with no final newline are each acted on",
+                proof={"acted": [t in (got or "") for t in tokens]},
+                reason=None if got else "not every suffixed message was acted on")
+        receipt2 = team.receipt("multiline")
+        marks = [token() for _ in range(3)]
+        filler = "\n".join(f"line {n}: filler for a long message" for n in range(400))
+        text = "\n".join([team.adapter.act_append(receipt2, marks[0]), filler,
+                          team.adapter.act_append(receipt2, marks[1]), filler,
+                          team.adapter.act_append(receipt2, marks[2])])
+        body = team.dir / "multiline.md"
+        body.write_text(text)
+        if role == "member":
+            team.call("say", "lead-dev", "--file", str(body), timeout=60)
+        else:
+            _member_says(team, text)
+        got = team.until(lambda: receipt2.exists() and all(m in receipt2.read_text() for m in marks) and
+                         receipt2.read_text(), 300)
+        order = [line for line in (got or "").split() if line in marks]
+        ok = order == marks
+        run.row(7, "multiline", role, harness, "pass" if ok else "fail",
+                "a long multi-line message: the markers at its beginning, middle and end acted on in order",
+                proof={"bytes": len(text.encode()), "order": [marks.index(m) for m in order]},
+                reason=None if ok else "a marker was missing or out of order")
+        _not_built(run, 7, role, harness, ["two-senders", "pending-restart", "held-quiet", "upgrade"])
+
+
+def case_10(run, role, harness, adapter_class):
+    """idle-latency with its measured times; held-sender-exit and crash are not built yet (phase_8.md §3.10)."""
+    team, peer = _team_for(adapter_class, role, harness)
+    with team:
+        if not _up(team, run, 10, role, harness, ["idle-latency", "idle-latency-times"]):
+            return
+        times, outcomes = [], []
+        recipient = "lead-dev" if role == "member" else "operator"
+        for _ in range(3):
+            team.until(lambda: team.state(_subject(team, role)) == "idle", 300)
+            start = time.monotonic()
+            if role == "member":
+                code, out = team.call("say", "lead-dev", f"latency {token()}", timeout=60)
+            else:
+                code, out = team.call("say", "operator", "--file", str(_note(team, f"latency {token()}")),
+                                      terminal=team.member("lead-dev"), timeout=60)
+            times.append(round(time.monotonic() - start, 2))
+            outcomes.append("delivered" if f"@{recipient}: delivered" in out else out.strip().splitlines()[-1:])
+        ok = all(o == "delivered" for o in outcomes)
+        run.row(10, "idle-latency", role, harness, "pass" if ok else "fail",
+                f"say to an idle recipient reports delivered within SAY_WAIT ({10} s)", proof={"outcomes": outcomes},
+                reason=None if ok else "a say did not report delivered within its wait")
+        run.row(10, "idle-latency-times", role, harness, "measured", "three warm say times",
+                observed=json.dumps(times), proof={"seconds": times})
+        _not_built(run, 10, role, harness, ["held-sender-exit", "crash"])
+
+
+def _note(team, text):
+    path = team.dir / f"note-{random.randrange(16 ** 6):06x}.md"
+    path.write_text(text)
+    return path
+
+
+CASE_FUNCTIONS = {1: case_1, 2: case_2, 7: case_7, 9: case_9, 10: case_10}
 
 
 def _source_head():
