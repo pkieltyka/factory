@@ -30,6 +30,7 @@ import secrets
 import shutil
 import signal
 import stat
+import string
 import subprocess
 import sys
 import tempfile
@@ -2778,15 +2779,24 @@ def record_session(cfg, state, member, term, environ=os.environ):
 
 
 def launch_entry(state, m, term, how, value):
-    """Called by up once m's brief is delivered: the launch's fallback entry. Never replaces an entry say already
-    made for this terminal."""
+    """up's entry for a launch: "new" as soon as a fresh launch starts, so an older conversation is never resumed
+    in its place; the assigned ID or folder once its brief is delivered. Never replaces an entry say made for this
+    terminal, nor repeats one."""
     def decide(newest):
         e = newest.get(m["name"])
-        if e is not None and e["term"] == term:
+        if e is not None and e["term"] == term and (e["how"] == "env" or (e["how"], e["value"]) == (how, value)):
             return None
         return {"member": m["name"], "harness": m["harness"], "model": m.get("model"), "term": term, "how": how,
                 "value": value, "at": utc_now()}
     _sessions(state, decide)
+
+
+def new_session_id(harness):
+    """An ID for a conversation that does not exist yet, in the form the harness accepts: a UUID for Claude Code;
+    for OpenCode "ses_" and 26 letters and digits (LC-4: a UUID is refused)."""
+    if harness == "opencode":
+        return "ses_" + "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(26))
+    return str(uuid.uuid4())
 
 
 def session_folder(state, m):
@@ -2828,7 +2838,7 @@ def session_plan(m, state, entry, fresh):
                           else f"@{m['name']} starts fresh: its saved conversation is for {entry['harness']}"
                                f" {entry.get('model')}")
     if t.get("session") == "id":
-        sess["assigned"] = str(uuid.uuid4())
+        sess["assigned"] = new_session_id(harness)
         sess["args"] += FRESH_ARGS[harness](sess["assigned"])
     return sess
 
@@ -3425,6 +3435,12 @@ def _up(cfg, args, hc, team, operator, state, names, me_id):
             failed[m["name"]] = f"{error.what} ({error.fix})"
             return
         starts[m["name"]] = (m, sess, record)
+        if not sess["resume"]:                       # before its brief: a late one must not leave the old entry newest
+            try:
+                launch_entry(state, m, record["address"], "new", None)
+            except (OSError, LogDamage, Problem) as error:
+                print(f"warning: @{m['name']}'s fresh launch was not recorded ({error}); if it ends before it"
+                      f" reports, run factory.py up {m['name']} --fresh", file=sys.stderr)
         how = "resumed" if sess["resume"] else "started"
         where = f", worktree {m['dir']}" if m["branch"] else ""
         print(f"{how} @{m['name']} ({m['role']}) on {m['harness']} {m['model']}, thinking {m['thinking']},"

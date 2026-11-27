@@ -2170,6 +2170,45 @@ class TeamCommandTests(TeamCase):
         self.assertEqual(self.cmd(self.operator, "up", "lead-dev")[0], 0)
         self.assertFalse(any("for later" in text for text in self.fake.sent(self.member_terms()["lead-dev"])))
 
+    def test_a_fresh_launch_never_falls_back_to_the_old_conversation(self):
+        old = self.terminal("lead-dev")[0]
+        factory.record_session(self.cfg, self.state_dir, "lead-dev", old, {"CODEX_THREAD_ID": "old-conversation"})
+        self.fake.finish(old)
+        def in_flight(log, ident, recipients, offset, timeout=0):
+            return {recipients[0]: {"o": "queued", "why": "waiting"}}
+        with patch.object(factory, "wait_outcomes", in_flight):
+            code, _, _ = self.cmd(self.operator, "up", "lead-dev", "--fresh")
+        self.assertEqual(code, 3)                                      # its brief is still in flight
+        new = self.member_terms()["lead-dev"]
+        self.deliver()                                                 # delivered after up gave up waiting
+        self.fake.finish(new)                                          # and it ends before any say
+        entry = factory.saved_sessions(self.state_dir)[0]["lead-dev"]
+        self.assertEqual((entry["term"], entry["how"], entry["value"]), (new, "new", None))
+        m = factory.plan(self.cfg, "lead-dev", self.state_dir)
+        self.assertFalse(factory.session_plan(m, self.state_dir, entry, fresh=False)["resume"])
+
+    def test_the_launch_entry_gives_way_to_say_in_either_order(self):
+        m = {**factory.plan(self.cfg, "frontend-dev", self.state_dir), "model": "claude-opus-5-5"}
+        for order in ("say first", "say after"):
+            with self.subTest(order=order):
+                term = f"t-{order[4:9]}"
+                factory.launch_entry(self.state_dir, m, term, "new", None)            # at its start
+                if order == "say first":
+                    factory.record_session(self.cfg, self.state_dir, "frontend-dev", term,
+                                           {"CLAUDE_CODE_SESSION_ID": "from-say"})
+                factory.launch_entry(self.state_dir, m, term, "id", "assigned-1")       # at its delivery
+                if order == "say after":
+                    factory.record_session(self.cfg, self.state_dir, "frontend-dev", term,
+                                           {"CLAUDE_CODE_SESSION_ID": "from-say"})
+                entry = factory.saved_sessions(self.state_dir)[0]["frontend-dev"]
+                self.assertEqual((entry["term"], entry["how"], entry["value"]), (term, "env", "from-say"))
+        factory.launch_entry(self.state_dir, m, "t-plain", "new", None)
+        factory.launch_entry(self.state_dir, m, "t-plain", "id", "assigned-2")          # no say: the ID wins
+        factory.launch_entry(self.state_dir, m, "t-plain", "id", "assigned-2")          # and is not repeated
+        lines = (self.state_dir / factory.SESSIONS).read_text().splitlines()
+        self.assertEqual(sum('"assigned-2"' in line for line in lines), 1)
+        self.assertEqual(factory.saved_sessions(self.state_dir)[0]["frontend-dev"]["value"], "assigned-2")
+
     def test_brief_send_does_not_wait_for_a_missing_keeper(self):
         self.cmd(self.operator, "up", "lead-dev")
         with patch.object(factory, "ensure_keeper", side_effect=factory.Problem("no keeper", "fix")), \
@@ -4953,6 +4992,18 @@ class SessionTests(unittest.TestCase):
         self.assertFalse(factory.TABLE["pi"].get("session"))
         sess = factory.session_plan(self.m("pi-dev"), self.state, entry, fresh=False)
         self.assertEqual((sess["resume"], sess["args"]), (False, []))
+
+    def test_opencode_gets_an_id_in_its_own_form_and_records_its_variable(self):
+        m = {"name": "oc", "harness": "opencode", "model": "openrouter/z-ai/glm-5.3"}
+        sess = factory.session_plan(m, self.state, None, fresh=False)
+        self.assertRegex(sess["assigned"], r"^ses_[A-Za-z0-9]{26}$")
+        self.assertEqual(sess["args"], ["--session", sess["assigned"]])
+        cfg = types.SimpleNamespace(members={"oc": m})
+        factory.record_session(cfg, self.state, "oc", "t1", {"OPENCODE_SESSION_ID": "ses_abc"})
+        factory.record_session(cfg, self.state, "oc", "t1", {"OPENCODE_SESSION_ID": "ses_def"})   # after /new
+        self.assertEqual(factory.saved_sessions(self.state)[0]["oc"]["value"], "ses_def")
+        again = factory.session_plan(m, self.state, factory.saved_sessions(self.state)[0]["oc"], fresh=False)
+        self.assertEqual((again["resume"], again["args"]), (True, ["--session", "ses_def"]))
 
     def test_codex_runs_without_its_daemon_fresh_or_resumed(self):
         m = {"name": "x", "role": "lead-dev", "harness": "codex", "model": "gpt-6.2-sol", "thinking": "high",

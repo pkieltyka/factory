@@ -86,7 +86,9 @@ install = "Install OpenCode v2 or later (https://opencode.ai) so `opencode` is o
 models = ["openrouter/openai/gpt-6-astra", "openrouter/z-ai/glm-5.3", "openrouter/z-ai/glm-5.3-flash"]
 never = []
 prompt = "message"
-resume_model = "provider"   # starts fresh with a notice until LC-4 or LC-11 shows a way to resume
+session = "id"                       # LC-4: --session ses_<26 letters and digits>, new or existing
+session_env = "OPENCODE_SESSION_ID"  # LC-11: the current conversation, also after /new
+resume_model = "provider"
 
 [opencode.permissions]   # --auto approves whatever the user's own rules do not deny
 full = ["--auto"]

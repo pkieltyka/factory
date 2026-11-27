@@ -116,7 +116,7 @@ Inside the lock, `launch_entry` appends only when the newest entry for the membe
 - a ready line that arrived first has already recorded the real ID for this terminal, and `up`'s later fallback never replaces it;
 - a successful fresh launch always ends with an entry for the new terminal, so the previous launch's conversation is no longer the newest. Codex in conversation A, `up --fresh` gives B, `down` before B has said anything: the newest entry is `new` with no value, and the next `up` starts fresh with the notice. It does not reopen A.
 
-Nothing is saved before the brief is delivered: until then the conversation may not exist, and a saved ID that names nothing would make the next `up` fail on resume.
+A fresh launch saves `new` (no value) for its terminal as soon as it starts, so a brief delivered after `up` stopped waiting can never leave an older conversation as the newest entry. Its ID or folder is saved only once the brief is delivered: until then the conversation may not exist, and a saved ID that names nothing would make the next `up` fail on resume. A later `say` from that terminal replaces either.
 
 `down` cannot read a member's environment and saves no ID. Before it stops anyone it checks that `sessions.jsonl` can be appended to and synced; if not, it stops nobody and prints `sessions cannot be saved (<error>): members left running`, exit 1 (§9.4's "left running"). A switch made inside the harness after the member's last `say` is not seen.
 
