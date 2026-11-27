@@ -142,7 +142,7 @@ The program is started directly, not typed into a shell, so v1's 1,024-byte line
 1. `t = hc.get(address)`. `state == "finished"`: settle with `exited (code <n>)` plus the last non-empty line of `hc.read(address)`.
 2. `word = t.status.state` or None. If `word == "working"`: not ready, next member.
 3. Otherwise read the screen: `screen = "".join(hc.read(address).split())`. For each configured dialog whose text, with whitespace removed, is in `screen`:
-   - empty `keys`: settle with `waits on its trust dialog: accept it in its pane, then run: factory.py brief --send <member>`;
+   - empty `keys`: settle with `waits on its trust dialog: accept it in its pane, then run: python3 <script> brief --send <member>` (the running script's absolute path, keeper.md §5);
    - not yet answered: `hc.keys(address, keys)` once, remember it, not ready this round;
    - already answered: not ready this round.
 4. No dialog on screen and `word == "idle"`: ready (§6.3). No other word counts.

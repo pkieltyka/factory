@@ -1416,15 +1416,15 @@ def run_real(args, live):
 
 
 def installed_verdict(result, failed, observed=()):
-    """The owner's rule: an installed Factory script seen in a QA terminal or transcript fails the run where the
-    harness's skill discovery was switched off (failed), and is recorded for one without a switch (observed).
+    """The owner's rule: an installed Factory script run in a QA transcript fails the run where the harness's skill
+    discovery was switched off (failed). A run by one without a switch, or a path only seen, is recorded (observed).
     Returns whether it failed."""
     if observed:
         result["installed_factory_observed"] = list(observed)
     if not failed:
         return False
     result.update(status="fail", installed_factory_seen=failed,
-                  detail=f"an installed Factory script appeared in a QA terminal or transcript: {failed}")
+                  detail=f"an installed Factory script was run in a QA transcript: {failed}")
     return True
 
 

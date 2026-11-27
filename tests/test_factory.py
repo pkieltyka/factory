@@ -44,6 +44,7 @@ SCRIPT = pathlib.Path(__file__).resolve().parent.parent / "skill/scripts/factory
 spec = importlib.util.spec_from_file_location("factory", SCRIPT)
 factory = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(factory)
+CMD = factory.factory_command    # a runnable command as Factory prints it: python3 and the script's absolute path
 os.environ["LOGNAME"] = "ada"  # whose team the tests run as: the first part of worktree branches
 # Fixtures are written as `+++ settings +++ prose`; Env.write_brief puts them on disk as factory.toml and FACTORY.md.
 TEMPLATE = ("+++\n" + (factory.SKILL / "templates/factory.toml").read_text().strip() + "\n+++\n"
@@ -1950,6 +1951,34 @@ class TeamCommandTests(TeamCase):
         self.assertEqual(len([m for m in self.log.read_box()[1].msgs.values() if m["kind"] == "brief"]), 4)
         self.assertEqual(sum(1 for c in self.mutations()[before:] if c["method"] == "terminal.run"), 2)
 
+    def test_the_exit_note_command_reaches_its_team_from_another_directory(self):
+        """@reviewer on #234: the note's command carries --cwd and the team's checkout, so an operator that runs it
+        from another directory recovers this team, not whatever checkout it stands in."""
+        code, out, err = self.cmd(self.operator, "up", "lead-dev")
+        self.assertEqual(code, 0, out + err)
+        record = {"address": "t9", "state": "finished", "reason": "killed", "labels": {"factory.last": "done"}}
+        _, text = self.keeper._episode("lead-dev", record, None, types.SimpleNamespace(state=lambda name: "gone"))
+        argv = shlex.split(text.split(" Run: ", 1)[1])
+        root = str(self.root.resolve())
+        self.assertEqual((argv[:2], argv[2:4], argv[-2:]), (["python3", str(factory.SCRIPT)], ["up", "lead-dev"],
+                                                              ["--cwd", root]))
+        elsewhere = self.enterContext(tempfile.TemporaryDirectory())
+        out, err = io.StringIO(), io.StringIO()
+        with (contextlib.chdir(elsewhere), patch.dict(os.environ, {"HC_TERMINAL_ID": self.operator,
+                                                                    "HC_BIN": self.hc.bin or factory.HC}),
+              patch.object(factory, "HC", self.hc.bin or factory.HC),
+              contextlib.redirect_stdout(out), contextlib.redirect_stderr(err)):
+            try:
+                factory.main(argv[2:])
+            except SystemExit as error:
+                self.assertFalse(error.code, out.getvalue() + err.getvalue())
+        self.assertIn("already running: @lead-dev", out.getvalue())
+        for args in (("inbox", "--for", "operator"), ("brief", "--send", "pm"), ("status",), ("down", "a")):
+            self.assertEqual(shlex.split(factory.factory_command(*args))[-2:], ["--cwd", root])   # the pending-inbox
+        self.assertNotIn("--cwd", factory.factory_command("say", "operator"))    # and trust hints; say has none
+        with patch.object(factory, "TEAM_ROOT", None):     # before any checkout is verified (resolve_team, team.json)
+            self.assertTrue(factory.factory_command("up").endswith(" up --cwd <team checkout>"))
+
     def test_up_labels_are_written_after_doc_set(self):
         term = self.terminal("lead-dev")[0]
         self.hc.label(term, {"herdr.seen": "9"})
@@ -2138,8 +2167,8 @@ class TeamCommandTests(TeamCase):
                                                                                            "why": "waiting"}}):
             code, out, err = self.cmd(self.operator, "up", "lead-dev")
         self.assertEqual(code, 3)
-        self.assertIn("is still queued (waiting); the keeper delivers it when it can. Run factory.py status.", out)
-        self.assertIn("Then run: factory.py status", err)
+        self.assertIn("is still queued (waiting); the keeper delivers it when it can. Run " + CMD("status") + ".", out)
+        self.assertIn("Then run: " + CMD("status"), err)
         self.assertNotIn("brief --send", err)
 
     def test_up_with_everyone_running_still_starts_the_keeper(self):
@@ -2159,7 +2188,7 @@ class TeamCommandTests(TeamCase):
         with patch.object(factory, "wait_outcomes", side_effect=OSError("cannot read")):
             code, _, err = self.cmd(self.operator, "up", "reviewer")
         self.assertEqual(code, 3)
-        self.assertIn("is stored; its outcome could not be read (cannot read). Then run: factory.py status", err)
+        self.assertIn("is stored; its outcome could not be read (cannot read). Then run: " + CMD("status"), err)
 
     def test_an_unrecorded_stop_is_finished_by_the_next_down_and_blocks_up(self):
         self.cmd(self.operator, "up", "lead-dev")
@@ -2167,10 +2196,10 @@ class TeamCommandTests(TeamCase):
         with patch.object(factory, "mark_stopped", side_effect=OSError("no space")):
             code, out, _ = self.cmd(self.operator, "down", "lead-dev")
         self.assertEqual(code, 1)
-        self.assertIn(f"its record {term} is kept. Run factory.py down lead-dev again.", out)
+        self.assertIn(f"its record {term} is kept. Run {CMD('down', 'lead-dev')} again.", out)
         code, _, err = self.cmd(self.operator, "up", "lead-dev")
         self.assertEqual(code, 2)
-        self.assertIn("the last stop of @lead-dev was not recorded; run factory.py down lead-dev first", err)
+        self.assertIn(f"the last stop of @lead-dev was not recorded; run {CMD('down', 'lead-dev')} first", err)
         code, out, err = self.cmd(self.operator, "down", "lead-dev")
         self.assertEqual(code, 0, out + err)
         self.assertIn("stopped @lead-dev (was stopped)", out)
@@ -2197,7 +2226,7 @@ class TeamCommandTests(TeamCase):
         with patch.object(factory.Log, "drop_queued", side_effect=OSError("disk full")):
             code, out, _ = self.cmd(self.operator, "down", "lead-dev")
         self.assertEqual(code, 1)
-        self.assertIn("their records are kept. Run factory.py down lead-dev again.", out)
+        self.assertIn(f"their records are kept. Run {CMD('down', 'lead-dev')} again.", out)
         self.assertIn(term, [r["address"] for r in self.hc.list(self.team)])
         self.assertEqual(self.cmd(self.operator, "up", "lead-dev")[0], 2)          # no replacement yet
         code, out, err = self.cmd(self.operator, "down", "lead-dev")
@@ -2232,7 +2261,7 @@ class TeamCommandTests(TeamCase):
             code, _, err = self.cmd(self.operator, "up", "lead-dev", "--fresh")
         self.assertEqual(code, 3)
         self.assertIn("its fresh launch could not be recorded (disk full), so up stopped it", err)
-        self.assertIn("then factory.py up lead-dev --fresh", err)                # the retry stays fresh
+        self.assertIn("then " + CMD("up", "lead-dev", "--fresh"), err)                # the retry stays fresh
         self.assertEqual(self.member_terms(), {})                               # nothing runs unrecorded
         self.assertIn(old, [r["address"] for r in self.hc.list(self.team)])     # the old record stays
         self.assertFalse([m for m in self.log.read_box()[1].msgs.values() if m["kind"] == "brief"])
@@ -2277,7 +2306,8 @@ class TeamCommandTests(TeamCase):
         self.fake.on_run("pm", status="idle", screen="Do you trust the contents of this project?")
         code, out, err = self.cmd(self.operator, "up")
         self.assertEqual(code, 3)
-        self.assertIn("waits on its trust dialog: accept it in its pane, then run: factory.py brief --send pm", err)
+        self.assertIn("waits on its trust dialog: accept it in its pane, then run: " + CMD("brief", "--send", "pm"),
+                      err)
         self.assertFalse(self.fake.calls("terminal.keys"))
         self.assertFalse([m for m in self.log.read_box()[1].msgs.values() if m["kind"] == "brief"])
 
@@ -2464,7 +2494,7 @@ class TeamCommandTests(TeamCase):
         self.assertEqual(code, 0, out + err)
         self.assertIn("stopped @lead-dev (was idle); 1 queued messages dropped", out)
         self.assertIn("@reviewer was not running", out)
-        self.assertIn("run factory.py up to bring members back", out)
+        self.assertIn(f"run {CMD('up')} to bring members back", out)
         calls = [(c["method"], c["params"].get("labels")) for c in self.mutations()[before:]
                  if c["params"].get("terminal") == term]
         self.assertEqual(calls, [("terminal.label", {"factory.down": "1"}), ("terminal.kill", None),
@@ -2535,16 +2565,16 @@ class TeamCommandTests(TeamCase):
         self.assertRegex(out, rf"@reviewer +reviewer +codex +gpt-6-luna +high +gone +{reviewer}")
         self.assertIn("@reviewer interrupted: exited (code 1)", out)
         self.assertIn("pending: @operator 1", out)
-        self.assertIn("read them with: factory.py inbox --for operator", out)
+        self.assertIn("read them with: " + CMD("inbox", "--for", "operator"), out)
         self.assertIn("keeper: starting (keeper)\n", out)                  # placed, no heartbeat yet
         self.assertIn("operator: reachable", out)
-        self.assertIn("@reviewer gone: run `factory.py up reviewer` to bring them back.", out)
+        self.assertIn(f"@reviewer gone: run `{CMD('up', 'reviewer')}` to bring them back.", out)
 
     def test_brief_previews_offline_with_placeholders(self):
         with patch.dict(os.environ, {"XDG_CACHE_HOME": str(self.env.root / "elsewhere")}):
             code, out, err = self.cmd(None, "brief", "reviewer")
         self.assertEqual(code, 0, err)
-        self.assertIn("paths are final after factory.py up", err)
+        self.assertIn("paths are final after " + CMD("up"), err)
         self.assertIn("<state>/messages/reviewer/FILENAME", out)
         self.assertIn("<state>/reviewer.md", out)
         code, out, err = self.cmd(None, "brief", "reviewer")             # the team's state exists: real paths
@@ -2557,8 +2587,8 @@ class TeamCommandTests(TeamCase):
         starting = self.terminal("frontend-dev", status=None)[0]
         code, out, err = self.cmd(self.operator, "status")
         self.assertEqual(code, 0, err)
-        self.assertIn("no pane: @frontend-dev, @reviewer (run factory.py up)", out)
-        self.assertIn("@reviewer has no confirmed brief: run factory.py brief --send reviewer", out)
+        self.assertIn(f"no pane: @frontend-dev, @reviewer (run {CMD('up')})", out)
+        self.assertIn("@reviewer has no confirmed brief: run " + CMD("brief", "--send", "reviewer"), out)
         self.assertNotIn("@frontend-dev has no confirmed brief", out)
         self.assertNotIn("@lead-dev has no confirmed brief", out)
         self.assertIsNone(factory.where(self.hc.doc_get()[0], reviewer))
@@ -2566,7 +2596,7 @@ class TeamCommandTests(TeamCase):
         with patch.object(factory, "ensure_keeper", return_value="replacement"):
             code, out, err = self.cmd(self.operator, "status")
         self.assertEqual(code, 0, err)
-        self.assertIn("keeper: starting (replacement), no pane (run factory.py up)", out)
+        self.assertIn(f"keeper: starting (replacement), no pane (run {CMD('up')})", out)
 
     def test_status_survives_a_malformed_doc_and_a_damaged_log(self):
         self.assertEqual(self.cmd(self.operator, "up", "lead-dev")[0], 0)
@@ -2586,8 +2616,8 @@ class TeamCommandTests(TeamCase):
         self.fake.set_status(term, None)                      # the terminal survives, but its harness is gone
         code, out, err = self.cmd(self.operator, "status")
         self.assertEqual(code, 0, out + err)
-        self.assertIn("@reviewer gone: run `factory.py up reviewer`", out)
-        self.assertNotIn("factory.py brief --send reviewer", out)
+        self.assertIn(f"@reviewer gone: run `{CMD('up', 'reviewer')}`", out)
+        self.assertNotIn("brief --send reviewer", out)
 
     def test_brief_send_reaches_a_replacement_resting_in_done(self):
         """Claude Code member case 8 at 97afeec: the replacement answered its unconfirmed brief and rested in done,
@@ -2640,7 +2670,7 @@ class TeamCommandTests(TeamCase):
                 code, out, err = self.cmd(self.operator, "status")
                 self.assertEqual(code, 0, out + err)
                 self.assertIn(f"@reviewer: first brief {first} is still {pending}", out)
-                self.assertNotIn("run factory.py brief --send reviewer", out)
+                self.assertNotIn("brief --send reviewer", out)
                 code, out, err = self.cmd(self.operator, "brief", "--send", "reviewer")
                 self.assertEqual(code, 1, out + err)
                 self.assertIn(f"@reviewer: first brief {first} is still {pending}", out)
@@ -2796,7 +2826,7 @@ class IntegratedTeamTests(TeamCase):
         self.env.write_brief(formation({"lead-dev": CATALOG_MEMBERS["lead-dev"]}))
         code, out, err = self.cmd("down")
         self.assertEqual(code, 1, out + err)
-        self.assertIn("run factory.py up to bring members back", out)
+        self.assertIn(f"run {CMD('up')} to bring members back", out)
         old = members["reviewer"]
         self.assertIn(f"@reviewer ({old}) is still running outside factory.toml.", err)
         self.assertIn(f"Run hc kill {old} to stop it.", err)
@@ -2845,7 +2875,7 @@ class IntegratedTeamTests(TeamCase):
         self.assertEqual(set(factory.blocks(self.hc.doc_get()[0])), {first["reviewer"], keeper})
         code, out, err = self.cmd("down")
         self.assertEqual(code, 0, out + err)
-        self.assertIn("run factory.py up to bring members back", out)
+        self.assertIn(f"run {CMD('up')} to bring members back", out)
         self.assertFalse(factory.blocks(self.hc.doc_get()[0]))
         self.until(lambda: self.hc.get(keeper)["state"] == "finished", "the keeper's exit after the last down")
         code, out, err = self.cmd("up", "lead-dev")
@@ -2912,7 +2942,30 @@ class MemberNoteTests(TeamCase):
         self.assertEqual(error["text"], "@lead-dev hit an error: login expired.")
         self.assertEqual(exit_note["meta"], {"what": "exit", "about": "lead-dev", "term": self.lead})
         self.assertEqual(exit_note["text"], f"@lead-dev exited (code 1) while error. Its last message from you was"
-                                            f" #{task}. Run: factory.py up lead-dev")
+                                            f" #{task}. Run: {CMD('up', 'lead-dev')}")
+
+    def test_the_exit_note_runs_its_own_copy_from_any_directory(self):
+        """#173 pi member case 8 at a198b9c: an operator ran the note's bare 'factory.py up lead-dev' and went
+        searching. The note names python3 and the running script's absolute path, quoted, so it works from another
+        directory and from a path with a space (@architect-2)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            skill = pathlib.Path(tmp) / "a b" / "skill"
+            shutil.copytree(SCRIPT.parent.parent, skill, ignore=shutil.ignore_patterns("__pycache__"))
+            copy = skill / "scripts" / "factory.py"
+            spec = importlib.util.spec_from_file_location("factory_copy", copy)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            module.TEAM_ROOT = pathlib.Path(tmp) / "my project"          # a team checkout with a space as well
+            keeper = types.SimpleNamespace(box=types.SimpleNamespace(last_to=lambda name, sender=None: None),
+                                           cfg=types.SimpleNamespace(operator={"name": "operator"}))
+            view = types.SimpleNamespace(state=lambda name: "gone")
+            record = {"address": "t3", "state": "finished", "reason": "killed", "labels": {"factory.last": "done"}}
+            meta, text = module.Keeper._episode(keeper, "lead-dev", record, None, view)
+            self.assertEqual(meta["what"], "exit")
+            line = text.split(" Run: ", 1)[1]
+            self.assertEqual(shlex.split(line), ["python3", str(copy.resolve()), "up", "lead-dev", "--cwd",
+                                                 str(module.TEAM_ROOT)])
+            self.assertIn(shlex.quote(str(copy.resolve())), line)
 
     def test_nothing_for_unbriefed_stopping_or_unwatched_members(self):
         reviewer = self.terminal("reviewer")[0]                          # never briefed
@@ -4807,7 +4860,7 @@ class TeamLookupTests(unittest.TestCase):
         now = datetime.datetime.fromisoformat("2026-11-26T17:03:00Z").timestamp()
         self.assertEqual(factory.pending_lines(state, "operator", now), [
             "pending: @operator 2 (oldest 3m, blocked); @lead-dev 1 (oldest 3m, waiting)",
-            "read them with: factory.py inbox --for operator",
+            "read them with: " + CMD("inbox", "--for", "operator"),
         ])
         self.assertEqual(len(factory.pending_lines(state, "reviewer", now)), 1)
         with log.path.open("ab") as stream:
@@ -6612,8 +6665,8 @@ class ReadyTests(unittest.TestCase):
 
     def test_a_dialog_without_keys_is_left_to_the_owner(self):
         out, hc = self.ready({"a": [("live", "blocked", self.TRUST)]}, [[self.TRUST, []]])
-        self.assertEqual(out, {"a": "waits on its trust dialog: accept it in its pane, then run:"
-                                    " factory.py brief --send a"})
+        self.assertEqual(out, {"a": "waits on its trust dialog: accept it in its pane, then run: "
+                                    + CMD("brief", "--send", "a")})
         self.assertEqual(hc.keys_sent, [])
 
     def test_an_exit_reports_its_code_and_last_line_and_others_go_on(self):
@@ -6812,6 +6865,42 @@ class QualifyJudgeTests(unittest.TestCase):
 
     def trials(self, *seconds, idle=True, outcome="delivered"):
         return [{"idle": idle, "seconds": s, "outcome": outcome} for s in seconds]
+
+    def test_two_senders_setup_needs_a_started_turn_that_settled(self):
+        """@reviewer's #230 follow-up: an assignment that was delivered but never started a turn, or whose turn
+        has not settled, leaves the trial not_run."""
+        import live
+        done = {"status": {"state": "done"}, "turn": 2}
+        delivered = {"o": "delivered", "started": True, "turn": 2}
+        self.assertTrue(live._setup_settled(delivered, done))
+        self.assertTrue(live._setup_settled(delivered, {"status": {"state": "idle"}, "turn": 3}))
+        self.assertFalse(live._setup_settled({**delivered, "started": False}, done))     # typed, never started
+        self.assertFalse(live._setup_settled({**delivered, "turn": None}, done))
+        self.assertFalse(live._setup_settled(delivered, {"status": {"state": "working"}, "turn": 2}))
+        self.assertFalse(live._setup_settled(delivered, {"status": {"state": "idle"}, "turn": 1}))   # before it
+        self.assertFalse(live._setup_settled({"o": "sending"}, done))
+
+    def test_a_lost_session_probe_is_asked_again_only_once_the_terminal_is_ready(self):
+        """@reviewer's #230 follow-up: case 6's retry waits for readiness; a terminal that never becomes ready is
+        not asked again, and the switch row says it is unproved."""
+        import live
+        tmp = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
+
+        def team(state):
+            sent = []
+            return sent, types.SimpleNamespace(receipt=lambda name: tmp / f"{name}-{len(sent)}", state=lambda t: state,
+                                               send=lambda t, text: sent.append(t), until=lambda pred, timeout: pred())
+        adapter = types.SimpleNamespace(act_run=lambda done, command: f"run {command}")
+        sent, blocked = team("blocked")
+        retries, unready = [], []
+        self.assertIsNone(live._session_probe(blocked, adapter, "CODEX_THREAD_ID", "t1", retries, unready))
+        self.assertEqual((sent, retries, unready), (["t1"], [], [{"terminal": "t1", "state": "blocked"}]))
+        self.assertTrue(live._probe_unproved("no variable", unready).startswith("unproved: the session probe on t1"))
+        self.assertEqual(live._probe_unproved("no variable", []), "no variable")
+        sent, ready = team("idle")
+        retries, unready = [], []
+        live._session_probe(ready, adapter, "CODEX_THREAD_ID", "t2", retries, unready)
+        self.assertEqual((sent, retries, unready), (["t2", "t2"], ["t2"], []))          # asked again once
 
     def test_between_turns_judges_refuse_the_old_failure(self):
         """@architect-2: a report already typed and ignored must not pass as one Factory held (keeper.md §9)."""
@@ -7243,7 +7332,10 @@ class QualifyFrameworkTests(unittest.TestCase):
         root = home / "qa-run"
         claude = home / ".claude" / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(root / "work"))
         claude.mkdir(parents=True)
-        (claude / "a.jsonl").write_text('{"cmd": "python3 /store/factory/scripts/factory.py wait"}\n')
+        (claude / "a.jsonl").write_text(json.dumps({"type": "tool_use", "id": "u1", "name": "Bash", "input": {
+            "command": "python3 /store/factory/scripts/factory.py wait"}}) + "\n"         # run: a shell call's command
+                                        + json.dumps({"type": "tool_result", "tool_use_id": "u1", "content": "ok"})
+                                        + "\n")
         other = home / ".claude" / "projects" / "-home-owner-project"
         other.mkdir(parents=True)
         (other / "b.jsonl").write_text('{"cmd": "python3 /store/factory/scripts/factory.py say"}\n')
@@ -7261,12 +7353,96 @@ class QualifyFrameworkTests(unittest.TestCase):
                                            else {"text": screens[params["terminal"]]})
         seen = core.installed_seen([root], lambda record: {"t1": "agy"}.get(record["address"]))
         self.assertEqual(len(seen), 3)
-        self.assertIn(("agy", "t1 screen: /store/factory/scripts/factory.py"), seen)
-        self.assertEqual({h for h, _ in seen}, {"agy", "claude", "codex"})
-        self.assertFalse(any("t2" in s or "b.jsonl" in s or "rollout-2" in s for _, s in seen))
+        self.assertEqual(seen[0], ("claude", "a.jsonl: ran /store/factory/scripts/factory.py", True))   # runs first
+        self.assertIn(("agy", "t1 screen: /store/factory/scripts/factory.py", False), seen)
+        self.assertIn(("codex", "rollout-1.jsonl: ~/.codex/skills/factory/scripts/factory.py", False), seen)
+        self.assertFalse(any("t2" in s or "b.jsonl" in s or "rollout-2" in s for _, s, _ in seen))
         failed, observed = live.split_seen(seen)
-        self.assertEqual(len(failed), 2)                  # Claude Code and Codex had their discovery off
-        self.assertEqual(observed, ["agy: t1 screen: /store/factory/scripts/factory.py"])
+        self.assertEqual(failed, ["a.jsonl: ran /store/factory/scripts/factory.py"])   # only the run fails
+        self.assertEqual(observed, ["codex: rollout-1.jsonl: ~/.codex/skills/factory/scripts/factory.py",
+                                    "agy: t1 screen: /store/factory/scripts/factory.py"])
+
+    def test_only_an_invocation_with_a_result_runs_a_script(self):
+        """@architect-2 and @lead-dev at daa3b35: a path as an argument, in a comment, after a redirect or in a call
+        with no result was not run; a python script operand or the program itself, in any simple command or a
+        sh -c script, was."""
+        import live
+        script = "/home/o/.codex/skills/factory/scripts/factory.py"
+        for command in (f"ls -l {script}", f"cat {script}", f"rg --files / | rg {shlex.quote(script)}",
+                        f"echo hi # python3 {script} up", f"echo x > {script}", f"python3 -c 'print(1)' {script}",
+                        f"grep -n say {script}"):
+            with self.subTest(command=command):
+                self.assertNotIn(script, live.invoked(command))
+        for command in (f"python3 {script} status", f"python3 '{script}' up lead-dev", f"{script} inbox",
+                        f"cd /tmp && PYTHONPATH=x python3 -u {script} say", f"env A=1 python3.13 {script} up",
+                        f"bash -lc 'python3 {script} status'", f"bash -lc python3 {script} status",
+                        f"echo a; python3 {script} down\npython3 x.py"):
+            with self.subTest(command=command):
+                self.assertIn(script, live.invoked(command))
+        home = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(patch.dict(os.environ, {"HOME": str(home), "CODEX_HOME": str(home / ".codex")}))
+        root = home / "qa-run"
+        day = home / ".codex" / "sessions" / time.strftime("%Y/%m/%d")
+        day.mkdir(parents=True)
+        installed = str(home / ".codex/skills/factory/scripts/factory.py")
+        core = live.Core.__new__(live.Core)
+        core.installed = [(str(home / ".codex/skills/factory"), str(home / ".codex/skills/factory"))]
+        core.rpc = lambda method, params: {"terminals": []} if method == "terminal.list" else {"text": ""}
+
+        def transcript(*calls):
+            lines = [{"payload": {"cwd": str(root / "work")}}]
+            for n, (cmd, output) in enumerate(calls):
+                lines.append({"type": "function_call", "name": "exec_command", "call_id": f"c{n}",
+                              "arguments": json.dumps({"cmd": cmd})})
+                if output is not None:
+                    lines.append({"type": "function_call_output", "call_id": f"c{n}", "output": output})
+            (day / "rollout-1.jsonl").write_text("".join(json.dumps(line) + "\n" for line in lines))
+            return [run for _, _, run in core.installed_seen([root])]
+        self.assertEqual(transcript((f"ls -l {installed}", "-rw-r--r-- 1 o o 9 factory.py")), [False])
+        self.assertEqual(transcript((f"python3 {installed} status", None)), [False])        # called, no result
+        self.assertEqual(transcript((f"python3 {installed} status", "Exit code: 2\nno team")), [True])   # it ran
+        self.assertEqual(transcript((f"python3 '{installed}' up lead-dev", "Exit code: 0\nok")), [True])
+        # @architect-2 at fd65f71: a here-document's body is data, and a commented code-mode call ran nothing
+        self.assertEqual(transcript((f"cat <<'EOF'\npython3 {installed} status\nEOF", "python3 ... status")), [False])
+        self.assertIn(script, live.invoked(f"cat <<EOF\nx\nEOF\npython3 {script} status"))        # after it, a run
+        commented = {"type": "custom_tool_call", "call_id": "k1", "input": (
+            f'// await tools.exec_command({{cmd:"python3 {installed} status"}});\ntext("nothing executed")')}
+        direct = {"type": "custom_tool_call", "call_id": "k1", "input": (
+            f'const r = await tools.exec_command({{cmd:"python3 {installed} status"}});\ntext(r.output)')}
+        output = {"type": "custom_tool_call_output", "call_id": "k1", "output": "nothing executed"}
+        for node, expected in ((commented, [False]), (direct, [True])):
+            lines = [{"payload": {"cwd": str(root / "work")}}, node, output]
+            (day / "rollout-1.jsonl").write_text("".join(json.dumps(line) + "\n" for line in lines))
+            with self.subTest(code=node["input"][:12]):
+                self.assertEqual([run for _, _, run in core.installed_seen([root])], expected)
+
+    def test_a_search_that_lists_an_installed_script_is_only_observed(self):
+        """@operator (#173 pi member case 8 at a198b9c): the Codex peer's rg --files listed the installed v1
+        script, which it never ran. A path in a shell call's output is an observation; in its command, a failure."""
+        import live
+        home = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(patch.dict(os.environ, {"HOME": str(home), "CODEX_HOME": str(home / ".codex")}))
+        script = str(home / ".codex/skills/factory/scripts/factory.py")
+        root = home / "qa-run"
+        day = home / ".codex" / "sessions" / time.strftime("%Y/%m/%d")
+        day.mkdir(parents=True)
+        search = [{"payload": {"cwd": str(root / "work")}},
+                  {"type": "function_call", "name": "exec_command", "call_id": "c1",
+                   "arguments": json.dumps({"cmd": "rg --files / | rg factory.py"})},
+                  {"type": "function_call_output", "call_id": "c1", "output": script + "\n"}]
+        rollout = day / "rollout-1.jsonl"
+        rollout.write_text("".join(json.dumps(line) + "\n" for line in search))
+        core = live.Core.__new__(live.Core)
+        core.installed = [(str(home / ".codex/skills/factory"), str(home / ".codex/skills/factory"))]
+        core.rpc = lambda method, params: {"terminals": []} if method == "terminal.list" else {"text": ""}
+        seen = core.installed_seen([root])
+        self.assertEqual([(h, run) for h, _, run in seen], [("codex", False)])
+        self.assertEqual(live.split_seen(seen)[0], [])
+        run = {"type": "function_call", "name": "exec_command", "call_id": "c2",
+               "arguments": json.dumps({"cmd": f"python3 {script} up lead-dev"})}
+        result = {"type": "function_call_output", "call_id": "c2", "output": "Exit code: 0"}
+        rollout.write_text(rollout.read_text() + json.dumps(run) + "\n" + json.dumps(result) + "\n")
+        self.assertEqual(len(live.split_seen(core.installed_seen([root]))[0]), 1)       # now it ran: a failure
         core.installed = []
         self.assertEqual(core.installed_seen([root]), [])
 
@@ -7277,11 +7453,12 @@ class QualifyFrameworkTests(unittest.TestCase):
         self.enterContext(patch.object(live.Core, "stop", lambda core: None))
         self.enterContext(patch.object(live.tempfile, "gettempdir",
                                        return_value=self.enterContext(tempfile.TemporaryDirectory())))
-        seen = [("codex", "t1 screen: /store/factory/scripts/factory.py")]
+        seen = [("codex", "a.jsonl: ran /store/factory/scripts/factory.py", True)]
         with patch.object(live.Core, "installed_seen", lambda core, roots, harness_of: seen):
             result = live.harness_check("LC-6", ["sh"], lambda qa, result: result.update(result="pass"))
-        self.assertEqual(result["result"], "fail: an installed Factory script appeared in a QA terminal or transcript")
-        with patch.object(live.Core, "installed_seen", lambda core, roots, harness_of: [("agy", "t1 screen: x")]):
+        self.assertEqual(result["result"], "fail: an installed Factory script was run in a QA transcript")
+        observed_only = [("agy", "t1 screen: x", False)]
+        with patch.object(live.Core, "installed_seen", lambda core, roots, harness_of: observed_only):
             result = live.harness_check("LC-12", ["sh"], lambda qa, result: result.update(result="pass"))
         self.assertEqual((result["result"], result["installed_factory_observed"]), ("pass", ["agy: t1 screen: x"]))
         with patch.object(live.Core, "installed_seen", lambda core, roots, harness_of: []):
@@ -7317,9 +7494,10 @@ class QualifyFrameworkTests(unittest.TestCase):
         # case 6 needs Claude Code's /clear, which the switch turns off (pilot at 0748216): exempt, and observed
         self.assertEqual(live.skills_off("claude", installed, exempt=("claude",)), [])
         self.assertEqual(live.skills_off("codex", installed, exempt=("claude",))[0], "-c")
-        seen = [("claude", "t3 screen: x"), ("codex", "t1 screen: y")]
-        self.assertEqual(live.split_seen(seen, exempt=("claude",)), (["t1 screen: y"], ["claude: t3 screen: x"]))
-        self.assertEqual(live.split_seen(seen), (["t3 screen: x", "t1 screen: y"], []))
+        seen = [("claude", "a: ran x", True), ("codex", "b: ran y", True), ("codex", "t1 screen: z", False)]
+        self.assertEqual(live.split_seen(seen, exempt=("claude",)), (["b: ran y"], ["claude: a: ran x",
+                                                                                  "codex: t1 screen: z"]))
+        self.assertEqual(live.split_seen(seen), (["a: ran x", "b: ran y"], ["codex: t1 screen: z"]))
 
     def test_restart_waits_for_the_shell_prompt(self):
         """claude-op-8 at 7a90602: a harness clears its status before it has exited, and a restart typed then is
@@ -7835,7 +8013,8 @@ class ConfigTests(unittest.TestCase):
             text = e.run("brief").stdout
             self.assertIn("| **@product** | Claude Code, claude-opus-5-5, medium |", text)
             self.assertIn("No reply needed.", text)
-            self.assertIn("factory.py say", text)
+            self.assertIn("Use the send command in your standing instructions", text)
+            self.assertNotIn("`factory.py say`", text)          # the standing instructions have the full command
             self.assertNotIn("Works in", text)  # no worktrees on this team
             prompt = e.run("brief", "reviewer").stdout
             self.assertIn("run it only when the brief's Review section or the requester calls for the deep lane", prompt)
