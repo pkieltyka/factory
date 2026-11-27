@@ -3880,13 +3880,22 @@ def case_6(run, role, harness, adapter_class):
             view.keys("enter")
         variable = harness_table().get(harness, {}).get("session_env")
 
+        probe_retries = []
+
         def session(terminal):
             """The harness's own session variable, as its tool sees it (observation through hc)."""
             if not variable:
                 return None
             out, done = team.receipt("session"), team.receipt("session-run")
-            team.send(terminal, adapter.act_run(done, f'printf "%s\\n" "${{{variable}:-}}" > {shlex.quote(str(out))}'))
-            team.until(lambda: done.exists() and "exit" in done.read_text(), 300)
+            ask = adapter.act_run(done, f'printf "%s\\n" "${{{variable}:-}}" > {shlex.quote(str(out))}')
+            team.send(terminal, ask)
+            if not team.until(lambda: done.exists() and "exit" in done.read_text(), 120):
+                # keys typed while a harness redraws after a native switch can be lost (Codex /new at a65a1fe:
+                # the probe never reached the new conversation); it only prints a variable, so ask again once
+                team.until(lambda: team.state(terminal) in READY, 60)
+                team.send(terminal, ask)
+                probe_retries.append(terminal)
+                team.until(lambda: done.exists() and "exit" in done.read_text(), 180)
             team.until(lambda: team.state(terminal) in READY, 120)
             return out.read_text().strip() if out.exists() else None
         if role == "operator":
@@ -3903,7 +3912,8 @@ def case_6(run, role, harness, adapter_class):
             run.row(6, "operator-switch", role, harness, status,
                     "after the operator switches conversation natively in its terminal (its session variable changes),"
                     " a member's report reaches it and is acted on once",
-                    proof={"variable": variable, "switched": switched, "member_say": said, "action_count": count},
+                    proof={"variable": variable, "switched": switched, "member_say": said, "action_count": count,
+                           "probe_retries": len(probe_retries)},
                     reason=None if status == "pass" else why or f"the action ran {count} times" if switched
                     else why or f"no {variable or 'session variable'} to show the switch")
             return
