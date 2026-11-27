@@ -1943,7 +1943,8 @@ class RealAdapter(FixtureAdapter):
             raise NotRun(f"{', '.join(missing)} not on PATH")
 
     def operator_argv(self, harness):
-        return [shutil.which(harness), *harness_table()[harness]["permissions"]["full"]]
+        """The operator as the owner would start it, with the profile's model pinned (as Factory pins a member's)."""
+        return [shutil.which(harness), "--model", self.model(harness), *harness_table()[harness]["permissions"]["full"]]
 
     def act_append(self, path, token):
         return (f"Using your shell tool, append one line containing exactly {token} to the file {path}"
