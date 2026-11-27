@@ -6696,10 +6696,11 @@ class QualifyFixtureTests(unittest.TestCase):
 
     def test_cases_2_and_9_pass_on_fake_agents_and_say_so(self):
         evidence, code = live.qualify("codex", None, [2, 9], fixture=True)
-        self.assertEqual((evidence["mode"], code), ("fixture", 0))
+        commands = "pass" if live.RODEO else "not_run"      # the owner's first prompt goes through rodeo
+        self.assertEqual((evidence["mode"], code), ("fixture", 0 if live.RODEO else 2))
         self.assertEqual(sorted((r["role"], r["subcase"], r["status"]) for r in evidence["rows"]),
                          [("member", "guarded", "pass"), ("member", "idle-report", "pass"),
-                          ("operator", "idle-report", "pass"), ("operator", "operator-commands", "pass")])
+                          ("operator", "idle-report", commands), ("operator", "operator-commands", commands)])
 
     def test_an_echoed_token_without_the_action_fails(self):
         # The report reaches the operator with the token in it, but no action is asked for: no receipt.

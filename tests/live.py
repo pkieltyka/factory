@@ -2733,6 +2733,8 @@ def _note(team, text):
 def _rodeo(team, titles):
     """rodeo on a driver core, viewing the QA core's team tab once its titles render; closed with the team."""
     if getattr(team, "view", None) is None:
+        if not RODEO:
+            raise NotRun("rodeo is not installed: owner input goes through rodeo")
         team.drv = Core("qualifydrv")
         team.view = Rodeo(team.qa, team.drv)
         team.view.focused_terminal = None
