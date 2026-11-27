@@ -259,7 +259,7 @@ Each step is one commit, green in fake mode; real mode before review.
 
 Risks and gaps:
 - **Stale blocks Factory cannot see.** If the owner removes a member's terminal record by hand, or a `down` could not update the layout, a block with a dead terminal stays until a client removes it or the owner closes it. Factory does not guess which blocks are its own.
-- **A pane closed in a client.** What rodeo does to the terminal when the owner closes a Factory pane is not known. If the terminal lives on with its `herdr.space` label, the client re-adopts it; if it dies, the member is `gone` and `up` restarts it. To observe during the smoke run and record.
+- **Closing a pane in rodeo.** On private hc 0.1.20 and rodeo 0.2.1, `Ctrl+B` then `x` on a probe pane with `keep=false` removed the pane and left the terminal `finished`. Factory treats that record as `gone` and `up` restarts the member.
 - **5a's names.** `start_member`, `launch_entry`, `session_plan`, `saved_sessions` and the shape of `up`'s steps are taken from the plan, not from merged code. Confirmed by @lead-dev-2 on 27 November 2026: `start_member` builds the terminal's labels in one dict at its `hc.run` call, where `factory.launch` joins; `session_plan` returns `{"args", "resume", "assigned", "notice"}`; `launch_entry` skips a terminal whose newest entry is its own.
 
 Decided by @operator on 27 November 2026; no question is open:

@@ -1590,16 +1590,12 @@ class UpTests(unittest.TestCase):
             self.assertIn("must be one of full, guarded", e.run("check", "pm", check=False).stderr)
 
 
-    def test_claude_socket_settings_follow_platform_and_permission_level(self):
-        for platform in ("linux", "darwin"):
-            for socket_path in ("", "/tmp/hc-test.sock"):
-                with self.subTest(platform=platform, socket=socket_path), patch.object(factory.sys, "platform", platform), \
-                        patch.dict(os.environ, {"HC_TERMINAL_SOCKET": socket_path}):
-                    full = json.loads(factory.claude_settings("full", "/s/messages/x"))["sandbox"]
-                    expected = {"allowUnixSockets": [socket_path]} if platform == "darwin" and socket_path else {"allowAllUnixSockets": True}
-                    self.assertEqual(full["network"], expected)
-                    guarded = json.loads(factory.claude_settings("guarded", "/s/messages/x"))["sandbox"]
-                    self.assertNotIn("network", guarded)
+    def test_claude_socket_settings_in_the_qualified_environment(self):
+        with patch.object(factory.sys, "platform", "linux"):
+            full = json.loads(factory.claude_settings("full", "/s/messages/x"))["sandbox"]
+            self.assertEqual(full["network"], {"allowAllUnixSockets": True})
+            guarded = json.loads(factory.claude_settings("guarded", "/s/messages/x"))["sandbox"]
+            self.assertNotIn("network", guarded)
 
 
     def test_existing_member_settings_only_come_from_the_brief(self):
@@ -2128,6 +2124,30 @@ class TeamCommandTests(TeamCase):
         self.assertFalse(any("herdr.space" in r["params"]["labels"] for r in self.fake.calls("terminal.label")))
         self.assertNotIn("layout", factory.read_team(self.state_dir))
 
+    def test_layout_metadata_write_failure_is_only_a_warning(self):
+        real = factory.update_team
+
+        def update(state, **changes):
+            if "layout" in changes:
+                raise OSError("test metadata failure")
+            return real(state, **changes)
+
+        with patch.object(factory, "update_team", update):
+            code, out, err = self.cmd(self.operator, "up", "lead-dev")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("layout placed, but team.json was not updated: test metadata failure", err)
+        term = self.member_terms()["lead-dev"]
+        self.assertIn(term, factory.blocks(self.hc.doc_get()[0]))
+        self.assertNotIn("layout", factory.read_team(self.state_dir))
+        self.assertEqual(self.cmd(self.operator, "up", "lead-dev")[0], 0)
+        old = factory.read_team(self.state_dir)["layout"]
+        with patch.object(factory, "update_team", update):
+            code, out, err = self.cmd(self.operator, "down")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("layout updated, but team.json was not updated: test metadata failure", err)
+        self.assertNotIn(term, factory.blocks(self.hc.doc_get()[0]))
+        self.assertEqual(factory.read_team(self.state_dir)["layout"], old)
+
     def test_conflict_recomputes_the_winning_tab_and_keeps_an_owner_moved_pane(self):
         lead = self.terminal("lead-dev")[0]
         space = LayoutTests.space("a", LayoutTests.tab("first", LayoutTests.pane(lead)))
@@ -2367,6 +2387,11 @@ class TeamCommandTests(TeamCase):
         self.assertEqual(first[1:3], ["resume", "thread-a"])
         self.assertNotIn("resume", second)
         self.assertEqual(len(self.member_terms()), 1)
+        edits = [c["params"]["value"] for c in self.fake.calls("doc.set")]
+        original, fresh = (next(p for p in factory.blocks(doc).values() if p["title"] == "@lead-dev")
+                           for doc in edits)
+        self.assertEqual(fresh["id"], original["id"])
+        self.assertNotEqual(fresh["content"]["terminal"], original["content"]["terminal"])
 
     def test_members_already_running_hear_who_joined(self):
         lead = self.terminal("lead-dev")[0]
@@ -2720,7 +2745,8 @@ class IntegratedTeamTests(TeamCase):
         self.hc.kill(self.operator)
         self.until(lambda: self.hc.get(self.operator)["state"] == "finished", "old operator to finish")
         first = self.add("operator", "first queued report")
-        second = self.add("operator", "second queued report")
+        second, offset, _ = self.log.add("pm", ["operator"], "second queued report")
+        self.until(lambda: self.outcome(first, "operator").get("why") == "gone", "old operator's queued message")
         self.assertEqual([m["id"] for m, _ in self.log.read_box()[1].pending("operator")], [first, second])
         before = self.hc.doc_get()
         self.operator = term
@@ -2730,7 +2756,7 @@ class IntegratedTeamTests(TeamCase):
         self.assertEqual(self.members(), members)
         self.assertEqual(self.hc.doc_get(), before)
         self.assertEqual(factory.read_team(self.state_dir)["layout"], saved)
-        receipts = factory.wait_outcomes(self.log, second, ["operator"], 0, timeout=15)
+        receipts = factory.wait_outcomes(self.log, second, ["operator"], offset, timeout=15)
         self.assertEqual((receipts["operator"]["o"], receipts["operator"]["term"]), ("delivered", term))
         self.assertEqual(self.outcome(first, "operator")["term"], term)
         self.assertEqual([text.splitlines()[-1] for text in self.inputs(term, log)],

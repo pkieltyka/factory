@@ -2428,7 +2428,7 @@ def _place_team(cfg, state, hc, team, me, keeper, replacements):
     if saved_layout is not None and saved_layout != layout:
         try:
             update_team(state, layout=saved_layout)
-        except (Problem, OSError, LogDamage) as error:
+        except (Problem, OSError, LogDamage, ValueError) as error:
             print(f"layout placed, but team.json was not updated: {error}", file=sys.stderr)
     for terminal, (space, tab) in placed.items():
         try:
@@ -2475,7 +2475,7 @@ def _unplace_team(state, hc, recorded, last, keeper):
     elif saved_layout != layout:
         try:
             update_team(state, layout=saved_layout)
-        except (Problem, OSError, LogDamage) as error:
+        except (Problem, OSError, LogDamage, ValueError) as error:
             print(f"layout updated, but team.json was not updated: {error}", file=sys.stderr)
 
 

@@ -9,6 +9,7 @@ only after server.status names that id, so the owner's sessions are never reache
     python3 tests/live.py check lc1|lc10|lc13|lc8|rodeo_focus|all [--json PATH]
     python3 tests/live.py check lc2|lc3|lc4|lc6|lc7|lc12|login [--json PATH]   # real harnesses, the owner's login
     python3 tests/live.py fixtures [--out tests/hc_fixtures.json]
+    python3 tests/live.py smoke
 """
 
 import argparse
@@ -19,6 +20,7 @@ import pathlib
 import random
 import re
 import select
+import shlex
 import shutil
 import signal
 import socket
@@ -1416,6 +1418,128 @@ def lc8():
     return result
 
 
+def smoke():
+    """Exercise the real Factory commands and keeper through rodeo on two private cores."""
+    if not RODEO:
+        raise RuntimeError("rodeo not found (set RODEO_BIN)")
+    here = pathlib.Path(__file__).resolve().parent
+    script = here.parent / "skill/scripts/factory.py"
+    agent = [sys.executable, str(here / "fake_agent.py"), "reports"]
+    lead, reviewer = "@lead-dev", "@reviewer"
+    with Core("smokeqa", config="draft_wait = 15\n") as qa, Core("smokedrv") as drv:
+        work, bin_ = qa.dir / "repo", qa.dir / "bin"
+        codex = qa.dir / "home/.codex"
+        for path in (work, bin_, codex):
+            path.mkdir()
+        (work / "FACTORY.md").write_text("Smoke-test team.\n")
+        (work / "factory.toml").write_text(
+            '[members.lead-dev]\nharness = "codex"\nmodel = "smoke-lead"\n'
+            '[members.reviewer]\nharness = "codex"\nmodel = "smoke-review"\n')
+        (codex / "models_cache.json").write_text(json.dumps({"models": [
+            {"slug": slug, "supported_reasoning_levels": [{"effort": "high"}, {"effort": "medium"}]}
+            for slug in ("smoke-lead", "smoke-review")]}))
+        mock = bin_ / "codex"
+        mock.write_text("#!/bin/sh\n"
+                        'while [ "$#" -gt 1 ] && [ "$1" != "-m" ]; do shift; done\n'
+                        f'export FAKE_LOG={shlex.quote(str(qa.dir))}/"$2.jsonl"\n'
+                        f"exec {shlex.join(agent)}\n")
+        mock.chmod(0o755)
+        agent_log = qa.dir / "smoke-lead.jsonl"
+        op = qa.rpc("terminal.run", {"argv": agent, "cwd": str(work)})["address"]
+        env = {**qa.env, "HC_TERMINAL_ID": op, "HC_BIN": shutil.which(HC) or HC,
+               "PATH": f"{bin_}:{qa.env['PATH']}", "XDG_CACHE_HOME": str(qa.dir / "cache"),
+               "CODEX_HOME": str(codex)}
+        command = [sys.executable, str(script)]
+
+        def call(*args):
+            result = subprocess.run([*command, *args], cwd=work, env=env, capture_output=True, text=True,
+                                    timeout=35)
+            if result.returncode:
+                raise RuntimeError(f"{' '.join(args)} exited {result.returncode}\n{result.stdout}{result.stderr}")
+            return result.stdout
+
+        def check(ok, label):
+            if not ok:
+                raise RuntimeError(label)
+            print(f"PASS {label}", flush=True)
+
+        def inputs():
+            if not agent_log.exists():
+                return []
+            return [json.loads(line)["text"].splitlines()[-1] for line in agent_log.read_text().splitlines()]
+
+        def until(predicate, timeout=10):
+            deadline = now() + timeout
+            while now() < deadline:
+                if predicate():
+                    return True
+                time.sleep(0.1)
+            return False
+
+        def get(terminal):
+            return qa.rpc("terminal.get", {"terminal": terminal})
+
+        check(until(lambda: (get(op).get("status") or {}).get("state") == "idle"), "operator reported idle")
+        out = call("up")
+        check(all(re.search(rf"{name}: brief \d+ delivered", out) for name in (lead, reviewer)),
+              "up delivered both briefs")
+        doc = qa.rpc("doc.get", {"name": "herdr-app"})["value"]
+        panes = doc["spaces"][0]["tabs"][0]["root"]["children"]
+        keeper = panes[-1]["content"]["terminal"]
+        check([pane["title"] for pane in panes] == [lead, reviewer, "keeper"]
+              and panes[-1]["size"]["weight"] == 0.4, "doc puts the keeper last at weight 0.4")
+        rodeo = Rodeo(qa, drv)
+        try:
+            screen = rodeo.wait_for(["team", lead, reviewer, "keeper"])
+            title_row = next((line for line in (screen or "").splitlines() if lead in line and reviewer in line
+                              and "keeper" in line), "")
+            a, b, k = (title_row.find(title) for title in (lead, reviewer, "keeper"))
+            check(0 <= a < b < k and len(title_row.rstrip()) - k < 0.7 * min(b - a, k - b)
+                  and title_row.count(lead) == title_row.count(reviewer) == 1,
+                  "rodeo showed team and each member title once, with the keeper last and narrowest")
+            # Navigate away and back to test that the driver's keys reach the intended pane.
+            rodeo.focus(reviewer)
+            rodeo.focus(lead)
+            rodeo.type("manual input")
+            rodeo.keys("enter")
+            check(until(lambda: "manual input" in inputs()), "rodeo submitted input to the selected member")
+
+            def keeper_screen():
+                return qa.rpc("terminal.read", {"terminal": keeper, "lines": 0})["text"]
+
+            sent = call("say", "lead-dev", "first smoke message")
+            ident = re.search(r"^message (\d+)$", sent, re.M)
+            check(ident is not None and f"{lead}: delivered" in sent
+                  and keeper_screen().count(f"#{ident[1]} @operator -> {lead} delivered") == 1,
+                  "say delivered once and the keeper pane recorded it")
+            rodeo.type("held draft")
+            with subprocess.Popen([*command, "say", "lead-dev", "message after draft"], cwd=work, env=env,
+                                  text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as sending:
+                try:
+                    time.sleep(6)
+                    check("message after draft" not in inputs() and "held draft" not in inputs()
+                          and "sending (held)" in keeper_screen(), "draft held the next say for six seconds")
+                    rodeo.keys("enter")
+                    out, err = sending.communicate(timeout=15)
+                    check(sending.returncode == 0 and f"{lead}: delivered" in out
+                          and until(lambda: inputs()[-2:] == ["held draft", "message after draft"]),
+                          f"Enter released the draft before the stored message{': ' + err.strip() if err else ''}")
+                finally:
+                    if sending.poll() is None:
+                        sending.kill()
+                        sending.communicate()
+
+            tab = doc["spaces"][0]["tabs"][0]["id"]
+            call("down")
+            check(until(lambda: not any(t["id"] == tab
+                                        for space in qa.rpc("doc.get", {"name": "herdr-app"})["value"]["spaces"]
+                                        for t in space["tabs"])), "down removed the team tab from the doc")
+            check(until(lambda: all(title not in rodeo.screen() for title in (lead, reviewer, "keeper"))),
+                  "rodeo removed the team panes")
+        finally:
+            rodeo.close()
+
+
 # Fixtures: replies recorded from a real core, scrubbed of host details.
 
 def scrubber(core):
@@ -1647,8 +1771,15 @@ def main(argv=None):
     check.add_argument("--json", help="also write the results to this file")
     fix = sub.add_parser("fixtures")
     fix.add_argument("--out", default=str(pathlib.Path(__file__).with_name("hc_fixtures.json")))
+    sub.add_parser("smoke")
     args = parser.parse_args(argv)
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
+    if args.command == "smoke":
+        try:
+            smoke()
+        except (RuntimeError, HcError, HcDown, subprocess.TimeoutExpired) as error:
+            parser.exit(1, f"FAIL {error}\n")
+        return
     if args.command == "fixtures":
         results = [fixtures(args.out)]
     else:
