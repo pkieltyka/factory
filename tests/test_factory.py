@@ -7292,10 +7292,18 @@ class E2EJudgeTests(unittest.TestCase):
         original = sample.messages[6]
         for changes in ({"text": original.text.replace("approve", "changes required")},
                         {"text": original.text.replace("(1)", "(2)")},
-                        {"text": original.text.replace(self.revision, "d" * 40)}, {"delivered": 43}):
+                        {"text": original.text.replace(self.revision, "d" * 40)},
+                        {"text": original.text + "\nChanges required before integration."}, {"delivered": 43}):
             with self.subTest(changes=changes):
                 messages = (*sample.messages[:6], replace(original, **changes), *sample.messages[7:])
                 self.assertEqual(self.status(replace(sample, messages=messages), "reviewed", "(1)"), "fail")
+
+    def test_reviewer_can_send_a_formatted_approval_to_the_developer(self):
+        sample = self.normal()
+        verdict = replace(sample.messages[6], recipient="lead-dev",
+                          text=f"- **Status:** `approve` for item `(1)`. The reviewed commit is `{self.revision}`.")
+        messages = (*sample.messages[:6], verdict, *sample.messages[7:])
+        self.assertEqual(self.status(replace(sample, messages=messages), "reviewed", "(1)"), "pass")
 
     def test_run_rows_reject_direct_code_missing_ci_extra_input_and_wrong_build(self):
         sample = self.normal()
@@ -7421,6 +7429,48 @@ class E2EObserverTests(unittest.TestCase):
                 self.assertEqual(e2e.run(fixture, None, None, None, None), 0)
                 self.assertEqual(json.loads(output.getvalue())["mode"], "fixture")
             rehearsal.assert_called_once()
+
+
+class E2ELocalEvidenceTests(unittest.TestCase):
+    def test_approval_must_precede_the_local_merge_not_just_its_push(self):
+        for late in (False, True):
+            with self.subTest(late=late), tempfile.TemporaryDirectory() as directory:
+                repo = e2e.make_local(pathlib.Path(directory), factory.SKILL)
+                e2e.git(repo.root, "worktree", "add", "-b", "qa/lead-dev", str(repo.developer), repo.initial)
+                tickets = tuple(e2e.Ticket(f"({n})") for n in range(1, 4))
+                evidence = e2e.Evidence(tickets)
+                counter = iter(range(1, 100))
+                observer = types.SimpleNamespace(evidence=evidence, collect=lambda: None, stamp=counter.__next__)
+                local = e2e.LocalEvidence(repo, observer)
+                e2e.move_file_item(repo.root, "(1)", "In progress", "plan: clamp the value and cover its boundaries")
+                local.collect()
+                e2e.implement_fixture(repo.developer, 1)
+                e2e.git(repo.developer, "add", "--", "calc", "tests")
+                e2e.git(repo.developer, "commit", "-m", "Implement (1)")
+                revision = e2e.git(repo.developer, "rev-parse", "HEAD").stdout.strip()
+                local.collect()
+
+                def send_verdict():
+                    evidence.messages = (e2e.Message(1, "reviewer", "lead-dev",
+                        f"**status:** approve for (1) at `{revision}`", observer.stamp(),
+                        delivered=observer.stamp(), outcome="delivered"),)
+                    local.collect()
+
+                if not late:
+                    send_verdict()
+                e2e.git(repo.root, "merge", "--no-ff", "-m", "Integrate (1)", revision)
+                local.collect()
+                if late:
+                    send_verdict()
+                merge = e2e.git(repo.root, "rev-parse", "HEAD").stdout.strip()
+                e2e.move_file_item(repo.root, "(1)", "Done", f"work: {merge}")
+                e2e.git(repo.root, "push", "origin", "main")
+                local.collect()
+                first = evidence.tickets[0]
+                self.assertEqual(first.branch_proof, not late)
+                self.assertEqual(first.revision, "" if late else revision)
+                self.assertEqual(first.test_count, 0 if late else 2)
+                self.assertEqual(first.closed is None, late)
 
 
 class SkillTextTests(unittest.TestCase):

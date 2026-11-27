@@ -233,10 +233,16 @@ def row(name, passed, *, item=None, detail=None):
 def approval(ticket, messages):
     if not re.fullmatch(r"[a-f0-9]{40}", ticket.revision):
         return None
-    exact = rf"(?m)^status: approve; item {re.escape(ticket.item)}; commit {ticket.revision}(?:\s|$)"
-    return next((msg for msg in messages if msg.sender == "reviewer" and msg.recipient == "operator"
-                 and msg.kind == "say" and ordered(msg.delivered, ticket.integrated)
-                 and re.search(exact, msg.text)), None)
+    for msg in messages:
+        if (msg.sender != "reviewer" or msg.recipient not in {"operator", "lead-dev"}
+                or not names_item(msg, ticket.item) or not ordered(msg.delivered, ticket.integrated)):
+            continue
+        verdict = msg.text.lower().translate(str.maketrans("", "", "*`_"))
+        if (re.search(r"\bstatus\s*:\s*approve\b(?![-/])", verdict)
+                and not re.search(r"\bchanges\s+required\b", verdict)
+                and re.search(rf"\b{ticket.revision}\b", verdict)):
+            return msg
+    return None
 
 
 def is_note(message, what):
@@ -452,15 +458,24 @@ def file_items(todo):
     return items
 
 
+@dataclass(frozen=True)
+class MainAdvance:
+    order: int
+    earlier_messages: tuple
+    developer_tips: frozenset
+
+
 class LocalEvidence:
     """Match tracker records to the developer branch, approved revision and remote integration."""
 
     def __init__(self, fixture, observer):
         self.repo, self.observer = fixture, observer
         self.head = fixture.initial
+        self.local_head = fixture.initial
         self.branch_tips = set()
         self.last_messages = ()
         self.merges = {}
+        self.advances = {}
 
     def collect(self):
         previous = self.last_messages
@@ -468,13 +483,19 @@ class LocalEvidence:
         evidence, repo = self.observer.evidence, self.repo
         self.last_messages = evidence.messages
         order = self.observer.stamp()
-        local = file_items(git(repo.root, "show", "HEAD:TODO.md").stdout)
+        local = file_items(git(repo.root, "show", "main:TODO.md").stdout)
         branch = git(repo.root, "rev-parse", "--verify", "refs/heads/qa/lead-dev", check=False)
         tip = branch.stdout.strip() if branch.returncode == 0 else None
-        root_tip = git(repo.root, "rev-parse", "HEAD").stdout.strip()
+        root_tip = git(repo.root, "rev-parse", "main").stdout.strip()
+        if root_tip != self.local_head:
+            advance = MainAdvance(order, previous, frozenset(self.branch_tips))
+            commits = git(repo.root, "rev-list", "--first-parent", f"{self.local_head}..{root_tip}").stdout.split()
+            for commit in commits:
+                self.advances[commit] = advance
+            self.local_head = root_tip
         remote = git(repo.origin, "rev-parse", "main").stdout.strip()
         if remote != self.head:
-            self.integrate(remote, previous)
+            self.integrate(remote)
         if tip:
             self.branch_tips.add(tip)
         working = False
@@ -500,7 +521,7 @@ class LocalEvidence:
             tickets.append(replace(ticket, state=committed_state if committed_state == "Done" else state))
         evidence.tickets = tuple(tickets)
 
-    def integrate(self, remote, previous_messages):
+    def integrate(self, remote):
         evidence = self.observer.evidence
         repo = self.repo
         new = git(repo.origin, "rev-list", "--first-parent", "--reverse", f"{self.head}..{remote}").stdout.split()
@@ -513,17 +534,18 @@ class LocalEvidence:
                 continue
             evidence.main_code = evidence.main_code | {commit}
             revision = parents[1] if len(parents) == 2 else commit
-            if (revision not in self.branch_tips or len(parents) > 2
+            advance = self.advances.get(commit)
+            if (advance is None or revision not in advance.developer_tips or len(parents) > 2
                     or git(repo.origin, "diff", "--name-only", revision, commit, "--", *CODE_PATHS).stdout):
                 continue
-            order = self.observer.stamp()
-            introduced = frozenset(git(repo.origin, "rev-list", f"{self.head}..{revision}").stdout.split()) | {commit}
+            predecessors = git(repo.origin, "rev-list", f"{self.head}..{revision}").stdout.split()
+            introduced = frozenset(c for c in predecessors if self.advances.get(c, advance) is advance) | {commit}
             tickets = list(evidence.tickets)
             for n, ticket in enumerate(tickets):
                 if ticket.integrated is not None:
                     continue
-                candidate = replace(ticket, revision=revision, integrated=order)
-                if approval(candidate, previous_messages) is None:
+                candidate = replace(ticket, revision=revision, integrated=advance.order)
+                if approval(candidate, advance.earlier_messages) is None:
                     continue
                 count = self.verify(repo.origin, revision, test_run)
                 self.merges[ticket.item] = commit
@@ -623,13 +645,13 @@ def fake_harness(run):
                    "XDG_CACHE_HOME": str(run / "cache")}
 
 
-def wait_for(collect, predicate, deadline, description):
+def wait_for(collect, predicate, deadline, description, *, interval=0.2):
     while time.monotonic() < deadline:
         collect()
         result = predicate()
         if result:
             return result
-        time.sleep(0.2)
+        time.sleep(interval)
     raise RuntimeError(f"timed out waiting for {description}")
 
 
@@ -712,7 +734,8 @@ class Rehearsal:
     def empty(self):
         self.wait_for(lambda: self.note("quiet", 0), "one quiet note")
         start = time.monotonic()
-        self.wait_for(lambda: time.monotonic() - start >= SILENCE_SECONDS, "15 minutes of quiet")
+        wait_for(self.observer.collect, lambda: time.monotonic() - start >= SILENCE_SECONDS,
+                 self.deadline, "15 minutes of quiet", interval=2)
         self.evidence.quiet_seconds = time.monotonic() - start
         self.evidence.moved = self.observer.stamp()
         start = time.monotonic()
