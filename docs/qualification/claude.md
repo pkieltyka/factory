@@ -15,6 +15,8 @@
 - **Case 9 (member):** rerun pending. At 3321bfc the driver's compound say ran inside the owner's sandbox and failed on a read-only log. A plain say from the same guarded member was delivered and restarted the keeper, so no permission change was needed (@architect).
 - **Still to rerun at the current head:** the operator rows 2, 5, 6, 7 and 10, and the member rows 2, 4 and 7, which are unproved or not built in the older batches below.
 
+- **Owner's Esc in a working member's pane (case 4, member) fails at a65a1fe, in the next-delivery trial.** Factory delivered M1 (#4) while the member worked, and it was on screen at Esc. The member's transcript has the whole tagged M1 in the running turn's context ("The user sent a new message while you were working"), then the owner's interrupt of that turn. The model never acted on M1; M2 (#5), a later separate submission, was acted on once. The owner-line trial passed: the exact owner line, then M1 acted on once. Recorded as a harness limit (@operator's decision): a deliberate owner interrupt can discard a message received mid-turn. functional spec §8.3 records the narrow exception and its reopen condition, and leading.md tells the operator to check the member's inbox and work after Esc. The failed trial and @lead-dev's repeat stay in this report.
+
 ## Findings
 
 - **Owner Esc while a message is queued (case 4, operator), recorded as pass.** These were @lead-dev's focused runs at 670dd76, with a real Codex member saying M1 to a working Claude Code operator. After the owner's Esc through rodeo, Claude Code kept the queued message: it did not return it to the input and did not drop it. It then ran the message by itself as its next turn.

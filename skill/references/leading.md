@@ -38,6 +38,8 @@ Check the reported tests before accepting work. `say` prints a message ID and on
 
 `factory.py status` lists configured members, their states, pending recipients and the oldest pending age. Check its version and path if you might be running another installed copy.
 
+After you press Esc in a working Claude Code member’s pane, check `factory.py inbox --for NAME` for messages delivered during the interrupted turn. Check the work or ask the member what it completed before reassigning anything.
+
 | Status | Action |
 |---|---|
 | `working` | Let the member work. |
