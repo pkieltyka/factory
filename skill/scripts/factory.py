@@ -3550,7 +3550,7 @@ def cmd_down(args):
 
 
 def _stop(hc, log, state, name, record):
-    """One terminal of a member: factory.down, kill, the stop record, rm. -> whether its stop is recorded."""
+    """One terminal of a member: factory.down, kill, the stop record, rm. -> (stop recorded, every step done)."""
     address = record["address"]
     try:
         if record["state"] == "live":
@@ -3559,22 +3559,23 @@ def _stop(hc, log, state, name, record):
     except HcError as error:
         if error.kind != "finished":
             print(f"@{name} ({address}) could not be stopped: {error}")
-            return False
+            return False, False
     except HcDown as error:
         print(f"@{name} ({address}) could not be stopped: {error}")
-        return False
+        return False, False
     try:
         mark_stopped(state, [address], log.read_box()[1])
     except (Problem, ValueError, OSError, LogDamage) as error:
         print(f"@{name} stopped, but the stop could not be recorded ({error}); its record {address} is kept."
               f" Run factory.py down {name} again.")
-        return False
+        return False, False
     try:
         hc.rm(address)
     except (HcError, HcDown) as error:
         if not (isinstance(error, HcError) and error.kind == "not_found"):
             print(f"@{name}'s record {address} could not be removed ({error}); run factory.py down {name} again")
-    return True
+            return True, False
+    return True, True
 
 
 def _down(cfg, hc, team, state, names):
@@ -3600,9 +3601,10 @@ def _down(cfg, hc, team, state, names):
             continue
         word = view.state(name) if current is not None else "stopped"
         for record in [r for r in (current, *earlier) if r is not None]:   # an earlier down's unfinished stop too
-            if _stop(hc, log, state, name, record):
-                stopped[name] = word
-            else:
+            recorded, done = _stop(hc, log, state, name, record)
+            if recorded:
+                stopped[name] = word                 # its queue is swept even when its record stays
+            if not done:
                 code = 1
     if stopped:
         try:

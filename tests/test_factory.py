@@ -2141,6 +2141,18 @@ class TeamCommandTests(TeamCase):
         self.assertNotIn(term, [r["address"] for r in self.hc.list(self.team)])
         self.assertEqual(self.cmd(self.operator, "up", "lead-dev")[0], 0)
 
+    def test_a_record_that_cannot_be_removed_still_sweeps_and_exits_1(self):
+        self.cmd(self.operator, "up", "lead-dev")
+        self.log.add("pm", ["lead-dev"], "for later")
+
+        def refuse(hc, term):
+            raise factory.HcError("live", "still there")
+        with patch.object(factory.Hc, "rm", refuse):
+            code, out, _ = self.cmd(self.operator, "down", "lead-dev")
+        self.assertEqual(code, 1)
+        self.assertIn("could not be removed (", out)
+        self.assertIn("stopped @lead-dev (was idle); 1 queued messages dropped", out)
+
     def test_brief_send_does_not_wait_for_a_missing_keeper(self):
         self.cmd(self.operator, "up", "lead-dev")
         with patch.object(factory, "ensure_keeper", side_effect=factory.Problem("no keeper", "fix")), \
