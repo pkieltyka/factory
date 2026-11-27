@@ -3437,13 +3437,15 @@ def _up(cfg, args, hc, team, operator, state, names, me_id):
         except Problem as error:
             failed[m["name"]] = f"{error.what} ({error.fix})"
             return
-        starts[m["name"]] = (m, sess, record)
         if not sess["resume"]:                       # before its brief: a late one must not leave the old entry newest
             try:
                 launch_entry(state, m, record["address"], "new", None)
             except (OSError, LogDamage, Problem) as error:
-                print(f"warning: @{m['name']}'s fresh launch was not recorded ({error}); if it ends before it"
-                      f" reports, run factory.py up {m['name']} --fresh", file=sys.stderr)
+                _remove_record(hc, record)           # an unrecorded fresh launch could let an old conversation back
+                failed[m["name"]] = f"its fresh launch could not be recorded ({error}), so it was stopped"
+                fixes[m["name"]] = f"fix {state / SESSIONS}, then factory.py up {m['name']}"
+                return None
+        starts[m["name"]] = (m, sess, record)
         how = "resumed" if sess["resume"] else "started"
         where = f", worktree {m['dir']}" if m["branch"] else ""
         print(f"{how} @{m['name']} ({m['role']}) on {m['harness']} {m['model']}, thinking {m['thinking']},"

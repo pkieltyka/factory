@@ -2187,6 +2187,18 @@ class TeamCommandTests(TeamCase):
         m = factory.plan(self.cfg, "lead-dev", self.state_dir)
         self.assertFalse(factory.session_plan(m, self.state_dir, entry, fresh=False)["resume"])
 
+    def test_a_fresh_launch_that_cannot_be_recorded_is_stopped(self):
+        old = self.terminal("lead-dev")[0]
+        factory.record_session(self.cfg, self.state_dir, "lead-dev", old, {"CODEX_THREAD_ID": "old-conversation"})
+        self.fake.finish(old)
+        with patch.object(factory, "launch_entry", side_effect=OSError("disk full")):
+            code, _, err = self.cmd(self.operator, "up", "lead-dev", "--fresh")
+        self.assertEqual(code, 3)
+        self.assertIn("its fresh launch could not be recorded (disk full), so it was stopped", err)
+        self.assertEqual(self.member_terms(), {})                               # nothing runs unrecorded
+        self.assertIn(old, [r["address"] for r in self.hc.list(self.team)])     # the old record stays
+        self.assertFalse([m for m in self.log.read_box()[1].msgs.values() if m["kind"] == "brief"])
+
     def test_the_launch_entry_gives_way_to_say_in_either_order(self):
         m = {**factory.plan(self.cfg, "frontend-dev", self.state_dir), "model": "claude-opus-5-5"}
         for order in ("say first", "say after"):
