@@ -47,8 +47,7 @@ session_env = "CODEX_THREAD_ID"
 session_follow = false   # LC-12 not shown yet
 dialogs = [["Trust and continue", ["enter"]]]   # asked once per new folder, a worktree included
 
-# guarded: the workspace-write sandbox, with automatic review of what leaves it. Network access stays on:
-# herdr's socket needs it, so without it a member cannot message anyone.
+# guarded: workspace-write sandbox with automatic review. Network access lets the member reach the hc socket.
 [codex.permissions]
 full = ["--dangerously-bypass-approvals-and-sandbox"]
 guarded = ["--approve-for-me", "-c", "sandbox_workspace_write.network_access=true"]

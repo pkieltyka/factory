@@ -7,6 +7,7 @@ import datetime
 import errno
 import fcntl
 import hashlib
+import inspect
 import io
 import json
 import os
@@ -6885,6 +6886,85 @@ class ListingTests(unittest.TestCase):
 
 
 class SkillTextTests(unittest.TestCase):
+    @staticmethod
+    def pages():
+        root = factory.SKILL.parent
+        return [root / "README.md", *sorted((root / "docs").glob("*.md")),
+                *sorted(factory.SKILL.rglob("*.md")), *sorted(factory.SKILL.rglob("*.toml"))]
+
+    @classmethod
+    def examples(cls):
+        invocation = re.compile(r"^((?:python3\s+)?(?:\S+/)?factory\.py|/factory)\s+([a-z][a-z-]*)\b(.*)")
+        for page in cls.pages():
+            fenced = False
+            for line in page.read_text().splitlines():
+                if line.startswith("```"):
+                    fenced = not fenced
+                    continue
+                spans = [line.split(" #", 1)[0].strip()] if fenced else re.findall(r"`([^`]+)`", line)
+                for span in spans:
+                    if match := invocation.match(span):
+                        yield page, *match.groups()
+
+    @staticmethod
+    def help_text(*args):
+        return subprocess.run([sys.executable, str(SCRIPT), *args, "--help"], text=True,
+                              capture_output=True, check=True).stdout
+
+    def test_no_removed_commands_or_stale_instructions(self):
+        removed = re.compile(
+            r"\bherdr\b(?!-(?:core|app)\b)|\bHERDR_\w+|(?<!\w)(?:factory\.py|/factory)\s+(?:wait|prompt|continue)\b"
+            r"|(?<!\w)--(?:seen|restart|no-brief)\b|\bv1\b", re.IGNORECASE)
+        banner = ("> **This checkout is Factory for herdr-core.** Until v2 ships, install the current release from "
+                  "the [`v1` branch](https://github.com/pkieltyka/factory/tree/v1) (tag `v1.0.0`).")
+        for page in self.pages():
+            for number, line in enumerate(page.read_text().splitlines(), 1):
+                if page == factory.SKILL.parent / "README.md" and line == banner:
+                    continue
+                prose = re.sub(r"https?://[^\s)>`]+", "", line)
+                self.assertIsNone(removed.search(prose), f"{page}:{number}: {line}")
+
+    def test_commands_named_in_the_text_exist(self):
+        commands = set(re.search(r"\{([a-z,-]+)\}", self.help_text())[1].split(","))
+        private = {"keeper", "init", "harnesses", "check"}
+        for page, invocation, command, _ in self.examples():
+            with self.subTest(page=page.name, invocation=invocation, command=command):
+                supported = (commands - private) | {"setup"} if invocation == "/factory" else commands
+                self.assertIn(command, supported)
+
+    def test_flags_named_in_the_text_exist(self):
+        options = {}
+        for page, _, command, tail in self.examples():
+            flags = set(re.findall(r"(?<![\w-])--[a-z][a-z-]*", tail))
+            if not flags:
+                continue
+            if command not in options:
+                options[command] = set(re.findall(r"(?<![\w-])--[a-z][a-z-]*", self.help_text(command)))
+            self.assertFalse(flags - options[command], f"{page}: {command} {tail}")
+
+    def test_status_words_in_leading_are_the_real_ones(self):
+        leading = (factory.SKILL / "references/leading.md").read_text()
+        table = leading.split("| Status | Action |", 1)[1].split("\n\n", 1)[0]
+        states = {"not started", "starting", "idle", "working", "done", "blocked", "error", "gone"}
+        hints = {"first brief N is still", "no confirmed brief", "no pane", "operator: not reachable",
+                 "keeper: not running"}
+        words = {word for row in table.splitlines() if row.startswith("|")
+                 for word in re.findall(r"`([^`]+)`", row.split("|", 2)[1])}
+        self.assertEqual(words, states | hints)
+        source = inspect.getsource(factory.cmd_status) + inspect.getsource(factory._pending_brief_line)
+        for hint in hints - {"first brief N is still"}:
+            self.assertIn(hint, source)
+        self.assertIn("first brief {", source)
+
+    def test_outcome_words_are_the_real_ones(self):
+        diagnostics = {"nothing sent", "not stored", "not confirmed stored"}
+        for name in ("references/leading.md", "templates/member-prompt.md"):
+            page = (factory.SKILL / name).read_text()
+            for word in set(factory.OUTCOMES) | diagnostics:
+                self.assertIn(f"`{word}`", page, name)
+        for diagnostic in diagnostics:
+            self.assertIn(diagnostic, inspect.getsource(factory.cmd_say))
+
     def test_template_formation_has_no_active_autonomy_key(self):
         sample = (factory.SKILL / "templates/factory.toml").read_text()
         before_tables = sample.split("\n[operator]", 1)[0]
