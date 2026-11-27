@@ -7523,16 +7523,52 @@ class QualifyFrameworkTests(unittest.TestCase):
         self.assertFalse(adapter.restart(QA(), "t1"))
         self.assertEqual(sent, [])
 
+    def test_each_operator_starts_from_factory_s_own_builder_with_the_skills_switch_first(self):
+        """phase_10.md §1: the skills switch right after the executable, then the harness's own model form and full
+        preset; OpenCode's model in its terminal env, agy trusting the operator's own folder for the session only;
+        no member instructions; a case exemption and a model override honoured; argv the same for any form."""
+        import live
+        work = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
+        installed = [("/home/o/.codex/skills/factory", "/store/factory")]
+        adapter = live.RealAdapter.__new__(live.RealAdapter)
+        adapter.team = types.SimpleNamespace(qa=types.SimpleNamespace(installed=installed), skills_exempt=(),
+                                             script=live.ROOT / "skill/scripts/factory.py", work=work)
+        self.enterContext(patch.object(live.shutil, "which", lambda name, *a, **k: f"/bin/{name}"))
+        self.enterContext(patch.object(adapter, "model", lambda harness: f"{harness}-model", create=True))
+        launches = {h: adapter.operator_launch(h) for h in live.QUALIFY_HARNESSES}
+        self.assertEqual(launches["claude"][0][:2], ["/bin/claude", "--disable-slash-commands"])
+        self.assertEqual(launches["codex"][0][1], "-c")
+        for h in ("pi", "omp"):
+            argv = launches[h][0]
+            self.assertEqual(argv[:4], [f"/bin/{h}", "--no-skills", "--model", f"{h}-model"])
+            self.assertNotIn("--append-system-prompt", argv)
+            self.assertNotIn("--name", argv)
+        self.assertEqual(launches["omp"][0][-2:], ["--approval-mode", "yolo"])
+        argv, env = launches["opencode"]
+        self.assertEqual(argv[:2], ["/bin/opencode", "--standalone"])
+        self.assertEqual(json.loads(env["OPENCODE_CONFIG_CONTENT"])["model"].split("#")[0], "opencode-model")
+        argv, env = launches["agy"]
+        self.assertEqual((argv[:3], env), (["/bin/agy", "--model", "agy-model-high"], {}))
+        settings = json.loads(argv[argv.index("--settings") + 1])
+        self.assertEqual(settings["trustedWorkspaces"], [str(work)])
+        self.assertEqual(adapter.operator_argv("pi"), launches["pi"][0])            # argv-only callers
+        self.assertEqual(adapter.operator_launch("pi", "openai-codex/x")[0][3], "openai-codex/x")
+        adapter.team.skills_exempt = ("claude",)
+        self.assertEqual(adapter.operator_launch("claude")[0][:2], ["/bin/claude", "--model"])
+
     def test_defaults_and_scope(self):
-        self.assertEqual(live.select_profiles("codex", None), [("operator", "codex"), ("member", "codex")])
-        self.assertEqual(live.select_profiles("pi", None), [("member", "pi")])
-        for harness, role, why in (("pi", "operator", "member in this phase"), ("vim", None, "is not one of")):
+        """Phase 10: every harness in both roles; an omitted role runs operator then member."""
+        for harness in live.QUALIFY_HARNESSES:
+            self.assertEqual(live.select_profiles(harness, None), [("operator", harness), ("member", harness)])
+            self.assertEqual(live.select_profiles(harness, "operator"), [("operator", harness)])
+            self.assertEqual(live.select_profiles(harness, "member"), [("member", harness)])
+        for harness, role, why in (("vim", None, "is not one of"), ("pi", "owner", "not owner")):
             with self.assertRaisesRegex(ValueError, why):
                 live.select_profiles(harness, role)
 
     def test_bad_choices_are_refused_before_any_core(self):
         with patch.object(live, "Core", side_effect=AssertionError("no core may start")):
-            for args, why in ((("pi", "operator", None), "member in this phase"), (("codex", None, [11]), "1 to 10"),
+            for args, why in ((("vim", "operator", None), "is not one of"), (("codex", None, [11]), "1 to 10"),
                               (("cross", "member", None), "no --role")):
                 with self.subTest(args=args), self.assertRaisesRegex(ValueError, why):
                     live.qualify(*args)

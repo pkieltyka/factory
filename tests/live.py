@@ -2326,9 +2326,30 @@ class RealAdapter(FixtureAdapter):
             raise NotRun(f"{', '.join(missing)} not on PATH")
 
     def operator_argv(self, harness, model=None):
-        """The operator as the owner would start it, with the profile's model pinned (as Factory pins a member's)."""
-        return [shutil.which(harness), *skills_off(harness, self.team.qa.installed, self.team.skills_exempt), "--model",
-                model or self.model(harness), *harness_table()[harness]["permissions"]["full"]]
+        """The operator's argv alone (operator_launch's), for callers that need no environment."""
+        return self.operator_launch(harness, model)[0]
+
+    def operator_launch(self, harness, model=None):
+        """(argv, env): the operator as the owner would start it, from Factory's own per-harness builder and full
+        preset (phase_10.md §1), with the profile's model pinned as Factory pins a member's, and the QA skills switch
+        right after the executable. No member instructions, name or session: an operator has none. The same argv
+        serves a direct launch, the shell-start form and a same-pane restart, and env goes on the terminal."""
+        table = harness_table()[harness]
+        model = model or self.model(harness)
+        argv = [shutil.which(harness), *skills_off(harness, self.team.qa.installed, self.team.skills_exempt)]
+        full = list(table["permissions"]["full"])
+        if harness in ("claude", "codex"):
+            return argv + ["--model", model, *full], {}
+        thinking = table.get("default_thinking") or ("medium" if "medium" in table.get("thinking", []) else "default")
+        if harness in ("pi", "omp"):
+            return argv + ["--model", model, "--thinking", thinking, *full], {}
+        module = factory_module(self.team.script)
+        m = {"name": "operator", "harness": harness, "model": model, "thinking": thinking, "permissions": "full",
+             "args": [], "dir": str(self.team.work)}
+        native, env = module.CODE[harness].argv(m, None, None)
+        if harness == "agy":                        # the operator's own scratch folder, session-only (LC-7)
+            full = module.agy_trusted(full, self.team.work)
+        return argv + native + full, env
 
     def act_append(self, path, token):
         return (f"Using your shell tool, append one line containing exactly {token} to the file {path}"
@@ -2480,9 +2501,9 @@ class QATeam:
                   "XDG_CACHE_HOME": str(self.dir / "cache"), "HOME": str(self.home)}
         if not self.real:
             shared["CODEX_HOME"] = str(self.home / ".codex")
-        argv = (self.adapter.operator_argv(operator, operator_model) if self.real
-                else self.adapter.operator_argv(operator))
-        params = {"argv": argv, "cwd": str(self.work), "env": dict(shared)}
+        argv, launch_env = (self.adapter.operator_launch(operator, operator_model) if self.real
+                            else (self.adapter.operator_argv(operator), {}))
+        params = {"argv": argv, "cwd": str(self.work), "env": {**shared, **launch_env}}   # kept by a shell restart
         if not self.real:
             params["env"]["FAKE_LOG"] = str(self.dir / "operator-input.jsonl")   # every input the fake received
             params["env"]["FAKE_ECHO"] = "1"
@@ -2657,12 +2678,13 @@ class QATeam:
 # The current case's closed teams' diagnostics and test markers, and this run's rodeo_tabs probe.
 EVIDENCE = {"teams": [], "tokens": [], "rodeo_tabs": None}
 QUALIFY_HARNESSES = ("claude", "codex", "pi", "omp", "opencode", "agy")
-OPERATOR_HARNESSES = ("claude", "codex")
+OPERATOR_HARNESSES = QUALIFY_HARNESSES    # Phase 10: every harness as operator too
 CROSS_CASES = ("two-teams", "multi-down", "owner-pane", "other-version")
 STATUSES = ("pass", "fail", "not_run", "measured")
 CASES = {   # case -> its subcases: (name, roles it is required for, measurement only)
     1: (("states", "both", False), ("startup-dialog", "both", False)),
-    2: (("idle-report", "both", False), ("operator-commands", "operator", False)),
+    2: (("idle-report", "both", False), ("operator-commands", "operator", False),
+        ("operator-handoff", "operator", False)),
     3: (("draft", "both", False), ("draft-cleared", "operator", False)),
     4: (("mid-turn", "both", False), ("owner-interrupt", "both", False)),
     5: (("blocked", "both", False),),
@@ -2671,7 +2693,7 @@ CASES = {   # case -> its subcases: (name, roles it is required for, measurement
         ("pending-restart", "both", False), ("held-quiet", "both", False), ("upgrade", "both", False)),
     8: (("dead-member", "member", False), ("operator-gone", "operator", False), ("same-pane", "operator", False),
         ("unconfirmed-brief", "member", False), ("quit-during-hold", "both", True)),
-    9: (("guarded", "member", False),),
+    9: (("guarded", "both", False),),    # an operator's guarded peer member (phase_10.md §2)
     10: (("idle-latency", "both", False), ("idle-latency-times", "both", True), ("held-sender-exit", "both", False),
          ("crash", "both", False)),
 }
@@ -3081,8 +3103,10 @@ def case_9(run, role, harness, adapter_class):
         said = said["id"] if said else None
         new = team.until(team.keeper, 60)
         acted = team.until(lambda: receipt.exists() and tok in receipt.read_text(), 300)
+        member_harness = team.members["lead-dev"]       # the guarded one: the subject, or an operator's peer
         proof = {"old_keeper_finished": bool(gone), "new_keeper": bool(new) and new != old, "member_say_id": said,
-                 "guarded_args": harness_table()[harness]["permissions"]["guarded"], "peer": peer}
+                 "guarded_args": harness_table()[member_harness]["permissions"]["guarded"],
+                 "guarded_member": member_harness, "peer": peer}
         ok = bool(gone) and bool(new) and new != old and bool(acted) and said is not None
         run.row(9, "guarded", role, harness, "pass" if ok else "fail",
                 "a guarded member's say reaches hc, restarts the keeper and is acted on", proof=proof,
