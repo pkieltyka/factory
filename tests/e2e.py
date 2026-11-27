@@ -637,8 +637,7 @@ class GitHubFixture:
             self.set_status(card, "Backlog" if empty else "Todo")
         self.todos("doctor")
         expected = {issue["number"]: "Backlog" if empty else "Todo" for issue in self.manifest["issues"]}
-        if self.board() != expected:
-            raise RuntimeError("the freshly created project does not show exactly this run's cards and statuses")
+        self.wait_for_board(expected)
 
     def gh(self, *args, payload=None, text=False):
         operation = subprocess.run(["gh", *args], cwd=self.root, env={**os.environ, "GH_HOST": "github.com"},
@@ -692,12 +691,22 @@ class GitHubFixture:
 
     def board(self):
         board = self.todos("board")
-        if board.get("truncated") is not False:
-            raise RuntimeError("GitHub project snapshot is incomplete")
+        project = board.get("project") or {}
+        if (board.get("truncated") is not False or project.get("title") != self.name
+                or f"{project.get('owner')}/{project.get('number')}" != self.project):
+            raise RuntimeError("the GitHub project snapshot is incomplete or belongs to another project")
         cards = [(card["number"], column["status"]) for column in board["columns"] for card in column["cards"]]
         if len(dict(cards)) != len(cards):
             raise RuntimeError("GitHub project returned duplicate issue numbers")
         return dict(cards)
+
+    def wait_for_board(self, expected, timeout=20):
+        """Read back recent GitHub writes until this exact set of cards and states is visible."""
+        deadline = time.monotonic() + timeout
+        while self.board() != expected:
+            if time.monotonic() >= deadline:
+                raise RuntimeError("the freshly created project does not show exactly this run's cards and statuses")
+            time.sleep(1)
 
     def seed_repo(self, skill):
         git(self.root, "-c", f"credential.helper={QA_CREDENTIAL}", "clone", "--no-checkout", QA_URL + ".git", ".")

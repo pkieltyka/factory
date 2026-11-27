@@ -7473,6 +7473,19 @@ class E2EObserverTests(unittest.TestCase):
 
 
 class E2EGitHubEvidenceTests(unittest.TestCase):
+    def test_fixture_waits_for_the_exact_board_after_recent_writes(self):
+        fixture = e2e.GitHubFixture.__new__(e2e.GitHubFixture)
+        expected = {1: "Todo", 2: "Todo", 3: "Todo"}
+        incomplete = {1: "Todo", 2: "Todo"}
+        with (patch.object(fixture, "board", side_effect=[incomplete, expected]) as board,
+              patch.object(e2e.time, "sleep") as sleep):
+            fixture.wait_for_board(expected)
+        self.assertEqual(board.call_count, 2)
+        sleep.assert_called_once_with(1)
+        with patch.object(fixture, "board", return_value={**expected, 4: "Todo"}):
+            with self.assertRaisesRegex(RuntimeError, "does not show exactly this run's cards"):
+                fixture.wait_for_board(expected, timeout=0)
+
     def test_check_requires_a_real_test_job_completed_before_merge(self):
         revision = "a" * 40
         merge = e2e.forge_time("2026-11-27T10:20:00Z")
