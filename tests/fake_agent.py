@@ -59,6 +59,23 @@ def submitted_lines():
                 incoming = incoming[1:]
 
 
+def act(text):
+    """Test-only action protocol (phase_8.md §2): a line "ACT append <path> <text>" appends the text, and
+    "ACT run <path> <shell command>" runs the command, as this agent's own tool would, and appends its exit."""
+    for line in text.splitlines():
+        parts = line.split(" ", 3)
+        if len(parts) < 4 or parts[0] != "ACT":
+            continue
+        verb, path, rest = parts[1], pathlib.Path(parts[2]), parts[3]
+        if verb == "append":
+            with path.open("a") as stream:
+                stream.write(rest + "\n")
+        elif verb == "run":
+            done = subprocess.run(["sh", "-c", rest], stdin=subprocess.DEVNULL, capture_output=True, text=True)
+            with path.open("a") as stream:
+                stream.write(f"exit {done.returncode}\n")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("script", nargs="?", choices=SCRIPTS, default="reports")
@@ -111,6 +128,7 @@ def main():
             waiting = True
             continue
         time.sleep(work)
+        act(text)
         if script == "reports" and reply:
             subprocess.run(reply, input=text.partition("\n")[0] + "\n", text=True, check=True)
         report("idle")

@@ -991,6 +991,14 @@ class Harness:
         self.term = self.record["address"]
         self.answered = []
 
+    @classmethod
+    def attach(cls, qa, harness, address):
+        """Observe a terminal started by someone else (a QA operator, a member up started): no launch."""
+        h = cls.__new__(cls)
+        h.qa, h.harness, h.term, h.answered, h.argv = qa, harness, address, [], None
+        h.dialogs = harness_table().get(harness, {}).get("dialogs", [])
+        return h
+
     def get(self):
         return self.qa.rpc("terminal.get", {"terminal": self.term})
 
@@ -1763,6 +1771,169 @@ CHECKS = {"lc1": lc1, "lc10": lc10, "lc13": lc13, "lc8": lc8, "rodeo_focus": rod
 LOGIN_CHECKS = {"lc2": lc2, "lc3": lc3, "lc4": lc4, "lc6": lc6, "lc7": lc7, "lc12": lc12}   # start real harnesses
 
 
+QA_PREFIX = "factory-qa-"   # every scratch project's name begins so: the owner can find and remove them
+PEERS = {"claude": "codex", "codex": "claude"}
+
+
+def _peer(role, harness):
+    """The counterpart: a named member for an operator run, a Claude Code or Codex operator for a member run."""
+    return PEERS.get(harness, "codex") if role == "operator" else ("claude" if harness == "codex" else "codex")
+
+
+class FixtureAdapter:
+    """Fake agents in place of every harness: the same case code as a real run, never a qualification."""
+
+    mode = "fixture"
+
+    def __init__(self, team):
+        self.team = team
+        self.agent = [sys.executable, str(ROOT / "tests" / "fake_agent.py"), "reports"]
+
+    def version(self, harness):
+        return "fake_agent"
+
+    def model(self, harness):
+        return f"fixture-{harness}"
+
+    def prepare(self, harnesses):
+        """A wrapper per harness that runs the fake agent with a log named after the member's model."""
+        for harness in harnesses:
+            wrapper = self.team.bin / harness
+            wrapper.write_text("#!/bin/sh\n" + f"exec {shlex.join(self.agent)}\n")
+            wrapper.chmod(0o755)
+        codex = self.team.home / ".codex"
+        codex.mkdir(parents=True, exist_ok=True)
+        (codex / "models_cache.json").write_text(json.dumps({"models": [
+            {"slug": self.model("codex"), "supported_reasoning_levels": [{"effort": e} for e in
+                                                                     ("low", "medium", "high", "xhigh")]}]}))
+
+    def operator_argv(self, harness):
+        return list(self.agent)
+
+    def act_append(self, path, token):
+        return f"ACT append {path} {token}"
+
+    def act_run(self, path, command):
+        return f"ACT run {path} {command}"
+
+
+class RealAdapter(FixtureAdapter):
+    """Real harnesses with the owner's own login, started normally (@lead-dev-3's runs; phase_8.md §2)."""
+
+    mode = "real"
+
+    def version(self, harness):
+        return harness_version(harness)
+
+    def model(self, harness):
+        override = os.environ.get(f"FACTORY_QA_MODEL_{harness.upper()}")
+        return override or (harness_table()[harness].get("default_model") or harness_table()[harness]["models"][0])
+
+    def prepare(self, harnesses):
+        missing = [h for h in harnesses if shutil.which(h) is None]
+        if missing:
+            raise NotRun(f"{', '.join(missing)} not on PATH")
+
+    def operator_argv(self, harness):
+        return [shutil.which(harness), *harness_table()[harness]["permissions"]["full"]]
+
+    def act_append(self, path, token):
+        return (f"Using your shell tool, append one line containing exactly {token} to the file {path}"
+                " (create it if needed). Then reply with the single word done.")
+
+    def act_run(self, path, command):
+        return (f"Using your shell tool, run exactly this command: {command}; echo \"exit $?\" >> {path}"
+                " Then reply with the single word done.")
+
+
+class QATeam:
+    """A scratch project, a private QA core, a team with an operator terminal, and Factory's real commands from a
+    private copy of the skill (phase_8.md §2)."""
+
+    def __init__(self, adapter_class, operator, members, draft_wait=None, permissions="full"):
+        self.operator_harness, self.members, self.permissions = operator, members, permissions
+        self.real = adapter_class is RealAdapter
+        home = os.path.expanduser("~")
+        extra = {"HOME": home} if self.real else None   # a real harness needs the owner's login (testing.md §6)
+        self.qa = Core("qualify", config=f"draft_wait = {draft_wait}\n" if draft_wait is not None else "",
+                       extra_env=extra)
+        self.dir = pathlib.Path(tempfile.mkdtemp(prefix=QA_PREFIX, dir=tempfile.gettempdir()))
+        self.bin, self.home = self.dir / "bin", (pathlib.Path(home) if self.real else self.dir / "home")
+        self.bin.mkdir()
+        self.skill = self.dir / "skill"
+        shutil.copytree(ROOT / "skill", self.skill, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        self.script = self.skill / "scripts" / "factory.py"
+        self.work = self.dir / "work"
+        self.work.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "main", str(self.work)], check=True)
+        self.adapter = adapter_class(self)
+        self.adapter.prepare({operator, *members.values()})
+        (self.work / "FACTORY.md").write_text("Qualification team: answer every request exactly as asked.\n")
+        lines = [f'[operator]\nharness = "{operator}"\n']
+        for name, harness in members.items():
+            lines.append(f'[members.{name}]\nharness = "{harness}"\nmodel = "{self.adapter.model(harness)}"\n'
+                         f'permissions = "{permissions}"\n')
+        (self.work / "factory.toml").write_text("\n".join(lines))
+        subprocess.run(["git", "-C", str(self.work), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(self.work), "-c", "user.name=qa", "-c", "user.email=qa@example.invalid",
+                        "-c", "commit.gpgsign=false", "commit", "-q", "-m", "qa"], check=True)
+        self.operator = self.qa.rpc("terminal.run", {"argv": self.adapter.operator_argv(operator),
+                                                     "cwd": str(self.work)})["address"]
+        self.env = {**self.qa.env, "HC_TERMINAL_ID": self.operator, "HC_BIN": shutil.which(HC) or HC,
+                    "PATH": f"{self.bin}:{os.environ.get('PATH', '')}", "XDG_CACHE_HOME": str(self.dir / "cache"),
+                    "HOME": str(self.home)}
+        if not self.real:
+            self.env["CODEX_HOME"] = str(self.home / ".codex")
+
+    def call(self, *args, terminal=None, timeout=60):
+        """A Factory command as the operator (or as terminal): (exit code, output)."""
+        env = dict(self.env, **({"HC_TERMINAL_ID": terminal} if terminal else {}))
+        done = subprocess.run([sys.executable, str(self.script), *args], cwd=self.work, env=env,
+                              capture_output=True, text=True, timeout=timeout, check=False)
+        return done.returncode, done.stdout + done.stderr
+
+    def get(self, terminal):
+        return self.qa.rpc("terminal.get", {"terminal": terminal})
+
+    def state(self, terminal):
+        return (self.get(terminal).get("status") or {}).get("state")
+
+    def member(self, name):
+        for record in self.qa.rpc("terminal.list", {"all": False})["terminals"]:
+            labels = record.get("labels") or {}
+            if labels.get("factory.member") == name and labels.get("factory.kind") == "member":
+                return record["address"]
+        return None
+
+    def keeper(self):
+        for record in self.qa.rpc("terminal.list", {"all": False})["terminals"]:
+            if (record.get("labels") or {}).get("factory.kind") == "keeper":
+                return record["address"]
+        return None
+
+    def until(self, predicate, timeout):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            value = predicate()
+            if value:
+                return value
+            time.sleep(0.5)
+        return None
+
+    def receipt(self, name):
+        return self.dir / f"receipt-{name}-{random.randrange(16 ** 6):06x}.txt"
+
+    def close(self):
+        self.qa.stop()
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
 # Qualification (phase_8.md): functional_spec §10's ten cases over eight role profiles, the four cross cases once.
 # One JSON object on stdout (progress on stderr), checkpointed to --json after each case.
 
@@ -1868,6 +2039,111 @@ class Qualification:
         return 1 if "fail" in statuses else 2 if "not_run" in statuses else 0
 
 
+def _team_for(adapter_class, role, harness, **options):
+    """A two-member-or-less team where the profile's harness has its role (phase_8.md §1)."""
+    peer = _peer(role, harness)
+    operator, member = (harness, peer) if role == "operator" else (peer, harness)
+    if adapter_class is FixtureAdapter:
+        member = "codex"           # fake agents stand in; the formation needs a harness Factory can check offline
+    return QATeam(adapter_class, operator, {"lead-dev": member}, **options), peer
+
+
+def _up(team, run, case, role, harness, names):
+    """Bring the team up; on failure every listed subcase is not_run with up's output."""
+    if team.real:                                     # a real operator first gets past its own startup dialogs
+        settled = Harness.attach(team.qa, team.operator_harness, team.operator).settle(timeout=120)
+        if not settled.startswith("idle"):
+            for name in names:
+                run.row(case, name, role, harness, "not_run", f"case {case} {name}",
+                        reason=f"the operator did not start: {settled}")
+            return False
+    code, out = team.call("up", timeout=240)
+    if code != 0:
+        for name in names:
+            run.row(case, name, role, harness, "not_run", f"case {case} {name}", observed=out[-BOUND:],
+                    reason=f"up exited {code}")
+        return False
+    if not team.until(lambda: team.state(team.operator) == "idle", 120):
+        for name in names:
+            run.row(case, name, role, harness, "not_run", f"case {case} {name}", reason="the operator never idled")
+        return False
+    return True
+
+
+def _member_says(team, text, timeout=300):
+    """Have the member itself run say to the operator through its own tool, with text in a file."""
+    member = team.member("lead-dev")
+    body = team.dir / f"report-{random.randrange(16 ** 6):06x}.md"
+    body.write_text(text)
+    command = f"python3 {shlex.quote(str(team.script))} say operator --file {shlex.quote(str(body))}"
+    done = team.receipt("member-say")
+    team.qa.rpc("terminal.send", {"terminal": member, "text": team.adapter.act_run(done, command)}, timeout=60)
+    return team.until(lambda: done.exists() and "exit" in done.read_text() and done.read_text().strip(), timeout)
+
+
+def case_2(run, role, harness, adapter_class):
+    """idle-report, and for an operator profile operator-commands (phase_8.md §3.2, @architect's change 1)."""
+    names = [n for n, _ in subcases(2, role)]
+    team, peer = _team_for(adapter_class, role, harness)
+    with team:
+        if not _up(team, run, 2, role, harness, names):
+            return
+        receipt, tok = team.receipt("operator"), token()
+        turn = team.get(team.operator)["turn"]
+        start = time.monotonic()
+        said = _member_says(team, team.adapter.act_append(receipt, tok))
+        acted = team.until(lambda: receipt.exists() and tok in receipt.read_text(), 300)
+        proof = {"member_say": said, "operator_turn": [turn, team.get(team.operator)["turn"]],
+                 "peer": peer, "prompted_by": "hc terminal.send to the member (the report is the member's say)"}
+        if acted:
+            run.row(2, "idle-report", role, harness, "pass", "the operator acts on an idle report with no input",
+                    observed="token appended by the operator", proof=proof, elapsed=time.monotonic() - start)
+        else:
+            run.row(2, "idle-report", role, harness, "fail", "the operator acts on an idle report with no input",
+                    proof=proof, reason="no action from the operator within 300 s")
+        if role != "operator":
+            return
+        exits, tok2 = team.receipt("operator-commands"), token()
+        member_receipt = team.receipt("member")
+        py = f"python3 {shlex.quote(str(team.script))}"
+        message = shlex.quote(team.adapter.act_append(member_receipt, tok2))
+        commands = [f"{py} status", f"{py} inbox", f"{py} say lead-dev {message}", f"{py} up"]
+        prompt = "\n".join(team.adapter.act_run(exits, command) for command in commands)
+        team.qa.rpc("terminal.send", {"terminal": team.operator, "text": prompt}, timeout=60)
+        lines = team.until(lambda: exits.exists() and len(exits.read_text().split()) >= 8 and exits.read_text(), 600)
+        codes = [line for line in (lines or "").splitlines() if line.startswith("exit")]
+        reached = member_receipt.exists() and tok2 in member_receipt.read_text()
+        proof = {"exits": codes, "member_acted": reached, "prompted_by": "hc terminal.send (rodeo typing pending)"}
+        ok = codes == ["exit 0"] * 4 and reached
+        run.row(2, "operator-commands", role, harness, "pass" if ok else "fail",
+                "the operator runs status, inbox, say and up through its own tool; the say reaches the member",
+                proof=proof, reason=None if ok else "a command failed or the member never acted")
+
+
+def case_9(run, role, harness, adapter_class):
+    """guarded: a guarded member restarts the keeper with its own say (phase_8.md §3.9)."""
+    team, peer = _team_for(adapter_class, role, harness, permissions="guarded")
+    with team:
+        if not _up(team, run, 9, role, harness, ["guarded"]):
+            return
+        old = team.keeper()
+        team.qa.rpc("terminal.kill", {"terminal": old})
+        gone = team.until(lambda: team.get(old)["state"] == "finished", 30)
+        receipt, tok = team.receipt("operator"), token()
+        said = _member_says(team, team.adapter.act_append(receipt, tok))
+        new = team.until(team.keeper, 60)
+        acted = team.until(lambda: receipt.exists() and tok in receipt.read_text(), 300)
+        proof = {"old_keeper_finished": bool(gone), "new_keeper": bool(new) and new != old, "member_say": said,
+                 "guarded_args": harness_table()[harness]["permissions"]["guarded"], "peer": peer}
+        ok = bool(gone) and bool(new) and new != old and bool(acted) and "exit 0" in (said or "")
+        run.row(9, "guarded", role, harness, "pass" if ok else "fail",
+                "a guarded member's say reaches hc, restarts the keeper and is acted on", proof=proof,
+                reason=None if ok else "the keeper did not restart or the operator did not act")
+
+
+CASE_FUNCTIONS = {2: case_2, 9: case_9}
+
+
 def _source_head():
     try:
         return subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True,
@@ -1897,10 +2173,27 @@ def qualify(target, role=None, cases=None, json_path=None, fixture=False):
                     f"the {name} cross case", reason="not built yet")
             run.checkpoint()
         return run.data, 2
+    adapter_class = FixtureAdapter if fixture else RealAdapter
     for role_, harness, case in selected:
         print(f"qualify {role_} {harness} case {case}", file=sys.stderr)
-        for name, measured in subcases(case, role_):
-            run.row(case, name, role_, harness, "not_run", f"case {case} {name}", reason="not built yet")
+        function = CASE_FUNCTIONS.get(case)
+        if not subcases(case, role_):
+            continue
+        if function is None:
+            for name, measured in subcases(case, role_):
+                run.row(case, name, role_, harness, "not_run", f"case {case} {name}", reason="not built yet")
+        else:
+            try:
+                function(run, role_, harness, adapter_class)
+            except NotRun as why:
+                for name, _ in subcases(case, role_):
+                    run.row(case, name, role_, harness, "not_run", f"case {case} {name}", reason=str(why))
+            except (RuntimeError, HcError, HcDown, OSError, subprocess.SubprocessError) as error:
+                for name, _ in subcases(case, role_):
+                    if not any(r["subcase"] == name and r["case"] == case and r["role"] == role_
+                               for r in run.data["rows"]):
+                        run.row(case, name, role_, harness, "not_run", f"case {case} {name}",
+                                reason=f"the driver stopped: {type(error).__name__}: {error}")
         run.checkpoint()
     run.data["summary"] = run.summary(selected)
     return run.data, run.exit_code(selected)

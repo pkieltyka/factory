@@ -1027,6 +1027,12 @@ class FakeAgentTests(HcBackend, unittest.TestCase):
         self.hc.send(term, "first line\nFAKE: blocks")
         self.state(term, "blocked")
 
+    def test_act_lines_append_and_run(self):
+        receipt = self.directory / "receipt.txt"
+        term, _ = self.launch("reports")
+        self.hc.send(term, f"[from @x]\nACT append {receipt} tok-1\nACT run {receipt} exit 3")
+        self.until(lambda: receipt.exists() and receipt.read_text() == "tok-1\nexit 3\n", "both actions")
+
     def test_log_has_every_input(self):
         term, log = self.launch("silent")
         self.hc.send(term, "first\nsecond")
@@ -6527,12 +6533,35 @@ class QualifyFrameworkTests(unittest.TestCase):
     def test_a_fixture_run_says_so_and_checkpoints_each_case(self):
         with tempfile.TemporaryDirectory() as directory:
             path = pathlib.Path(directory) / "evidence.json"
-            evidence, code = live.qualify("codex", "member", [1, 2], str(path), fixture=True)
+            with patch.dict(live.CASE_FUNCTIONS, clear=True):             # nothing built: not run, not pass
+                evidence, code = live.qualify("codex", "member", [1, 2], str(path), fixture=True)
             self.assertEqual(evidence["mode"], "fixture")
             self.assertEqual(json.loads(path.read_text())["rows"], evidence["rows"])
             self.assertEqual(code, 2)                                     # nothing built yet: not run, not pass
             self.assertEqual(evidence["summary"], {"member codex": {1: "not_run", 2: "not_run"}})
             self.assertEqual(sorted(p.name for p in pathlib.Path(directory).iterdir()), ["evidence.json"])
+
+
+@real_only
+class QualifyFixtureTests(unittest.TestCase):
+    """phase_8.md §5.1-2: the qualification cases on fake agents and the private real hc, no login."""
+
+    def test_cases_2_and_9_pass_on_fake_agents_and_say_so(self):
+        evidence, code = live.qualify("codex", None, [2, 9], fixture=True)
+        self.assertEqual((evidence["mode"], code), ("fixture", 0))
+        self.assertEqual(sorted((r["role"], r["subcase"], r["status"]) for r in evidence["rows"]),
+                         [("member", "guarded", "pass"), ("member", "idle-report", "pass"),
+                          ("operator", "idle-report", "pass"), ("operator", "operator-commands", "pass")])
+
+    def test_an_echoed_token_without_the_action_fails(self):
+        # The report reaches the operator with the token in it, but no action is asked for: no receipt.
+        real_until = live.QATeam.until
+        with patch.object(live.FixtureAdapter, "act_append", lambda self, path, tok: f"please note {tok}"), \
+                patch.object(live.QATeam, "until", lambda self, predicate, timeout: real_until(self, predicate,
+                                                                                               min(timeout, 15))):
+            evidence, code = live.qualify("codex", "member", [2], fixture=True)
+        row, = evidence["rows"]
+        self.assertEqual((row["subcase"], row["status"], code), ("idle-report", "fail", 1))
 
 
 class LiveToolTests(unittest.TestCase):
