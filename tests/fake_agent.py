@@ -53,8 +53,11 @@ def submitted_lines():
     pending = bytearray()
     incoming = b""
     paste = False
+    echo = bool(os.environ.get("FAKE_ECHO"))
     while chunk := read_input():
         incoming += chunk
+        if echo:   # show the unsubmitted input, as a harness's composer would
+            os.write(1, b"\r\x1b[K> " + bytes(pending) + CONTROL.sub(b" ", incoming))
         while incoming:
             if paste:
                 end = incoming.find(END)
