@@ -3444,8 +3444,9 @@ def _up(cfg, args, hc, team, operator, state, names, me_id):
                 launch_entry(state, m, record["address"], "new", None)
             except (OSError, LogDamage, Problem) as error:
                 _remove_record(hc, record)           # an unrecorded fresh launch could let an old conversation back
-                failed[m["name"]] = f"its fresh launch could not be recorded ({error}), so it was stopped"
-                fixes[m["name"]] = f"fix {state / SESSIONS}, then factory.py up {m['name']}"
+                failed[m["name"]] = f"its fresh launch could not be recorded ({error}), so up stopped it"
+                again = f"factory.py up {m['name']}" + (" --fresh" if args.fresh else "")
+                fixes[m["name"]] = f"fix {state / SESSIONS}, then {again}"
                 return None
         starts[m["name"]] = (m, sess, record)
         how = "resumed" if sess["resume"] else "started"

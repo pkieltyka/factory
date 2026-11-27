@@ -2194,7 +2194,8 @@ class TeamCommandTests(TeamCase):
         with patch.object(factory, "launch_entry", side_effect=OSError("disk full")):
             code, _, err = self.cmd(self.operator, "up", "lead-dev", "--fresh")
         self.assertEqual(code, 3)
-        self.assertIn("its fresh launch could not be recorded (disk full), so it was stopped", err)
+        self.assertIn("its fresh launch could not be recorded (disk full), so up stopped it", err)
+        self.assertIn(f"then factory.py up lead-dev --fresh", err)                # the retry stays fresh
         self.assertEqual(self.member_terms(), {})                               # nothing runs unrecorded
         self.assertIn(old, [r["address"] for r in self.hc.list(self.team)])     # the old record stays
         self.assertFalse([m for m in self.log.read_box()[1].msgs.values() if m["kind"] == "brief"])
