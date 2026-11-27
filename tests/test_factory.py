@@ -2832,6 +2832,248 @@ class MemberNoteTests(TeamCase):
         self.assertEqual(partial.deliveries, 0)
 
 
+@fake_only
+class QuietTests(TeamCase):
+    """keeper.md §6 and phase_6.md §3: the team-quiet note, its re-arming and its freshness at hand-off."""
+
+    def setUp(self):
+        super().setUp()
+        self.operator = self.terminal("operator", kind="operator")[0]
+        self.lead = self.terminal("lead-dev")[0]
+        self.reviewer = self.terminal("reviewer")[0]
+        for name, term in (("lead-dev", self.lead), ("reviewer", self.reviewer)):
+            self.briefed(name, term)
+
+    def quiet_notes(self):
+        """The quiet notes as written, text included (a box drops the text once every recipient is final)."""
+        records = [json.loads(line) for line in self.log.path.read_bytes().splitlines()]
+        return [r for r in records if r["t"] == "msg" and r["kind"] == "note" and r["meta"].get("what") == "quiet"]
+
+    def run_for(self, seconds, step=10):
+        for _ in range(int(seconds / step)):
+            self.clock.sleep(step)
+            self.keeper.tick()
+            self.run_jobs()
+        self.keeper.tick()
+
+    def deliver(self, sender, to, text, term):
+        ident = self.log.add(sender, [to], text)[0]
+        _, box = self.log.read_box()
+        self.log.out(box, ident, to, "sending", term=term)
+        self.log.out(box, ident, to, "delivered", term=term, started=True, turn=0)
+        return ident
+
+    def test_stall_member_without_report(self):
+        self.keeper.tick()
+        self.run_for(110)
+        self.assertEqual(self.quiet_notes(), [])                         # inside the grace
+        self.run_for(20)
+        notes = self.quiet_notes()
+        self.assertEqual(len(notes), 1)
+        text = notes[0]["text"]
+        self.assertTrue(text.startswith("team quiet for 2m: nobody is working and nothing is waiting"))
+        self.assertIn("@lead-dev idle", text)
+        self.assertIn("Last received #1 from @operator.", text)
+        self.assertTrue(text.endswith("may owe a reply."))
+        self.assertEqual(self.outcome(notes[0]["id"], "operator")["o"], "delivered")
+        self.run_for(15 * 60, step=30)                                    # no loop while nothing happens
+        self.assertEqual(len(self.quiet_notes()), 1)
+
+    def test_stall_operator_ended_early_or_mutual_wait(self):
+        self.run_for(130)
+        self.assertEqual(len(self.quiet_notes()), 1)
+        self.fake.set_status(self.operator, "working")                    # the operator's own turn
+        self.run_for(30)
+        self.fake.set_status(self.operator, "idle")
+        self.run_for(300)
+        self.assertEqual(len(self.quiet_notes()), 1)                      # told once
+        self.deliver("lead-dev", "reviewer", "over to you", self.reviewer)   # real activity
+        self.run_for(130)
+        self.assertEqual(len(self.quiet_notes()), 2)
+
+    def test_working_or_young_members_keep_the_team_busy(self):
+        self.fake.set_status(self.lead, "working")
+        self.run_for(300)
+        self.assertEqual(self.quiet_notes(), [])
+        self.fake.set_status(self.lead, "idle")
+        self.fake.add({"factory.team": self.team, "factory.kind": "member", "factory.member": "pm",
+                       "factory.dir": str(self.state_dir)}, None)          # starting, never reported
+        self.run_for(30)
+        self.assertEqual(self.quiet_notes(), [])                          # younger than LAUNCH_TIMEOUT
+        self.run_for(160)
+        self.assertEqual(len(self.quiet_notes()), 1)
+
+    def test_a_member_turn_new_terminal_or_receipt_rearms(self):
+        self.run_for(130)
+        for change in ("turn", "terminal", "receipt"):
+            with self.subTest(change=change):
+                before = len(self.quiet_notes())
+                if change == "turn":
+                    self.fake.set_status(self.lead, "working")
+                    self.keeper.tick()
+                    self.fake.set_status(self.lead, "idle")
+                elif change == "terminal":
+                    self.fake.finish(self.reviewer)
+                    self.reviewer = self.terminal("reviewer")[0]
+                    self.briefed("reviewer", self.reviewer)
+                else:
+                    self.deliver("operator", "lead-dev", "next", self.lead)
+                self.run_for(130)
+                self.assertEqual(len(self.quiet_notes()), before + 1)
+
+    def test_a_held_older_message_delivered_after_the_note_rearms(self):
+        self.fake.set_status(self.reviewer, "blocked", "permission")
+        held = self.log.add("lead-dev", ["reviewer"], "held for a blocked member")[0]
+        self.run_for(150)                                                 # the blocked note goes first
+        self.assertEqual(len(self.quiet_notes()), 1)                      # a queued, undeliverable pair is quiet
+        self.assertLess(held, self.quiet_notes()[0]["id"])
+        self.fake.set_status(self.reviewer, "idle")
+        self.keeper.tick()
+        self.run_jobs()
+        self.keeper.tick()
+        self.assertEqual(self.outcome(held, "reviewer")["o"], "delivered")
+        self.run_for(130)
+        self.assertEqual(len(self.quiet_notes()), 2)                      # by the count, not by message ID
+
+    def test_a_quiet_note_no_longer_true_at_hand_off_is_dropped(self):
+        self.fake.set_status(self.operator, "blocked", "question")
+        self.run_for(130)
+        self.assertEqual(self.quiet_notes(), [])                          # not added for a blocked operator
+        self.fake.set_status(self.operator, "idle")
+        self.clock.sleep(1)
+        self.keeper._quiet(factory.team_view(self.hc, self.team), self.clock.monotonic())
+        note = self.quiet_notes()[0]
+        self.fake.set_status(self.lead, "working")                        # work resumes before the hand-off
+        self.keeper.tick()
+        self.assertEqual(self.outcome(note["id"], "operator"), {**self.outcome(note["id"], "operator"),
+                                                               "o": "dropped", "why": "no longer true"})
+        self.assertEqual(self.fake.sent(self.operator), [])
+
+    def test_a_quiet_note_is_never_queued_behind_another_head(self):
+        self.run_for(10)
+        self.keeper._quiet(factory.team_view(self.hc, self.team), self.clock.monotonic() + 1000)
+        note = self.quiet_notes()[0]
+        ordinary = self.log.add("lead-dev", ["operator"], "a report")[0]
+        self.fake.finish(self.operator)                                   # the operator is gone
+        self.keeper.tick()
+        self.keeper.tick()
+        self.assertEqual(self.outcome(ordinary, "operator")["why"], "gone")
+        self.assertEqual(self.outcome(note["id"], "operator")["o"], "dropped")
+
+
+@fake_only
+class ReadyCheckTests(TeamCase):
+    """keeper.md §6 step 4 and phase_6.md §4: the owner's ready check while the team is quiet."""
+
+    def setUp(self):
+        super().setUp()
+        self.operator = self.terminal("operator", kind="operator")[0]
+        self.lead = self.terminal("lead-dev")[0]
+        self.briefed("lead-dev", self.lead)
+        self.board = self.root / "board.txt"
+        self.board.write_text("T-1 ship it\n")
+        self.check(f"cat {shlex.quote(str(self.board))}")
+
+    def check(self, command):
+        conf = self.root / "factory.toml"
+        body = re.sub(r'(?m)^ready_check(_every)? = .*\n', "", conf.read_text())
+        conf.write_text(f"ready_check = {json.dumps(command)}\nready_check_every = 60\n" + body)
+
+    def records(self, what):
+        records = [json.loads(line) for line in self.log.path.read_bytes().splitlines()]
+        return [r for r in records if r["t"] == "msg" and r["kind"] == "note" and r["meta"].get("what") == what]
+
+    def run_for(self, seconds, step=10):
+        for _ in range(int(seconds / step)):
+            self.clock.sleep(step)
+            self.keeper.tick()
+            self.run_jobs()
+        self.keeper.tick()
+
+    def test_stall_ready_work_while_idle(self):
+        self.run_for(150)
+        self.assertEqual(len(self.records("quiet")), 1)
+        self.assertEqual(self.records("ready"), [])                       # the first check waits a full period
+        self.run_for(70)
+        ready = self.records("ready")
+        self.assertEqual([r["text"] for r in ready], ["ready work:\nT-1 ship it"])
+        self.assertEqual(ready[0]["meta"]["quiet_id"], self.records("quiet")[0]["id"])
+        self.assertTrue(any(text.startswith("[from factory]\nready work:") for text in self.fake.sent(self.operator)))
+        self.run_for(200)
+        self.assertEqual(len(self.records("ready")), 1)                   # unchanged output: told once
+
+    def test_new_output_wakes_and_none_then_the_same_wakes_again(self):
+        self.run_for(220)
+        self.board.write_text("T-1 ship it\nT-2 docs\n")
+        self.run_for(70)
+        self.assertEqual(len(self.records("ready")), 2)
+        self.board.write_text("")                                         # no ready work: the report clears
+        self.run_for(70)
+        self.assertEqual(factory.read_team(self.state_dir)["ready_clear"], self.keeper.box.highest)
+        self.board.write_text("T-1 ship it\nT-2 docs\n")                   # the same work comes back
+        self.run_for(70)
+        self.assertEqual(len(self.records("ready")), 3)
+
+    def test_unknown_results_change_nothing(self):
+        for command, line in (("exit 2", "ready check: exit 2"), ("printf '\\377'", "ready check: failed")):
+            with self.subTest(command=command):
+                self.check(command)
+                self.pane.clear()
+                self.run_for(300)
+                self.assertTrue(any(p.startswith(line) for p in self.pane), self.pane)
+                self.assertEqual(self.records("ready"), [])
+        with patch.object(factory.subprocess, "run", side_effect=factory.subprocess.TimeoutExpired("sh", 30)):
+            self.run_for(70)
+        self.assertIn("ready check: timed out", self.pane)
+
+    def test_the_check_runs_in_the_main_checkout_with_output_trimmed(self):
+        self.check("pwd; seq 1 30")
+        self.run_for(220)
+        text = self.records("ready")[0]["text"]
+        self.assertEqual(text.splitlines()[1], str(self.root))
+        self.assertEqual(len(text.splitlines()), 21)                     # the heading and the first 20 lines
+
+    def test_a_late_result_for_another_interval_is_dropped(self):
+        self.run_for(150)
+        for _ in range(20):                                               # until the check is spawned, not run
+            self.clock.sleep(10)
+            self.keeper.tick()
+            if self.keeper.ready_job is not None:
+                break
+            self.run_jobs()
+        self.assertIsNotNone(self.keeper.ready_job)
+        job = self.jobs.pop()
+        self.fake.set_status(self.lead, "working")                        # real activity: a new interval
+        self.keeper.tick()
+        self.fake.set_status(self.lead, "idle")
+        job()
+        self.keeper.tick()
+        self.assertEqual(self.records("ready"), [])
+
+    def test_a_broken_factory_toml_stops_the_check(self):
+        self.run_for(150)
+        conf = self.root / "factory.toml"
+        conf.write_text(conf.read_text() + "[broken\n")
+        self.run_for(300)
+        self.assertEqual(self.records("ready"), [])
+        self.assertTrue(any("factory.toml" in p for p in self.pane))
+
+    def test_stall_member_blocked(self):
+        self.fake.set_status(self.lead, "blocked", "permission")
+        self.keeper.tick()
+        self.assertEqual([r["meta"]["what"] for r in self.records("blocked:permission")], ["blocked:permission"])
+
+    def test_stall_member_error(self):
+        self.fake.set_status(self.lead, "error", msg="rate limited")
+        self.keeper.tick()
+        self.assertEqual(self.records("error")[0]["text"], "@lead-dev hit an error: rate limited.")
+
+    def test_stall_member_lost(self):
+        self.fake.finish(self.lead, reason="server_stop")
+        self.keeper.tick()
+        self.assertTrue(self.records("exit")[0]["text"].startswith("@lead-dev hc stopped (state unknown)."))
+
+
 class KeeperTests(TeamCase):
     def member(self, *, status="idle", briefed=True):
         term, agent_log = self.terminal("lead-dev", status=status)
