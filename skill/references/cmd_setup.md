@@ -27,7 +27,7 @@ Edit `factory.toml`, your formation:
 
 - Keep the chosen members, each with a harness and project-specific `notes`. Set the model explicitly unless using the agy default. `up` starts every member in it; there are no named rosters.
 - Use `worktree = true` for developers who work in parallel: each gets branch `<user>/<member>` (for example `peter/lead-dev`), so two people's branches do not collide when their `user` differs. `user` is a top-level key above `[operator]` and defaults to the system user name; set it when that name is generic (`root`, `ubuntu`).
-- In `[operator]`, record this pane’s harness and its known model and thinking level. Omit any model or thinking value you cannot verify.
+- In `[operator]`, record this pane’s harness and its known model and thinking level. Omit any model or thinking value you cannot verify. The name `factory` is reserved for keeper notes.
 - If the owner wants a ready check, set `ready_check` as a top-level key in their local `factory.toml`, above `[operator]`. Use the command for `TODO.md` in the template, or the [todos](../recipes/tasks-todos.md#ready-check) or [gh](../recipes/tasks-gh.md#ready-check) recipe. The command runs only while the team is quiet. Keep the command in the local formation. Leave the template example commented.
 
 Edit `FACTORY.md`, the shared brief, as plain Markdown without comments. Paste the chosen recipe's section and fill the names in capitals; names in angle brackets stay for members. Write it by role ("the operator", never an @name), so it holds for any person's formation:

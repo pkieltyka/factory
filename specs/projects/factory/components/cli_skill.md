@@ -162,7 +162,7 @@ Notes from `[from factory]` describe an observation that may have changed while 
 |---|---|
 | `@x is blocked` | Resolve the current block, or ask the owner when only they can. |
 | `@x hit an error` | Reassign, or retry after the provider's delay. |
-| Member exit: `exited`, `was killed`, `hc stopped`, `was lost`, or `its harness ended` | Run `factory.py up NAME` or reassign. Reconcile the pickup report, tracker and inbox before assigning the task again. |
+| Member exit (`exited`, `was killed`, `hc stopped`, `was lost`, or `its harness ended`) | Run `factory.py up NAME` or reassign. Reconcile the pickup report, tracker and inbox before assigning the task again. |
 | `team quiet` | Check who owes a report, then check for ready work. If neither needs action, end your turn without replying. |
 | `ready work` | Read the current tracker and take its next ready item if you can assign it. |
 
