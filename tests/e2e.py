@@ -917,7 +917,7 @@ class GitHubEvidence:
                 done = forge_time(job.get("completed_at"))
                 if job["name"] != "tests" or job["conclusion"] != "success" or not done or not done < merged_at:
                     continue
-                log = repo.gh("api", f"repos/{QA_REPO}/actions/jobs/{job['id']}/logs", text=True)
+                log = repo.gh("run", "view", "--repo", QA_REPO, "--job", str(job["id"]), "--log", text=True)
                 count = max((int(n) for n in re.findall(r"\bRan ([0-9]+) tests? in ", log)), default=0)
                 if count:
                     self.checks[revision] = count

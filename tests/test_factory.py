@@ -7520,10 +7520,15 @@ class E2EGitHubEvidenceTests(unittest.TestCase):
                         {"id": 4, "name": "tests", "conclusion": "success", "completed_at": completion}]},
                 }
                 forge = e2e.GitHubEvidence.__new__(e2e.GitHubEvidence)
-                forge.repo = types.SimpleNamespace(prefix="qa/fixture/", api=responses.__getitem__,
-                                                   gh=lambda *args, **kwargs: log)
+                forge.repo = types.SimpleNamespace(prefix="qa/fixture/", api=responses.__getitem__, gh=None)
                 forge.checks = {}
-                self.assertEqual(forge.checked(revision, merge), expected)
+                with patch.object(forge.repo, "gh", return_value=log) as read_logs:
+                    self.assertEqual(forge.checked(revision, merge), expected)
+                if completion < "2026-11-27T10:20:00Z":
+                    read_logs.assert_called_once_with("run", "view", "--repo", e2e.QA_REPO, "--job", "4", "--log",
+                                                      text=True)
+                else:
+                    read_logs.assert_not_called()
 
 
 class E2ELocalEvidenceTests(unittest.TestCase):
