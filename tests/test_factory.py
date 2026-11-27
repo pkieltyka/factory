@@ -7583,6 +7583,15 @@ class ConfigTests(unittest.TestCase):
         self.assertIn("name: factory2\n", (factory.SKILL / "SKILL.md").read_text())   # beside v1 until v2's tag
         self.assertTrue((factory.SKILL / "templates/FACTORY.md").read_text().startswith("# Factory\n"))
 
+    def test_a_project_without_its_files_is_told_the_v2_invocation(self):
+        """@reviewer on #229: with v1 installed as factory and v2 as factory2, the hint must name factory2, or a user
+        following it would form the team with v1."""
+        directory = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
+        with self.assertRaises(SystemExit) as stop:
+            factory.Config(directory)
+        self.assertIn("Run `/factory2 setup`", str(stop.exception))
+        self.assertNotIn("`/factory setup`", str(stop.exception))
+
     def test_todo_item_format(self):
         first = "- [x] (1) First\n    * verdict: approved"
         second = "- [ ] (2) Second"
@@ -8414,7 +8423,8 @@ class SkillTextTests(unittest.TestCase):
 
     @classmethod
     def examples(cls):
-        invocation = re.compile(r"^((?:python3\s+)?(?:\S+/)?factory\.py|/factory)\s+([a-z][a-z-]*)\b(.*)")
+        invocation = re.compile(r"^((?:python3\s+)?(?:\S+/)?factory\.py|/factory2)\s+([a-z][a-z-]*)\b(.*)")
+        # factory2 until the v2 tag, beside v1 (the owner's request); a stale /factory example would be v1's
         for page in cls.pages():
             fenced = False
             for line in page.read_text().splitlines():
@@ -8433,8 +8443,9 @@ class SkillTextTests(unittest.TestCase):
 
     def test_no_removed_commands_or_stale_instructions(self):
         removed = re.compile(
-            r"\bherdr\b(?!-(?:core|app)\b)|\bHERDR_\w+|(?<!\w)(?:factory\.py|/factory)\s+(?:wait|prompt|continue)\b"
-            r"|(?<!\w)--(?:seen|restart|no-brief)\b|\bv1\b", re.IGNORECASE)
+            r"\bherdr\b(?!-(?:core|app)\b)|\bHERDR_\w+|(?<!\w)(?:factory\.py|/factory2?)\s+(?:wait|prompt|continue)\b"
+            r"|(?<!\w)--(?:seen|restart|no-brief)\b|\bv1\b"
+            r"|(?<![\w.~/-])/factory(?![\w/-]|\.py)", re.IGNORECASE)    # v1's invocation, while v2 is factory2
         banner = ("> **This checkout is Factory for herdr-core.** Until v2 ships, install the current release from "
                   "the [`v1` branch](https://github.com/pkieltyka/factory/tree/v1) (tag `v1.0.0`).")
         for page in self.pages():
@@ -8449,7 +8460,7 @@ class SkillTextTests(unittest.TestCase):
         private = {"keeper", "init", "harnesses", "check"}
         for page, invocation, command, _ in self.examples():
             with self.subTest(page=page.name, invocation=invocation, command=command):
-                supported = (commands - private) | {"setup"} if invocation == "/factory" else commands
+                supported = (commands - private) | {"setup"} if invocation == "/factory2" else commands
                 self.assertIn(command, supported)
 
     def test_flags_named_in_the_text_exist(self):

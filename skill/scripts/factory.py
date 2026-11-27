@@ -392,7 +392,7 @@ class Config:
         missing = [f.name for f in (self.brief_file, self.conf_file) if not f.is_file()]
         if missing and require:
             refuse_dangling_links(self.root)
-            raise SystemExit(f"no {' or '.join(missing)} in {self.root} or above. Run `/factory setup`, or"
+            raise SystemExit(f"no {' or '.join(missing)} in {self.root} or above. Run `/factory2 setup`, or"
                              f" `factory.py init`, which writes what is missing and copies the project's {SAMPLE} to"
                              f" {CONF} if there is one.")
         try:
