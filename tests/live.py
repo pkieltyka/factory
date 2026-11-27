@@ -172,14 +172,19 @@ def qa_environ(environ):
 
 
 HERDR_STUB = "#!/bin/sh\necho 'herdr is not available in a Factory qualification run' >&2\nexit 1\n"
+INSTALLED_NAMES = ("factory", "factory2")   # v1, and v2 installed beside it until the tag (the owner)
+
+
 def installed_factory_skills(home, exclude=(), depth=4):
     """[(path, resolved folder)] of every Factory skill installed under home's dot-directories: a folder named
-    factory in a skills folder, holding SKILL.md or scripts/factory.py, found by a scan at run start so a later
-    install is caught (the owner's rule: no QA run may use an installed copy). Folders under exclude are skipped."""
+    factory or factory2 in a skills folder, holding SKILL.md or scripts/factory.py, found by a scan at run start so a
+    later install is caught (the owner's rule: no QA run may use an installed copy). Folders under exclude are
+    skipped."""
     home, found, seen = pathlib.Path(home), [], set()
     excluded = [pathlib.Path(e).resolve() for e in exclude]
     try:
-        tops = [t for t in home.iterdir() if t.name.startswith(".") and t.is_dir() and t.name not in (".cache", ".npm")]
+        tops = [t for t in home.iterdir()
+                if t.name.startswith(".") and t.is_dir() and t.name not in (".cache", ".npm")]
     except OSError:
         return found
     walked = set()
@@ -189,8 +194,10 @@ def installed_factory_skills(home, exclude=(), depth=4):
         walked.add(top.resolve())
         for dirpath, dirnames, _ in os.walk(top, onerror=lambda error: None):
             here = pathlib.Path(dirpath)
-            if here.name == "skills" and "factory" in dirnames:
-                path = here / "factory"
+            for name in INSTALLED_NAMES if here.name == "skills" else ():
+                if name not in dirnames:
+                    continue
+                path = here / name
                 resolved = path.resolve()
                 if ((resolved / "SKILL.md").is_file() or (resolved / "scripts" / "factory.py").is_file()) \
                         and not any(resolved == e or e in resolved.parents for e in excluded) and path not in seen:

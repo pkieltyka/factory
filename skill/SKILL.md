@@ -1,9 +1,9 @@
 ---
-name: factory
+name: factory2
 description: >
   Form, launch and lead a software team in herdr-core (hc) across Claude Code, Codex, pi, omp,
   OpenCode and Antigravity CLI (agy). Commands: setup, up, down, status, brief, say, inbox, or bare
-  /factory. Use for team formation, delegation, peer review and session recovery.
+  /factory2. Use for team formation, delegation, peer review and session recovery.
 ---
 
 # factory
@@ -38,7 +38,7 @@ Use `factory.py say` for every team message. Members send private drafts with `-
 | `say` | `factory.py say NAME --file PATH`. Separate recipients with spaces or commas. `all` selects other live members. The operator can pass quoted text in place of the file. |
 | `inbox` | `factory.py inbox [N] [--for NAME]` shows recent messages and their outcomes. It defaults to the last ten addressed to you. |
 
-Bare `/factory` starts setup if either project file is missing. Otherwise run `status`. If no member runs, run `up`. Use `up <names>` for gone members and start extra members only when asked. Report blocked members by name. Reconcile unfinished work even if everyone is running.
+Bare `/factory2` starts setup if either project file is missing. Otherwise run `status`. If no member runs, run `up`. Use `up <names>` for gone members and start extra members only when asked. Report blocked members by name. Reconcile unfinished work even if everyone is running.
 
 ## Launch
 

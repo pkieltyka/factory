@@ -23,18 +23,18 @@ The pane where you run setup becomes the operator when you run `up`. These are t
 
 | Harness | Install the skill at | Enter in its conversation |
 |---|---|---|
-| Claude Code | `~/.claude/skills/factory` | `/factory setup` |
-| Codex | `~/.agents/skills/factory` | `$factory setup` |
-| pi | `~/.pi/agent/skills/factory` | `/skill:factory setup` |
-| omp | `~/.omp/agent/skills/factory` | `/skill:factory setup` with skill commands enabled |
-| [OpenCode](https://opencode.ai/docs/skills/#loading) | `~/.config/opencode/skills/factory` | `@factory setup` |
-| Antigravity CLI (agy) | `.agents/skills/factory` in the project or `~/.gemini/config/skills/factory` | `/factory setup` |
+| Claude Code | `~/.claude/skills/factory2` | `/factory2 setup` |
+| Codex | `~/.agents/skills/factory2` | `$factory2 setup` |
+| pi | `~/.pi/agent/skills/factory2` | `/skill:factory2 setup` |
+| omp | `~/.omp/agent/skills/factory2` | `/skill:factory2 setup` with skill commands enabled |
+| [OpenCode](https://opencode.ai/docs/skills/#loading) | `~/.config/opencode/skills/factory2` | `@factory2 setup` |
+| Antigravity CLI (agy) | `.agents/skills/factory2` in the project or `~/.gemini/config/skills/factory2` | `/factory2 setup` |
 
 From the factory clone, copy `skill/` to the corresponding path. For example, for a fresh Claude Code install:
 
 ```bash
 mkdir -p ~/.claude/skills
-cp -R skill ~/.claude/skills/factory
+cp -R skill ~/.claude/skills/factory2
 ```
 
 You can symlink the skill directory instead. After pulling an update, refresh a copied installation from the checkout. To load changed instructions for a running member, finish its current work, stop it with `factory.py down NAME`, and start it with `factory.py up NAME`.
@@ -62,7 +62,7 @@ From the project directory, run `rodeo --session first-factory`. Start your sign
 
 If your agy operator shows a trust dialog, accept it yourself only if you trust the workspace. Right after accepting, compare `trustedWorkspaces` with your backup, if you made one. Restore any missing entries and keep the new workspace entry.
 
-Enter `/factory setup` using the spelling for your harness. Give the operator your goal, the available harnesses and the work you want ready. For a first team, use the built-in `TODO.md` tracker and the reviewer's own review. [Default team](README.md#the-team)
+Enter `/factory2 setup` using the spelling for your harness. Give the operator your goal, the available harnesses and the work you want ready. For a first team, use the built-in `TODO.md` tracker and the reviewer's own review. [Default team](README.md#the-team)
 
 To turn off prompt suggestions for your Claude Code operator, set `"promptSuggestionEnabled": false` in your own `.claude/settings.local.json` in this project.
 
@@ -72,9 +72,9 @@ Commit the shared brief `FACTORY.md` and suggested formation `factory.toml.sampl
 
 Before `up` starts agy members in untrusted workspaces, [back up agy's trust settings](#back-up-agy-trust-settings).
 
-Enter `/factory up`. It marks your current pane as the operator and adds the members and a narrow keeper pane to the `team` tab. Your pane stays where it is. Check `/factory status` for members, pending messages and keeper state.
+Enter `/factory2 up`. It marks your current pane as the operator and adds the members and a narrow keeper pane to the `team` tab. Your pane stays where it is. Check `/factory2 status` for members, pending messages and keeper state.
 
-If a member's agy trust dialog appears, accept it yourself in that pane only if you trust the workspace. Right after accepting, compare `trustedWorkspaces` with your backup, if you made one. Restore any missing entries and keep the new workspace entry. Back up the resulting settings before accepting another workspace. Then run `/factory brief --send NAME` for that member.
+If a member's agy trust dialog appears, accept it yourself in that pane only if you trust the workspace. Right after accepting, compare `trustedWorkspaces` with your backup, if you made one. Restore any missing entries and keep the new workspace entry. Back up the resulting settings before accepting another workspace. Then run `/factory2 brief --send NAME` for that member.
 
 Follow the recovery instructions printed by `up`.
 
@@ -90,9 +90,9 @@ Pushing, deploying, destructive actions, spending and sending anything outside t
 
 ## Stop and come back
 
-From the operator's pane, `/factory down` stops configured members and keeps their saved conversations, worktrees and message log. Pass a name to stop one member. If it reports a live terminal for a removed member, use the command it gives to stop that terminal.
+From the operator's pane, `/factory2 down` stops configured members and keeps their saved conversations, worktrees and message log. Pass a name to stop one member. If it reports a live terminal for a removed member, use the command it gives to stop that terminal.
 
-Detach rodeo with its prefix key then **q** to leave terminals running in `hc`. Reopen the same named session to return. After an `hc` restart, restart your operator harness if needed. Use `/factory up NAME` for the members you want back. Factory tries the saved compatible conversation and reports a fresh start. Use `/factory inbox` to reread messages.
+Detach rodeo with its prefix key then **q** to leave terminals running in `hc`. Reopen the same named session to return. After an `hc` restart, restart your operator harness if needed. Use `/factory2 up NAME` for the members you want back. Factory tries the saved compatible conversation and reports a fresh start. Use `/factory2 inbox` to reread messages.
 
 ## Limits
 

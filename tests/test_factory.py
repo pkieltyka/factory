@@ -7144,6 +7144,9 @@ class QualifyFrameworkTests(unittest.TestCase):
             (home / other).mkdir(parents=True)
             (home / other / "SKILL.md").write_text("x")
         (home / ".agents" / "skills" / "factory").mkdir(parents=True)      # empty: not a skill
+        v2 = home / ".config" / "opencode" / "skills" / "factory2"          # v2 installed beside v1 (the owner)
+        v2.mkdir(parents=True)
+        (v2 / "SKILL.md").write_text("x")
         elsewhere = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory())) / "dotfiles"
         (elsewhere / "skills" / "factory").mkdir(parents=True)
         (elsewhere / "skills" / "factory" / "SKILL.md").write_text("x")
@@ -7152,9 +7155,12 @@ class QualifyFrameworkTests(unittest.TestCase):
         self.assertEqual(found, {str(store): str(store), str(home / ".claude/skills/factory"): str(store),
                                  str(home / ".gemini/config/skills/factory"): str(store),
                                  str(home / ".codex/skills/factory"): str(home / ".codex/skills/factory"),
-                                 str(home / ".linked/skills/factory"): str((elsewhere / "skills/factory").resolve())})
+                                 str(home / ".linked/skills/factory"): str((elsewhere / "skills/factory").resolve()),
+                                 str(v2): str(v2.resolve())})
         self.assertEqual(set(dict(live.installed_factory_skills(home, exclude=(store,)))),
-                         {str(home / ".codex/skills/factory"), str(home / ".linked/skills/factory")})
+                         {str(home / ".codex/skills/factory"), str(home / ".linked/skills/factory"), str(v2)})
+        self.assertEqual(live.skills_off("codex", [(str(v2), str(v2))])[1],
+                         'skills.config=[{path="' + str(v2) + '/SKILL.md",enabled=false}]')   # Codex disables it too
 
     def test_an_installed_factory_seen_fails_the_case(self):
         import live
@@ -7574,7 +7580,7 @@ class ConfigTests(unittest.TestCase):
             text = path.read_text()
             for name in ("TEAM.md", "team.toml", "team-brief", "a-team", "ateam.py", "ATEAM_"):
                 self.assertNotIn(name, text, str(path))
-        self.assertIn("name: factory\n", (factory.SKILL / "SKILL.md").read_text())
+        self.assertIn("name: factory2\n", (factory.SKILL / "SKILL.md").read_text())   # beside v1 until v2's tag
         self.assertTrue((factory.SKILL / "templates/FACTORY.md").read_text().startswith("# Factory\n"))
 
     def test_todo_item_format(self):

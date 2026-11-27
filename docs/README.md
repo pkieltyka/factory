@@ -38,13 +38,13 @@ Use these in the Claude Code operator conversation. For another harness, use its
 
 | Command | What it does |
 |---|---|
-| `/factory` | Reads the current state and chooses the next step. |
-| `/factory setup` | Forms or changes the team and project brief. |
-| `/factory up` | Starts or resumes members and briefs those launched. To apply changed settings, stop the member, then start it again. |
-| `/factory down` | Stops configured members so they can resume later. Pass names to stop selected members. |
-| `/factory status` | Shows member state, pending messages, the keeper and the operator. |
-| `/factory inbox` | Rereads recent messages addressed to you and their outcomes. |
-| `/factory brief` | Previews or resends the team brief. |
-| `/factory say` | Lets the operator send one message to one or more teammates. |
+| `/factory2` | Reads the current state and chooses the next step. |
+| `/factory2 setup` | Forms or changes the team and project brief. |
+| `/factory2 up` | Starts or resumes members and briefs those launched. To apply changed settings, stop the member, then start it again. |
+| `/factory2 down` | Stops configured members so they can resume later. Pass names to stop selected members. |
+| `/factory2 status` | Shows member state, pending messages, the keeper and the operator. |
+| `/factory2 inbox` | Rereads recent messages addressed to you and their outcomes. |
+| `/factory2 brief` | Previews or resends the team brief. |
+| `/factory2 say` | Lets the operator send one message to one or more teammates. |
 
 Members send messages with the standalone command `factory.py say NAME --file <path>`.

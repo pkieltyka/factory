@@ -54,8 +54,8 @@ Install `hc` 0.1.20 or newer, rodeo, Python 3.11+, Git and a signed-in harness. 
 From your project directory, run `rodeo --session first-factory` and start your operator harness in its pane. In Claude Code, enter the commands below. [Other harness invocations](docs/getting-started.md#operator-harnesses)
 
 ```text
-/factory setup
-/factory up
+/factory2 setup
+/factory2 up
 ```
 
 The default member permissions assume a safe machine such as a sandbox or VM. Choose `guarded` during setup to keep the harness guard for Claude Code and Codex.
