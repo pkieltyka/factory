@@ -24,7 +24,7 @@ To message several teammates, address each with `@name` in one draft and send it
 
 ## Messages and status
 
-Team messages arrive in your pane with `[from @name]`. Use `factory.py inbox [N]` after compaction or to reread your last messages and their outcomes. Members send private drafts with `--file`. Factory removes a draft when every recipient has it. A cold `up` lists undelivered files to check before resending or discarding. A member's local final reply stays in its pane.
+Team messages arrive in your pane with `[from @name]`. After you assign or ask, end your turn: the report or a Factory note starts your next one. Do not poll `inbox`, `status` or a member's pane, sleep, or keep a background task to wait for a teammate. A wait on your own command, such as the bounded CI wait in [pull-requests.md](pull-requests.md), is different: run it. Use `factory.py inbox [N]` after compaction or to reread your last messages and their outcomes. Members send private drafts with `--file`. Factory removes a draft when every recipient has it. A cold `up` lists undelivered files to check before resending or discarding. A member's local final reply stays in its pane.
 
 Check the reported tests before accepting work. `say` prints a message ID and one outcome per recipient.
 
@@ -76,7 +76,7 @@ Notes from `[from factory]` describe an observation that may have changed while 
 
 Work through ready items within the owner’s scope and the workflow in `FACTORY.md`. Record the goal, priority and constraints on the tracker.
 
-- Take only items the tracker marks ready, as many at a time as `FACTORY.md` allows. Assign, receive reports, review and integrate as above, then take the next.
+- Take only items the tracker marks ready, as many at a time as `FACTORY.md` allows. Assign, receive reports, review and integrate as above, then take the next. Between them, end your turn as [Messages and status](#messages-and-status) says, also when the owner is away.
 - When an item's criteria cannot be met, keep them as written and have the tracker owner record the blocker. Use authorized recovery or reassignment first. When those options are exhausted, or only the owner can decide, ask the owner once in your pane and set the item aside. Keep task commands inside your sandbox.
 - Continue with ready items independent of the blocker and any pending owner decision.
 - When the review rounds in `FACTORY.md` are exhausted, decide how to resolve the remaining findings and carry on.
