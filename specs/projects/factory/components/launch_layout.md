@@ -222,7 +222,7 @@ One to three members sit side by side; four to nine fill three columns; the keep
 4. One `edit_layout(remove_panes)`.
 5. If no member record is left: `team.json` `up: false`; print `run factory.py up to bring members back`. The keeper stops itself ([keeper.md](keeper.md) §8).
 
-`factory.down` is set before the kill so the keeper, which may tick between the kill and the `rm`, sends no exit note and drops rather than requeues a send in flight (§8.4, §8.5).
+`factory.down` is set before the kill, so a finished record with it is not a `gone` member (no exit note) and `up` does not replace that member until `down` has recorded and swept the stop. A send in flight to a stopped terminal is dropped through `team.json`'s `stopped` list, which `mark_stopped` writes and the keeper reads when it settles a definite refusal (§8.4, §8.5).
 
 ## 7. Claude Code settings and sandboxes
 
