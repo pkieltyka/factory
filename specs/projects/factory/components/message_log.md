@@ -123,6 +123,7 @@ class Box:
     def last_note(self, term: str) -> dict | None # meta of the newest member note about that terminal
     def quiet_note(self) -> dict | None           # newest quiet note whose outcome is not dropped
     def ready_note(self) -> dict | None           # newest ready-work note whose outcome is not dropped
+    deliveries: int                               # delivered outcomes of non-notes (full boxes only)
 ```
 
 ## Algorithms
@@ -208,6 +209,7 @@ Computed by `Box` from committed records only, so a crash between two steps of t
 | `last_note(term)` | The `meta` of the newest note whose `meta.term` is that terminal. A member note is sent only when the state the keeper observes differs from it in `what` or in `since` ([keeper.md](keeper.md) §5) |
 | `quiet_note()` | The newest note with `meta.what == "quiet"` whose outcome for the operator is not `dropped` |
 | `ready_note()` | The newest note with `meta.what == "ready"` whose outcome for the operator is not `dropped` |
+| `deliveries` | The count of `delivered` outcomes of messages that are not notes, in a box replayed from offset 0 (a partial box keeps 0). The quiet note saves it, and a higher count re-arms the quiet rule ([keeper.md](keeper.md) §6) |
 
 ### `say`: waiting for outcomes
 

@@ -1866,6 +1866,12 @@ class Keeper:
         self.ready_job = None                # the running check's key, or None
         self._ready_done = None              # its result, applied after the box is refreshed
         self._cfg_failed = False             # the current factory.toml does not load: no ready check
+        self.draining = None                 # the newer build on disk this keeper drains for, then execs
+        self._version_at = 0                 # monotonic time of the next look at the installed build
+        self._title = None
+        self._told = False                   # the operator has a quiet note for this interval
+        self.title_out = sys.stdout          # OSC 2 goes straight to the pane, not through emit
+        self._execv = os.execv
         self._quiet_sample = None            # member turns and the delivery count at the previous quiet tick
         self._retry_log_at = 0
         self._reported_errors = {}
@@ -1923,6 +1929,8 @@ class Keeper:
                 self.emit(f"keeper {VERSION} started")
                 while not self.stop:
                     self.tick()
+                    if self.draining and not self.stop and self._drained():
+                        self._reexec()
                     if not self.stop:
                         try:
                             result = self.results.get(timeout=TICK)
@@ -1986,9 +1994,54 @@ class Keeper:
         except (LogDamage, NotStored, OSError) as error:
             self._log_failed(error)
 
+    def _check_version(self, now):
+        """Every 30 s: a newer build on disk starts the drain (phase_6.md §5). A read failure changes nothing."""
+        if now < self._version_at or self.draining:
+            return
+        self._version_at = now + 30
+        try:
+            installed = hashlib.sha1(SCRIPT.read_bytes()).hexdigest()[:12]
+        except OSError:
+            return
+        if installed != VERSION:
+            self.draining = installed
+            self.emit(f"keeper {installed} installed: finishing what is in flight, then restarting")
+
+    def _drained(self):
+        """Nothing in flight, no ready check running and no withheld result: safe to exec."""
+        return not self.inflight and self.ready_job is None and not self.unsettled
+
+    def _reexec(self):
+        argv = [sys.executable, str(SCRIPT), "keeper", "--state", str(self.state)]
+        self.emit("keeper restarting: new Factory version")
+        try:
+            self._execv(sys.executable, argv)   # the lock fd is close-on-exec: the new image takes it again
+        except OSError as error:
+            self.emit(f"keeper could not restart itself ({error}); it goes on serving")
+            self.draining = None
+            self._version_at = self.clock.monotonic() + 30
+
+    def _show_title(self):
+        """OSC 2, only when it changes: pending pairs, else a reported quiet interval, else keeper."""
+        try:
+            pending = len(self.box.pending())
+        except LogDamage:
+            pending = 0
+        if pending:
+            title = f"keeper · {pending} pending"
+        elif self._told and self.quiet_since is not None:
+            title = f"keeper · quiet {int((self.clock.monotonic() - self.quiet_since) // 60)}m"
+        else:
+            title = "keeper"
+        if title != self._title:
+            self._title = title
+            self.title_out.write(f"\x1b]2;{title}\x07")
+            self.title_out.flush()
+
     def tick(self):
         if self._beat_fd is not None:
             os.utime(self._beat_fd)
+        self._check_version(self.clock.monotonic())
         previous = set(self.inflight.items())
         self._drain_results()
         if not self._read_team():
@@ -2024,10 +2077,10 @@ class Keeper:
         if self.cfg is None or self.stop:
             return
         try:
-            if self.damaged is None and self.team.get("up") is True:
+            if self.damaged is None and self.team.get("up") is True and not self.draining:
                 self._member_notes(view)
                 self._quiet(view, now)
-            if self.damaged is None:
+            if self.damaged is None and not self.draining:   # draining: no new claims, only settlements
                 self._deliver(view, now)
             operator = self.cfg.operator["name"]
             if (self.team.get("up") is not True and not self.inflight
@@ -2035,6 +2088,7 @@ class Keeper:
                 self.stop = "team is down"
         except (LogDamage, NotStored, OSError) as error:
             self._log_failed(error)
+        self._show_title()
 
     def _member_notes(self, view):
         """keeper.md §5: housekeeping on briefed member terminals, then one note per new episode for the operator."""
@@ -2073,8 +2127,10 @@ class Keeper:
         wall = self.clock.time()
         q = self.box.quiet_note()
         told = q is not None and not rearmed(q, view, self.box, self.cfg)
+        self._told = told
         if not quiet_now(view, self.box, self.cfg, wall, now, self.inflight, self.op_null_since):
             self.quiet_since = self._quiet_sample = self.ready_next = self._ready_done = None
+            self._told = False
             return
         sample = ({a: t.get("turn", 0) for a, t in _member_terminals(view, self.cfg).items()}, self.box.deliveries)
         if self.quiet_since is None or sample != self._quiet_sample:

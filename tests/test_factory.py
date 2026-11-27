@@ -1720,6 +1720,7 @@ class TeamCase(HcBackend, unittest.TestCase):
         self.clock = ManualClock()
         self.jobs, self.pane = [], []
         self.keeper = factory.Keeper(self.state_dir, self.hc, self.clock, self.pane.append, self.jobs.append)
+        self.keeper.title_out = self.title = io.StringIO()
 
     def terminal(self, name, *, kind="member", status="idle"):
         labels = {"factory.team": self.team, "factory.kind": kind,
@@ -3072,6 +3073,101 @@ class ReadyCheckTests(TeamCase):
         self.fake.finish(self.lead, reason="server_stop")
         self.keeper.tick()
         self.assertTrue(self.records("exit")[0]["text"].startswith("@lead-dev hc stopped (state unknown)."))
+
+
+@fake_only
+class KeeperUpgradeTests(TeamCase):
+    """phase_6.md §5: the pane title, and draining for a newer build before re-executing in the same terminal."""
+
+    def setUp(self):
+        super().setUp()
+        self.operator = self.terminal("operator", kind="operator")[0]
+        self.lead = self.terminal("lead-dev")[0]
+        self.briefed("lead-dev", self.lead)
+        self.execs = []
+        self.keeper._execv = lambda path, argv: self.execs.append((path, argv))
+        self.enterContext(patch.object(factory, "VERSION", "000000000000"))   # the build on disk is newer
+
+    def test_the_title_changes_only_when_it_has_to(self):
+        self.keeper._version_at = float("inf")
+        first = self.add("lead-dev", "one")
+        self.keeper.tick()
+        self.keeper.tick()
+        self.assertEqual(self.title.getvalue(), "\x1b]2;keeper · 1 pending\x07")
+        self.run_jobs()
+        self.keeper.tick()
+        self.assertEqual(self.outcome(first)["o"], "delivered")
+        self.assertEqual(self.title.getvalue(), "\x1b]2;keeper · 1 pending\x07\x1b]2;keeper\x07")
+
+    def test_a_newer_build_drains_then_execs_the_same_keeper(self):
+        first = self.add("lead-dev", "one")
+        self.keeper._version_at = float("inf")
+        self.keeper.tick()                                           # claims the first; its send is held
+        self.assertEqual(self.outcome(first)["o"], "sending")
+        self.keeper._version_at = 0
+        self.clock.sleep(30)
+        self.keeper.tick()
+        self.assertTrue(self.keeper.draining)
+        self.assertTrue(any("installed: finishing what is in flight" in line for line in self.pane))
+        second = self.add("lead-dev", "two")
+        self.keeper.tick()
+        self.assertFalse(self.keeper._drained())                    # the held send is still in flight
+        self.assertEqual(self.outcome(second)["why"], "waiting")      # no new claim while draining
+        self.run_jobs()
+        self.keeper.tick()
+        self.assertEqual(self.outcome(first)["o"], "delivered")
+        self.assertTrue(self.keeper._drained())
+        self.keeper._reexec()
+        self.assertEqual(self.execs, [(sys.executable, [sys.executable, str(factory.SCRIPT), "keeper", "--state",
+                                                        str(self.keeper.state)])])
+        self.assertEqual(self.outcome(second)["why"], "waiting")      # for the new image
+        self.assertEqual(self.fake.sent(self.lead).count("[from @pm]\none\n"), 1)
+
+    def test_a_withheld_result_or_a_running_check_holds_the_exec(self):
+        self.keeper.draining = "new"
+        self.keeper.unsettled = [("lead-dev", 1, self.lead, {"turn": 0})]
+        self.assertFalse(self.keeper._drained())
+        self.keeper.unsettled, self.keeper.ready_job = [], (1, None, "true")
+        self.assertFalse(self.keeper._drained())
+        self.keeper.ready_job = None
+        self.assertTrue(self.keeper._drained())
+
+    def test_a_failed_exec_goes_on_serving(self):
+        def refuse(path, argv):
+            raise OSError(8, "Exec format error")
+        self.keeper._execv = refuse
+        self.keeper.draining = "new"
+        self.keeper._reexec()
+        self.assertIsNone(self.keeper.draining)
+        self.assertTrue(any("could not restart itself" in line for line in self.pane))
+        ident = self.add("lead-dev", "after")
+        self.keeper.tick()
+        self.assertEqual(self.outcome(ident)["o"], "sending")         # claims again
+
+    def test_an_unreadable_build_keeps_the_keeper(self):
+        with patch.object(factory.pathlib.Path, "read_bytes", side_effect=OSError("gone")):
+            self.keeper.tick()
+        self.assertIsNone(self.keeper.draining)
+
+
+@real_only
+class RealMemberNoteTests(TeamCase):
+    """phase_6.md §6.4: an actual member episode on the private real core, noted and delivered."""
+
+    def test_a_blocked_member_is_noted_to_the_operator(self):
+        operator, operator_log = self.terminal("operator", kind="operator")
+        lead, _ = self.terminal("lead-dev")
+        self.briefed("lead-dev", lead)
+        self.hc.send(lead, "first line\nFAKE: blocks")
+        self.state(lead, "blocked")
+        self.keeper.tick()
+        self.run_jobs()
+        self.keeper.tick()
+        records = [json.loads(line) for line in self.log.path.read_bytes().splitlines()]
+        notes = [r for r in records if r["t"] == "msg" and r["kind"] == "note"]
+        self.assertEqual([n["meta"]["what"] for n in notes], ["blocked:permission"])
+        self.until(lambda: any(text.startswith("[from factory]\n@lead-dev is blocked (permission)")
+                               for text in self.inputs(operator, operator_log)), "the note in the operator's pane")
 
 
 class KeeperTests(TeamCase):
