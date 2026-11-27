@@ -2316,7 +2316,10 @@ def cmd_say(args):
     operator = cfg.operator["name"]
     if kind == "member" and sender not in cfg.members:
         refuse(f"@{sender} is no longer in factory.toml")
-    # Phase 5a: record_session(cfg, state, sender, me["address"]) for a member, before validation.
+    if kind == "member":   # before anything else can refuse: a refused say still saves the session (§3)
+        warning = record_session(cfg, state, sender, me["address"])
+        if warning:
+            print(warning, file=sys.stderr)
     names = list(dict.fromkeys(name.lstrip("@") for name in re.findall(r"[^,\s]+", " ".join(args.to))))
     try:
         view = team_view(hc, labels["factory.team"])
@@ -2787,7 +2790,7 @@ def _sessions(state, decide=None):
     """The one reader and writer of sessions.jsonl, under the team lock: shared to read; exclusive to read, let
     decide(newest) return an entry or None, and append it in one write followed by fsync. A torn last line (a writer
     killed mid-write) gets its newline first. -> (newest entry per member, damaged lines skipped)."""
-    with Log(state)._locked(exclusive=decide is not None) as fd:
+    with open_log(state).locked(exclusive=decide is not None) as fd:
         if fd is None:
             return {}, 0
         newest, skipped, existed, whole = _read_sessions(fd)
@@ -2815,13 +2818,13 @@ def saved_sessions(state):
 def sessions_writable(state):
     """down's check before it stops anyone: None, or why sessions.jsonl cannot be appended to and synced."""
     try:
-        with Log(state)._locked(exclusive=True) as fd:
+        with open_log(state).locked(exclusive=True) as fd:
             out = private_open(SESSIONS, os.O_WRONLY | os.O_APPEND | os.O_CREAT, dir_fd=fd)
             try:
                 os.fsync(out)
             finally:
                 os.close(out)
-    except (OSError, LogDamage) as error:
+    except (OSError, LogDamage, Problem) as error:
         return str(error)
     return None
 
@@ -2850,7 +2853,7 @@ def record_session(cfg, state, member, term, environ=os.environ):
                 "value": value, "at": utc_now()}
     try:
         _sessions(state, decide)
-    except (OSError, LogDamage) as error:
+    except (OSError, LogDamage, Problem) as error:
         return f"warning: could not record your session: {error}"
     return None
 
@@ -2921,12 +2924,6 @@ def v1_session(m, ref):
 
 # ================================================================ starting members (launch_layout.md §4)
 
-def team_key(root):
-    """The team's name in labels and the cache: v1's cache key. #168 owns it; this copy goes at the rebase."""
-    root = pathlib.Path(root)
-    return f"{root.name[:24]}-{hashlib.sha1(str(root).encode()).hexdigest()[:8]}"
-
-
 def private_dir(parent_fd, name, shown):
     """name below parent_fd, created 0700 when missing, never through a symbolic link: its descriptor."""
     try:
@@ -2953,7 +2950,7 @@ def member_settings(level, message_dir):
     """Claude Code's launch settings for a v2 member (§7): say and inbox run outside a sandbox the owner turned
     on, and at full the hc socket is reachable inside it. The last key skips the first bypassPermissions warning.
     It replaces v1's claude_settings when v1's launch goes."""
-    script = ["python3", str(SKILL / "scripts/factory.py")]
+    script = ["python3", str(SCRIPT)]
     commands = [shlex.join([*script, "say"]) + " *", shlex.join([*script, "inbox"]) + " *"]
     sandbox = {"excludedCommands": commands, "filesystem": {"allowWrite": [str(message_dir)]}}
     if level == "full":
@@ -2975,7 +2972,7 @@ def start_member(cfg, state, hc, m, operator, sess):
         raise Problem(f"{harness} is not on PATH", TABLE[harness]["install"])
     message_dir = state / "messages" / name
     try:
-        root = Log(state)._open_state(create=True)
+        root = open_log(state).open_dir(create=True)
     except OSError as error:
         raise Problem(f"cannot open the state directory {state}: {error}", "Fix its permissions, then run up again.")
     opened = [root]

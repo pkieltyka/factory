@@ -3549,6 +3549,26 @@ class CliTests(TeamCase):
         return "keeper"
 
     @fake_only
+    def test_a_member_say_records_its_session_even_when_refused(self):
+        member = self.prepare_sender("lead-dev", kind="member")
+        operator = self.prepare_sender()
+        threads = {"CODEX_THREAD_ID": "thread-1", "CLAUDE_CODE_SESSION_ID": "s-1", "PI_SESSION_ID": "p-1"}
+        with patch.dict(os.environ, threads):
+            status, _, err = self.say(member, "operator", "text")          # refused: members send with --file
+            self.assertEqual(status, 2, err)
+            self.assertEqual(self.say(operator, "operator", "text")[0], 2)
+        newest, _ = factory.saved_sessions(self.state_dir)
+        self.assertEqual(set(newest), {"lead-dev"})                         # the operator records nothing
+        self.assertEqual({k: newest["lead-dev"][k] for k in ("harness", "term", "how", "value")},
+                         {"harness": "codex", "term": member, "how": "env", "value": "thread-1"})
+        (self.state_dir / factory.SESSIONS).unlink()
+        (self.state_dir / factory.SESSIONS).mkdir()                         # cannot be written
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": "thread-2"}):
+            status, _, err = self.say(member, "operator", "text")
+        self.assertIn("warning: could not record your session:", err)
+        self.assertIn("nothing sent: members send with --file", err)        # and say went on
+
+    @fake_only
     def test_say_refusals_never_store_or_deliver(self):
         member = self.prepare_sender("lead-dev", kind="member")
         operator = self.prepare_sender()
@@ -5695,7 +5715,7 @@ class StartMemberTests(unittest.TestCase):
                            (self.state / "messages" / name, 0o700)):
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), mode, path)
         values = json.loads(settings.read_text())
-        say = shlex.join(["python3", str(factory.SKILL / "scripts/factory.py"), "say"]) + " *"
+        say = shlex.join(["python3", str(factory.SCRIPT), "say"]) + " *"
         self.assertIn(say, values["sandbox"]["excludedCommands"])
         self.assertIn(f"Bash({say})", values["permissions"]["allow"])
         self.assertEqual(values["permissions"]["additionalDirectories"], [str(self.state / "messages" / name)])
