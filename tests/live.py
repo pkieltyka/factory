@@ -200,6 +200,26 @@ def installed_factory_skills(home, exclude=(), depth=4):
     return found
 
 
+SKILLS_SWITCH = ("claude", "codex", "pi", "omp")   # harnesses whose user skill discovery a launch switch turns off
+
+
+def skills_off(harness, installed):
+    """QA launch arguments that turn off a harness's user skill discovery, where it has a switch (the owner's
+    decision; each read from its own --help, Codex's checked offline with codex debug prompt-input on 0.172.0).
+    [] for OpenCode and agy, which have none: their installed copy may run, harmless with no HERDR_* and the herdr
+    stub, and is recorded, not failed."""
+    if harness in ("pi", "omp"):
+        return ["--no-skills"]
+    if harness == "claude":
+        return ["--disable-slash-commands"]               # "Disable all skills and commands"
+    if harness == "codex":
+        paths = sorted({f"{folder}/SKILL.md" for path, resolved in installed for folder in (path, resolved)})
+        if paths:                                         # only the factory skill, by every path it is found at
+            return ["-c", "skills.config=[" + ",".join("{path=" + json.dumps(p) + ",enabled=false}"
+                                                      for p in paths) + "]"]
+    return []
+
+
 def installed_needles(installed):
     """The whitespace-free forms of each installed copy's scripts/factory.py: its path, its target, with ~."""
     home, needles = os.path.expanduser("~"), set()
@@ -212,9 +232,9 @@ def installed_needles(installed):
     return sorted("".join(n.split()) for n in needles)
 
 
-def qa_transcripts(roots):
+def qa_transcripts(roots, labelled=False):
     """Claude Code and Codex session files of conversations whose working directory is under one of roots, read
-    from their normal places (never anything else there)."""
+    from their normal places (never anything else there); with labelled, [(harness, path)]."""
     roots = [str(pathlib.Path(r)) for r in roots]
     if not roots:
         return []
@@ -222,7 +242,7 @@ def qa_transcripts(roots):
     projects = pathlib.Path(os.path.expanduser("~/.claude/projects"))
     prefixes = [re.sub(r"[^A-Za-z0-9]", "-", r) for r in roots]
     try:
-        found += [f for d in projects.iterdir() if any(d.name.startswith(p) for p in prefixes)
+        found += [("claude", f) for d in projects.iterdir() if any(d.name.startswith(p) for p in prefixes)
                   for f in d.glob("*.jsonl")]
     except OSError:
         pass
@@ -235,8 +255,8 @@ def qa_transcripts(roots):
             except (OSError, ValueError):
                 continue
             if any(cwd == r or cwd.startswith(r + "/") for r in roots):
-                found.append(f)
-    return found
+                found.append(("codex", f))
+    return found if labelled else [f for _, f in found]
 
 
 class Core:
@@ -282,10 +302,10 @@ class Core:
             self.stop()   # stops only a core whose id was verified; otherwise leaves the directory and says so
             raise
 
-    def installed_seen(self, roots=()):
+    def installed_seen(self, roots=(), harness_of=lambda record: None):
         """The owner's after-the-fact check: every installed factory.py path that appears in the screen of one of
         this core's terminals, or in a Claude Code or Codex transcript whose working directory is under one of
-        roots. Bounded; [] for an unprotected core."""
+        roots. -> [(harness or None, what was seen)], bounded; [] for an unprotected core."""
         needles = installed_needles(self.installed)
         if not needles:
             return []
@@ -296,14 +316,14 @@ class Core:
             except (HcError, HcDown):
                 continue
             flat = "".join(text.split())                 # a screen wraps long paths
-            hits.update(f"{record['address']} screen: {n}" for n in needles if n in flat)
-        for path in qa_transcripts(roots):
+            hits.update((harness_of(record), f"{record['address']} screen: {n}") for n in needles if n in flat)
+        for harness, path in qa_transcripts(roots, labelled=True):
             try:
                 flat = "".join(path.read_text(errors="replace").split())
             except OSError:
                 continue
-            hits.update(f"{path.name}: {n}" for n in needles if n in flat)
-        return [_bounded(h) for h in sorted(hits)[:10]]
+            hits.update((harness, f"{path.name}: {n}") for n in needles if n in flat)
+        return [(h, _bounded(text)) for h, text in sorted(hits, key=lambda hit: hit[1])[:10]]
 
     def start(self):
         out = subprocess.run([HC, "server", "start", "--json"], env=self.start_env,
@@ -1115,7 +1135,7 @@ class Harness:
             raise NotRun(f"{harness} is not on PATH")
         self.qa, self.harness = qa, harness
         self.dialogs = harness_table().get(harness, {}).get("dialogs", [])
-        self.argv = [exe, *args]
+        self.argv = [exe, *skills_off(harness, getattr(qa, "installed", [])), *args]   # before a subcommand
         env = {**owner_env(), **(env or {})}
         if getattr(qa, "bin", None) is not None:          # a protected core's herdr stub first
             env["PATH"] = f"{qa.bin}:{env.get('PATH', '')}"
@@ -1258,6 +1278,19 @@ def harness_version(name):
     return text.splitlines()[0] if text else "unknown"
 
 
+def split_seen(seen):
+    """(failures, observations): a sighting fails where the harness's skill discovery was switched off (or the
+    harness is unknown), and is only recorded for one without a switch (the owner's decision)."""
+    failed = [text for harness, text in seen if harness is None or harness in SKILLS_SWITCH]
+    return failed, [f"{harness}: {text}" for harness, text in seen if harness is not None
+                    and harness not in SKILLS_SWITCH]
+
+
+def lc_harness(record):
+    name = (record.get("labels") or {}).get("name", "")
+    return name[len("@lc-"):] if name.startswith("@lc-") else None
+
+
 def harness_check(name, harnesses, body):
     """Common frame: versions, a private QA core with no draft hold, NotRun as "not run: <why>"."""
     result = {"check": name, "versions": {h: harness_version(h) for h in harnesses},
@@ -1271,10 +1304,13 @@ def harness_check(name, harnesses, body):
             try:
                 body(qa, result)
             finally:
-                seen = qa.installed_seen([qa.dir])
-                if seen:              # the owner's rule was broken: the check fails whatever it observed
+                seen = qa.installed_seen([qa.dir], lc_harness)
+                failed, observed = split_seen(seen)
+                if observed:
+                    result["installed_factory_observed"] = observed
+                if failed:            # discovery was off for that harness: the check fails whatever it observed
                     result.update(result="fail: an installed Factory script appeared in a QA terminal or transcript",
-                                  installed_factory_seen=seen)
+                                  installed_factory_seen=failed)
     except NotRun as why:
         if "installed_factory_seen" not in result:
             result["result"] = f"not run: {why}"
@@ -2090,8 +2126,8 @@ class RealAdapter(FixtureAdapter):
 
     def operator_argv(self, harness, model=None):
         """The operator as the owner would start it, with the profile's model pinned (as Factory pins a member's)."""
-        return [shutil.which(harness), "--model", model or self.model(harness),
-                *harness_table()[harness]["permissions"]["full"]]
+        return [shutil.which(harness), *skills_off(harness, self.team.qa.installed), "--model",
+                model or self.model(harness), *harness_table()[harness]["permissions"]["full"]]
 
     def act_append(self, path, token):
         return (f"Using your shell tool, append one line containing exactly {token} to the file {path}"
@@ -2226,6 +2262,8 @@ class QATeam:
         if not self.real:
             params["env"]["FAKE_LOG"] = str(self.dir / "operator-input.jsonl")   # every input the fake received
             params["env"]["FAKE_ECHO"] = "1"
+            if harness_table().get(operator, {}).get("operator_deliver"):
+                params["env"]["FAKE_APP"] = operator      # reported as the real one is, so Factory's rule applies
             params["env"]["CODEX_THREAD_ID"] = f"thread-{token().lower()}"   # the fake operator's conversation
         self.operator_command = None
         self.sink = None
@@ -2253,8 +2291,9 @@ class QATeam:
         if quiet_grace:
             lines.insert(0, f"quiet_grace = {quiet_grace}\n")
         for name, harness in self.members.items():
+            off = skills_off(harness, self.qa.installed) if self.real else []
             lines.append(f'[members.{name}]\nharness = "{harness}"\nmodel = "{self.adapter.model(harness)}"\n'
-                         f'permissions = "{self.permissions}"\n')
+                         f'permissions = "{self.permissions}"\n' + (f"args = {json.dumps(off)}\n" if off else ""))
         (work / "factory.toml").write_text("\n".join(lines))
         subprocess.run(["git", "-C", str(work), "add", "-A"], check=True)
         subprocess.run(["git", "-C", str(work), "-c", "user.name=qa", "-c", "user.email=qa@example.invalid",
@@ -2308,12 +2347,33 @@ class QATeam:
                     raise
             time.sleep(1)
 
+    def harness_of(self, record):
+        """The harness running in one of this team's terminals, from its Factory labels."""
+        labels = record.get("labels") or {}
+        if labels.get("factory.kind") in ("operator", "operator-lost"):
+            return self.operator_harness
+        return self.members.get(labels.get("factory.member")) if labels.get("factory.member") else None
+
     def receipt(self, name):
-        return self.dir / f"receipt-{name}-{random.randrange(16 ** 6):06x}.txt"
+        """A file a harness writes for the driver: in its work directory, where a sandboxed shell may write (the
+        owner's Claude Code sandbox applies at full too; case 6 at 14ed74a), left out of git status."""
+        return self.scratch() / f"receipt-{name}-{random.randrange(16 ** 6):06x}.txt"
+
+    def scratch(self):
+        folder = self.work / ".factory-qa"
+        if not folder.exists():
+            folder.mkdir()
+            exclude = self.work / ".git" / "info" / "exclude"
+            if exclude.parent.is_dir():
+                with exclude.open("a") as stream:
+                    stream.write(".factory-qa/\n")
+        return folder
 
     def close(self):
         try:
-            EVIDENCE.setdefault("installed_factory_seen", []).extend(self.qa.installed_seen([self.dir]))
+            failed, observed = split_seen(self.qa.installed_seen([self.dir], self.harness_of))
+            EVIDENCE.setdefault("installed_factory_seen", []).extend(failed)
+            EVIDENCE.setdefault("installed_factory_observed", []).extend(observed)
         except (OSError, HcError, HcDown) as error:
             EVIDENCE.setdefault("installed_factory_seen", []).append(f"the check could not run: {error}"[:BOUND])
         if self.agy_roots:
@@ -2555,45 +2615,34 @@ def _trust_entries(run, team, directories=None):
     run.checkpoint()
 
 
-def _member_says_alone(team, text, timeout=300):
-    """The member runs say by itself, as its standing instructions say; the driver sees it in the log. -> the
-    message ID, or None."""
+def _member_says(team, text, timeout=300, record=None):
+    """Have the member itself run say to the operator through its own tool, with text in a file, by itself in its
+    own tool call as its standing instructions say: a sandbox exempts exactly 'python3 <script> say *', which the
+    earlier compound line (redirect, '; echo') did not match (cases 6 and 9 at 14ed74a and 3321bfc). The say is
+    seen in the log. -> "exit 0" once it is there, else None; team.last_say (and record["out"]) get its message ID
+    and the operator's outcome, in say's own form."""
     body = team.dir / f"report-{random.randrange(16 ** 6):06x}.md"
     body.write_text(text)
+    log = factory_log(team)
+    before = max((rec["id"] for rec in log.read_box()[0] if rec["t"] == "msg"), default=0)
     command = f"python3 {shlex.quote(str(team.script))} say operator --file {shlex.quote(str(body))}"
     team.send(team.member("lead-dev"), team.adapter.act_alone(command))
-    log = factory_log(team)
 
     def found():
-        return next((rec["id"] for rec in log.read_box()[0]
-                     if rec["t"] == "msg" and rec.get("from") == "lead-dev" and rec.get("text") == text), None)
-    return team.until(found, timeout) or None
-
-
-def _member_says(team, text, timeout=300, record=None):
-    """Have the member itself run say to the operator through its own tool, with text in a file."""
-    member = team.member("lead-dev")
-    body = team.dir / f"report-{random.randrange(16 ** 6):06x}.md"
-    body.write_text(text)
-    # What the member writes stays in its own work directory, where a guarded sandbox lets it write (case 9 at
-    # 1819b5d: Read-only file system for receipts in the QA folder). Left out of git status.
-    scratch = team.work / ".factory-qa"
-    if not scratch.exists():
-        scratch.mkdir()
-        exclude = team.work / ".git" / "info" / "exclude"
-        if exclude.parent.is_dir():
-            with exclude.open("a") as stream:
-                stream.write(".factory-qa/\n")
-    out = scratch / f"say-out-{random.randrange(16 ** 6):06x}.txt"     # the say's own output: its message ID
-    command = (f"python3 {shlex.quote(str(team.script))} say operator --file {shlex.quote(str(body))}"
-               f" > {shlex.quote(str(out))} 2>&1")
-    done = scratch / f"receipt-member-say-{random.randrange(16 ** 6):06x}.txt"
-    team.send(member, team.adapter.act_run(done, command))
-    result = team.until(lambda: done.exists() and "exit" in done.read_text() and done.read_text().strip(), timeout)
-    team.last_say = out.read_text() if out.exists() else None
+        return next((rec["id"] for rec in log.read_box()[0] if rec["t"] == "msg" and rec["id"] > before
+                     and rec.get("from") == "lead-dev" and rec.get("text") == text), None)
+    ident = team.until(found, timeout) and found()
+    team.last_say = None
+    if ident:
+        deadline = time.monotonic() + SAY_WAIT        # what say itself waits for before it reports
+        while time.monotonic() < deadline and log.read_box()[1].outcome(ident, "operator")["o"] == "sending":
+            time.sleep(0.2)
+        outcome = log.read_box()[1].outcome(ident, "operator")
+        word = f"queued ({outcome.get('why')})" if outcome["o"] == "queued" else outcome["o"]
+        team.last_say = f"message {ident}\n@operator: {word}\n"
     if record is not None:
         record["out"] = team.last_say
-    return result
+    return "exit 0\n" if ident else None
 
 
 # Pure judgements, each unit-tested for its false-pass paths (@architect-2's review of the first PR).
@@ -2787,7 +2836,8 @@ def case_9(run, role, harness, adapter_class):
         team.qa.rpc("terminal.kill", {"terminal": old})
         gone = team.until(lambda: team.get(old)["state"] == "finished", 30)
         receipt, tok = team.receipt("operator"), token()
-        said = _member_says_alone(team, team.adapter.act_append(receipt, tok))   # the say by itself, as members do
+        said = _member_says(team, team.adapter.act_append(receipt, tok)) and _say_id(team.last_say or "")
+        said = int(said.group(1)) if said else None                    # the say by itself, as members do
         new = team.until(team.keeper, 60)
         acted = team.until(lambda: receipt.exists() and tok in receipt.read_text(), 300)
         proof = {"old_keeper_finished": bool(gone), "new_keeper": bool(new) and new != old, "member_say_id": said,
@@ -3808,6 +3858,16 @@ def case_6(run, role, harness, adapter_class):
                 else "another conversation")
 
 
+def between_turns(harness, role):
+    """Whether Factory delivers to this profile only between turns (keeper.md §9): Codex as operator."""
+    return role == "operator" and harness_table().get(harness, {}).get("operator_deliver") == "idle"
+
+
+def _app_selects(app):
+    """Whether a live status app selects between-turns delivery in the table (keeper.md §9's lookup)."""
+    return bool(app) and harness_table().get(app, {}).get("operator_deliver") == "idle"
+
+
 def _ask_later(team, role, text):
     """_ask in a thread: a say to a working recipient may wait for delivery, and the case must go on meanwhile.
     box["out"] gets the say's own output (its message ID) when it returns."""
@@ -3894,14 +3954,33 @@ def case_4(run, role, harness, adapter_class):
                         run.row(4, trial, role, harness, "not_run", f"case 4 {trial}", reason=why)
                     continue
                 turn = team.get(subject)["turn"]
+                between = between_turns(harness, role)
+                app = (team.get(subject).get("status") or {}).get("app")     # the live root status, working
                 later = _ask_later(team, role, team.adapter.act_append(work, second))
-                delivered = team.until(lambda: later[1].get("out") and said(later[1])[1]
-                                       and said(later[1])[1][0] == "delivered", 30)
+                third, later3 = token(), None
+                if between and trial == "mid-turn":     # two reports in one working turn (keeper.md §9)
+                    later3 = _ask_later(team, role, team.adapter.act_append(work, third))
+                if between:                             # Factory keeps it queued while the operator works
+                    delivered = team.until(lambda: later[1].get("out") and said(later[1])[1] == ("queued", "busy"),
+                                           60)
+                else:
+                    delivered = team.until(lambda: later[1].get("out") and said(later[1])[1]
+                                           and said(later[1])[1][0] == "delivered", 30)
                 time.sleep(5)
                 proof = {"peer": peer, "turn_at_start": turn, "second_id": said(later[1])[0],
                          "second_outcome_while_working": said(later[1])[1],
                          "working_when_delivered": team.state(subject) == "working",
-                         "pending_before_esc": second not in _lines(work)}
+                         "pending_before_esc": second not in _lines(work),
+                         "operator_app": app, "between_turns": between}
+                if between:
+                    proof["app_selects_between_turns"] = _app_selects(app)
+                if later3 is not None:
+                    team.until(lambda: later3[1].get("out"), 60)
+                    proof.update(third_id=said(later3[1])[0], third_outcome_while_working=said(later3[1])[1],
+                                 held_while_working=(sorted([said(later[1])[1] or ("",), said(later3[1])[1] or ("",)])
+                                                     == [("queued", "busy"), ("queued", "waiting")]
+                                                     and second not in _lines(work) and third not in _lines(work)
+                                                     and team.state(subject) == "working"))
                 if trial != "mid-turn":
                     view = _rodeo(team, ["operator", "team"] if role == "operator" else ["team", "@lead-dev"])
                     view.keys("ctrl+b")
@@ -3927,8 +4006,14 @@ def case_4(run, role, harness, adapter_class):
                     if trial == "owner-line":                # the owner types straight after Esc, no Enter yet
                         extra, owner = f"owner line {token()}", team.receipt("owner")
                         view.paste(team.adapter.act_append(owner, extra), submit=False)
-                        moved = team.until(lambda: second in _lines(work), 120)   # Claude Code took 5-21 s
-                        proof["queued_turn_started"] = bool(moved)
+                        if between:    # still Factory's: it waits behind the owner's line, which goes first
+                            time.sleep(5)             # well inside draft_wait: past it hc types after the line
+                            proof["held_behind_owner_line"] = (second not in _lines(work)
+                                                               and (said(later[1])[1] or ("",))[0] in ("queued",
+                                                                                                       "sending"))
+                        else:
+                            moved = team.until(lambda: second in _lines(work), 120)   # Claude Code took 5-21 s
+                            proof["queued_turn_started"] = bool(moved)
                         screen = flat()
                         proof["input_once_queued_ran"] = look(screen)
                         proof["owner_line_whole_before_enter"] = "".join(extra.split()) in screen
@@ -3939,8 +4024,11 @@ def case_4(run, role, harness, adapter_class):
                     # on screen at all: in the input or in the transcript, which a screen cannot tell apart
                     proof["second_on_screen_after_esc"] = second in screen
                     proof["pending_and_working_at_esc"] = pending_at_esc
+                    # between turns: committed and still queued in Factory at Esc, nothing typed to it yet
                     proof["precondition"] = (bool(delivered) and proof["working_when_delivered"]
                                              and proof["pending_before_esc"] and pending_at_esc)
+                    if between:
+                        proof["outcome_at_esc"] = said(later[1])[1]
                 if trial == "next-delivery":                # touch nothing: the keeper's next delivery
                     while time.monotonic() - esc_at < 65:    # past the QA core's draft_wait (60 s) since Esc
                         time.sleep(1)
@@ -3963,7 +4051,7 @@ def case_4(run, role, harness, adapter_class):
                     team.until(lambda: finished in _lines(work), 300)
                 team.until(lambda: team.state(subject) in READY, 120)
                 time.sleep(15)                               # time for a duplicate to show
-                for thread, _ in (first, later):
+                for thread, _ in (first, later, *((later3,) if later3 else ())):
                     thread.join(timeout=60)
                 proof["at_deadline"] = look()
                 if trial != "mid-turn":
@@ -3976,6 +4064,24 @@ def case_4(run, role, harness, adapter_class):
                 log = factory_log(team)
                 proof.update(turn=[turn, team.get(subject)["turn"]], order=order, second_count=count,
                              second_final=said(later[1], log)[1], at_end=look())
+                if trial == "mid-turn" and between:
+                    order3 = [{finished: "finished", second: "second", third: "third"}[line] for line in lines
+                              if line in (finished, second, third)]
+                    proof.update(order=order3, third_count=lines.count(third),
+                                 third_final=said(later3[1], log)[1])
+                    committed = [name for _, name in sorted([(proof["second_id"] or 0, "second"),
+                                                             (proof["third_id"] or 0, "third")])]
+                    proof["committed_order"] = committed          # the two says can commit in either order
+                    ok = (count == 1 and proof["third_count"] == 1 and order3 == ["finished", *committed]
+                          and proof["held_while_working"] and proof["app_selects_between_turns"])
+                    how = "held by Factory until the turn ended, then both acted on once, in order"
+                    proof["classification"] = how if ok else "not held, lost or repeated"
+                    run.row(4, "mid-turn", role, harness, "pass" if ok else "fail",
+                            "two instructions while working: Factory types neither until the turn ends, then each"
+                            " is acted on exactly once, in order", observed=how if ok else None, proof=proof,
+                            reason=None if ok else "see proof" if proof["app_selects_between_turns"] else
+                            f"the live operator reported app {app!r}, which does not select between-turns delivery")
+                    continue
                 if trial == "mid-turn":
                     ok = count == 1 and finished in lines
                     how = ("steered this turn" if ok and order.index("second") < order.index("finished")
@@ -4430,6 +4536,8 @@ def _file_evidence(run, first_row):
     installed = EVIDENCE.get("installed_factory_seen") or []
     for row in run.data["rows"][first_row:]:
         row["diagnostics"] = EVIDENCE["teams"]
+        if EVIDENCE.get("installed_factory_observed"):   # a harness with no switch: recorded, not failed
+            row["installed_factory_observed"] = EVIDENCE["installed_factory_observed"]
         if installed:          # the owner's rule was broken: the case fails whatever it observed
             row.update(status="fail", reason=_bounded("an installed Factory script appeared in a QA terminal or"
                                                       f" transcript: {installed}"))
@@ -4479,7 +4587,8 @@ def qualify(target, role=None, cases=None, json_path=None, fixture=False):
     EVIDENCE["rodeo_tabs"] = None                       # probed once, by the first case that uses rodeo
     if target == "cross":
         for name in CROSS_CASES:
-            EVIDENCE.update(teams=[], tokens=[], settings_changed=[], installed_factory_seen=[])
+            EVIDENCE.update(teams=[], tokens=[], settings_changed=[], installed_factory_seen=[],
+                            installed_factory_observed=[])
             first_row = len(run.data["rows"])
             function = CROSS_FUNCTIONS.get(name)
             try:
@@ -4514,7 +4623,8 @@ def qualify(target, role=None, cases=None, json_path=None, fixture=False):
             for name, measured in subcases(case, role_):
                 run.row(case, name, role_, harness, "not_run", f"case {case} {name}", reason="not built yet")
         else:
-            EVIDENCE.update(teams=[], tokens=[], settings_changed=[], installed_factory_seen=[])
+            EVIDENCE.update(teams=[], tokens=[], settings_changed=[], installed_factory_seen=[],
+                            installed_factory_observed=[])
             first_row = len(run.data["rows"])
             try:
                 function(run, role_, harness, adapter_class)

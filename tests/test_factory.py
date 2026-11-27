@@ -6217,6 +6217,20 @@ class SessionTests(unittest.TestCase):
         self.assertEqual((newest["claude-dev"]["value"], skipped), ("bbb", 0))
         self.assertEqual(stat.S_IMODE(os.stat(self.state / factory.SESSIONS).st_mode), 0o600)
 
+    def test_claude_code_resumes_the_conversation_it_switched_to(self):
+        """claude-m6-14ed74a: after a followed /clear, up resumed the launch ID. With session_follow on in the
+        shipped table, a say from the switched conversation records its ID and the next up resumes it; the run's
+        post-switch say was the driver's compound line, which a sandbox does not exempt."""
+        self.assertTrue(factory.TABLE["claude"]["session_follow"])
+        m = self.m("claude-dev")
+        factory.launch_entry(self.state, m, "t1", "new", None)                   # a fresh launch
+        launch, switched = str(uuid.uuid4()), str(uuid.uuid4())
+        self.record("claude-dev", "t1", launch)                                   # its ready line
+        self.record("claude-dev", "t1", switched)                                 # a say after /clear
+        entry = factory.saved_sessions(self.state)[0]["claude-dev"]
+        self.assertEqual((entry["how"], entry["value"]), ("env", switched))
+        self.assertEqual(factory.session_plan(m, self.state, entry, fresh=False)["args"], ["--resume", switched])
+
     def test_without_follow_the_first_capture_of_a_launch_wins_in_either_order(self):
         self.assertFalse(factory.TABLE["codex"].get("session_follow", True))
         m = self.m("codex-dev")
@@ -7022,10 +7036,14 @@ class QualifyFrameworkTests(unittest.TestCase):
         core.installed = installed
         core.rpc = lambda method, params: ({"terminals": [{"address": t} for t in screens]} if method == "terminal.list"
                                            else {"text": screens[params["terminal"]]})
-        seen = core.installed_seen([root])
+        seen = core.installed_seen([root], lambda record: {"t1": "agy"}.get(record["address"]))
         self.assertEqual(len(seen), 3)
-        self.assertTrue(any(s.startswith("t1 screen: /store/factory/scripts/factory.py") for s in seen))
-        self.assertFalse(any("t2" in s or "b.jsonl" in s or "rollout-2" in s for s in seen))
+        self.assertIn(("agy", "t1 screen: /store/factory/scripts/factory.py"), seen)
+        self.assertEqual({h for h, _ in seen}, {"agy", "claude", "codex"})
+        self.assertFalse(any("t2" in s or "b.jsonl" in s or "rollout-2" in s for _, s in seen))
+        failed, observed = live.split_seen(seen)
+        self.assertEqual(len(failed), 2)                  # Claude Code and Codex had their discovery off
+        self.assertEqual(observed, ["agy: t1 screen: /store/factory/scripts/factory.py"])
         core.installed = []
         self.assertEqual(core.installed_seen([root]), [])
 
@@ -7036,22 +7054,43 @@ class QualifyFrameworkTests(unittest.TestCase):
         self.enterContext(patch.object(live.Core, "stop", lambda core: None))
         self.enterContext(patch.object(live.tempfile, "gettempdir",
                                        return_value=self.enterContext(tempfile.TemporaryDirectory())))
-        seen = ["t1 screen: /store/factory/scripts/factory.py"]
-        with patch.object(live.Core, "installed_seen", lambda core, roots: seen):
+        seen = [("codex", "t1 screen: /store/factory/scripts/factory.py")]
+        with patch.object(live.Core, "installed_seen", lambda core, roots, harness_of: seen):
             result = live.harness_check("LC-6", ["sh"], lambda qa, result: result.update(result="pass"))
         self.assertEqual(result["result"], "fail: an installed Factory script appeared in a QA terminal or transcript")
-        with patch.object(live.Core, "installed_seen", lambda core, roots: []):
+        with patch.object(live.Core, "installed_seen", lambda core, roots, harness_of: [("agy", "t1 screen: x")]):
+            result = live.harness_check("LC-12", ["sh"], lambda qa, result: result.update(result="pass"))
+        self.assertEqual((result["result"], result["installed_factory_observed"]), ("pass", ["agy: t1 screen: x"]))
+        with patch.object(live.Core, "installed_seen", lambda core, roots, harness_of: []):
             result = live.harness_check("LC-6", ["sh"], lambda qa, result: result.update(result="pass"))
         self.assertEqual(result["result"], "pass")
 
     def test_an_e2e_run_where_an_installed_factory_appears_fails(self):
         import e2e
         result = {"status": "pass"}
-        self.assertFalse(e2e.installed_verdict(result, []))
+        self.assertFalse(e2e.installed_verdict(result, [], []))
         self.assertEqual(result, {"status": "pass"})
+        self.assertFalse(e2e.installed_verdict(result, [], ["opencode: t3 screen: x"]))
+        self.assertEqual((result["status"], result["installed_factory_observed"]), ("pass", ["opencode: t3 screen: x"]))
         self.assertTrue(e2e.installed_verdict(result, ["t1 screen: x"]))
         self.assertEqual(result["status"], "fail")
         self.assertIn("installed Factory script", result["detail"])
+
+    def test_qa_agents_get_each_harness_s_switch_for_user_skills(self):
+        """The owner's decision: discovery off where a launch switch exists; none for OpenCode and agy."""
+        import live
+        installed = [("/home/o/.codex/skills/factory", "/store/factory")]
+        self.assertEqual(live.skills_off("pi", installed), ["--no-skills"])
+        self.assertEqual(live.skills_off("omp", installed), ["--no-skills"])
+        self.assertEqual(live.skills_off("claude", installed), ["--disable-slash-commands"])
+        flag, value = live.skills_off("codex", installed)
+        self.assertEqual(flag, "-c")
+        self.assertEqual(tomllib.loads(value)["skills"]["config"],
+                         [{"path": "/home/o/.codex/skills/factory/SKILL.md", "enabled": False},
+                          {"path": "/store/factory/SKILL.md", "enabled": False}])
+        self.assertEqual(live.skills_off("codex", []), [])
+        self.assertEqual((live.skills_off("opencode", installed), live.skills_off("agy", installed)), ([], []))
+        self.assertEqual(set(live.SKILLS_SWITCH), {"claude", "codex", "pi", "omp"})
 
     def test_restart_waits_for_the_shell_prompt(self):
         """claude-op-8 at 7a90602: a harness clears its status before it has exited, and a restart typed then is
@@ -7866,7 +7905,8 @@ class E2EObserverTests(unittest.TestCase):
                 team = types.SimpleNamespace(
                     dir=root, skill=factory.SKILL, script=factory.SCRIPT, operator_start={},
                     adapter=types.SimpleNamespace(model=lambda _: "qa", version=lambda _: "test"),
-                    qa=types.SimpleNamespace(id="12345678", installed_seen=lambda roots: []),
+                    qa=types.SimpleNamespace(id="12345678", installed=[], installed_seen=lambda roots, harness_of: []),
+                    harness_of=lambda record: None,
                     env={"XDG_CACHE_HOME": str(root / "cache")},
                     call=unittest.mock.Mock(side_effect=down),
                 )
