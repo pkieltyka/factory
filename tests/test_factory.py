@@ -18,6 +18,7 @@ import shlex
 import shutil
 import stat
 import subprocess
+import signal
 import sys
 import tempfile
 import textwrap
@@ -1331,6 +1332,12 @@ class UpTests(unittest.TestCase):
             self.assertIn("# Team brief", text)
 
 
+    def test_agy_trusted_merges_into_the_settings_it_already_passes(self):
+        self.assertEqual(factory.agy_trusted(["--mode", "x", "--settings", '{"a":1}'], "/w"),
+                         ["--mode", "x", "--settings", '{"a":1,"trustedWorkspaces":["/w"]}'])
+        self.assertEqual(factory.agy_trusted(["--mode", "x"], "/w"),
+                         ["--mode", "x", "--settings", '{"trustedWorkspaces":["/w"]}'])
+
     def test_agy_model_variants_and_guarded_permissions(self):
         cases = {"pm": ("gemini-4-neon", "low", "gemini-4-neon-low"),
                  "reviewer": ("gemini-4-neon-low", None, "gemini-4-neon-low"),
@@ -1339,9 +1346,16 @@ class UpTests(unittest.TestCase):
                           **({"thinking": level} if level else {})} for name, (model, level, _) in cases.items()}
         with Env(formation(members)) as e:
             launches = self.launches(e)
+            with patch.dict(os.environ, e.env, clear=True):
+                cfg = factory.Config(e.repo)
+                dirs = {m["name"]: m["dir"] for m in factory.checked(cfg, [factory.plan(cfg, n) for n in cfg.members])}
             for name, (_, _, wanted) in cases.items():
-                self.assertEqual(launches[name][0], ["--model", wanted, "--mode", "accept-edits",
-                                 "--settings", '{"toolPermission":"always-proceed"}'])
+                argv = launches[name][0]
+                self.assertEqual(argv[:5], ["--model", wanted, "--mode", "accept-edits", "--settings"])
+                # LC-7: the member's own folder is trusted for this launch only, in the session-only settings
+                self.assertEqual(json.loads(argv[5]), {"toolPermission": "always-proceed",
+                                                       "trustedWorkspaces": [str(dirs[name])]})
+                self.assertEqual(argv.count("--settings"), 1)
             brief = e.run("brief").stdout
             self.assertIn("gemini-4-neon-low, low", brief)
             self.assertIn("gemini-pro-orchestrator-neon, default", brief)
@@ -6571,6 +6585,9 @@ class QualifyJudgeTests(unittest.TestCase):
         owner = [["Do you trust the contents of this project?", []]]
         self.assertEqual(live.judge_dialog(owner, owner[0][0], False)[0], "pass")
         self.assertEqual(live.judge_dialog(owner, owner[0][0], True)[0], "fail")
+        self.assertEqual(live.judge_dialog(owner, None, True, suppressed=True)[0], "pass")   # agy's argument, verified
+        self.assertEqual(live.judge_dialog(owner, None, True)[0], "not_run")      # no prompt alone proves nothing
+        self.assertEqual(live.judge_dialog(owner, None, False, suppressed=True)[0], "not_run")
 
     def test_blocked(self):
         note = {"about": "lead-dev", "term": "t3", "outcome": "delivered"}
@@ -6635,6 +6652,47 @@ class QualifyReportTests(unittest.TestCase):
             self.assertIn("`/tmp/old`", trust)
             self.assertNotIn("/tmp/fake", trust)
 
+    def test_the_latest_attempt_wins_across_heads_and_trust_entries_accumulate(self):
+        """@reviewer: a later fail on an older head must not hide behind an earlier pass on a newer one; and a
+        partial import must keep the cleanup entries an earlier import listed."""
+        head = subprocess.run(["git", "-C", str(live.ROOT), "rev-parse", "HEAD"], capture_output=True,
+                              text=True).stdout.strip()
+        base = subprocess.run(["git", "-C", str(live.ROOT), "rev-list", "--max-parents=0", "HEAD"], capture_output=True,
+                              text=True).stdout.split()[0]
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+
+            def run(name, source, utc, status):
+                row = {"case": 2, "subcase": "idle-report", "role": "member", "harness": "codex", "status": status,
+                       "observed": f"seen at {name}", "reason": None if status == "pass" else "see proof",
+                       "proof": {"turn_completed": True}}
+                data = {"mode": "real", "source_head": source, "utc": utc, "rows": [row], "profiles": [],
+                        "trust_entries": [{"harness": "codex", "file": "~/.codex/config.toml",
+                                           "directory": f"/tmp/factory-qa-{name}/work"}]}
+                (tmp / f"{name}.json").write_text(json.dumps(data))
+                return str(tmp / f"{name}.json")
+            out = tmp / "out"
+            first = run("a", head, "2026-11-27T01:00:00Z", "pass")
+            later = run("b", base, "2026-11-27T02:00:00Z", "fail")
+            live.report([first, later], out)
+            text = (out / "codex.md").read_text()
+            self.assertIn("| 2 | idle-report | fail | seen at b", text)
+            self.assertIn(f"2 idle-report: pass at {head[:7]}, superseded by the fail above", text)
+            stale = {"case": 6, "subcase": "member-switch", "role": "member", "harness": "codex", "status": "pass",
+                     "proof": {"switched": True, "replaced": False, "down_exit": 1, "up_exit": 0}}
+            data = json.loads(pathlib.Path(later).read_text())
+            data["rows"].append(stale)
+            pathlib.Path(later).write_text(json.dumps(data))
+            live.report([first, later], out)
+            self.assertIn("| 6 | member-switch | unproved (its proof does not meet today's check)",
+                          (out / "codex.md").read_text())
+            live.report([later], out)                                     # a partial import: only b's evidence
+            trust = (out / "trust-entries.md").read_text()
+            self.assertIn("/tmp/factory-qa-a/work", trust)
+            self.assertIn("/tmp/factory-qa-b/work", trust)
+            live.report([first, later], out)                              # importing again changes nothing
+            self.assertEqual((out / "trust-entries.md").read_text(), trust)
+
 
 class QualifyFrameworkTests(unittest.TestCase):
     """phase_8.md §1 and §5.1: selection, rows, the case rule, exit precedence and checkpoints, with no login."""
@@ -6667,6 +6725,16 @@ class QualifyFrameworkTests(unittest.TestCase):
         self.assertEqual((partial.case_status("member", "pi", 8), partial.exit_code(selected)), ("fail", 1))
         mixed = selected + [("member", "pi", 9)]                          # one fails, one not run: fail wins
         self.assertEqual(partial.exit_code(mixed), 1)
+
+    def test_a_case_stopped_late_keeps_its_earlier_failure(self):
+        def case(run, role, harness, adapter_class):
+            run.row(6, "resume", role, harness, "fail", "x", reason="the recalled word did not match")
+            raise live.NotRun("rodeo is not installed")
+        with patch.dict(live.CASE_FUNCTIONS, {6: case}), patch.object(live, "QATeam"):
+            evidence, code = live.qualify("codex", "member", [6], fixture=True)
+        self.assertEqual([(r["subcase"], r["status"]) for r in evidence["rows"]],
+                         [("resume", "fail"), ("member-switch", "not_run")])
+        self.assertEqual(code, 1)
 
     def test_rows_need_reasons_and_stay_bounded(self):
         run = live.Qualification("real")
@@ -6701,6 +6769,30 @@ class QualifyFixtureTests(unittest.TestCase):
         self.assertEqual(sorted((r["role"], r["subcase"], r["status"]) for r in evidence["rows"]),
                          [("member", "guarded", "pass"), ("member", "idle-report", "pass"),
                           ("operator", "idle-report", commands), ("operator", "operator-commands", commands)])
+
+    @real_only
+    def test_sigterm_during_a_run_stops_its_cores_and_removes_its_scratch(self):
+        """@reviewer: SIGTERM during qualify must run the with-blocks and atexit cleanup, leaving no private core
+        or scratch project behind."""
+        with tempfile.TemporaryDirectory() as tmp:
+            env = dict(os.environ, TMPDIR=tmp)
+            proc = subprocess.Popen([sys.executable, str(live.ROOT / "tests" / "live.py"), "qualify", "codex",
+                                     "--role", "member", "--case", "9", "--fixture"], env=env,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                deadline = time.monotonic() + 120
+                while time.monotonic() < deadline and not list(pathlib.Path(tmp).glob("factory-qa-*")):
+                    time.sleep(0.2)
+                self.assertTrue(list(pathlib.Path(tmp).glob("factory-qa-*")), "the run never started its team")
+                time.sleep(3)
+                proc.send_signal(signal.SIGTERM)
+                self.assertEqual(proc.wait(timeout=90), 1)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+            left = sorted(p.name for p in pathlib.Path(tmp).iterdir()
+                          if p.name.startswith(("factory-qa-", "hc-qualify")))
+            self.assertEqual(left, [])
 
     def test_an_echoed_token_without_the_action_fails(self):
         # The report reaches the operator with the token in it, but no action is asked for: no receipt.

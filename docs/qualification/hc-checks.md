@@ -109,6 +109,41 @@ Verified facts about `hc` and `rodeo`, collected on isolated private cores (neve
   - Codex: both ran, but the child's ID differs, so `session_follow = false` stays.
   - agy: neither the child nor the parent ran.
 
+## Cross cases (Phase 8, phase_8.md §4)
+
+- **Run:** `python3 tests/live.py qualify cross` at `5d36f88` (Factory `31d3e84d827b`), hc 0.1.20, rodeo 0.2.1, Linux, 2026-11-27, run ID `20261127T104137Z-95`.
+- **Setup:** real private hc cores and rodeo, with scripted fake agents. These cases test Factory itself, and §1 allows a named scripted peer. The run probed `rodeo_tabs` first, and it passed.
+- **Results:**
+  - **two-teams: pass.** Two checkouts with the same member names ran on one core, each with its own key, state, keeper and operator.
+    - Each concurrent say's action recorded the terminal that ran it, and each was its own team's member.
+    - The two members' blocks sat in distinct tabs, and each team's inbox held only its own token.
+    - After team A's `down` (exit 0), team B's own member still acted on a new say.
+  - **multi-down: pass.** Two briefed members were stopped together.
+    - No member-exit or lost note followed, and the terminals went.
+    - A message queued for the blocked one ended `dropped (stopped by down)`.
+  - **owner-pane: pass.** After the first `up`, the owner added a block of their own to the team tab that holds the members.
+    - Through a repeated `up`, `down` of one member and `down` of the last, the block stayed in that tab with its terminal and seeded contents, and each stopped member's block went.
+    - Afterwards a marker typed into the owner's pane through rodeo arrived.
+  - **other-version: pass.** A comment-only copy of the script was installed atomically under a live keeper while the owner's draft held a send.
+    - A second message was queued during the drain. The held send finished delivered.
+    - The same keeper terminal's beat and `factory.version` label then showed the new version (one keeper before and after), and the queued message was delivered and acted on once, with no wakeup.
+    - Case 7's `upgrade` runs the same trial with each real profile.
+- **Earlier runs:** the cross runs at `dbd7fcd` and `b06c253` used weaker checks, which @architect-2's review replaced:
+  - two-teams: actions were not attributed to the terminal that ran them;
+  - owner-pane: the owner's block was seeded in the operator's tab;
+  - other-version: the restart line counted as proof, and the second say came after it.
+  This run supersedes both.
+
+## LC-7 again: agy's session-only trust, isolated (Phase 8)
+
+- **Run:** `python3 tests/live.py check lc7` by @lead-dev-3 at `f4e5ea1`, agy 1.5.18, inside a `bwrap --tmp-overlay "$HOME"` overlay. Nothing reached the real HOME.
+- **Observed:**
+  - Baseline: `dialog: Do you trust the contents of this project?`.
+  - With `--settings '{"toolPermission":"always-proceed","trustedWorkspaces":["<folder>"]}'` in another scratch folder: `idle`, and the stored action ran.
+  - `settings_changed` lists 21 paths, all session state: conversation databases and WALs, caches, `history.jsonl`, logs, crash logs, presence locks, annotations and `~/.config/antigravity/credential-user-scope`. None is `settings.json` or a trust list.
+- **Verdict:** the check reports "inconclusive" because a stat cannot tell a trust list from other state. Reading the path list shows none of them is one.
+- **Consequence:** @operator enabled per-launch `trustedWorkspaces` for agy (spec §6.3; `launch_layout.md` §3, "agy's trust dialog"). The earlier LC-7 at `325223a` does not count: it ran against the owner's real settings.
+
 ---
 
 ## Fixtures (`tests/hc_fixtures.json`)
