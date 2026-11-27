@@ -1976,6 +1976,8 @@ class TeamCommandTests(TeamCase):
         for args in (("inbox", "--for", "operator"), ("brief", "--send", "pm"), ("status",), ("down", "a")):
             self.assertEqual(shlex.split(factory.factory_command(*args))[-2:], ["--cwd", root])   # the pending-inbox
         self.assertNotIn("--cwd", factory.factory_command("say", "operator"))    # and trust hints; say has none
+        with patch.object(factory, "TEAM_ROOT", None):     # before any checkout is verified (resolve_team, team.json)
+            self.assertTrue(factory.factory_command("up").endswith(" up --cwd <the team's checkout>"))
 
     def test_up_labels_are_written_after_doc_set(self):
         term = self.terminal("lead-dev")[0]

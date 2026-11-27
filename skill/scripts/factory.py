@@ -51,8 +51,12 @@ def factory_command(*args):
     case 8: a bare factory.py from a keeper note was not found, and with factory and factory2 installed side by side
     it can name another copy). A command that acts on a team adds --cwd and the team's checkout once this process
     knows it, so it reaches that team from any directory (@reviewer on #234). Prose keeps the name factory.py."""
-    where = ["--cwd", str(TEAM_ROOT)] if TEAM_ROOT is not None and args and args[0] in TEAM_COMMANDS else []
-    return shlex.join(["python3", str(SCRIPT), *map(str, args), *where])
+    line = shlex.join(["python3", str(SCRIPT), *map(str, args)])
+    if not args or args[0] not in TEAM_COMMANDS:
+        return line
+    if TEAM_ROOT is None:     # no checkout verified yet: a placeholder, never the caller's directory (@lead-dev)
+        return line + " --cwd <the team's checkout>"
+    return line + " " + shlex.join(["--cwd", str(TEAM_ROOT)])
 SKILL = SCRIPT.parent.parent
 TABLE = tomllib.loads((SKILL / "harnesses.toml").read_text())  # harness -> its data
 HARNESSES = tuple(TABLE)
