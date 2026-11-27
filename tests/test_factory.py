@@ -6836,6 +6836,42 @@ class QualifyJudgeTests(unittest.TestCase):
     def trials(self, *seconds, idle=True, outcome="delivered"):
         return [{"idle": idle, "seconds": s, "outcome": outcome} for s in seconds]
 
+    def test_two_senders_setup_needs_a_started_turn_that_settled(self):
+        """@reviewer's #230 follow-up: an assignment that was delivered but never started a turn, or whose turn
+        has not settled, leaves the trial not_run."""
+        import live
+        done = {"status": {"state": "done"}, "turn": 2}
+        delivered = {"o": "delivered", "started": True, "turn": 2}
+        self.assertTrue(live._setup_settled(delivered, done))
+        self.assertTrue(live._setup_settled(delivered, {"status": {"state": "idle"}, "turn": 3}))
+        self.assertFalse(live._setup_settled({**delivered, "started": False}, done))     # typed, never started
+        self.assertFalse(live._setup_settled({**delivered, "turn": None}, done))
+        self.assertFalse(live._setup_settled(delivered, {"status": {"state": "working"}, "turn": 2}))
+        self.assertFalse(live._setup_settled(delivered, {"status": {"state": "idle"}, "turn": 1}))   # before it
+        self.assertFalse(live._setup_settled({"o": "sending"}, done))
+
+    def test_a_lost_session_probe_is_asked_again_only_once_the_terminal_is_ready(self):
+        """@reviewer's #230 follow-up: case 6's retry waits for readiness; a terminal that never becomes ready is
+        not asked again, and the switch row says it is unproved."""
+        import live
+        tmp = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
+
+        def team(state):
+            sent = []
+            return sent, types.SimpleNamespace(receipt=lambda name: tmp / f"{name}-{len(sent)}", state=lambda t: state,
+                                               send=lambda t, text: sent.append(t), until=lambda pred, timeout: pred())
+        adapter = types.SimpleNamespace(act_run=lambda done, command: f"run {command}")
+        sent, blocked = team("blocked")
+        retries, unready = [], []
+        self.assertIsNone(live._session_probe(blocked, adapter, "CODEX_THREAD_ID", "t1", retries, unready))
+        self.assertEqual((sent, retries, unready), (["t1"], [], [{"terminal": "t1", "state": "blocked"}]))
+        self.assertTrue(live._probe_unproved("no variable", unready).startswith("unproved: the session probe on t1"))
+        self.assertEqual(live._probe_unproved("no variable", []), "no variable")
+        sent, ready = team("idle")
+        retries, unready = [], []
+        live._session_probe(ready, adapter, "CODEX_THREAD_ID", "t2", retries, unready)
+        self.assertEqual((sent, retries, unready), (["t2", "t2"], ["t2"], []))          # asked again once
+
     def test_between_turns_judges_refuse_the_old_failure(self):
         """@architect-2: a report already typed and ignored must not pass as one Factory held (keeper.md §9)."""
         import live
@@ -7267,7 +7303,9 @@ class QualifyFrameworkTests(unittest.TestCase):
         claude = home / ".claude" / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(root / "work"))
         claude.mkdir(parents=True)
         (claude / "a.jsonl").write_text(json.dumps({"type": "tool_use", "id": "u1", "name": "Bash", "input": {
-            "command": "python3 /store/factory/scripts/factory.py wait"}}) + "\n")     # run: a shell call's command
+            "command": "python3 /store/factory/scripts/factory.py wait"}}) + "\n"         # run: a shell call's command
+                                        + json.dumps({"type": "tool_result", "tool_use_id": "u1", "content": "ok"})
+                                        + "\n")
         other = home / ".claude" / "projects" / "-home-owner-project"
         other.mkdir(parents=True)
         (other / "b.jsonl").write_text('{"cmd": "python3 /store/factory/scripts/factory.py say"}\n')
@@ -7294,6 +7332,47 @@ class QualifyFrameworkTests(unittest.TestCase):
         self.assertEqual(observed, ["codex: rollout-1.jsonl: ~/.codex/skills/factory/scripts/factory.py",
                                     "agy: t1 screen: /store/factory/scripts/factory.py"])
 
+    def test_only_an_invocation_with_a_result_runs_a_script(self):
+        """@architect-2 and @lead-dev at daa3b35: a path as an argument, in a comment, after a redirect or in a call
+        with no result was not run; a python script operand or the program itself, in any simple command or a
+        sh -c script, was."""
+        import live
+        script = "/home/o/.codex/skills/factory/scripts/factory.py"
+        for command in (f"ls -l {script}", f"cat {script}", f"rg --files / | rg {shlex.quote(script)}",
+                        f"echo hi # python3 {script} up", f"echo x > {script}", f"python3 -c 'print(1)' {script}",
+                        f"grep -n say {script}"):
+            with self.subTest(command=command):
+                self.assertNotIn(script, live.invoked(command))
+        for command in (f"python3 {script} status", f"python3 '{script}' up lead-dev", f"{script} inbox",
+                        f"cd /tmp && PYTHONPATH=x python3 -u {script} say", f"env A=1 python3.13 {script} up",
+                        f"bash -lc 'python3 {script} status'", f"bash -lc python3 {script} status",
+                        f"echo a; python3 {script} down\npython3 x.py"):
+            with self.subTest(command=command):
+                self.assertIn(script, live.invoked(command))
+        home = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(patch.dict(os.environ, {"HOME": str(home), "CODEX_HOME": str(home / ".codex")}))
+        root = home / "qa-run"
+        day = home / ".codex" / "sessions" / time.strftime("%Y/%m/%d")
+        day.mkdir(parents=True)
+        installed = str(home / ".codex/skills/factory/scripts/factory.py")
+        core = live.Core.__new__(live.Core)
+        core.installed = [(str(home / ".codex/skills/factory"), str(home / ".codex/skills/factory"))]
+        core.rpc = lambda method, params: {"terminals": []} if method == "terminal.list" else {"text": ""}
+
+        def transcript(*calls):
+            lines = [{"payload": {"cwd": str(root / "work")}}]
+            for n, (cmd, output) in enumerate(calls):
+                lines.append({"type": "function_call", "name": "exec_command", "call_id": f"c{n}",
+                              "arguments": json.dumps({"cmd": cmd})})
+                if output is not None:
+                    lines.append({"type": "function_call_output", "call_id": f"c{n}", "output": output})
+            (day / "rollout-1.jsonl").write_text("".join(json.dumps(line) + "\n" for line in lines))
+            return [run for _, _, run in core.installed_seen([root])]
+        self.assertEqual(transcript((f"ls -l {installed}", "-rw-r--r-- 1 o o 9 factory.py")), [False])
+        self.assertEqual(transcript((f"python3 {installed} status", None)), [False])        # called, no result
+        self.assertEqual(transcript((f"python3 {installed} status", "Exit code: 2\nno team")), [True])   # it ran
+        self.assertEqual(transcript((f"python3 '{installed}' up lead-dev", "Exit code: 0\nok")), [True])
+
     def test_a_search_that_lists_an_installed_script_is_only_observed(self):
         """@operator (#173 pi member case 8 at a198b9c): the Codex peer's rg --files listed the installed v1
         script, which it never ran. A path in a shell call's output is an observation; in its command, a failure."""
@@ -7318,7 +7397,8 @@ class QualifyFrameworkTests(unittest.TestCase):
         self.assertEqual(live.split_seen(seen)[0], [])
         run = {"type": "function_call", "name": "exec_command", "call_id": "c2",
                "arguments": json.dumps({"cmd": f"python3 {script} up lead-dev"})}
-        rollout.write_text(rollout.read_text() + json.dumps(run) + "\n")
+        result = {"type": "function_call_output", "call_id": "c2", "output": "Exit code: 0"}
+        rollout.write_text(rollout.read_text() + json.dumps(run) + "\n" + json.dumps(result) + "\n")
         self.assertEqual(len(live.split_seen(core.installed_seen([root]))[0]), 1)       # now it ran: a failure
         core.installed = []
         self.assertEqual(core.installed_seen([root]), [])
@@ -7890,7 +7970,8 @@ class ConfigTests(unittest.TestCase):
             text = e.run("brief").stdout
             self.assertIn("| **@product** | Claude Code, claude-opus-5-5, medium |", text)
             self.assertIn("No reply needed.", text)
-            self.assertIn("factory.py say", text)
+            self.assertIn("Use the send command in your standing instructions", text)
+            self.assertNotIn("`factory.py say`", text)          # the standing instructions have the full command
             self.assertNotIn("Works in", text)  # no worktrees on this team
             prompt = e.run("brief", "reviewer").stdout
             self.assertIn("run it only when the brief's Review section or the requester calls for the deep lane", prompt)

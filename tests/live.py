@@ -245,7 +245,7 @@ def installed_needles(installed):
 CODE_EXEC = re.compile(r'exec_command\(\{\s*cmd\s*:\s*("(?:[^"\\]|\\.)*")')
 
 
-def tool_calls(text):
+def tool_calls(text, pairing=False):
     """[(command, result text or None)] for every shell execution in a Claude Code or Codex transcript (JSONL),
     paired by the call's own ID, with its actual command argument: Claude Code's Bash tool_use (input.command),
     Codex's shell or exec_command function_call (arguments' cmd or command), and a Codex code-mode call that runs
@@ -311,7 +311,67 @@ def tool_calls(text):
             for key in set(results) - before:
                 if results[key] in (None, '""', "") and not _errored(record, key):
                     results[key] = native["stdout"] + (f"\n{native['stderr']}" if native.get("stderr") else "")
+    if pairing:     # (command, result, paired): paired says a result record exists, failed (None) or not
+        return [(command, results.get(ident), ident in results) for ident, command in calls.items()]
     return [(command, results.get(ident)) for ident, command in calls.items()]
+
+
+PYTHON = re.compile(r"python(\d+(\.\d+)*)?$")
+SHELLS = ("sh", "bash", "zsh", "dash")
+WRAPPERS = ("env", "exec", "nohup", "command", "time")
+
+
+def invoked(command):
+    """The programs or scripts a shell command line runs: for each simple command, the script operand of a python
+    interpreter or else the program itself, after VAR=value prefixes and plain wrappers; a sh -c or bash -lc script
+    is read in turn. A file that is only an argument (ls, cat, rg) is not run (@architect-2, @lead-dev at daa3b35)."""
+    try:
+        lex = shlex.shlex(command.replace("\n", " ; "), posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        tokens = list(lex)
+    except ValueError:
+        return []
+    argvs, argv, skip = [], [], False
+    for token in tokens:
+        if skip:
+            skip = False
+        elif token and set(token) <= set("<>&"):
+            if token[0] in "<>":
+                skip = True                 # a redirect's file is not a command
+            else:
+                argvs.append(argv)
+                argv = []
+        elif token and set(token) <= set(";|()"):
+            argvs.append(argv)
+            argv = []
+        else:
+            argv.append(token)
+    argvs.append(argv)
+    found = []
+    for argv in argvs:
+        while argv and ("=" in argv[0] and not argv[0].startswith(("=", "/", "~", ".")) or argv[0] in WRAPPERS):
+            argv = argv[1:]
+        if not argv:
+            continue
+        name = os.path.basename(argv[0])
+        if name in SHELLS:
+            flag = next((i for i, a in enumerate(argv[1:], 1) if a.startswith("-") and "c" in a[1:]), None)
+            if flag is not None:
+                found += invoked(" ".join(argv[flag + 1:]))
+                continue
+        if PYTHON.match(name):
+            rest = iter(argv[1:])
+            for arg in rest:
+                if arg in ("-c", "-m"):
+                    break                   # code or a module, not a script file
+                if arg in ("-W", "-X", "-Q"):
+                    next(rest, None)
+                elif not arg.startswith("-"):
+                    found.append(arg)
+                    break
+            continue
+        found.append(argv[0])
+    return found
 
 
 def _errored(record, key):
@@ -394,9 +454,10 @@ class Core:
     def installed_seen(self, roots=(), harness_of=lambda record: None):
         """The owner's after-the-fact check: every installed factory.py path that appears in the screen of one of
         this core's terminals, or in a Claude Code or Codex transcript whose working directory is under one of
-        roots. A transcript's path counts as run when it is in the command of an actual shell call (tool_calls'
-        pairing); anywhere else, a search's output or a screen, it was only seen (@operator, #173 pi member case 8
-        at a198b9c). -> [(harness or None, what was seen, run)], runs first, bounded; [] for an unprotected core."""
+        roots. A transcript's path counts as run when a shell call with a paired result invokes it, as a python
+        script or as the program (invoked()); as an argument (ls, cat), in a search's output, in a call with no
+        result or on a screen it was only seen (@operator, #173 pi member case 8 at a198b9c; @architect-2).
+        -> [(harness or None, what was seen, run)], runs first, bounded; [] for an unprotected core."""
         needles = installed_needles(self.installed)
         if not needles:
             return []
@@ -414,9 +475,10 @@ class Core:
             except OSError:
                 continue
             flat = "".join(raw.split())
-            commands = ["".join(command.split()) for command, _ in tool_calls(raw)]
+            ran = {program for command, _, paired in tool_calls(raw, pairing=True) if paired   # a call with no
+                   for program in invoked(command)}                                         # result never ran
             for n in needles:
-                if any(n in command for command in commands):
+                if n in ran:
                     hits.add((harness, f"{path.name}: ran {n}", True))
                 elif n in flat:
                     hits.add((harness, f"{path.name}: {n}", False))
@@ -3190,15 +3252,17 @@ def _case_7_two_senders(run, role, harness, adapter_class):
                 " your assignment for both. Nothing to append now: reply with the single word done."), timeout=120)
             ident = _say_id(out)
             authorized = {"id": int(ident.group(1)) if ident else None, "code": code}
-            team.until(lambda: ident is not None
-                       and (_outcome(factory_log(team), ident, recipient) or ("",))[0] == "delivered"
-                       and team.state(subject) in ("idle", "done"), 300)
+            team.until(lambda: ident is not None and _setup_settled(factory_log(team).read_box()[1].outcome(
+                int(ident.group(1)), recipient), team.get(subject)), 300)
+            record = factory_log(team).read_box()[1].outcome(int(ident.group(1)), recipient) if ident else {}
+            now = team.get(subject)
             authorized.update(outcome=_outcome(factory_log(team), ident, recipient) if ident else None,
-                              state=team.state(subject), receipt_empty=not (receipt.exists() and receipt.read_text()))
-            if (authorized["outcome"] != ("delivered", None) or authorized["state"] not in ("idle", "done")
-                    or not authorized["receipt_empty"]):     # settled: delivered, idle or done (@lead-dev at 8428e8a)
+                              delivery={k: record.get(k) for k in ("o", "term", "turn", "started")},
+                              state=(now.get("status") or {}).get("state"), turn=now.get("turn"),
+                              receipt_empty=not (receipt.exists() and receipt.read_text()))
+            if not (ident and _setup_settled(record, now) and authorized["receipt_empty"]):
                 run.row(7, "two-senders", role, harness, "not_run", "case 7 two-senders",
-                        proof={"authorized": authorized}, reason="the assignment was not delivered and settled"
+                        proof={"authorized": authorized}, reason="the assignment did not start a turn that settled"
                         " with the receipt empty")
                 return
 
@@ -3950,30 +4014,20 @@ def case_6(run, role, harness, adapter_class):
             view.keys("enter")
         variable = harness_table().get(harness, {}).get("session_env")
 
-        probe_retries = []
+        probe_retries, probe_unready = [], []
+
+        def unproved(why):
+            return _probe_unproved(why, probe_unready)
 
         def session(terminal):
-            """The harness's own session variable, as its tool sees it (observation through hc)."""
-            if not variable:
-                return None
-            out, done = team.receipt("session"), team.receipt("session-run")
-            ask = adapter.act_run(done, f'printf "%s\\n" "${{{variable}:-}}" > {shlex.quote(str(out))}')
-            team.send(terminal, ask)
-            if not team.until(lambda: done.exists() and "exit" in done.read_text(), 120):
-                # keys typed while a harness redraws after a native switch can be lost (Codex /new at a65a1fe:
-                # the probe never reached the new conversation); it only prints a variable, so ask again once
-                team.until(lambda: team.state(terminal) in READY, 60)
-                team.send(terminal, ask)
-                probe_retries.append(terminal)
-                team.until(lambda: done.exists() and "exit" in done.read_text(), 180)
-            team.until(lambda: team.state(terminal) in READY, 120)
-            return out.read_text().strip() if out.exists() else None
+            return _session_probe(team, adapter, variable, terminal, probe_retries, probe_unready)
         if role == "operator":
             before = session(team.operator)
             switch()
             team.until(lambda: team.state(team.operator) in READY, 120)
             after = session(team.operator)
             switched, why = judge_switch(before, after)
+            why = why if switched else unproved(why)
             receipt, tok = team.receipt("operator-switch"), token()
             said = _member_says(team, adapter.act_append(receipt, tok))
             acted = team.until(lambda: receipt.exists() and tok in receipt.read_text(), 300)
@@ -3983,7 +4037,7 @@ def case_6(run, role, harness, adapter_class):
                     "after the operator switches conversation natively in its terminal (its session variable changes),"
                     " a member's report reaches it and is acted on once",
                     proof={"variable": variable, "switched": switched, "member_say": said, "action_count": count,
-                           "probe_retries": len(probe_retries)},
+                           "probe_retries": len(probe_retries), "probe_unready": probe_unready},
                     reason=None if status == "pass" else why or f"the action ran {count} times" if switched
                     else why or f"no {variable or 'session variable'} to show the switch")
             return
@@ -4027,6 +4081,7 @@ def case_6(run, role, harness, adapter_class):
         idle()
         after = session(team.member("lead-dev"))
         switched, why = judge_switch(before, after)
+        why = why if switched else unproved(why)
         second = token()
         team.call("say", "lead-dev", adapter.remember(second), timeout=60)
         idle()
@@ -4036,7 +4091,8 @@ def case_6(run, role, harness, adapter_class):
         fresh = team.member("lead-dev")
         if judge_member_switch(switched, launch, True) != "pass":   # the cycle failed: no terminal to ask
             run.row(6, "member-switch", role, harness, judge_member_switch(switched, launch, True),
-                    "after a native switch, down then up replaces the terminal", proof=dict(launch, switched=switched),
+                    "after a native switch, down then up replaces the terminal",
+                    proof=dict(launch, switched=switched, probe_unready=probe_unready),
                     reason=why if not switched else "down or up failed, or the same terminal stayed")
             return
         idle()
@@ -4053,12 +4109,50 @@ def case_6(run, role, harness, adapter_class):
                 f"after a native switch (its session variable changes) and a say, up resumes the"
                 f" {'switched' if follow else 'launch'} conversation (session_follow = {str(follow).lower()})",
                 observed=f"recalled the {which} word", proof=dict(launch, session_follow=follow, variable=variable,
-                                                               switched=switched),
+                                                               switched=switched, probe_unready=probe_unready),
                 reason=None if status == "pass" else why if not switched
                 else "down or up failed, or the same terminal stayed" if not (launch["down_exit"] == 0
                                                                               and launch["up_exit"] == 0
                                                                               and launch["replaced"])
                 else "another conversation")
+
+
+def _setup_settled(delivery, terminal):
+    """Two-senders' setup (@reviewer's #230 follow-up): the assignment was delivered and started a turn of its own,
+    and the member has since settled after it, idle or done at that turn or a later one."""
+    turn = delivery.get("turn")
+    return (delivery.get("o") == "delivered" and delivery.get("started") is True and isinstance(turn, int)
+            and (terminal.get("status") or {}).get("state") in ("idle", "done")
+            and isinstance(terminal.get("turn"), int) and terminal["turn"] >= turn)
+
+
+def _session_probe(team, adapter, variable, terminal, retries, unready):
+    """The harness's own session variable, as its tool sees it (observation through hc), or None. A probe lost while
+    a harness redraws after a native switch is asked again once (Codex /new at a65a1fe), but only once the terminal
+    is ready again; one that never is goes to unready (@reviewer's #230 follow-up)."""
+    if not variable:
+        return None
+    out, done = team.receipt("session"), team.receipt("session-run")
+    ask = adapter.act_run(done, f'printf "%s\\n" "${{{variable}:-}}" > {shlex.quote(str(out))}')
+    team.send(terminal, ask)
+    if not team.until(lambda: done.exists() and "exit" in done.read_text(), 120):
+        if not team.until(lambda: team.state(terminal) in READY, 60):     # still blocked or working: no retry
+            unready.append({"terminal": terminal, "state": team.state(terminal)})
+            return None
+        team.send(terminal, ask)
+        retries.append(terminal)
+        team.until(lambda: done.exists() and "exit" in done.read_text(), 180)
+    team.until(lambda: team.state(terminal) in READY, 120)
+    return out.read_text().strip() if out.exists() else None
+
+
+def _probe_unproved(why, unready):
+    """A switch judged without a variable because its probe's terminal never became ready again is unproved."""
+    if not unready:
+        return why
+    last = unready[-1]
+    return (f"unproved: the session probe on {last['terminal']} went unanswered and it never became ready again"
+            f" (last {last['state']}), so it was not asked again")
 
 
 def between_turns(harness, role):

@@ -3758,7 +3758,7 @@ def render_team_brief(cfg, members, operator, closing=None):
                 " checkout, and `git -C <its path> status` shows what it has not committed yet. When you ask for a"
                 " review, name your branch."]
     names = ", ".join("`" + m["name"] + "`" for m in members)
-    messaging = " Use the standalone `factory.py say` command in your standing instructions to message one or more teammates."
+    messaging = " Use the send command in your standing instructions to message one or more teammates."
     out += ["", "## Talking to each other", "",
             f"Everyone has an @name, which is also their pane's title: {names}, and `{operator}` for the operator."
             + messaging,
