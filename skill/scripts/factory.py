@@ -251,8 +251,12 @@ class Hc:
         return self.call("terminal.run", {"argv": argv, "cwd": cwd, "env": env, "labels": labels,
                                           "no_parent": True, "no_notify": True})
 
-    def send(self, term: str, text: str) -> dict:
-        return self.call("terminal.send", {"terminal": term, "text": text}, timeout=None)
+    def send(self, term: str, text: str, cond: str | None = None) -> dict:
+        """terminal.send; cond="idle" has hc type only into an idle terminal (status_mismatch, nothing typed)."""
+        params = {"terminal": term, "text": text}
+        if cond:
+            params["if"] = cond
+        return self.call("terminal.send", params, timeout=None)
 
     def keys(self, term: str, keys: list[str]) -> dict:
         return self.call("terminal.keys", {"terminal": term, "keys": keys})
@@ -544,8 +548,8 @@ def resolve_listed(model, listed, harness):
 LOG_KINDS = ("say", "brief", "note")
 OUTCOMES = ("sending", "delivered", "queued", "unconfirmed", "dropped")
 FINAL = ("delivered", "unconfirmed", "dropped")
-QUEUE_REASONS = ("waiting", "blocked", "not ready", "gone")
-READ_QUEUE_REASONS = QUEUE_REASONS + ("busy",)   # "busy" is reserved for the §8.3 fallback: read, never written
+QUEUE_REASONS = ("waiting", "blocked", "not ready", "gone", "busy")   # busy: a between-turns operator is working
+READ_QUEUE_REASONS = QUEUE_REASONS
 MOVES = {"sending": ("queued",), "delivered": ("sending",), "unconfirmed": ("sending",),
          "queued": ("queued", "sending"), "dropped": ("queued", "sending")}   # new outcome: allowed from these
 UTC = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
@@ -1766,6 +1770,14 @@ def decide(name, msg, view, box, cfg, now, op_null_since, still_true=True):
             return "hold",
         if status["state"] == "blocked":
             return "queue", "blocked"
+        # keeper.md §9: an operator harness that may ignore text typed into a working turn (Codex, #173) gets
+        # Factory's messages between turns. The live app decides, the formation's harness when none is reported.
+        app = status.get("app") or cfg.operator.get("harness")
+        if TABLE.get(app, {}).get("operator_deliver") == "idle":
+            if status["state"] == "working":
+                return "queue", "busy"
+            if status["state"] == "idle":
+                return "send", terminal["address"], "idle"   # hc refuses, typing nothing, if it starts working
         return "send", terminal["address"]
 
     state = view.state(name)
@@ -2321,7 +2333,7 @@ class Keeper:
                     continue
                 action, detail = "queue", ["gone"]
             if action == "send":
-                self._claim(msg, name, detail[0])
+                self._claim(msg, name, detail[0], detail[1] if len(detail) > 1 else None)
                 continue
             why = detail[0]
             outcome = "queued" if action == "queue" else "dropped"
@@ -2337,7 +2349,7 @@ class Keeper:
             if outcome == "dropped" and _quiet_or_ready_note(msg) and msg["meta"]["what"] == "quiet":
                 self.quiet_since = None              # a dropped quiet note: a full grace before the next
 
-    def _claim(self, msg, name, term):
+    def _claim(self, msg, name, term, cond=None):
         if self.stop or not self._record(msg, name, "sending", term=term) or self.stop:
             return
         ident = msg["id"]
@@ -2348,15 +2360,15 @@ class Keeper:
             wire += "\n"
         self.inflight[name] = ident
         try:
-            self.spawn(functools.partial(self._send, name, ident, term, wire))
+            self.spawn(functools.partial(self._send, name, ident, term, wire, cond))
         except RuntimeError as error:
             self.results.put((name, ident, term, HcDown(False, str(error))))
 
-    def _send(self, name, ident, term, wire):
+    def _send(self, name, ident, term, wire, cond=None):
         try:
             if self.stop:
                 raise HcDown(False, "keeper stopped before sending")
-            result = self.hc.send(term, wire)
+            result = self.hc.send(term, wire, cond) if cond else self.hc.send(term, wire)
         except Exception as error:
             result = error
         self.results.put((name, ident, term, result))
@@ -2404,7 +2416,8 @@ class Keeper:
         if isinstance(result, HcDown) and not result.sent:
             why = "waiting"
         elif isinstance(result, HcError):
-            why = {"blocked": "blocked", "not_found": "gone", "finished": "gone"}.get(result.kind)
+            why = {"blocked": "blocked", "not_found": "gone", "finished": "gone",
+                   "status_mismatch": "busy"}.get(result.kind)   # the idle guard refused: nothing was typed
             if why is None and _unsettled_refusal(result, term):
                 why = "waiting"                      # nothing was typed: send it again once the output settles
         if why is None:
@@ -2847,6 +2860,8 @@ def outcome_lines(outcomes, operator, sender):
             missing.append(f"@{name}")
         if name == operator and outcome == "queued" and record["why"] == "gone":
             line += ": operator not running; message queued"
+        if name == operator and outcome == "queued" and record["why"] == "busy":
+            line += ": Factory will deliver it when the operator's turn ends."
         lines.append(line)
     if missing:
         instruction = "Do not resend unless asked"

@@ -246,9 +246,9 @@ class FakeHc:
                 "status": status, "screen": screen, "then": then, "error": error,
             }
 
-    def set_status(self, term, state, kind=None, msg=None):
+    def set_status(self, term, state, kind=None, msg=None, app="fake"):
         with self.state() as data:
-            fake_hc.set_status(data["terminals"][term], state, kind, msg)
+            fake_hc.set_status(data["terminals"][term], state, kind, msg, app)
 
     def finish(self, term, reason="exited", exit_code=0):
         with self.state() as state:
@@ -1698,6 +1698,43 @@ class DeliveryDecisionTests(unittest.TestCase):
                 decision = factory.decide("operator", {"kind": "say"}, factory.View(records),
                                           self.box, self.cfg, 10, since)
                 self.assertEqual(decision, expected)
+
+    def test_a_busy_operator_line_tells_the_sender_when_it_arrives(self):
+        lines, code = factory.outcome_lines({"operator": {"o": "queued", "why": "busy"}}, "operator", "lead-dev")
+        self.assertEqual(lines, ["@operator: queued (busy): Factory will deliver it when the operator's turn ends."])
+        self.assertEqual(code, 0)                       # queued is stored: say succeeds
+
+    def test_a_codex_operator_gets_messages_between_turns(self):
+        """keeper.md §9 (#173): the live app selects the rule, the formation's harness only when none is reported;
+        a Codex member and other operators are unchanged."""
+        def view(name, state, app, kind="operator"):
+            record = self.terminal(name, state, kind=kind)
+            if app is not None:
+                record["status"]["app"] = app
+            return factory.View([record])
+        for state, app, expected in (
+            ("working", "codex", ("queue", "busy")),
+            ("idle", "codex", ("send", "t-operator", "idle")),
+            ("done", "codex", ("send", "t-operator")),
+            ("error", "codex", ("send", "t-operator")),
+            ("blocked", "codex", ("queue", "blocked")),
+            ("working", "claude-code", ("send", "t-operator")),     # another harness now runs in the pane
+            ("working", "fake", ("send", "t-operator")),
+        ):
+            with self.subTest(state=state, app=app):
+                self.assertEqual(factory.decide("operator", {"kind": "say"}, view("operator", state, app),
+                                                self.box, self.cfg, 10, None), expected)
+        with patch.dict(self.cfg.operator, {"harness": "codex"}):
+            self.assertEqual(factory.decide("operator", {"kind": "say"}, view("operator", "working", None),
+                                            self.box, self.cfg, 10, None), ("queue", "busy"))
+            self.assertEqual(factory.decide("operator", {"kind": "say"}, view("operator", "working", "claude"),
+                                            self.box, self.cfg, 10, None), ("send", "t-operator"))
+        boss = types.SimpleNamespace(**{**vars(self.cfg), "operator": {"name": "boss"}})
+        self.assertEqual(factory.decide("boss", {"kind": "say"}, view("boss", "working", "codex"), self.box, boss, 10,
+                                        None), ("queue", "busy"))
+        self.briefed()
+        self.assertEqual(factory.decide("lead-dev", {"kind": "say"}, view("lead-dev", "working", "codex", "member"),
+                                        self.box, self.cfg, 0, None), ("send", "t-lead-dev"))
 
     def test_stale_note_takes_precedence_over_an_absent_operator(self):
         note = {"kind": "note", "meta": {"what": "quiet"}}
@@ -3335,6 +3372,12 @@ class RealMemberNoteTests(TeamCase):
 
 
 class KeeperTests(TeamCase):
+    def deliver(self):
+        for _ in range(2):
+            self.keeper.tick()
+            self.run_jobs()
+        self.keeper.tick()
+
     def member(self, *, status="idle", briefed=True):
         term, agent_log = self.terminal("lead-dev", status=status)
         if briefed:
@@ -3385,6 +3428,67 @@ class KeeperTests(TeamCase):
         self.run_jobs()
         self.keeper.tick()
         self.assertEqual(self.inputs(term, None), ["[from @pm]\nfirst\n", "[from @pm]\nsecond\n"])
+
+    @fake_only
+    def test_a_working_codex_operator_gets_both_messages_after_its_turn(self):
+        """keeper.md §9 (#173): nothing is typed while a Codex operator works; the head reads busy once, the next
+        waiting; both are delivered once each, in order, when it is idle, through hc's idle guard."""
+        operator, _ = self.terminal("operator", kind="operator")
+        self.fake.set_status(operator, "working", app="codex")
+        sends = []
+        real_send = self.keeper.hc.send
+        self.enterContext(patch.object(self.keeper.hc, "send",
+                                       lambda term, text, cond=None: sends.append(cond) or real_send(term, text, cond)))
+        first = self.add("operator", "first")
+        second = self.add("operator", "second")
+        for _ in range(3):
+            self.keeper.tick()
+        self.assertEqual((self.outcome(first, "operator")["why"], self.outcome(second, "operator")["why"]),
+                         ("busy", "waiting"))
+        self.assertEqual(sum(f"#{first} @pm -> @operator queued: busy" in line for line in self.pane), 1)
+        self.assertEqual((self.jobs, self.inputs(operator, None)), ([], []))
+        for ident in (first, second):
+            self.fake.set_status(operator, "idle", app="codex")
+            self.deliver()
+            self.assertEqual(self.outcome(ident, "operator")["o"], "delivered")
+        self.assertEqual(self.inputs(operator, None), ["[from @pm]\nfirst\n", "[from @pm]\nsecond\n"])
+        self.assertEqual(sends, ["idle", "idle"])
+
+    @fake_only
+    def test_a_refused_idle_guard_requeues_the_same_message(self):
+        """The operator starts working between the decision and the typing: hc refuses (status_mismatch, nothing
+        typed), the same ID is queued busy, and it is delivered once when the turn ends."""
+        operator, _ = self.terminal("operator", kind="operator")
+        self.fake.set_status(operator, "idle", app="codex")
+        ident = self.add("operator", "report")
+        self.keeper.tick()
+        self.assertEqual(self.outcome(ident, "operator")["o"], "sending")
+        self.fake.set_status(operator, "working", app="codex")
+        self.run_jobs()
+        self.keeper.tick()
+        self.assertEqual(self.outcome(ident, "operator"), {**self.outcome(ident, "operator"), "o": "queued",
+                                                            "why": "busy"})
+        self.assertEqual(self.inputs(operator, None), [])
+        self.fake.set_status(operator, "done", app="codex")
+        self.deliver()
+        self.assertEqual(self.outcome(ident, "operator")["o"], "delivered")
+        self.assertEqual(self.inputs(operator, None), ["[from @pm]\nreport\n"])
+
+    @fake_only
+    def test_a_codex_operator_in_done_is_sent_unguarded_and_a_codex_member_mid_turn(self):
+        operator, _ = self.terminal("operator", kind="operator")
+        self.fake.set_status(operator, "done", app="codex")
+        term, _ = self.member()
+        self.fake.set_status(term, "working", app="codex")
+        sends = []
+        real_send = self.keeper.hc.send
+        self.enterContext(patch.object(self.keeper.hc, "send",
+                                       lambda t, text, cond=None: sends.append((t, cond)) or real_send(t, text, cond)))
+        to_operator, to_member = self.add("operator", "a"), self.add("lead-dev", "b")
+        self.deliver()
+        self.assertEqual(self.outcome(to_operator, "operator")["o"], "delivered")
+        self.assertEqual(self.outcome(to_member)["o"], "delivered")      # steering into a working member stays
+        self.assertEqual(sorted(sends), sorted([(operator, None), (term, None)]))
 
     @fake_only
     def test_blocked_queues_the_head_once_then_delivers(self):
@@ -5658,7 +5762,7 @@ class LogOutcomeTests(unittest.TestCase):
         box = self.box()
         for args, kwargs in (((9, "operator", "sending"), {}), ((1, "reviewer", "sending"), {}),
                              ((1, "operator", "lost"), {}), ((1, "operator", "sending"), {"why": "x"}),
-                             ((1, "operator", "queued"), {"why": "busy"}), ((1, "operator", "queued"), {}),
+                             ((1, "operator", "queued"), {"why": "lost"}), ((1, "operator", "queued"), {}),
                              ((1, "operator", "dropped"), {"why": " "}),
                              ((1, "operator", "delivered"), {"started": 1})):
             with self.subTest(args=args, kwargs=kwargs), self.assertRaises(ValueError):

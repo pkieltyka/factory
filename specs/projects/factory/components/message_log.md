@@ -41,7 +41,7 @@ Durable storage for every message and every per-recipient outcome (§8.5–8.7):
 | `term` | str or absent | Terminal ID the send went to |
 | `started`, `turn` | bool or null, int | `delivered` only, from `hc`'s result; both required there, with `term`. `sending` requires `term` |
 
-The current outcome of (message, recipient) is its last `out` record; with none it is `queued`, reason `waiting`. `delivered`, `unconfirmed` and `dropped` are final. `refused` and `not stored` are never written. The reason `busy` (§8.3) is reserved and not written by v2.0 ([keeper.md](keeper.md) §9).
+The current outcome of (message, recipient) is its last `out` record; with none it is `queued`, reason `waiting`. `delivered`, `unconfirmed` and `dropped` are final. `refused` and `not stored` are never written. The reason `busy` (§8.3) is written for a between-turns operator that is `working` ([keeper.md](keeper.md) §9).
 
 ```
 queued ──▶ sending ──▶ delivered

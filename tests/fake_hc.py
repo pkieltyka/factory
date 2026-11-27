@@ -50,9 +50,9 @@ def terminal(state, address):
     return record
 
 
-def set_status(record, word, kind=None, msg=None):
+def set_status(record, word, kind=None, msg=None, app="fake"):
     previous = record["status"]
-    status = None if word is None else {"state": word, "app": "fake"}
+    status = None if word is None else {"state": word, "app": app}
     if status is not None:
         if kind is not None:
             status["kind"] = kind

@@ -142,7 +142,7 @@ A team is one repository checkout (its main worktree) in one `hc` session. Every
 
 ### 8.3 A recipient mid-turn
 
-Messages are delivered while the recipient is `working`. Each harness handles text arriving mid-turn its own way, queuing it for the end of the turn or steering the current turn with it. That is accepted as long as nothing is lost and the owner's text is untouched; §10 records each harness's behavior. If a harness loses or garbles mid-turn text, that harness alone switches to delivery once it stops `working` (`idle`, `done` or `error`), built only if a harness fails §10.4.
+Messages are delivered while the recipient is `working`. Each harness handles text arriving mid-turn its own way, queuing it for the end of the turn or steering the current turn with it. That is accepted as long as nothing is lost and the owner's text is untouched; §10 records each harness's behavior. If a harness loses or garbles mid-turn text, that harness alone switches to delivery once it stops `working` (`idle`, `done` or `error`). Codex **as operator** does so (#173): a report submitted whole into its working turn was ignored, so Factory keeps messages to a working Codex operator `queued (busy)` and types them when its turn ends. Codex members still take messages mid-turn.
 
 ### 8.4 Notes about members
 

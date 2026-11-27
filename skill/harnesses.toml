@@ -16,6 +16,8 @@
 #   session_env  the variable in which the harness gives its current conversation ID to the commands it runs
 #   session_follow  false: `say` records that variable once per launch, not at every change (LC-12)
 #   resume_model `provider`: resume only while the model's provider prefix is unchanged (default `any`)
+#   operator_deliver  `idle`: as operator, messages wait while it is working and are typed between turns
+#                (keeper.md §9); members are not affected
 #   [x.permissions]  native flags per permission level. `full` (default) never stops for approval and adds no
 #                sandbox. `guarded` keeps the harness's own guard; only Claude Code and Codex have one.
 
@@ -44,6 +46,7 @@ models = ["gpt-6.2-astra", "gpt-6.2-sol", "gpt-6-astra", "gpt-6.1-sol", "gpt-6-l
 never = ["max", "ultra"]
 prompt = "pointer"
 session_env = "CODEX_THREAD_ID"
+operator_deliver = "idle"   # keeper.md §9: as operator, Factory types between turns (#173: a working turn ignored it)
 session_follow = false   # LC-12 not shown yet
 dialogs = [["Trust and continue", ["enter"]]]   # asked once per new folder, a worktree included
 
