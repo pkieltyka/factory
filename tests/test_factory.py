@@ -6271,6 +6271,32 @@ class SessionTests(unittest.TestCase):
             self.assertEqual(factory.session_plan(m, self.state, None, False)["args"],
                              [f"--session-dir={self.state / 'sessions' / 'omp-dev-omp'}"])
 
+    def test_omp_resumes_from_its_own_session_folder(self):
+        """LC-6 at db85120: omp stores each member's conversation in --session-dir and --continue reopens that
+        folder's newest one, so the shipped table resumes omp that way (launch_layout.md §4). pi keeps its
+        variable."""
+        self.assertEqual(factory.TABLE["omp"]["session"], "dir")
+        self.assertNotIn("session", factory.TABLE["pi"])
+        m = {"name": "omp-dev", "harness": "omp", "model": "openai-codex/gpt-6-astra"}
+        folder = self.state / "sessions" / "omp-dev-omp"
+        fresh = factory.session_plan(m, self.state, None, fresh=False)
+        self.assertEqual((fresh["resume"], fresh["args"]), (False, [f"--session-dir={folder}"]))
+        self.assertEqual(factory._launch_fact(m, self.state, fresh), ("dir", str(folder)))
+        entry = {"member": "omp-dev", "harness": "omp", "model": m["model"], "term": "t1", "how": "dir",
+                 "value": str(folder), "at": "x"}
+        again = factory.session_plan(m, self.state, entry, fresh=False)
+        self.assertEqual((again["resume"], again["args"]), (True, [f"--session-dir={folder}", "--continue"]))
+        self.assertEqual(factory._launch_fact(m, self.state, again), ("dir", str(folder)))   # recorded on a resume too
+        self.assertEqual(factory.session_plan(m, self.state, entry, fresh=True)["args"], [f"--session-dir={folder}"])
+        other = factory.session_plan({**m, "model": "z-ai/glm-5.3"}, self.state, entry, fresh=False)
+        self.assertEqual((other["resume"], other["args"]), (False, [f"--session-dir={folder}"]))
+        self.assertIn("is for omp openai-codex/gpt-6-astra", other["notice"])
+        full = {**m, "role": "lead-dev", "thinking": "high", "permissions": "full", "args": [], "dir": "/w",
+                "inbox_dir": "/s"}
+        argv, _ = factory.launch_argv(full, pathlib.Path("/p.md"), again)
+        self.assertEqual(argv[argv.index("--continue") - 1:argv.index("--continue") + 1],
+                         [f"--session-dir={folder}", "--continue"])
+
     def test_launch_arguments_stay_separate_items(self):
         prompt = pathlib.Path("/tmp/state dir/it's.md")
         for harness, model, expect in (

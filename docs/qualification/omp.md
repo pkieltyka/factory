@@ -6,7 +6,7 @@
 - **Model:** the table default, openai/gpt-6-astra, resolves to openrouter/openai/gpt-6-astra, and this machine has no openrouter key ("No API key found for openrouter"). That also explains LC-6's stored=false for omp. openai-codex was rate-limited at times (turn_rate_limit_exceeded).
 - **Batch at 26f0611 on the real HOME (@lead-dev-3):** cases 1, 2, 3, 5, 8 and 10 pass, with case 4 mid-turn and five of the six case 7 subcases. The gaps:
   - case 4 owner-interrupt: not_run, inconclusive (the second message was not pending when Esc was pressed).
-  - case 6 resume: fail. omp has no session capture and starts fresh, a known limit (LC-6).
+  - case 6 resume: fail. Factory had no resume for omp and started it fresh. LC-6 at db85120 then showed --session-dir with --continue keeps and reopens each member's own conversation, and from the next head Factory resumes omp that way (launch_layout.md §4, @operator's decision). Case 6 is rerun on that build.
   - case 9 guarded: fail. The member's say reached the operator and the keeper restarted, but the driver never saw omp's own guarded command run.
   - case 7 upgrade: fail, caused by the trial's own timing. omp's say ran past the owner's 60 s hold, so nothing was ever held. From c09143b both sends are instant driver-run says.
 - **Case 7 at c09143b:** upgrade, two-senders, pending-restart and held-quiet pass. suffix and multiline failed on this run's first team: all three suffix messages were delivered and their markers are on omp's screen, but omp completed no turn for them. Both passed at 26f0611. A provider failure inside omp fits, as openai-codex rate-limited before, but nothing has shown it yet. A rerun is queued.

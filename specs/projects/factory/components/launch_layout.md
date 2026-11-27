@@ -95,7 +95,7 @@ An entry is **compatible** when `entry["harness"] == m["harness"]`, its `value` 
 | codex | `--no-daemon` | | `resume <value>` before the options (v1) |
 | agy | | | `--conversation <value>` |
 | opencode | | `--session <new id>` in the format LC-4 finds (`assigned`) | `--session <value>` |
-| pi | `--session-dir <state>/sessions/<member>-pi` | | `--continue` |
+| pi | (`PI_SESSION_ID`, kept: case 6 proves it) | | `--session <value>` |
 | omp | `--session-dir=<state>/sessions/<member>-omp` | | `--continue` |
 
 A member that has run before (it has a finished record or a saved entry) and has no compatible entry gets the `notice` `@x starts in a new conversation: none was recorded for it`, and its brief carries the "new session" closing, so the operator gives it its task again (§9.5).
