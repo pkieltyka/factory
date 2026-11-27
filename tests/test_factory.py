@@ -6885,7 +6885,10 @@ class ListingTests(unittest.TestCase):
 class DocumentationTests(unittest.TestCase):
     def test_relative_links_and_headings(self):
         root = factory.SKILL.parent
-        for page in [root / "README.md", *sorted((root / "docs").glob("*.md"))]:
+        pages = [root / "README.md", *sorted((root / "docs").glob("*.md")), factory.SKILL / "SKILL.md"]
+        pages += sorted((factory.SKILL / "references").glob("*.md"))
+        pages += sorted((factory.SKILL / "recipes").glob("*.md"))
+        for page in pages:
             for href in re.findall(r"\]\(([^\s)]+)\)", page.read_text()):
                 link = urlsplit(href)
                 if link.scheme or link.netloc:
@@ -6927,7 +6930,10 @@ class RecipeTests(unittest.TestCase):
                 section = blocks[0][0]
                 self.assertIn(f"`{section}`", setup)
                 self.assertTrue(headings[0].startswith(f"# {section[3:]}: "))
-                self.assertEqual(headings[1:], ["## Needs", "## Check", "## FACTORY.md section", "## Tested with"])
+                expected = ["## Needs", "## Check", "## FACTORY.md section"]
+                if "## Ready check" in headings and path.name in ("tasks-gh.md", "tasks-todos.md"):
+                    expected.append("## Ready check")
+                self.assertEqual(headings[1:], [*expected, "## Tested with"])
                 self.assertIn(f"(../skill/recipes/{path.name})", overview)
 
 
