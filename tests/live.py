@@ -2274,8 +2274,10 @@ def case_2(run, role, harness, adapter_class):
         team.send(team.operator, prompt)
         lines = team.until(lambda: exits.exists() and len(exits.read_text().split()) >= 8 and exits.read_text(), 600)
         codes = [line for line in (lines or "").splitlines() if line.startswith("exit")]
-        reached = member_receipt.exists() and tok2 in member_receipt.read_text()
-        proof = {"exits": codes, "member_acted": reached, "prompted_by": "hc terminal.send (rodeo typing pending)"}
+        reached = bool(codes == ["exit 0"] * 4         # the member acts on its own turn, after say has returned
+                       and team.until(lambda: member_receipt.exists() and tok2 in member_receipt.read_text(), 300))
+        proof = {"exits": codes, "member_acted": reached,
+                 "prompted_by": "hc terminal.send; typing this first prompt through rodeo is not built yet"}
         ok = codes == ["exit 0"] * 4 and reached
         run.row(2, "operator-commands", role, harness, "pass" if ok else "fail",
                 "the operator runs status, inbox, say and up through its own tool; the say reaches the member",
