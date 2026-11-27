@@ -2290,7 +2290,7 @@ class RealAdapter(FixtureAdapter):
 
     def switch_request(self, harness):
         command = {"claude": "/clear", "codex": "/new", "opencode": "/new", "pi": "/new",
-                   "omp": "/new"}.get(harness)
+                   "omp": "/new", "agy": "/clear"}.get(harness)   # agy: "Clear conversation and start a new one"
         if command is None:
             raise NotRun(f"no known way to start a new conversation in {harness}")
         return command
