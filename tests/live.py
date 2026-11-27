@@ -6,7 +6,7 @@ temporary directory, with its own HC_SESSION, HC_SOCKET and XDG_RUNTIME_DIR. Eve
 connection checks hello's core id before it writes a request, and a core is stopped
 only after server.status names that id, so the owner's sessions are never reached.
 
-    python3 tests/live.py check lc1|lc10|lc13|lc8|all [--json PATH]
+    python3 tests/live.py check lc1|lc10|lc13|lc8|rodeo_focus|all [--json PATH]
     python3 tests/live.py check lc2|lc3|lc4|lc6|lc7|lc12|login [--json PATH]   # real harnesses, the owner's login
     python3 tests/live.py fixtures [--out tests/hc_fixtures.json]
 """
@@ -28,6 +28,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 
 HC = os.environ.get("HC_BIN", "hc")
 RODEO = shutil.which(os.environ.get("RODEO_BIN") or "rodeo") or ""
@@ -616,9 +617,63 @@ class Rodeo:
         self.record = drv.rpc("terminal.run", {"argv": argv, "cwd": str(qa.dir), "env": env,
                                                "size": {"cols": cols, "rows": rows}})
         self.term = self.record["address"]
+        self.focused_terminal = None
 
     def keys(self, *names):
         return self.drv.rpc("terminal.keys", {"terminal": self.term, "keys": list(names)})
+
+    def type(self, text):
+        """Type through the client, leaving the draft unsubmitted."""
+        if "\n" in text or "\r" in text:
+            raise ValueError("type takes one line; send Enter separately")
+        for char in text:
+            self.keys("space" if char == " " else char)
+
+    def _move(self, direction, count):
+        for _ in range(count):
+            self.keys("ctrl+b")
+            time.sleep(0.2)
+            self.keys(direction)
+            time.sleep(0.2)
+
+    def focus(self, pane_title):
+        """Move within the current QA tab, starting at its first pane on attach."""
+        doc = self.qa.rpc("doc.get", {"name": "herdr-app"})["value"]
+        for space in doc["spaces"]:
+            for tab in space["tabs"]:
+                root = tab["root"]
+                if root["type"] != "row":
+                    raise RuntimeError("rodeo focus requires a row of panes or columns")
+                columns = [node["children"] if node["type"] == "column" else [node] for node in root["children"]]
+                current, targets = None, []
+                for x, column in enumerate(columns):
+                    for y, pane in enumerate(column):
+                        address = pane["content"]["terminal"]
+                        if address == self.focused_terminal or (self.focused_terminal is None and (x, y) == (0, 0)):
+                            current = x, y
+                        if pane["title"] == pane_title:
+                            targets.append((x, y, address))
+                if current is not None:
+                    if not targets:
+                        raise RuntimeError(f"no pane titled {pane_title} in the current rodeo tab")
+                    if len(targets) != 1:
+                        raise RuntimeError(f"the current rodeo tab has multiple panes titled {pane_title}")
+                    self._focus_pane(current, targets[0], columns)
+                    return
+        raise RuntimeError("could not find the focused pane in the QA layout")
+
+    def _focus_pane(self, current, target, columns):
+        x, y = current
+        to_x, to_y, terminal = target
+        if x == to_x:
+            self._move("j" if to_y > y else "k", abs(to_y - y))
+        else:
+            self._move("k", y)
+            self._move("l" if to_x > x else "h", abs(to_x - x))
+            # A horizontal move can land below the top of a stacked column.
+            self._move("k", len(columns[to_x]) - 1)
+            self._move("j", to_y)
+        self.focused_terminal = terminal
 
     def screen(self):
         return self.drv.rpc("terminal.read", {"terminal": self.term, "lines": 0}).get("text", "")
@@ -641,6 +696,56 @@ class Rodeo:
             self.drv.rpc("terminal.kill", {"terminal": self.term})
         except HcError:
             pass
+
+
+def _focus_probe_layout(qa, probes, stack):
+    def ident(prefix):
+        return prefix + uuid.uuid4().hex
+
+    panes = [{"id": ident("p"), "type": "block", "title": "@" + name,
+              "content": {"terminal": probe.address}} for name, probe in probes.items()]
+    if stack:
+        panes = [{"id": ident("s"), "type": "column", "children": [panes[0], panes[3]]}, *panes[1:3]]
+    root = {"id": ident("s"), "type": "row", "children": panes}
+    tab = {"id": ident("tb"), "name": "team", "root": root}
+    space = {"id": ident("sp"), "name": "focus", "folder": str(qa.dir), "tabs": [tab]}
+    qa.rpc("doc.set", {"name": "herdr-app", "value": {"spaces": [space]}, "version": 0})
+
+
+def rodeo_focus():
+    """Exercise the driver on a three-pane row and a stacked Factory layout."""
+    result = {"check": "rodeo_focus", "rodeo": RODEO}
+    if not RODEO:
+        return {**result, "result": "not run: rodeo not found (set RODEO_BIN)"}
+    for name, order, stack in (("row", ("a", "c", "b", "a"), False),
+                               ("stack", ("a", "d", "b", "d", "a", "c", "a"), True)):
+        with Core("focusqa", config="draft_wait = 15\n") as qa, Core("focusdrv") as drv:
+            probes = {letter: Probe(qa, letter) for letter in ("abcd" if stack else "abc")}
+            _focus_probe_layout(qa, probes, stack)
+            rodeo = Rodeo(qa, drv)
+            try:
+                if not rodeo.wait_for(["team", *("@" + letter for letter in probes)]):
+                    return {**result, "result": f"fail: {name} layout did not render"}
+                reached = []
+                for i, target in enumerate(order):
+                    rodeo.focus("@" + target)
+                    marker = f"focus {i}"
+                    rodeo.type(marker)
+                    deadline = time.monotonic() + 3
+                    recipients = []
+                    while time.monotonic() < deadline:
+                        recipients = [letter for letter, probe in probes.items() if marker in probe.text()]
+                        if recipients:
+                            break
+                        time.sleep(0.1)
+                    if recipients != [target]:
+                        return {**result, "result": f"fail: {name} focus @{target} typed into {recipients}"}
+                    rodeo.keys("enter")
+                    reached.append(target)
+                result[name] = reached
+            finally:
+                rodeo.close()
+    return {**result, "result": "pass"}
 
 
 def hc_env_names(core):
@@ -1530,7 +1635,7 @@ def fixtures(out):
     return {"check": "fixtures", "out": str(out), "hc": version, "replies": sorted(replies), "errors": sorted(errors)}
 
 
-CHECKS = {"lc1": lc1, "lc10": lc10, "lc13": lc13, "lc8": lc8}
+CHECKS = {"lc1": lc1, "lc10": lc10, "lc13": lc13, "lc8": lc8, "rodeo_focus": rodeo_focus}
 LOGIN_CHECKS = {"lc2": lc2, "lc3": lc3, "lc4": lc4, "lc6": lc6, "lc7": lc7, "lc12": lc12}   # start real harnesses
 
 

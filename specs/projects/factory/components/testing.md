@@ -158,13 +158,14 @@ class Rodeo:
     def type(self, text: str) -> None           # keys, one per character: text typed without Enter (an unsent draft)
     def screen(self) -> str                     # terminal.read on the driver core: rodeo's rendered screen as text
     def wait_for(self, text: str, timeout: float = 10) -> None   # poll screen() until it contains text
-    def focus(self, pane_title: str) -> None    # rodeo navigation keys (~0.2 s apart): ctrl+b then h/l (verified: LC-13) plus j/k for stacked columns, tracking focus from the first block against the QA layout doc (to verify at the start of Phase 5b)
+    def focus(self, pane_title: str) -> None    # within the current QA tab, tracking focus from its first pane
     def close(self) -> None                     # end rodeo, stop the driver core
 ```
 
 - **Two cores, both private (verified: LC-13 on `rodeo 0.2.1`).** The QA core holds the team under test (with its `herdr-app` doc written before rodeo starts, so rodeo does not spawn a default shell space). The driver core (`HC_SESSION=factory-drv-<pid>`, its own `HC_SOCKET` and `XDG_RUNTIME_DIR`) holds one terminal: `rodeo`, started with `env -u HC_TERMINAL_ID rodeo` (or `experimental.allow_nested = true`; only `HC_TERMINAL_ID` triggers nesting refusal), private `HOME`/`XDG_CONFIG_HOME`/`XDG_STATE_HOME`/`RODEO_CONFIG_PATH`/`HERDR_CONFIG_PATH`, and the QA core's `HC_SESSION` and `HC_SOCKET`, at a fixed size (`160x48` or `200x60`) so the layout is the same on every run. `RODEO_BIN` names the binary. Each core has its own `Hc(expect_core=…)`; neither is ever the owner's. LC-13 also observed `keep=false` on doc-placed panes after rodeo rendered them.
 - **Typing is the owner's path.** A key pressed in the rodeo terminal is forwarded by rodeo to the focused QA terminal as viewer input, which the QA core counts as human input: `draft_wait` applies exactly as it does for a person. `type()` never presses Enter, so it leaves an unsent draft.
 - **Reading is what the owner sees.** `screen()` returns rodeo's rendered text: tab names, pane titles, and the panes' contents.
+- **Focus navigation.** `python3 tests/live.py check rodeo_focus` verified `Ctrl+B` then `h`/`l` across three columns and `j`/`k` within a stacked column on rodeo 0.2.1 with private hc 0.1.20 cores. The check confirms each typed marker reached only the selected PTY.
 
 | Used for | How |
 |---|---|
