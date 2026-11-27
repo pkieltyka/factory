@@ -1043,7 +1043,7 @@ class Harness:
                 last = None
                 continue
             seen = None
-            if word == "idle":
+            if word in ("idle", "done"):        # done: idle with a turn not yet seen in the app
                 return "idle"
             if flat != last:
                 last, since = flat, time.monotonic()
@@ -1076,7 +1076,7 @@ class Harness:
                 return False
             word = (t.get("status") or {}).get("state")
             if expect is None:
-                if word == "idle" and t.get("turn") != turn:
+                if word in ("idle", "done") and t.get("turn") != turn:
                     return True
                 if flat != last:
                     last, since = flat, time.monotonic()
@@ -2092,6 +2092,7 @@ CASES = {   # case -> its subcases: (name, roles it is required for, measurement
          ("crash", "both", False)),
 }
 BOUND = 300   # characters kept of any observed or expected text
+READY = ("idle", "done")       # hc's two waiting states: done is idle with a turn the owner has not seen
 
 
 def subcases(case, role):
@@ -2190,7 +2191,7 @@ def _up(team, run, case, role, harness, names):
         watcher = Harness.attach(team.qa, team.operator_harness, team.operator)
         settled = watcher.settle(timeout=120)
         team.operator_start = {"settled": settled, "answered": watcher.answered}
-        if not settled.startswith("idle"):
+        if not settled.startswith(READY):
             for name in names:
                 run.row(case, name, role, harness, "not_run", f"case {case} {name}",
                         reason=f"the operator did not start: {settled}")
@@ -2201,12 +2202,14 @@ def _up(team, run, case, role, harness, names):
             run.row(case, name, role, harness, "not_run", f"case {case} {name}", observed=out[-BOUND:],
                     reason=f"up exited {code}")
         return False
-    if not team.until(lambda: team.state(team.operator) == "idle", 120):
+    if not team.until(lambda: team.state(team.operator) in READY, 120):
         for name in names:
             run.row(case, name, role, harness, "not_run", f"case {case} {name}", reason="the operator never idled")
         return False
     waiting = [name for name in team.members                 # members past their startup before any case sends
-               if not team.until(lambda: team.member(name) and team.state(team.member(name)) == "idle", 180)]
+               if not team.until(lambda: team.member(name) and team.state(team.member(name)) in READY, 180)]
+    team.ready_states = {"operator": team.state(team.operator),
+                         **{name: team.state(team.member(name)) for name in team.members if team.member(name)}}
     if waiting:
         for name in names:
             run.row(case, name, role, harness, "not_run", f"case {case} {name}",
@@ -2335,12 +2338,12 @@ def case_1(run, role, harness, adapter_class):
             if state != states[-1]:
                 states.append(state)
             time.sleep(0.25)
-        team.until(lambda: team.state(subject) == "idle", 60)
+        team.until(lambda: team.state(subject) in READY, 60)
         states.append(team.state(subject))
         after = team.get(subject)
         proof = {"states": states, "turn": [before.get("turn"), after.get("turn")],
                  "action": receipt.read_text().strip() if receipt.exists() else None}
-        ok = (states[0] == "idle" and "working" in states and states[-1] == "idle"
+        ok = (states[0] in READY and "working" in states and states[-1] in READY
               and after.get("turn", 0) > before.get("turn", 0) and proof["action"] == "exit 0")
         run.row(1, "states", role, harness, "pass" if ok else "fail",
                 "idle, working through a real tool action, idle again with the turn advanced", proof=proof,
@@ -2351,7 +2354,7 @@ def case_1(run, role, harness, adapter_class):
         observed = "no startup dialog declared" if not dialogs else f"declared: {[d[0] for d in dialogs]}"
         run.row(1, "startup-dialog", role, harness, "pass",
                 "a declared startup dialog is answered on its second poll, or left to the owner; none is invented",
-                observed=observed, proof={"started_idle": states[0] == "idle", "handled_by": how,
+                observed=observed, proof={"started_idle": states[0] in READY, "handled_by": how,
                                           "mode": team.adapter.mode})
 
 
@@ -2410,7 +2413,7 @@ def case_10(run, role, harness, adapter_class):
         times, outcomes = [], []
         recipient = "lead-dev" if role == "member" else "operator"
         for _ in range(3):
-            team.until(lambda: team.state(_subject(team, role)) == "idle", 300)
+            team.until(lambda: team.state(_subject(team, role)) in READY, 300)
             start = time.monotonic()
             if role == "member":
                 code, out = team.call("say", "lead-dev", f"latency {token()}", timeout=60)
@@ -2552,7 +2555,7 @@ def case_8(run, role, harness, adapter_class):
         latched = team.until(lambda: (team.get(operator).get("labels") or {}).get("factory.kind")
                              == "operator-lost", 60)
         team.adapter.restart(team.qa, operator)
-        back = team.until(lambda: team.state(operator) == "idle", 120)
+        back = team.until(lambda: team.state(operator) in READY, 120)
         time.sleep(5)
         held = not receipt.exists()
         up_code, _ = team.call("up", timeout=240)
@@ -2569,7 +2572,7 @@ def case_8(run, role, harness, adapter_class):
         team.send(operator, team.adapter.quit_request())
         team.until(lambda: team.state(operator) is None, 60)
         team.adapter.restart(team.qa, operator)
-        team.until(lambda: team.state(operator) == "idle", 60)
+        team.until(lambda: team.state(operator) in READY, 60)
         receipt2, tok2 = team.receipt("same-pane"), token()
         code, out = team.call("say", "operator", "--file", str(_note(team, team.adapter.act_append(receipt2, tok2))),
                               terminal=team.member("lead-dev"), timeout=60)
@@ -2653,7 +2656,7 @@ def case_6(run, role, harness, adapter_class):
         adapter = team.adapter
         if role == "operator":
             team.send(team.operator, adapter.switch_request(harness))
-            team.until(lambda: team.state(team.operator) == "idle", 120)
+            team.until(lambda: team.state(team.operator) in READY, 120)
             receipt, tok = team.receipt("operator-switch"), token()
             said = _member_says(team, adapter.act_append(receipt, tok))
             acted = team.until(lambda: receipt.exists() and tok in receipt.read_text(), 300)
@@ -2664,7 +2667,7 @@ def case_6(run, role, harness, adapter_class):
             return
 
         def idle():
-            return team.until(lambda: team.member("lead-dev") and team.state(team.member("lead-dev")) == "idle", 300)
+            return team.until(lambda: team.member("lead-dev") and team.state(team.member("lead-dev")) in READY, 300)
 
         def relaunch():
             team.call("down", "lead-dev", timeout=120)
