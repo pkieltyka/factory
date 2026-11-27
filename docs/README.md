@@ -1,6 +1,6 @@
 # The factory on one page
 
-Factory is an owner-directed software factory: a team of agents in herdr, plus the tools and sections a project turns on in `FACTORY.md`. You choose the work and permissions; the operator assigns, coordinates and integrates it. Start with the built-in tracker and review, then add only what the project needs. [Get started](getting-started.md).
+Factory is an owner-directed software factory: a team of agents running in `hc` and shown in rodeo, with the workflow from `FACTORY.md`. You choose the work and permissions; the operator assigns, coordinates and integrates it. Start with the built-in tracker and review, then add only what the project needs. [Get started](getting-started.md).
 
 | Section | Built-in default | Recommended choice and when | Recipe or reference |
 |---|---|---|---|
@@ -40,10 +40,10 @@ Use these in the Claude Code operator conversation. For another harness, use its
 |---|---|
 | `/factory` | Reads the current state and chooses the next step. |
 | `/factory setup` | Forms or changes the team and project brief. |
-| `/factory up` | Starts or resumes members and briefs those launched. Use `--restart` to reapply settings to running members. |
-| `/factory down` | Stops all running members and records their sessions for `up`. Pass names to stop selected members. |
-| `/factory status` | Shows each member's state and the message route. |
-| `/factory wait` | Returns when a message or member needs the operator. |
+| `/factory up` | Starts or resumes members and briefs those launched. To apply changed settings, stop the member, then start it again. |
+| `/factory down` | Stops configured members so they can resume later. Pass names to stop selected members. |
+| `/factory status` | Shows member state, pending messages, the keeper and the operator. |
+| `/factory inbox` | Rereads recent messages addressed to you and their outcomes. |
 | `/factory brief` | Previews or resends the team brief. |
 | `/factory say` | Lets the operator send one message to one or more teammates. |
 
