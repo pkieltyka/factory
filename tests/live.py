@@ -3170,6 +3170,25 @@ def _case_7_two_senders(run, role, harness, adapter_class):
         senders = (["lead-dev", "reviewer"] if role == "operator" else ["operator", "reviewer"])
         receipt, toks = team.receipt("two"), {s: token() for s in senders}
         start, outs = threading.Barrier(len(senders)), {}
+        authorized = None
+        if role == "member":    # a member may rightly refuse a peer's assignment (5fb3fb9): @operator assigns both
+            subject = team.member(recipient)    # receipt steps first, without their tokens, then waits (@architect-2)
+            code, out = team.call("say", recipient, (
+                f"Assignment from @operator for this QA trial: two messages will follow, one from @reviewer and one"
+                f" from @operator. Each asks you to append one token to {receipt}. Do each as it arrives; this is"
+                " your assignment for both. Nothing to append now: reply with the single word done."), timeout=120)
+            ident = _say_id(out)
+            authorized = {"id": int(ident.group(1)) if ident else None, "code": code}
+            team.until(lambda: ident is not None
+                       and (_outcome(factory_log(team), ident, recipient) or ("",))[0] == "delivered"
+                       and team.state(subject) in ("idle", "done"), 300)
+            authorized.update(outcome=_outcome(factory_log(team), ident, recipient) if ident else None,
+                              state=team.state(subject), receipt_empty=not (receipt.exists() and receipt.read_text()))
+            if authorized["outcome"] != ("delivered", None) or not authorized["receipt_empty"]:
+                run.row(7, "two-senders", role, harness, "not_run", "case 7 two-senders",
+                        proof={"authorized": authorized}, reason="the assignment was not delivered and settled"
+                        " with the receipt empty")
+                return
 
         def send(sender):
             body = _note(team, team.adapter.act_append(receipt, toks[sender]))
@@ -3209,7 +3228,7 @@ def _case_7_two_senders(run, role, harness, adapter_class):
                 + (", each typed between turns" if between else ""),
                 proof={"senders": senders, "ids": ids, "outcomes": outcomes, "counts": counts, "acted_order": acted,
                        "recipient_terminal": target, "deliveries": deliveries, "histories": histories,
-                       "between_turns": between, "peer": peer},
+                       "between_turns": between, "authorized": authorized, "peer": peer},
                 reason=None if ok else "a message was missing, repeated, out of order or typed into a working turn")
 
 
