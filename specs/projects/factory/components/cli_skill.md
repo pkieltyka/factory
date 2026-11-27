@@ -41,7 +41,7 @@ def find_team(args) -> tuple[Config, pathlib.Path | None, dict | None]
 | `say` | `NAME [NAME…] (--file PATH | TEXT)` | yes | operator or member | 0; 1; 2 (below) |
 | `keeper` | `--state DIR` | yes | Factory | 0 |
 
-Removed: `wait`, `prompt`, `up --restart`, `up --no-brief`, `wait --seen`. `continue` still prints a pointer to `up` and exits 2. `--timeout` is now seconds (default `LAUNCH_TIMEOUT`).
+Removed: `wait`, `prompt`, `continue`, `up --restart`, `up --no-brief`, `wait --seen`. `--timeout` is now seconds (default `LAUNCH_TIMEOUT`).
 
 ### `say`
 
@@ -129,7 +129,7 @@ Top-level keys of `factory.toml` accepted in addition to v1's (`user`, `permissi
 | `ready_check` | string, a shell line | non-empty | none: no ready check |
 | `ready_check_every` | integer seconds | at least 60 | `READY_EVERY` |
 
-A wrong type or value is a `SystemExit` naming the key, like v1's other checks. v1 needs the back-port that accepts and ignores these three keys (owner decision 4). `plan()` returns `state_dir` and `message_dir` in place of v1's `inbox_dir` and `draft_dir`.
+A wrong type or value is a `SystemExit` naming the key, like the other checks. `plan(cfg, name, state=None)` returns `state_dir`, `message_dir` and `instructions` (None without a state).
 
 ## 4. Skill text and templates
 

@@ -217,7 +217,7 @@ One to three members sit side by side; four to nine fill three columns; the keep
 `down [names]`:
 
 1. The caller's terminal must be `view.operator`: else exit 2, "run down from the operator's pane". Take `up.lock` as above. Check that `sessions.jsonl` can be appended to (§3); if not, stop nobody, exit 1.
-2. For each named member (default all): no record: `@x was not running`. Live: `hc.label(t, {"factory.down": "1"})`, `hc.kill`, `hc.rm`. Finished: `hc.rm`. A terminal that cannot be ended is reported and makes the exit code 1.
+2. For each named member (default all): no record: `@x was not running`. Live: `hc.label(t, {"factory.down": "1"})`, then `hc.kill`. Once the kill succeeded, or for a finished record: `mark_stopped(state, [t], box)` with a full box, then `hc.rm`. A terminal that cannot be ended records no stop and makes the exit code 1; a stop that cannot be recorded keeps the record, so `down` can be run again, and makes the exit code 1.
 3. One log section: `dropped` for pairs `queued` to the stopped members; print `stopped @x (was <word>); <n> queued messages dropped`.
 4. One `edit_layout(remove_panes)`.
 5. If no member record is left: `team.json` `up: false`; print `run factory.py up to bring members back`. The keeper stops itself ([keeper.md](keeper.md) §8).
