@@ -6757,6 +6757,30 @@ class QualifyReportTests(unittest.TestCase):
 class QualifyFrameworkTests(unittest.TestCase):
     """phase_8.md §1 and §5.1: selection, rows, the case rule, exit precedence and checkpoints, with no login."""
 
+    def test_restart_waits_for_the_shell_prompt(self):
+        """claude-op-8 at 7a90602: a harness clears its status before it has exited, and a restart typed then is
+        lost. The real restart types only at the pane's own prompt, and says so when the prompt never returns."""
+        import live
+        screens = {"t1": "Resume this session with: claude --resume x\n"}
+
+        class QA:
+            def rpc(self, method, params, timeout=None):
+                if method == "terminal.read":
+                    return {"text": screens[params["terminal"]]}
+                sent.append(params["text"])
+                return {}
+
+        sent = []
+        self.assertFalse(live.shell_prompt(QA(), "t1"))
+        screens["t1"] += "qa$ \n\n"
+        self.assertTrue(live.shell_prompt(QA(), "t1"))
+        adapter = live.RealAdapter.__new__(live.RealAdapter)
+        screens["t1"] = "  esc to interrupt\n"
+        adapter.team = types.SimpleNamespace(operator_command="claude --model m", until=lambda p, t: p(),
+                                             send=lambda t, text: sent.append(text))
+        self.assertFalse(adapter.restart(QA(), "t1"))
+        self.assertEqual(sent, [])
+
     def test_defaults_and_scope(self):
         self.assertEqual(live.select_profiles("codex", None), [("operator", "codex"), ("member", "codex")])
         self.assertEqual(live.select_profiles("pi", None), [("member", "pi")])

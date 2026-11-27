@@ -1,0 +1,20 @@
+{
+ "mode": "real",
+ "source_head": null,
+ "utc": "2026-11-27T14:58:00Z",
+ "imported": "LC-12 at db85120 (@lead-dev)",
+ "rows": [],
+ "profiles": [],
+ "trust_entries": [
+  {
+   "harness": "claude",
+   "file": "~/.claude.json",
+   "directory": "/tmp/factory-qa-173-takeover-3j54dOla/scratch/factory-qa-lc12/hc-lc12-bn6ew0es/work/lc12-claude-46ecd3"
+  },
+  {
+   "harness": "codex",
+   "file": "~/.codex/config.toml",
+   "directory": "/tmp/factory-qa-173-takeover-3j54dOla/scratch/factory-qa-lc12/hc-lc12-bn6ew0es/work/lc12-codex-68f044"
+  }
+ ]
+}

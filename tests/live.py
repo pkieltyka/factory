@@ -1943,6 +1943,7 @@ class FixtureAdapter:
     def restart(self, qa, terminal):
         """Start the fake operator again in its open pane (its loop waits for Enter)."""
         qa.rpc("terminal.keys", {"terminal": terminal, "keys": ["enter"]})
+        return True
 
 
 class RealAdapter(FixtureAdapter):
@@ -2032,11 +2033,16 @@ class RealAdapter(FixtureAdapter):
                 time.sleep(0.02)
 
     def restart(self, qa, terminal):
-        """Type the same command at the shell prompt in that pane."""
+        """Type the same command at the shell prompt in that pane, once the prompt is really back: a harness clears
+        its status before it has finished exiting, and keys typed then go to the dying harness (claude-op-8 at
+        7a90602: the restart was lost, the next say queued gone). False when the prompt never came back."""
         if not self.team.operator_command:
             raise NotRun("this team's operator was not started from a shell")
+        if not self.team.until(lambda: shell_prompt(qa, terminal), 60):
+            return False
         self.team.send(terminal, self.team.operator_command)
         Harness.attach(qa, self.team.operator_harness, terminal).settle(timeout=120)
+        return True
 
 
 class QATeam:
@@ -2363,6 +2369,13 @@ def _up(team, run, case, role, harness, names):
                     reason=f"never idle after up: {', '.join(waiting)}")
         return False
     return True
+
+
+def shell_prompt(qa, terminal):
+    """The operator pane's own shell shows its prompt (QATeam's PS1) as the last line: the harness has gone."""
+    lines = [line for line in qa.rpc("terminal.read", {"terminal": terminal, "lines": 0}).get("text", "").splitlines()
+             if line.strip()]
+    return bool(lines) and lines[-1].rstrip() == "qa$"
 
 
 def _team_quiet(team, hold, timeout):
@@ -3180,7 +3193,14 @@ def _case_8_main(run, role, harness, adapter_class):
                     proof=proof, reason=None if ok else "see proof")
             return
         operator = team.operator
-        # operator-gone: the harness stops reporting in an open pane; messages queue until up.
+        # operator-gone: the harness stops reporting in an open pane; messages queue until up. Each quit is of an
+        # idle operator: Ctrl+C in a working turn interrupts it instead.
+        if _team_quiet(team, hold=8, timeout=600) is None:
+            run.row(8, "operator-gone", role, harness, "not_run", "case 8 operator-gone",
+                    reason="the team was not quiet before the quit")
+            run.row(8, "same-pane", role, harness, "not_run", "case 8 same-pane",
+                    reason="operator-gone did not start")
+            return
         team.adapter.quit(team.qa, operator)
         stopped = team.until(lambda: team.state(operator) is None, 120)
         receipt, toks, ids = team.receipt("gone"), [token(), token()], []
@@ -3190,8 +3210,7 @@ def _case_8_main(run, role, harness, adapter_class):
             ids.append(_say_id(out))
         latched = team.until(lambda: (team.get(operator).get("labels") or {}).get("factory.kind")
                              == "operator-lost", 60)
-        team.adapter.restart(team.qa, operator)
-        back = team.until(lambda: team.state(operator) in READY, 120)
+        back = team.adapter.restart(team.qa, operator) and team.until(lambda: team.state(operator) in READY, 120)
         time.sleep(5)
         held = not receipt.exists()
         up_code, _ = team.call("up", timeout=240)
@@ -3205,10 +3224,19 @@ def _case_8_main(run, role, harness, adapter_class):
                 "an operator gone from an open pane: messages queue until up, then arrive in order",
                 proof=proof, reason=None if ok else "see proof")
         # same-pane: a quick quit and restart with nothing pending, then a message succeeds without up.
+        quiet = _team_quiet(team, hold=8, timeout=600)
         team.adapter.quit(team.qa, operator)
-        team.until(lambda: team.state(operator) is None, 60)
-        team.adapter.restart(team.qa, operator)
-        team.until(lambda: team.state(operator) in READY, 60)
+        stopped2 = team.until(lambda: team.state(operator) is None, 60)
+        restarted2 = bool(stopped2) and team.adapter.restart(team.qa, operator)
+        back2 = restarted2 and team.until(lambda: team.state(operator) in READY, 120)
+        if quiet is None or not back2:
+            run.row(8, "same-pane", role, harness, "not_run", "case 8 same-pane",
+                    reason="the team was not quiet before the quit" if quiet is None else
+                    "the operator did not stop reporting after the quit" if not stopped2 else
+                    "the shell prompt did not come back after the quit" if not restarted2 else
+                    "the restarted operator did not report ready within 120 s",
+                    proof={"stopped": bool(stopped2), "restarted": bool(restarted2), "state": team.state(operator)})
+            return
         receipt2, tok2 = team.receipt("same-pane"), token()
         code, out = team.call("say", "operator", "--file", str(_note(team, team.adapter.act_append(receipt2, tok2))),
                               terminal=team.member("lead-dev"), timeout=60)
@@ -3304,6 +3332,10 @@ def _case_8_quit_during_hold(run, role, harness, adapter_class):
         if not _up(team, run, 8, role, harness, ["quit-during-hold"]):
             return
         log = factory_log(team)
+        if _team_quiet(team, hold=8, timeout=600) is None:   # a working operator's Ctrl+C interrupts, not quits
+            run.row(8, "quit-during-hold", role, harness, "not_run", "case 8 quit-during-hold",
+                    reason="the team was not quiet before the draft")
+            return
         view = _rodeo(team, ["operator", "team"])
         view.keys("ctrl+b")
         time.sleep(0.2)
@@ -3317,6 +3349,8 @@ def _case_8_quit_during_hold(run, role, harness, adapter_class):
                               timeout=60)
         found = _say_id(out)
         claimed = team.until(lambda: found and _outcome(log, found, "operator") == ("sending", None), 60)
+        state_at_quit = team.state(team.operator)
+        held_at_quit = _outcome(log, found, "operator") if found else None
         start = time.monotonic()
         if team.sink is not None:                        # a real harness: its exit starts cat into a fresh file
             team.adapter.quit_keys_only(team.qa, team.operator, stop=team.sink.exists)
@@ -3337,7 +3371,8 @@ def _case_8_quit_during_hold(run, role, harness, adapter_class):
         after = sink().count(tok)
         recorder_alive = team.sink is None or team.get(team.operator)["state"] == "live"   # cat still reading
         final = _outcome(log, found, "operator") if found else None
-        missing = ("the send was not claimed and held" if not claimed else "the harness was not seen to exit"
+        missing = ("the send was not claimed and held" if not claimed else "the send was no longer held when the quit"
+                   " began" if (held_at_quit or ("",))[0] != "sending" else "the harness was not seen to exit"
                    if not exited else "the send was no longer held when the harness had exited"
                    if (held_at_exit or ("",))[0] != "sending" else "the sink stopped reading before the hold ended"
                    if not recorder_alive else None)
@@ -3348,7 +3383,8 @@ def _case_8_quit_during_hold(run, role, harness, adapter_class):
         run.row(8, "quit-during-hold", role, harness, "not_run" if missing else "measured",
                 "what reaches the pane after a quit during a held send", observed=observed,
                 proof={"id": int(found.group(1)) if found else None, "claimed": bool(claimed), "quit_s": quit_s,
-                       "held_at_exit": held_at_exit, "token_count_at_exit": at_exit, "token_count_after": after,
+                       "held_at_quit": held_at_quit, "held_at_exit": held_at_exit, "state_at_quit": state_at_quit,
+                       "token_count_at_exit": at_exit, "token_count_after": after,
                        "recorder_alive": recorder_alive,
                        "reached_after_exit": reached if not missing else None, "final": final,
                        "peer": peer}, reason=missing)

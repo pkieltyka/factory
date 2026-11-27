@@ -76,6 +76,9 @@ Claude Code and Codex may record per-directory trust for each QA scratch project
 | claude | `~/.claude.json` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-z9xj_6lf/work` |
 | claude | `~/.claude.json` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-z_13dk5z/work` |
 | claude | `~/.claude.json` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-zg88hg09/work` |
+| claude | `~/.claude.json` | `/tmp/factory-qa-173-takeover-3j54dOla/scratch/factory-qa-3zvo9ack/work` |
+| claude | `~/.claude.json` | `/tmp/factory-qa-173-takeover-3j54dOla/scratch/factory-qa-d_ochorb/work` |
+| claude | `~/.claude.json` | `/tmp/factory-qa-173-takeover-3j54dOla/scratch/factory-qa-lc12/hc-lc12-bn6ew0es/work/lc12-claude-46ecd3` |
 | claude | `~/.claude.json` | `/tmp/factory-qa-3ir867ml/work` |
 | claude | `~/.claude.json` | `/tmp/factory-qa-5jgxswui/work` |
 | claude | `~/.claude.json` | `/tmp/factory-qa-6cl5r4gy/work` |
@@ -88,6 +91,7 @@ Claude Code and Codex may record per-directory trust for each QA scratch project
 | claude | `~/.claude.json` | `/tmp/factory-qa-claude-probe-wvkf1gzb` |
 | claude | `~/.claude.json` | `/tmp/factory-qa-ec_u6smw/work` |
 | claude | `~/.claude.json` | `/tmp/factory-qa-eo0o8od7/work` |
+| claude | `~/.claude.json` | `/tmp/factory-qa-fqkf8pxw/work` |
 | claude | `~/.claude.json` | `/tmp/factory-qa-hmorlr71/work` |
 | claude | `~/.claude.json` | `/tmp/factory-qa-i82lw014/work` |
 | claude | `~/.claude.json` | `/tmp/factory-qa-q69bqbx7/work` |
@@ -186,6 +190,9 @@ Claude Code and Codex may record per-directory trust for each QA scratch project
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-z9xj_6lf/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-z_13dk5z/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-zg88hg09/work` |
+| codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-takeover-3j54dOla/scratch/factory-qa-3zvo9ack/work` |
+| codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-takeover-3j54dOla/scratch/factory-qa-d_ochorb/work` |
+| codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-takeover-3j54dOla/scratch/factory-qa-lc12/hc-lc12-bn6ew0es/work/lc12-codex-68f044` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-1w5n44a5/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-3h7u9bsk/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-3ir867ml/work` |
@@ -208,6 +215,7 @@ Claude Code and Codex may record per-directory trust for each QA scratch project
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-eo0o8od7/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-esww8t_5/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-fcschd99/work` |
+| codex | `~/.codex/config.toml` | `/tmp/factory-qa-fqkf8pxw/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-hmorlr71/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-i5lz01ut/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-i82lw014/work` |

@@ -104,10 +104,10 @@ Verified facts about `hc` and `rodeo`, collected on isolated private cores (neve
   - Consequence: neither directory/continue route can be enabled. pi's case 6 resume fails at 670dd76, consistent with this (see pi.md).
 - **LC-7, agy 1.5.18: not counted.** The baseline showed the trust dialog, and the session-only `--settings` suppressed it. But the run used the owner's real settings roots, and agy wrote under `~/.gemini/antigravity-cli/` during it.
   - phase_8.md §4 requires mutable trust state to be isolated before launch, so this LC-7 run does not count. It is to be rerun under an isolated HOME overlay.
-- **LC-12, Claude Code, Codex and agy: partial.**
-  - Claude Code: the child and the parent both ran, and the child's ID equals the parent's.
-  - Codex: both ran, but the child's ID differs, so `session_follow = false` stays.
-  - agy: neither the child nor the parent ran.
+- **LC-12, Claude Code, Codex and agy: pass** at db85120 on the real HOME (@lead-dev, lc12-db85120.json). Each harness started to idle, and its parent and an actual child each ran with the parent's ID present.
+  - Claude Code: the child's ID equals the parent's. That is the positive evidence `session_follow` needs. Turning it on changes what a resume opens after a switch, so it is left false here for @operator to decide (with a member-switch rerun on that build).
+  - Codex and agy: the child's ID differs, so `session_follow = false` stays.
+  - The stat-only check found no changed agy settings or trust file. The earlier partial run (agy's child and parent never ran, at 325223a) is superseded.
 
 ## Cross cases (Phase 8, phase_8.md §4)
 
