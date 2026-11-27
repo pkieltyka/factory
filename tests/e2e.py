@@ -1397,7 +1397,7 @@ def run_real(args, live):
                 if result["status"] == "running":
                     result.update(status="fail", detail="the runner ended the run before a verdict")
                 checkpoint(judge(evidence))
-                if tripwire_verdict(result, team.qa.tripwire_runs()):
+                if installed_verdict(result, team.qa.installed_seen([team.dir])):
                     report.checkpoint()
                 try:
                     code, out = team.call("down", timeout=60)
@@ -1411,13 +1411,13 @@ def run_real(args, live):
     return result
 
 
-def tripwire_verdict(result, runs):
-    """The owner's rule: a run in which a QA terminal ran an installed Factory skill fails, whatever else it
-    showed. Returns whether it did."""
-    if not runs:
+def installed_verdict(result, seen):
+    """The owner's rule: a run in which an installed Factory script appeared in a QA terminal or transcript fails,
+    whatever else it showed. Returns whether it did."""
+    if not seen:
         return False
-    result.update(status="fail", detail=f"a QA terminal ran an installed Factory skill: {runs}",
-                  installed_factory_runs=runs)
+    result.update(status="fail", detail=f"an installed Factory script appeared in a QA terminal or transcript: {seen}",
+                  installed_factory_seen=seen)
     return True
 
 

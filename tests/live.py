@@ -171,19 +171,6 @@ def qa_environ(environ):
 
 
 HERDR_STUB = "#!/bin/sh\necho 'herdr is not available in a Factory qualification run' >&2\nexit 1\n"
-TRIPWIRE_MARK = ".factory-qa-tripwire"
-TRIPWIRE_SKILL = ("---\nname: factory\ndescription: Not available in this qualification session. Use only the command"
-                  " FACTORY.md names.\n---\n\nNot available here: use only the command FACTORY.md names.\n")
-TRIPWIRE_SCRIPT = '''#!/usr/bin/env python3
-"""An installed Factory skill, hidden in a qualification run: a run of it is recorded and refused."""
-import json, os, sys, time
-with open({log!r}, "a") as out:
-    out.write(json.dumps({{"argv": sys.argv[1:4], "cwd": os.getcwd(), "at": time.time()}}) + "\\n")
-sys.stderr.write("The installed Factory skill is not available in a qualification run.\\n")
-sys.exit(3)
-'''
-
-
 def installed_factory_skills(home, exclude=(), depth=4):
     """[(path, resolved folder)] of every Factory skill installed under home's dot-directories: a folder named
     factory in a skills folder, holding SKILL.md or scripts/factory.py, found by a scan at run start so a later
@@ -213,27 +200,52 @@ def installed_factory_skills(home, exclude=(), depth=4):
     return found
 
 
-def make_tripwire(folder, log):
-    """What a protected core's terminals find in place of an installed Factory skill: a skill that says to use
-    FACTORY.md's command, and a scripts/factory.py that records its own run in log and refuses."""
-    (folder / "scripts").mkdir(parents=True)
-    (folder / "SKILL.md").write_text(TRIPWIRE_SKILL)
-    (folder / TRIPWIRE_MARK).write_text("")
-    script = folder / "scripts" / "factory.py"
-    script.write_text(TRIPWIRE_SCRIPT.format(log=str(log)))
-    script.chmod(0o755)
-    return folder
+def installed_needles(installed):
+    """The whitespace-free forms of each installed copy's scripts/factory.py: its path, its target, with ~."""
+    home, needles = os.path.expanduser("~"), set()
+    for path, resolved in installed:
+        for folder in (path, resolved):
+            script = f"{folder}/scripts/factory.py"
+            needles.add(script)
+            if script.startswith(home + "/"):
+                needles.add("~" + script[len(home):])
+    return sorted("".join(n.split()) for n in needles)
+
+
+def qa_transcripts(roots):
+    """Claude Code and Codex session files of conversations whose working directory is under one of roots, read
+    from their normal places (never anything else there)."""
+    roots = [str(pathlib.Path(r)) for r in roots]
+    if not roots:
+        return []
+    found = []
+    projects = pathlib.Path(os.path.expanduser("~/.claude/projects"))
+    prefixes = [re.sub(r"[^A-Za-z0-9]", "-", r) for r in roots]
+    try:
+        found += [f for d in projects.iterdir() if any(d.name.startswith(p) for p in prefixes)
+                  for f in d.glob("*.jsonl")]
+    except OSError:
+        pass
+    sessions = pathlib.Path(os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")) / "sessions"
+    for day in {time.strftime("%Y/%m/%d", time.localtime(time.time() - s)) for s in (0, 86400)}:
+        for f in sorted((sessions / day).glob("rollout-*.jsonl")) if (sessions / day).is_dir() else []:
+            try:
+                with f.open() as stream:
+                    cwd = (json.loads(stream.readline()).get("payload") or {}).get("cwd") or ""
+            except (OSError, ValueError):
+                continue
+            if any(cwd == r or cwd.startswith(r + "/") for r in roots):
+                found.append(f)
+    return found
 
 
 class Core:
     """A private hc core in its own temporary directory."""
 
-    def __init__(self, tag, config="", extra_env=None, hide=(), protect=False):
-        """protect: a core for real harnesses under the owner's rule that no QA terminal may find or run an
-        installed Factory skill. Every installed copy is scanned for, and the server runs under bwrap with a
-        tripwire bound over each one; a herdr stub that always fails is first on PATH; the tripwire is proved
-        from inside before anything starts, and the core is NotRun when it cannot be (no fallback)."""
-        self.hide = list(hide)      # [(folder, over)]: bound read-only over each path for this core's terminals only
+    def __init__(self, tag, config="", extra_env=None, protect=False):
+        """protect: a core for real harnesses under the owner's rule that no QA run may use an installed Factory
+        skill (the owner's simpler approach): a herdr stub that always fails is first on PATH, the installed
+        copies are scanned for, and installed_seen() finds any trace of one afterwards."""
         self.dir = pathlib.Path(tempfile.mkdtemp(prefix=f"hc-{tag}-", dir=tempfile.gettempdir()))
         d = self.dir
         for sub in ("run", "state", "config/herdr-core", "home"):
@@ -241,20 +253,14 @@ class Core:
         os.chmod(d / "run", 0o700)
         if config:
             (d / "config/herdr-core/config.toml").write_text(config)
-        self.bin, self.tripwire_log, installed = None, None, []
+        self.bin, self.installed = None, []
         if protect:
-            self.bin, self.tripwire_log = d / "bin", d / "installed-factory-runs.jsonl"
+            self.bin = d / "bin"
             self.bin.mkdir()
             stub = self.bin / "herdr"
             stub.write_text(HERDR_STUB)
             stub.chmod(0o755)
-            installed = installed_factory_skills(os.path.expanduser("~"), exclude=(ROOT, d))
-            if installed and not shutil.which("bwrap"):
-                shutil.rmtree(d, ignore_errors=True)
-                raise NotRun("bwrap is needed to hide the installed Factory skill from the QA terminals")
-            if installed:
-                trip = make_tripwire(d / "installed-skill", self.tripwire_log)
-                self.hide += [(str(trip), over) for over in sorted({r for _, r in installed})]
+            self.installed = installed_factory_skills(os.path.expanduser("~"), exclude=(ROOT, d))
         env = qa_environ(os.environ)
         if self.bin is not None:
             env["PATH"] = f"{self.bin}:{env.get('PATH', '')}"
@@ -272,38 +278,36 @@ class Core:
         self.id = None
         try:
             self.start()
-            if installed:
-                self._check_hidden([p for p, _ in installed])
         except BaseException:
             self.stop()   # stops only a core whose id was verified; otherwise leaves the directory and says so
             raise
 
-    def _check_hidden(self, paths):
-        """Prove from a terminal of this core that each installed path shows the tripwire."""
-        ok = self.dir / "tripwire-checked"
-        test = " && ".join(f"test -e {shlex.quote(str(pathlib.Path(p) / TRIPWIRE_MARK))}" for p in paths)
-        self.rpc("terminal.run", {"argv": ["sh", "-c", f"{test} && : > {shlex.quote(str(ok))}"],
-                                  "cwd": str(self.dir), "env": {"PATH": os.environ.get("PATH", "")},
-                                  "no_parent": True, "no_notify": True})
-        deadline = time.monotonic() + 15
-        while not ok.exists() and time.monotonic() < deadline:
-            time.sleep(0.2)
-        if not ok.exists():
-            raise NotRun("an installed Factory skill is still visible inside the QA core: "
-                         + ", ".join(p.replace(os.path.expanduser("~"), "~", 1) for p in paths))
-
-    def tripwire_runs(self):
-        """Bounded records of every run of an installed Factory skill's script from this core's terminals."""
-        if self.tripwire_log is None or not self.tripwire_log.exists():
+    def installed_seen(self, roots=()):
+        """The owner's after-the-fact check: every installed factory.py path that appears in the screen of one of
+        this core's terminals, or in a Claude Code or Codex transcript whose working directory is under one of
+        roots. Bounded; [] for an unprotected core."""
+        needles = installed_needles(self.installed)
+        if not needles:
             return []
-        return [_bounded(line) for line in self.tripwire_log.read_text().splitlines()[:5] if line.strip()]
+        hits = set()
+        for record in self.rpc("terminal.list", {"all": True})["terminals"]:
+            try:
+                text = self.rpc("terminal.read", {"terminal": record["address"], "lines": 0}).get("text", "")
+            except (HcError, HcDown):
+                continue
+            flat = "".join(text.split())                 # a screen wraps long paths
+            hits.update(f"{record['address']} screen: {n}" for n in needles if n in flat)
+        for path in qa_transcripts(roots):
+            try:
+                flat = "".join(path.read_text(errors="replace").split())
+            except OSError:
+                continue
+            hits.update(f"{path.name}: {n}" for n in needles if n in flat)
+        return [_bounded(h) for h in sorted(hits)[:10]]
 
     def start(self):
-        argv = [HC, "server", "start", "--json"]
-        if self.hide:   # the server, and so every terminal it starts, in a mount namespace with these bound over
-            argv = [shutil.which("bwrap") or "bwrap", "--dev-bind", "/", "/",
-                    *(arg for folder, over in self.hide for arg in ("--ro-bind", folder, over)), "--", *argv]
-        out = subprocess.run(argv, env=self.start_env, capture_output=True, text=True, timeout=30)
+        out = subprocess.run([HC, "server", "start", "--json"], env=self.start_env,
+                             capture_output=True, text=True, timeout=30)
         if out.returncode:
             raise RuntimeError(f"hc server start failed: {out.stderr.strip() or out.stdout.strip()}")
         started = json.loads(out.stdout)["core"]["id"]
@@ -1267,12 +1271,12 @@ def harness_check(name, harnesses, body):
             try:
                 body(qa, result)
             finally:
-                runs = qa.tripwire_runs()
-                if runs:              # the owner's rule was broken: the check fails whatever it observed
-                    result.update(result="fail: a QA terminal ran an installed Factory skill",
-                                  installed_factory_runs=runs)
+                seen = qa.installed_seen([qa.dir])
+                if seen:              # the owner's rule was broken: the check fails whatever it observed
+                    result.update(result="fail: an installed Factory script appeared in a QA terminal or transcript",
+                                  installed_factory_seen=seen)
     except NotRun as why:
-        if "installed_factory_runs" not in result:
+        if "installed_factory_seen" not in result:
             result["result"] = f"not run: {why}"
     return result
 
@@ -2308,7 +2312,10 @@ class QATeam:
         return self.dir / f"receipt-{name}-{random.randrange(16 ** 6):06x}.txt"
 
     def close(self):
-        EVIDENCE.setdefault("installed_factory_runs", []).extend(self.qa.tripwire_runs())
+        try:
+            EVIDENCE.setdefault("installed_factory_seen", []).extend(self.qa.installed_seen([self.dir]))
+        except (OSError, HcError, HcDown) as error:
+            EVIDENCE.setdefault("installed_factory_seen", []).append(f"the check could not run: {error}"[:BOUND])
         if self.agy_roots:
             home = os.path.expanduser("~")
             touched = [p for p in changed(self.agy_before, stamps(self.agy_roots))
@@ -4420,12 +4427,13 @@ def _file_evidence(run, first_row):
     """Attach the case's team diagnostics to each of its rows (bounded; for a team per trial, in order). A settings
     file agy changed during the case withholds its passes: the stamp cannot tell which process wrote it."""
     touched = sorted(set(EVIDENCE.get("settings_changed") or []))
-    installed = EVIDENCE.get("installed_factory_runs") or []
+    installed = EVIDENCE.get("installed_factory_seen") or []
     for row in run.data["rows"][first_row:]:
         row["diagnostics"] = EVIDENCE["teams"]
         if installed:          # the owner's rule was broken: the case fails whatever it observed
-            row.update(status="fail", reason=_bounded(f"a QA terminal ran an installed Factory skill: {installed}"))
-            row["installed_factory_runs"] = installed
+            row.update(status="fail", reason=_bounded("an installed Factory script appeared in a QA terminal or"
+                                                      f" transcript: {installed}"))
+            row["installed_factory_seen"] = installed
         if touched and row["status"] == "pass":
             row.update(status="not_run", reason=_bounded(f"a settings file changed during the case: {touched}"))
         if touched:
@@ -4471,7 +4479,7 @@ def qualify(target, role=None, cases=None, json_path=None, fixture=False):
     EVIDENCE["rodeo_tabs"] = None                       # probed once, by the first case that uses rodeo
     if target == "cross":
         for name in CROSS_CASES:
-            EVIDENCE.update(teams=[], tokens=[], settings_changed=[], installed_factory_runs=[])
+            EVIDENCE.update(teams=[], tokens=[], settings_changed=[], installed_factory_seen=[])
             first_row = len(run.data["rows"])
             function = CROSS_FUNCTIONS.get(name)
             try:
@@ -4506,7 +4514,7 @@ def qualify(target, role=None, cases=None, json_path=None, fixture=False):
             for name, measured in subcases(case, role_):
                 run.row(case, name, role_, harness, "not_run", f"case {case} {name}", reason="not built yet")
         else:
-            EVIDENCE.update(teams=[], tokens=[], settings_changed=[], installed_factory_runs=[])
+            EVIDENCE.update(teams=[], tokens=[], settings_changed=[], installed_factory_seen=[])
             first_row = len(run.data["rows"])
             try:
                 function(run, role_, harness, adapter_class)
