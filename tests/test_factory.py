@@ -1977,7 +1977,7 @@ class TeamCommandTests(TeamCase):
             self.assertEqual(shlex.split(factory.factory_command(*args))[-2:], ["--cwd", root])   # the pending-inbox
         self.assertNotIn("--cwd", factory.factory_command("say", "operator"))    # and trust hints; say has none
         with patch.object(factory, "TEAM_ROOT", None):     # before any checkout is verified (resolve_team, team.json)
-            self.assertTrue(factory.factory_command("up").endswith(" up --cwd <the team's checkout>"))
+            self.assertTrue(factory.factory_command("up").endswith(" up --cwd <team checkout>"))
 
     def test_up_labels_are_written_after_doc_set(self):
         term = self.terminal("lead-dev")[0]
@@ -2955,6 +2955,7 @@ class MemberNoteTests(TeamCase):
             spec = importlib.util.spec_from_file_location("factory_copy", copy)
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
+            module.TEAM_ROOT = pathlib.Path(tmp) / "my project"          # a team checkout with a space as well
             keeper = types.SimpleNamespace(box=types.SimpleNamespace(last_to=lambda name, sender=None: None),
                                            cfg=types.SimpleNamespace(operator={"name": "operator"}))
             view = types.SimpleNamespace(state=lambda name: "gone")
@@ -2962,7 +2963,8 @@ class MemberNoteTests(TeamCase):
             meta, text = module.Keeper._episode(keeper, "lead-dev", record, None, view)
             self.assertEqual(meta["what"], "exit")
             line = text.split(" Run: ", 1)[1]
-            self.assertEqual(shlex.split(line), ["python3", str(copy.resolve()), "up", "lead-dev"])
+            self.assertEqual(shlex.split(line), ["python3", str(copy.resolve()), "up", "lead-dev", "--cwd",
+                                                 str(module.TEAM_ROOT)])
             self.assertIn(shlex.quote(str(copy.resolve())), line)
 
     def test_nothing_for_unbriefed_stopping_or_unwatched_members(self):

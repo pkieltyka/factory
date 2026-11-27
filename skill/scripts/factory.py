@@ -55,7 +55,7 @@ def factory_command(*args):
     if not args or args[0] not in TEAM_COMMANDS:
         return line
     if TEAM_ROOT is None:     # no checkout verified yet: a placeholder, never the caller's directory (@lead-dev)
-        return line + " --cwd <the team's checkout>"
+        return line + " --cwd <team checkout>"
     return line + " " + shlex.join(["--cwd", str(TEAM_ROOT)])
 SKILL = SCRIPT.parent.parent
 TABLE = tomllib.loads((SKILL / "harnesses.toml").read_text())  # harness -> its data
