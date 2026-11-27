@@ -31,6 +31,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import traceback
 import time
 import uuid
 
@@ -232,6 +233,37 @@ def installed_needles(installed):
             if script.startswith(home + "/"):
                 needles.add("~" + script[len(home):])
     return sorted("".join(n.split()) for n in needles)
+
+
+def tool_calls(text):
+    """[(call text, its result text or None)] for every tool call in a Claude Code or Codex transcript (JSONL),
+    paired by the call's own ID: Claude Code's tool_use / tool_result, Codex's function_call or custom_tool_call /
+    its _output."""
+    calls, results = {}, {}
+
+    def walk(node):
+        if isinstance(node, dict):
+            kind = node.get("type")
+            if kind == "tool_use" and node.get("id"):
+                calls[node["id"]] = json.dumps(node.get("input"))
+            elif kind in ("function_call", "custom_tool_call", "local_shell_call") and node.get("call_id"):
+                calls[node["call_id"]] = json.dumps(node.get("arguments") or node.get("input") or node.get("action"))
+            elif kind == "tool_result" and node.get("tool_use_id"):
+                results[node["tool_use_id"]] = json.dumps(node.get("content"))
+            elif kind in ("function_call_output", "custom_tool_call_output") and node.get("call_id"):
+                results[node["call_id"]] = json.dumps(node.get("output"))
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+    for line in text.splitlines():
+        try:
+            walk(json.loads(line))
+        except ValueError:
+            continue
+    return [(json.loads(call) if isinstance(json.loads(call), str) else call, results.get(ident))
+            for ident, call in calls.items()]
 
 
 def qa_transcripts(roots, labelled=False):
@@ -2080,7 +2112,7 @@ class FixtureAdapter:
     def act_alone_each(self, commands):
         return "\n".join(self.act_alone(c) for c in commands)
 
-    def alone_output(self, command):
+    def alone_output(self, command, others=(), prompt=None):
         out = self.team.dir / f"alone-{hashlib.sha1(command.encode()).hexdigest()[:12]}.txt"
         return out.read_text() if out.exists() else None
 
@@ -2161,16 +2193,20 @@ class RealAdapter(FixtureAdapter):
                 f" tool call, exactly as written, with nothing added before or after it: {listed} Then reply with"
                 " the single word done.")
 
-    def alone_output(self, command):
-        """What the command printed, as the harness's own transcript of this run holds it (Claude Code and Codex),
-        else as the operator's screen shows it: the text after the command's last appearance, bounded."""
-        texts = [p.read_text(errors="replace") for p in qa_transcripts([self.team.dir])]
-        texts.append(self.team.qa.rpc("terminal.read", {"terminal": self.team.operator, "lines": 0}).get("text", ""))
-        for text in texts:
-            at = text.rfind(command)
-            if at >= 0:
-                return text[at + len(command):at + len(command) + 4000]
-        return None
+    def alone_output(self, command, others=(), prompt=None):
+        """What the command printed, from an actual tool call in the operator's own transcript of this run (Claude
+        Code and Codex; the one holding the owner's prompt): the result paired with the call that ran this command
+        and none of the others. None when no such call and result exist, so the command stays unproved: no screen,
+        prose or prompt text counts (@architect-2)."""
+        found = None
+        for path in qa_transcripts([self.team.dir]):
+            text = path.read_text(errors="replace")
+            if prompt and prompt not in text and json.dumps(prompt)[1:-1] not in text:
+                continue                                  # another conversation (a member's)
+            for call, output in tool_calls(text):
+                if command in call and not any(o in call for o in others) and output is not None:
+                    found = output
+        return found
 
     def blocked_request(self):
         return ("Before doing anything else, ask me one multiple-choice question with your question tool, and"
@@ -2534,6 +2570,7 @@ class Qualification:
         if reason:
             row["reason"] = _bounded(reason)
         self.data["rows"].append(row)
+        self.checkpoint()                 # on disk as soon as judged: a later crash cannot lose it (@operator)
         return row
 
     def checkpoint(self):
@@ -2791,6 +2828,14 @@ def _operator_commands(run, team, harness, peer):
     view.focused_terminal = team.operator
     start = time.monotonic()
     view.paste(prompt)
+    # up's own effect first: the member's terminal (the log exists only once up has run, @architect-2)
+    member = team.until(lambda: team.member("lead-dev"), 900)
+    if not member:
+        run.row(2, "operator-commands", "operator", harness, "fail",
+                "the owner's first prompt has the operator run up, say, status and inbox --for itself",
+                proof={"up_member": None, "peer": peer}, elapsed=time.monotonic() - start,
+                reason="no @lead-dev terminal within 900 s of the owner's prompt: up did not run or did not finish")
+        return True
     log = factory_log(team)
 
     def said_by_operator():          # the committed say in the log, from the operator to the member, this text
@@ -2802,12 +2847,13 @@ def _operator_commands(run, team, harness, peer):
     team.until(lambda: team.state(team.operator) in READY, 300)      # its turn over: status and inbox have run
     time.sleep(3)
     member = team.member("lead-dev")
-    box = log.read_box()[1] if member else None
+    box = log.read_box()[1]
     briefed = bool(box) and member in box.briefed()
     say_id = said_by_operator()
     say_outcome = list(_outcome(log, say_id, "lead-dev")) if say_id else None
     to_operator = sorted({ident for (ident, to) in box.outcomes if to == "operator"}) if box else []
-    full = {name: team.adapter.alone_output(commands[name]) for name in ("status", "inbox")}
+    full = {name: team.adapter.alone_output(commands[name], [c for n, c in commands.items() if n != name], prompt)
+            for name in ("status", "inbox")}
     listed = sorted({int(n) for n in re.findall(r"\[Message (\d+) ", full["inbox"] or "")})
     inbox_ok = bool(full["inbox"]) and set(listed) <= set(to_operator) and (
         bool(listed) or "no messages for @operator" in full["inbox"])
@@ -2815,7 +2861,7 @@ def _operator_commands(run, team, harness, peer):
     proof = {"member_acted": reached, "member_briefed": briefed, "say_id": say_id, "say_outcome": say_outcome,
              "status_names_member": status_ok, "inbox_ids": listed, "operator_ids_in_log": to_operator,
              "inbox_seen": full["inbox"] is not None, "status_seen": full["status"] is not None, "peer": peer,
-             "observed_in": "Factory's log and the commands' own output (transcript or screen), not shell receipts",
+             "observed_in": "Factory's log and each command's own tool result in the operator's transcript",
              "prompted_by": "the owner's paste and Enter through rodeo into a fresh operator (prefix+1)"}
     ok = reached and briefed and bool(say_id) and (say_outcome or [""])[0] == "delivered" and status_ok and inbox_ok
     run.row(2, "operator-commands", "operator", harness, "pass" if ok else "fail",
@@ -3684,16 +3730,14 @@ def case_3(run, role, harness, adapter_class):
         report = team.dir / "report.md"
         report.write_text(team.adapter.act_append(receipt, tok))
         member = team.member("lead-dev")
-        said = team.receipt("member-say")
         command = f"python3 {shlex.quote(str(team.script))} say operator --file {shlex.quote(str(report))}"
-        team.send(member, team.adapter.act_run(said, command))
+        team.send(member, team.adapter.act_alone(command))       # alone, as members say (not a compound line)
         log = factory_log(team)
         claimed = team.until(lambda: next((ident for (ident, to), rec in log.read_box()[1].outcomes.items()
                                            if rec["o"] == "sending" and to == "operator"), None), 300)
         if not claimed:                                 # the member never said: nothing about the draft hold is shown
             run.row(3, "draft", role, harness, "not_run", "a report held by the owner's draft",
-                    proof={"member_say": said.read_text().strip() if said.exists() else None,
-                           "member_state": team.state(member), "peer": peer},
+                    proof={"member_state": team.state(member), "peer": peer},
                     reason="the member's say was never claimed for the operator within 300 s")
             view.keys("enter")
             if role == "operator":
@@ -3760,7 +3804,7 @@ def _case_3_draft_cleared(run, team, harness, view, peer):
             "a report held by a draft the owner then deletes without sending: the report is acted on once, the"
             " deleted draft does nothing, and the next sent line has no stray characters",
             observed=f"report acted on {released_after} s after the draft was deleted" if acted else None,
-            proof={"report_id": int(found.group(1)) if found else None, "claimed": bool(claimed),
+            proof={"report_id": found, "claimed": bool(claimed),
                    "held_past_8s": held, "keyboard": f"backspace x{len(draft)}",
                    "released_after_clear_s": released_after,
                    "report_count": count, "cleared_draft_acted": not no_draft_action, "next_line_exact": exact,
@@ -4286,15 +4330,13 @@ def _upgrade(team, peer):
              "effect_order": [{tok1: "held", tok2: "queued"}[t] for t in lines if t in (tok1, tok2)],
              "histories": {"held": history(held), "queued": history(queued_id)},
              "deliveries": {"held": delivery(held), "queued": delivery(queued_id)},
-             "operator_seen": seen, "between_turns": between,
+             "operator_seen": seen, "between_turns": between, "operator": team.operator,
              "draft_exact": draft_receipt.exists() and draft_receipt.read_text() == literal + "\n", "peer": peer}
     ok = (old != new and keepers == [keeper] and bool(held) and bool(draining) and still_held and bool(finished)
           and first_outcome.get("o") == "delivered" and queued_while_draining and bool(reexeced) and bool(acted)
           and claimed_under.get("version") == new and restart_seen and not exec_failed
           and proof["new_message_count"] == 1 and (proof["queued_final"] or ("",))[0] == "delivered"
           and proof["held_message_count"] == 1 and proof["effect_order"] == ["held", "queued"])
-    if between:                           # neither typed into the owner's turn: each started its own (keeper.md §9)
-        ok = ok and judge_between_upgrade(proof)
     return ok, proof
 
 
@@ -4304,11 +4346,15 @@ def judge_between_upgrade(p):
     message the guard refused shows the requeue (sending, then queued busy) in its history."""
     seen, histories, deliveries = p.get("operator_seen") or {}, p.get("histories") or {}, p.get("deliveries") or {}
     held = histories.get("held") or []
-    requeue_ok = all(held[i + 1] == ["queued", "busy"] for i, h in enumerate(held[:-1])
-                     if h[0] == "sending" and held[i + 1][0] == "queued")
+    # positive evidence of the overlap: the guard refused the held send in the owner's turn (sending, then
+    # queued busy), and it was sent again afterwards (@architect-2: a sending-then-delivered history proves nothing)
+    requeued = any(a == ["sending", None] and b == ["queued", "busy"] for a, b in zip(held, held[1:]))
+    release = (seen.get("release") or {}).get("turn")
+    after = all(d.get("o") == "delivered" and d.get("started") is True and d.get("term") == p.get("operator")
+                and isinstance(d.get("turn"), int) and isinstance(release, int) and d["turn"] > release
+                for d in deliveries.values())
     return bool(p.get("between_turns") and any(_app_selects(s.get("app")) for s in seen.values())
-                and all(d.get("o") == "delivered" and d.get("started") is True for d in deliveries.values())
-                and len(deliveries) == 2 and requeue_ok and p.get("held_message_count") == 1
+                and len(deliveries) == 2 and after and requeued and p.get("held_message_count") == 1
                 and p.get("new_message_count") == 1 and p.get("effect_order") == ["held", "queued"])
 
 
@@ -4387,10 +4433,18 @@ def _case_7_upgrade(run, role, harness, adapter_class):
         if not _up(team, run, 7, role, harness, ["upgrade"]):
             return
         ok, proof = _upgrade(team, peer)
-        run.row(7, "upgrade", role, harness, "pass" if ok else "fail",
+        status, reason = ("pass", None) if ok else ("fail", "see proof")
+        if ok and proof.get("between_turns") and not judge_between_upgrade(proof):
+            # a between-turns operator (keeper.md §9) must show the overlap; one that never came is not run
+            held = (proof.get("histories") or {}).get("held") or []
+            requeued = any(a == ["sending", None] and b == ["queued", "busy"] for a, b in zip(held, held[1:]))
+            status, reason = (("fail", "see proof: a message reached the owner's turn") if requeued else
+                              ("not_run", "the owner's turn never overlapped the held send (no busy requeue):"
+                                          " between-turns delivery was not exercised"))
+        run.row(7, "upgrade", role, harness, status,
                 "a new Factory version under a live keeper while this profile works: the held send finishes, the"
                 " keeper restarts in its pane, and the next message is delivered once by the new image",
-                proof=proof, reason=None if ok else "see proof")
+                proof=proof, reason=reason)
 
 def _second_team(team, name="b"):
     """A second checkout on the same QA core, with the same member names and its own fake operator: (work, operator,
@@ -4731,12 +4785,14 @@ def qualify(target, role=None, cases=None, json_path=None, fixture=False):
                     if not any(r["subcase"] == name and r["case"] == case and r["role"] == role_
                                and r["harness"] == harness for r in run.data["rows"][first_row:]):
                         run.row(case, name, role_, harness, "not_run", f"case {case} {name}", reason=str(why))
-            except (RuntimeError, HcError, HcDown, OSError, subprocess.SubprocessError) as error:
+            except Exception as error:            # any driver stop: its rows say so, later cases still run
+                where = traceback.extract_tb(error.__traceback__)[-1]
                 for name, _ in subcases(case, role_):
                     if not any(r["subcase"] == name and r["case"] == case and r["role"] == role_
                                for r in run.data["rows"][first_row:]):
                         run.row(case, name, role_, harness, "not_run", f"case {case} {name}",
-                                reason=f"the driver stopped: {type(error).__name__}: {error}")
+                                reason=f"the driver stopped: {type(error).__name__}: {error}"
+                                       f" (tests/live.py:{where.lineno} {where.name})")
             _file_evidence(run, first_row)
         run.checkpoint()
     run.data["summary"] = run.summary(selected)

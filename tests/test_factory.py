@@ -6804,16 +6804,99 @@ class QualifyJudgeTests(unittest.TestCase):
                        {"app_selects_between_turns": False},
                        {"deliveries": {"second": mid["deliveries"]["second"]}}):
             self.assertFalse(live.judge_between_mid_turn({**mid, **broken}), broken)
-        up = {"between_turns": True, "operator_seen": {"release": {"app": "codex"}},
+        sent = {"o": "delivered", "started": True, "term": "t1", "turn": 4}
+        up = {"between_turns": True, "operator": "t1", "operator_seen": {"release": {"app": "codex", "turn": 3}},
               "histories": {"held": [["sending", None], ["queued", "busy"], ["sending", None], ["delivered", None]]},
-              "deliveries": {"held": {"o": "delivered", "started": True},
-                             "queued": {"o": "delivered", "started": True}},
+              "deliveries": {"held": sent, "queued": {**sent, "turn": 5}},
               "held_message_count": 1, "new_message_count": 1, "effect_order": ["held", "queued"]}
         self.assertTrue(live.judge_between_upgrade(up))
-        for broken in ({"deliveries": {**up["deliveries"], "held": {"o": "delivered", "started": False}}},
-                       {"effect_order": ["queued", "held"]}, {"operator_seen": {"release": {"app": "fake"}}},
-                       {"histories": {"held": [["sending", None], ["queued", "waiting"], ["delivered", None]]}}):
+        for broken in ({"deliveries": {**up["deliveries"], "held": {**sent, "started": False}}},
+                       {"deliveries": {**up["deliveries"], "held": {**sent, "turn": 3}}},     # typed into the owner's
+                       {"deliveries": {**up["deliveries"], "held": {**sent, "term": "t9"}}},
+                       {"effect_order": ["queued", "held"]}, {"operator_seen": {"release": {"app": "fake", "turn": 3}}},
+                       {"histories": {"held": [["sending", None], ["queued", "waiting"], ["delivered", None]]}},
+                       {"histories": {"held": [["sending", None], ["delivered", None]]}}):        # never requeued
             self.assertFalse(live.judge_between_upgrade({**up, **broken}), broken)
+
+    def test_command_output_counts_only_from_its_own_tool_call(self):
+        """@architect-2: a prompt or a plausible summary naming status and inbox is not their output; a call that
+        ran both is ambiguous; only a call of exactly that command, paired with its own result, counts."""
+        import live
+        status, inbox, up = "python3 /qa/f.py status", "python3 /qa/f.py inbox --for operator", "python3 /qa/f.py up"
+        prompt = f"run each: (1) {up} (2) {status} (3) {inbox}"
+        lines = [{"type": "user", "message": {"content": prompt}},
+                 {"type": "assistant", "message": {"content": [{"type": "text", "text":
+                  f"I ran {status} and {inbox}: @lead-dev is ready; no messages for @operator"}]}}]
+        home = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(patch.dict(os.environ, {"HOME": str(home), "CODEX_HOME": str(home / ".codex")}))
+        root = home / "qa"
+        project = home / ".claude" / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(root / "work"))
+        project.mkdir(parents=True)
+        transcript = project / "op.jsonl"
+
+        def write(extra):
+            transcript.write_text("\n".join(json.dumps(x) for x in lines + extra) + "\n")
+        adapter = live.RealAdapter.__new__(live.RealAdapter)
+        adapter.team = types.SimpleNamespace(dir=root)
+        write([])
+        self.assertIsNone(adapter.alone_output(status, [inbox, up], prompt))     # prose only: unproved
+        both = {"type": "tool_use", "id": "c1", "name": "Bash", "input": {"command": f"{status}; {inbox}"}}
+        write([{"type": "assistant", "message": {"content": [both]}},
+               {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "c1",
+                                                         "content": "@lead-dev idle\nno messages for @operator"}]}}])
+        self.assertIsNone(adapter.alone_output(status, [inbox, up], prompt))     # one call ran both: ambiguous
+        alone = {"type": "tool_use", "id": "c2", "name": "Bash", "input": {"command": status}}
+        write([{"type": "assistant", "message": {"content": [alone]}}])
+        self.assertIsNone(adapter.alone_output(status, [inbox, up], prompt))     # no result paired with it
+        write([{"type": "assistant", "message": {"content": [alone]}},
+               {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "c2",
+                                                         "content": "@lead-dev idle"}]}}])
+        self.assertIn("@lead-dev idle", adapter.alone_output(status, [inbox, up], prompt))
+        self.assertIsNone(adapter.alone_output(status, [inbox, up], "another conversation's prompt"))
+        codex = [{"type": "response_item", "payload": {"type": "function_call", "call_id": "x1", "name": "shell",
+                                                       "arguments": json.dumps({"cmd": inbox})}},
+                 {"type": "response_item", "payload": {"type": "function_call_output", "call_id": "x1",
+                                                       "output": "[Message 3 from @lead-dev]"}}]
+        self.assertEqual([(inbox in c, o is not None) for c, o in live.tool_calls(
+            "\n".join(json.dumps(x) for x in codex))], [(True, True)])
+
+    def test_a_driver_crash_in_a_case_keeps_its_judged_rows_and_runs_the_next(self):
+        """Codex operator case 3 at 9cf44d9: a stale match-object use raised after the draft row was judged, and
+        the run lost both. Each row is on disk once judged, and a driver stop marks only the rest not_run."""
+        import live
+        path = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory())) / "run.json"
+
+        def case_3(run, role, harness, adapter_class):
+            run.row(3, "draft", role, harness, "pass", "x")
+            self.assertEqual(json.loads(path.read_text())["rows"][0]["subcase"], "draft")   # on disk already
+            raise AttributeError("'int' object has no attribute 'group'")
+        with patch.dict(live.CASE_FUNCTIONS, {3: case_3, 5: lambda run, role, harness, a: run.row(
+                5, "blocked", role, harness, "pass", "x")}), patch.object(live, "_versions", return_value={}), \
+                contextlib.redirect_stderr(io.StringIO()):
+            data, code = live.qualify("codex", "operator", [3, 5], json_path=path, fixture=True)
+        rows = {(r["case"], r["subcase"]): r for r in data["rows"]}
+        self.assertEqual(rows[(3, "draft")]["status"], "pass")
+        self.assertEqual(rows[(3, "draft-cleared")]["status"], "not_run")
+        self.assertIn("AttributeError", rows[(3, "draft-cleared")]["reason"])
+        self.assertEqual(rows[(5, "blocked")]["status"], "pass")
+
+    def test_operator_commands_reads_the_log_only_after_up_made_the_member(self):
+        """@architect-2: the log does not exist until up runs; a slow or failed up is a reasoned row."""
+        import live
+        run = live.Qualification("real")
+        view = types.SimpleNamespace(keys=lambda *k: None, paste=lambda text: None, focused_terminal=None)
+        team = types.SimpleNamespace(script=pathlib.Path("/qa/f.py"), receipt=lambda name: pathlib.Path("/qa/r"),
+                                     adapter=types.SimpleNamespace(act_append=lambda p, t: f"append {t}",
+                                                                   act_alone_each=lambda c: "run each"),
+                                     operator="t1", member=lambda name: None, until=lambda predicate, timeout: None)
+        with patch.object(live, "_operator_start", return_value=True), \
+                patch.object(live, "_rodeo", return_value=view), \
+                patch.object(live, "factory_log", side_effect=AssertionError("read before up")), \
+                patch.object(live.time, "sleep"):
+            self.assertTrue(live._operator_commands(run, team, "claude", "codex"))
+        row = run.data["rows"][0]
+        self.assertEqual((row["subcase"], row["status"]), ("operator-commands", "fail"))
+        self.assertIn("up did not run or did not finish", row["reason"])
 
     def test_the_report_shows_an_old_codex_operator_steering_pass_unproved(self):
         import live
