@@ -238,7 +238,7 @@ def approval(ticket, messages):
                 or not names_item(msg, ticket.item) or not ordered(msg.delivered, ticket.integrated)):
             continue
         verdict = msg.text.lower().translate(str.maketrans("", "", "*`_"))
-        if (re.search(r"\bstatus\s*:\s*approve\b(?![-/])", verdict)
+        if (re.search(r"\bstatus\s*:\s*approved?\b(?![-/])", verdict)
                 and not re.search(r"\bchanges\s+required\b", verdict)
                 and re.search(rf"\b{ticket.revision}\b", verdict)):
             return msg

@@ -7300,10 +7300,11 @@ class E2EJudgeTests(unittest.TestCase):
 
     def test_reviewer_can_send_a_formatted_approval_to_the_developer(self):
         sample = self.normal()
-        verdict = replace(sample.messages[6], recipient="lead-dev",
-                          text=f"- **Status:** `approve` for item `(1)`. The reviewed commit is `{self.revision}`.")
-        messages = (*sample.messages[:6], verdict, *sample.messages[7:])
-        self.assertEqual(self.status(replace(sample, messages=messages), "reviewed", "(1)"), "pass")
+        for status in ("approve", "approved"):
+            verdict = replace(sample.messages[6], recipient="lead-dev",
+                              text=f"- **Status:** `{status}` for item `(1)`. The reviewed commit is `{self.revision}`.")
+            messages = (*sample.messages[:6], verdict, *sample.messages[7:])
+            self.assertEqual(self.status(replace(sample, messages=messages), "reviewed", "(1)"), "pass")
 
     def test_run_rows_reject_direct_code_missing_ci_extra_input_and_wrong_build(self):
         sample = self.normal()
