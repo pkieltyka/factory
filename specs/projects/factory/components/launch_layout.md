@@ -111,7 +111,7 @@ Other argv changes from v1: for `guarded` Codex `--add-dir <state>` replaces the
 | codex or agy, fresh | `how: "new"`, `value: null` |
 | any other resumed launch | none: the newest entry already names the conversation |
 
-Inside the lock, `launch_entry` appends only when the newest entry for the member is **not for this terminal**. So:
+Inside the lock, `launch_entry` appends unless the newest entry for the member is for this terminal and is an `env` entry `say` made, the same entry, or anything at all when the new one is `new`. A delivered ID or folder therefore replaces the terminal's own `new`, and nothing replaces what `say` recorded. So:
 
 - a ready line that arrived first has already recorded the real ID for this terminal, and `up`'s later fallback never replaces it;
 - a successful fresh launch always ends with an entry for the new terminal, so the previous launch's conversation is no longer the newest. Codex in conversation A, `up --fresh` gives B, `down` before B has said anything: the newest entry is `new` with no value, and the next `up` starts fresh with the notice. It does not reopen A.
