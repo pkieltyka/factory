@@ -3256,18 +3256,30 @@ def _case_8_quit_during_hold(run, role, harness, adapter_class):
         claimed = team.until(lambda: found and _outcome(log, found, "operator") == ("sending", None), 60)
         start = time.monotonic()
         team.adapter.quit(team.qa, team.operator)
-        quit_s = round(time.monotonic() - start, 1) if team.until(lambda: team.state(team.operator) is None, 60) \
-            else None
+        exited = team.until(lambda: team.state(team.operator) is None, 60)
+        quit_s = round(time.monotonic() - start, 1) if exited else None
+        held_at_exit = _outcome(log, found, "operator") if found else None
+
+        def sink():
+            return "".join(team.qa.rpc("terminal.read", {"terminal": team.operator, "lines": 0}).get("text", "")
+                           .split())
+        at_exit = sink().count(tok)                      # what was already on screen when the harness had gone
         time.sleep(75)                                   # past draft_wait: the hold has ended either way
-        sink = "".join(team.qa.rpc("terminal.read", {"terminal": team.operator, "lines": 0}).get("text", "").split())
-        observed = (f"after the quit ({quit_s} s), the held token {'reached' if tok in sink else 'did not reach'} the"
-                    f" pane's shell; the send ended {(_outcome(log, found, 'operator') or ('?',))[0]}")
-        status = "measured" if claimed else "not_run"
-        run.row(8, "quit-during-hold", role, harness, status, "what reaches the pane after a quit during a held send",
-                observed=observed if claimed else None,
+        after = sink().count(tok)
+        final = _outcome(log, found, "operator") if found else None
+        missing = ("the send was not claimed and held" if not claimed else "the harness was not seen to exit"
+                   if not exited else "the send was no longer held when the harness had exited"
+                   if (held_at_exit or ("",))[0] != "sending" else None)
+        reached = after > at_exit
+        observed = None if missing else (
+            f"the harness exited after {quit_s} s with the send held; afterwards the token"
+            f" {'reached' if reached else 'did not reach'} the pane's sink; the send ended {(final or ('?',))[0]}")
+        run.row(8, "quit-during-hold", role, harness, "not_run" if missing else "measured",
+                "what reaches the pane after a quit during a held send", observed=observed,
                 proof={"id": int(found.group(1)) if found else None, "claimed": bool(claimed), "quit_s": quit_s,
-                       "token_in_sink": tok in sink, "final": _outcome(log, found, "operator") if found else None,
-                       "peer": peer}, reason=None if claimed else "the send was not claimed and held")
+                       "held_at_exit": held_at_exit, "token_count_at_exit": at_exit, "token_count_after": after,
+                       "reached_after_exit": reached if not missing else None, "final": final,
+                       "peer": peer}, reason=missing)
 
 
 def _operator_tab(team):
@@ -3730,8 +3742,9 @@ def case_4(run, role, harness, adapter_class):
 
 def _upgrade(team, peer):
     """The other-version trial (phase_8.md §4) on a team that is up: with a send held by the owner's draft, a second
-    valid copy of the script is installed atomically at the same path. The old send finishes, the keeper restarts in
-    the same pane, and a message queued after that is delivered once by the new image without a wakeup.
+    valid copy of the script is installed atomically at the same path. A second message is queued during the drain;
+    the old send finishes; the same keeper terminal then reports the new version in its beat and label, and the
+    queued message is delivered once by the new image, with no wakeup. A failed exec keeps the old beat and fails.
     -> (ok, proof)."""
     keeper = team.keeper()
     old = hashlib.sha1(team.script.read_bytes()).hexdigest()[:12]
@@ -3760,26 +3773,36 @@ def _upgrade(team, peer):
         return "".join(team.qa.rpc("terminal.read", {"terminal": keeper, "lines": 0}).get("text", "").split())
     draining = team.until(lambda: f"keeper{new}installed" in keeper_screen(), 90)
     still_held = not first.exists()
+    second, tok2, said = team.receipt("second"), token(), {}
+    _member_says(team, team.adapter.act_append(second, tok2), record=said)   # queued during the drain, before release
+    queued = _say_id(said.get("out") or "")
+    queued_while_draining = bool(queued) and _outcome(log, queued, "operator")[0] == "queued" and not second.exists()
     view.keys("enter")                                           # the owner sends the draft: the send finishes
     finished = team.until(lambda: first.exists() and tok1 in first.read_text(), 300)
-    restarted = team.until(lambda: "keeperrestarting:newFactoryversion" in keeper_screen(), 120)
-    time.sleep(3)
-    second, tok2 = team.receipt("second"), token()
-    _member_says(team, team.adapter.act_append(second, tok2))
+    module = sys.modules["factory_under_test"]
+
+    def running_new():                                           # observed passively: the keeper's own beat and label
+        beat = module.read_beat(log.state)
+        return bool(beat) and beat[1] == new and beat[2] == keeper and (
+            (team.get(keeper).get("labels") or {}).get("factory.version") == new)
+    reexeced = team.until(running_new, 120)
     acted = team.until(lambda: second.exists() and tok2 in second.read_text(), 300)
     time.sleep(10)
     keepers = [r["address"] for r in team.qa.rpc("terminal.list", {"all": False})["terminals"]
                if (r.get("labels") or {}).get("factory.kind") == "keeper"]
     first_outcome = log.read_box()[1].outcome(held, "operator") if held else {}
+    beat = module.read_beat(log.state)
     proof = {"old_version": old, "new_version": new, "keeper_before": keeper, "keepers_after": keepers,
              "held_send_id": held, "held_send_outcome": [first_outcome.get("o"), first_outcome.get("why")],
              "draining_seen": bool(draining), "still_held_while_draining": still_held,
-             "old_send_finished": bool(finished), "restart_seen": bool(restarted),
+             "old_send_finished": bool(finished), "queued_id": int(queued.group(1)) if queued else None,
+             "queued_while_draining": queued_while_draining, "beat_version": beat[1] if beat else None,
+             "new_image_running": bool(reexeced), "queued_final": _outcome(log, queued, "operator") if queued else None,
              "new_message_count": second.read_text().split().count(tok2) if second.exists() else 0,
              "draft_exact": draft_receipt.exists() and draft_receipt.read_text() == literal + "\n", "peer": peer}
     ok = (old != new and keepers == [keeper] and bool(held) and bool(draining) and still_held and bool(finished)
-          and first_outcome.get("o") == "delivered" and bool(restarted) and bool(acted)
-          and proof["new_message_count"] == 1)
+          and first_outcome.get("o") == "delivered" and queued_while_draining and bool(reexeced) and bool(acted)
+          and proof["new_message_count"] == 1 and (proof["queued_final"] or ("",))[0] == "delivered")
     return ok, proof
 
 
@@ -3894,9 +3917,10 @@ def _team_terms(team, key):
 
 
 def cross_two_teams(run, fixture):
-    """two-teams (phase_8.md §4): two checkouts with identical member names on one QA core. Concurrent says reach
-    only their own team's member; each team's tab holds only its own terminals; after team A is stopped, team B
-    still sends and receives. Fake agents: the case is Factory's."""
+    """two-teams (phase_8.md §4): two checkouts with identical member names on one QA core. Each say's action names
+    the terminal that ran it, so a delivery to the other team's member fails even when the receipt is right; each
+    team's member block sits in its own tab; each inbox holds only its own token; after team A is stopped, team B
+    still sends and its own member acts. Fake agents: the case is Factory's."""
     team = QATeam(FixtureAdapter, "codex", {"lead-dev": "codex"})
     with team:
         if not _up(team, run, "cross", "system", "system", []):
@@ -3905,57 +3929,60 @@ def cross_two_teams(run, fixture):
             return
         work_b, op_b, call_b = _second_team(team)
         code_b, out_b = call_b("up", timeout=240)
-        module = sys.modules.get("factory_under_test") or (factory_log(team) and sys.modules["factory_under_test"])
+        factory_log(team)
+        module = sys.modules["factory_under_test"]
         key_a, key_b = module.team_key(team.work), module.team_key(work_b)
         if code_b != 0 or key_a == key_b:
             run.row("cross", "two-teams", "system", "system", "not_run", "the two-teams cross case",
                     observed=_bounded(out_b), reason="team B did not come up" if code_b else "the team keys match")
             return
-        receipts = {"a": team.receipt("team-a"), "b": team.receipt("team-b")}
-        toks = {"a": token(), "b": token()}
+
+        def member_of(key):
+            return next((r["address"] for r in _team_terms(team, key)
+                         if (r.get("labels") or {}).get("factory.kind") == "member"), None)
+        members = {"a": member_of(key_a), "b": member_of(key_b)}
+        actions, toks = team.receipt("two-teams"), {"a": token(), "b": token()}
         calls = {"a": team.call, "b": call_b}
-        threads = [threading.Thread(target=lambda t=t: calls[t]("say", "lead-dev", team.adapter.act_append(
-            receipts[t], toks[t]), timeout=120), daemon=True) for t in ("a", "b")]
+
+        def ask(t, tok):                                 # the action names the terminal that ran it
+            done = team.receipt(f"run-{t}")
+            command = f'printf "%s %s\\n" "$HC_TERMINAL_ID" {tok} >> {shlex.quote(str(actions))}'
+            calls[t]("say", "lead-dev", team.adapter.act_run(done, command), timeout=120)
+        threads = [threading.Thread(target=ask, args=(t, toks[t]), daemon=True) for t in ("a", "b")]
         for thread in threads:
             thread.start()
         for thread in threads:
             thread.join(timeout=180)
-        team.until(lambda: all(toks[t] in _lines(receipts[t]) for t in toks), 300)
-        own = {t: _lines(receipts[t]).count(toks[t]) == 1 and toks["b" if t == "a" else "a"] not in _lines(receipts[t])
-               for t in toks}
+        team.until(lambda: all(any(line.endswith(" " + toks[t]) for line in _lines(actions)) for t in toks), 300)
+        time.sleep(10)
+        lines = _lines(actions)
+        acted_by = {t: [line.split(" ", 1)[0] for line in lines if line.endswith(" " + toks[t])] for t in toks}
+        own = {t: acted_by[t] == [members[t]] for t in toks}
         doc = team.qa.rpc("doc.get", {"name": "herdr-app"})["value"] or {"spaces": []}
-        team_of = {r["address"]: (r.get("labels") or {}).get("factory.team")
-                   for r in team.qa.rpc("terminal.list", {"all": False})["terminals"]}
-        tabs = []
+        tab_of = {}
         for space in doc["spaces"]:
             for tab in space["tabs"]:
-                found = set()
-
-                def walk(node):
+                def walk(node, tab_id=tab["id"]):
                     if node.get("type") == "block":
-                        found.add(team_of.get((node.get("content") or {}).get("terminal")))
+                        tab_of[(node.get("content") or {}).get("terminal")] = tab_id
                     for child in node.get("children", []):
                         walk(child)
                 walk(tab["root"])
-                tabs.append(sorted(k or "none" for k in found))
-        tabs_separate = all(len({k for k in keys if k != "none"}) <= 1 for keys in tabs)
-        members_a = [r["address"] for r in _team_terms(team, key_a) if (r.get("labels") or {}).get("factory.kind")
-                     == "member"]
+        tabs = {t: tab_of.get(members[t]) for t in toks}
+        tabs_separate = None not in tabs.values() and tabs["a"] != tabs["b"]
+        inboxes = {t: calls[t]("inbox", "--for", "lead-dev", timeout=60)[1] for t in toks}
+        inbox_own = {t: toks[t] in inboxes[t] and toks["b" if t == "a" else "a"] not in inboxes[t] for t in toks}
         down_a, _ = team.call("down", timeout=120)
-        team.until(lambda: not [r for r in _team_terms(team, key_a)
-                                if (r.get("labels") or {}).get("factory.kind") == "member"], 60)
-        after = team.receipt("team-b-after")
+        team.until(lambda: member_of(key_a) is None, 60)
         tok2 = token()
-        call_b("say", "lead-dev", team.adapter.act_append(after, tok2), timeout=120)
-        still = team.until(lambda: tok2 in _lines(after), 300)
-        b_members = [r for r in _team_terms(team, key_b) if (r.get("labels") or {}).get("factory.kind") == "member"]
-        code_i, inbox_b = call_b("inbox", "--for", "lead-dev", timeout=60)
-        ok = all(own.values()) and tabs_separate and down_a == 0 and bool(still) and len(b_members) == 1
+        ask("b", tok2)
+        still = team.until(lambda: any(line == f"{members['b']} {tok2}" for line in _lines(actions)), 300)
+        ok = (all(own.values()) and tabs_separate and all(inbox_own.values()) and down_a == 0 and bool(still)
+              and member_of(key_b) == members["b"])
         run.row("cross", "two-teams", "system", "system", "pass" if ok else "fail",
                 "two teams with the same member names on one core stay apart, and B works after A stops",
-                proof={"keys_differ": key_a != key_b, "own_actions": own, "tabs": tabs, "tabs_separate": tabs_separate,
-                       "a_members_before_down": len(members_a), "down_a_exit": down_a, "b_after_a_down": bool(still),
-                       "b_members": len(b_members), "inbox_b_exit": code_i,
+                proof={"keys_differ": key_a != key_b, "acted_by_own_member": own, "member_tabs_distinct": tabs_separate,
+                       "inbox_holds_only_own_token": inbox_own, "down_a_exit": down_a, "b_after_a_down": bool(still),
                        "agents": "fake agents (the case is Factory's)"}, reason=None if ok else "see proof")
 
 
@@ -3994,24 +4021,51 @@ def cross_multi_down(run, fixture):
 
 
 def cross_owner_pane(run, fixture):
-    """owner-pane (phase_8.md §4): the owner's own block, seeded in the layout doc beside the operator, survives up,
-    a repeated up, down of one member and then the last, with its identity and contents; Factory's blocks go; the
-    owner's pane still takes a marker typed through rodeo."""
+    """owner-pane (phase_8.md §4, spec §10): after the first up, the owner adds a block of their own to the team tab
+    that holds the members. It survives a repeated up, down of one member and then the last, with its identity,
+    terminal and contents, in that tab; each stopped member's block goes; the owner's pane still takes a marker
+    typed through rodeo."""
     team = QATeam(FixtureAdapter, "codex", {"lead-dev": "codex", "reviewer": "codex"})
     with team:
         _operator_tab(team)
+        if not _up(team, run, "cross", "system", "system", []):
+            run.row("cross", "owner-pane", "system", "system", "not_run", "the owner-pane cross case",
+                    reason="the team did not come up")
+            return
+
+        def where():                                      # terminal -> (space id, tab id, tab index), block ids
+            current = team.qa.rpc("doc.get", {"name": "herdr-app"})
+            places, blocks = {}, {}
+            for space in (current["value"] or {"spaces": []})["spaces"]:
+                for index, tab in enumerate(space["tabs"], 1):
+                    def walk(node, tab=tab, index=index, space=space):
+                        if node.get("type") == "block":
+                            terminal = (node.get("content") or {}).get("terminal")
+                            places[terminal] = (space["id"], tab["id"], index)
+                            blocks[node["id"]] = (terminal, tab["id"], node.get("title"))
+                        for child in node.get("children", []):
+                            walk(child)
+                    walk(tab["root"])
+            return current, places, blocks
+        members = {n: team.member(n) for n in ("lead-dev", "reviewer")}
+        current, places, _ = where()
+        if not all(m in places for m in members.values()) or places[members["lead-dev"]][1] != places[
+                members["reviewer"]][1]:
+            run.row("cross", "owner-pane", "system", "system", "not_run", "the owner-pane cross case",
+                    reason="up did not put both members in one team tab")
+            return
+        space_id, tab_id, tab_index = places[members["lead-dev"]]
         owner = Probe(team.qa, "owner", fields="none", wait_status=False)
-        seed = f"seed{token().lower()}"
-        doc = team.qa.rpc("doc.get", {"name": "herdr-app"})
-        value = doc["value"]
-        tab = value["spaces"][0]["tabs"][0]
-        block = {"id": "p" + "e" * 32, "type": "block", "title": "owner", "content": {"terminal": owner.address}}
-        tab["root"]["children"].append(block)
-        team.qa.rpc("doc.set", {"name": "herdr-app", "value": value, "version": doc["version"]})
-        team.qa.rpc("terminal.label", {"terminal": owner.address, "labels": {
-            "herdr.space": value["spaces"][0]["id"], "herdr.tab": tab["id"], "herdr.seen": "0"}})
         team.until(lambda: "ready" in team.qa.rpc("terminal.read", {"terminal": owner.address, "lines": 0})
-                   .get("text", ""), 30)                  # the owner's program reads input before the seed is typed
+                   .get("text", ""), 30)
+        value = current["value"]
+        tab = next(t for s in value["spaces"] if s["id"] == space_id for t in s["tabs"] if t["id"] == tab_id)
+        block = {"id": "p" + "e" * 32, "type": "block", "title": "owner", "content": {"terminal": owner.address}}
+        tab["root"].setdefault("children", []).append(block)   # the owner's own block, in the team tab
+        team.qa.rpc("doc.set", {"name": "herdr-app", "value": value, "version": current["version"]})
+        team.qa.rpc("terminal.label", {"terminal": owner.address, "labels": {
+            "herdr.space": space_id, "herdr.tab": tab_id, "herdr.seen": "0"}})
+        seed = f"seed{token().lower()}"
         team.qa.rpc("terminal.keys", {"terminal": owner.address, "keys": list(seed)})
         if not team.until(lambda: seed in owner.text(), 30):
             run.row("cross", "owner-pane", "system", "system", "not_run", "the owner-pane cross case",
@@ -4019,53 +4073,44 @@ def cross_owner_pane(run, fixture):
             return
         steps = []
 
-        def owner_block():
-            current = team.qa.rpc("doc.get", {"name": "herdr-app"})["value"] or {"spaces": []}
-            found = []
-
-            def walk(node):
-                if node.get("id") == block["id"]:
-                    found.append(node)
-                for child in node.get("children", []):
-                    walk(child)
-            for space in current["spaces"]:
-                for t in space["tabs"]:
-                    walk(t["root"])
-            return found
-
-        def snapshot(what, code):
-            blocks = owner_block()
-            steps.append({"step": what, "exit": code, "owner_block": len(blocks) == 1
-                          and blocks[0]["content"]["terminal"] == owner.address and blocks[0]["title"] == "owner",
+        def snapshot(what, code, stopped=()):
+            _, places, blocks = where()
+            mine = blocks.get(block["id"])
+            steps.append({"step": what, "exit": code,
+                          "owner_block_in_team_tab": mine == (owner.address, tab_id, "owner"),
                           "owner_live": team.get(owner.address)["state"] == "live",
-                          "members": len([n for n in ("lead-dev", "reviewer") if team.member(n)])})
-        if not _up(team, run, "cross", "system", "system", []):
-            run.row("cross", "owner-pane", "system", "system", "not_run", "the owner-pane cross case",
-                    reason="the team did not come up")
-            return
-        snapshot("up", 0)
+                          "stopped_blocks_gone": all(members[n] not in places for n in stopped),
+                          "members_live": len([n for n in members if team.member(n)])})
         snapshot("up again", team.call("up", timeout=240)[0])
-        snapshot("down lead-dev", team.call("down", "lead-dev", timeout=120)[0])
-        snapshot("down reviewer", team.call("down", "reviewer", timeout=120)[0])
+        snapshot("down lead-dev", team.call("down", "lead-dev", timeout=120)[0], ["lead-dev"])
+        snapshot("down reviewer", team.call("down", "reviewer", timeout=120)[0], ["lead-dev", "reviewer"])
         contents = seed in owner.text()
-        view = _rodeo(team, ["operator"])
-        view.keys("ctrl+b")
-        time.sleep(0.2)
-        view.keys("1")
-        time.sleep(0.8)
-        view.focused_terminal = team.operator
-        view.focus("owner")
-        marker = "m" + token().lower()
-        before = len(owner.text())
-        view.type(marker)
-        time.sleep(1)
-        accepts = marker in owner.text()[before:]
-        ok = (all(s["owner_block"] and s["owner_live"] and s["exit"] == 0 for s in steps) and steps[-1]["members"] == 0
-              and contents and accepts)
+        _, places, _ = where()
+        accepts = False
+        if owner.address in places:
+            view = _rodeo(team, ["operator"])
+            view.keys("ctrl+b")
+            time.sleep(0.2)
+            view.keys(str(places[owner.address][2]))   # the tab that holds the owner's block
+            time.sleep(0.8)
+            doc_now = team.qa.rpc("doc.get", {"name": "herdr-app"})["value"]
+            team_tab = next(t for s in doc_now["spaces"] for t in s["tabs"] if t["id"] == tab_id)
+            first = team_tab["root"]["children"][0]                # rodeo starts on a tab's first pane
+            view.focused_terminal = ((first.get("children") or [first])[0].get("content") or {}).get("terminal")
+            if view.focused_terminal != owner.address:
+                view.focus("owner")
+            marker = "m" + token().lower()
+            before = len(owner.text())
+            view.type(marker)
+            time.sleep(1)
+            accepts = marker in owner.text()[before:]
+        ok = (all(s["owner_block_in_team_tab"] and s["owner_live"] and s["stopped_blocks_gone"] and s["exit"] == 0
+                  for s in steps) and steps[-1]["members_live"] == 0 and contents and accepts)
         run.row("cross", "owner-pane", "system", "system", "pass" if ok else "fail",
-                "the owner's own block and terminal survive up, a repeated up and down, and still take input",
-                proof={"steps": steps, "contents_kept": contents, "accepts_marker": accepts,
-                       "agents": "fake agents (the case is Factory's)"}, reason=None if ok else "see proof")
+                "the owner's own block in the team tab survives a repeated up and both downs, the stopped members'"
+                " blocks go, and the owner's pane still takes input", proof={
+                    "steps": steps, "contents_kept": contents, "accepts_marker": accepts, "team_tab": tab_index,
+                    "agents": "fake agents (the case is Factory's)"}, reason=None if ok else "see proof")
 
 
 CROSS_FUNCTIONS = {"two-teams": cross_two_teams, "multi-down": cross_multi_down, "owner-pane": cross_owner_pane,
