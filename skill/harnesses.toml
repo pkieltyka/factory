@@ -16,8 +16,9 @@
 #   session_env  the variable in which the harness gives its current conversation ID to the commands it runs
 #   session_follow  false: `say` records that variable once per launch, not at every change (LC-12)
 #   resume_model `provider`: resume only while the model's provider prefix is unchanged (default `any`)
-#   operator_deliver  `idle`: as operator, messages wait while it is working and are typed between turns
-#                (keeper.md §9); members are not affected
+#   status_app   the app name the harness reports in its OSC 7501 status, when not its key (decide maps it)
+#   deliver      `idle`: messages wait while it is working and are typed between turns, in either role
+#                (keeper.md §9)
 #   [x.permissions]  native flags per permission level. `full` (default) never stops for approval and adds no
 #                sandbox. `guarded` keeps the harness's own guard; only Claude Code and Codex have one.
 
@@ -30,6 +31,7 @@ thinking = ["low", "medium", "high", "xhigh", "max"]
 never = ["max"]
 prompt = "file"
 session_env = "CLAUDE_CODE_SESSION_ID"
+status_app = "claude-code"   # its OSC 7501 app (hc-capabilities.md)
 session_follow = true    # LC-3 and LC-12 (db85120): a sub-agent's say carries the parent's ID, so follow a switch
 
 # Both questions start on "No, exit". The bypass warning is normally skipped by a setting `up` passes.
@@ -46,7 +48,7 @@ models = ["gpt-6.2-astra", "gpt-6.2-sol", "gpt-6-astra", "gpt-6.1-sol", "gpt-6-l
 never = ["max", "ultra"]
 prompt = "pointer"
 session_env = "CODEX_THREAD_ID"
-operator_deliver = "idle"   # keeper.md §9: as operator, Factory types between turns (#173: a working turn ignored it)
+deliver = "idle"   # keeper.md §9, both roles: a working Codex ignored a report typed into its turn (#173)
 session_follow = false   # LC-12 not shown yet
 dialogs = [["Trust and continue", ["enter"]]]   # asked once per new folder, a worktree included
 
@@ -108,6 +110,7 @@ thinking = ["low", "medium", "high", "xhigh", "max"]
 never = []
 prompt = "message"
 session_env = "ANTIGRAVITY_CONVERSATION_ID"
+status_app = "antigravity"   # its OSC 7501 app (agy as operator at 5cdcbd4; hc-capabilities.md)
 session_follow = false   # LC-12 not shown yet
 dialogs = [["Do you trust the contents of this project?", []]]   # a fallback: LC-7 trusts the member's folder per launch
 

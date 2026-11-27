@@ -1706,7 +1706,7 @@ class DeliveryDecisionTests(unittest.TestCase):
 
     def test_a_codex_operator_gets_messages_between_turns(self):
         """keeper.md §9 (#173): the live app selects the rule, the formation's harness only when none is reported;
-        a Codex member and other operators are unchanged."""
+        other operators are unchanged."""
         def view(name, state, app, kind="operator"):
             record = self.terminal(name, state, kind=kind)
             if app is not None:
@@ -1732,9 +1732,33 @@ class DeliveryDecisionTests(unittest.TestCase):
         boss = types.SimpleNamespace(**{**vars(self.cfg), "operator": {"name": "boss"}})
         self.assertEqual(factory.decide("boss", {"kind": "say"}, view("boss", "working", "codex"), self.box, boss, 10,
                                         None), ("queue", "busy"))
+
+    def test_a_codex_member_gets_messages_between_turns_too(self):
+        """@operator's decision (#173, Codex member case 7 two-senders at a65a1fe): the rule holds in both roles,
+        after a member's own rows (not started, gone, starting, not ready, blocked); other members still steer."""
+        def view(state, app, briefed=True):
+            record = self.terminal("lead-dev", state)
+            if app is not None:
+                record["status"]["app"] = app
+            return factory.View([record])
         self.briefed()
-        self.assertEqual(factory.decide("lead-dev", {"kind": "say"}, view("lead-dev", "working", "codex", "member"),
-                                        self.box, self.cfg, 0, None), ("send", "t-lead-dev"))
+        for state, app, expected in (
+            ("working", "codex", ("queue", "busy")),
+            ("idle", "codex", ("send", "t-lead-dev", "idle")),
+            ("done", "codex", ("send", "t-lead-dev")),
+            ("blocked", "codex", ("queue", "blocked")),            # the member's own row first
+            ("working", "claude-code", ("send", "t-lead-dev")),    # a Claude Code member still steers
+            ("working", "pi", ("send", "t-lead-dev")),
+        ):
+            with self.subTest(state=state, app=app):
+                self.assertEqual(factory.decide("lead-dev", {"kind": "say"}, view(state, app), self.box, self.cfg,
+                                                0, None), expected)
+        formed = types.SimpleNamespace(**{**vars(self.cfg), "members": {"lead-dev": {"harness": "codex"}}})
+        self.assertEqual(factory.decide("lead-dev", {"kind": "say"}, view("working", None), self.box, formed, 0, None),
+                         ("queue", "busy"))                         # no app reported: the formation's harness
+        lines, code = factory.outcome_lines({"lead-dev": {"o": "queued", "why": "busy"}}, "operator", "operator")
+        self.assertEqual((lines, code), (["@lead-dev: queued (busy): Factory will deliver it when @lead-dev's turn"
+                                          " ends."], 0))
 
     def test_stale_note_takes_precedence_over_an_absent_operator(self):
         note = {"kind": "note", "meta": {"what": "quiet"}}
@@ -3475,7 +3499,7 @@ class KeeperTests(TeamCase):
         self.assertEqual(self.inputs(operator, None), ["[from @pm]\nreport\n"])
 
     @fake_only
-    def test_a_codex_operator_in_done_is_sent_unguarded_and_a_codex_member_mid_turn(self):
+    def test_a_codex_operator_in_done_is_sent_unguarded_and_a_codex_member_waits_its_turn(self):
         operator, _ = self.terminal("operator", kind="operator")
         self.fake.set_status(operator, "done", app="codex")
         term, _ = self.member()
@@ -3487,8 +3511,20 @@ class KeeperTests(TeamCase):
         to_operator, to_member = self.add("operator", "a"), self.add("lead-dev", "b")
         self.deliver()
         self.assertEqual(self.outcome(to_operator, "operator")["o"], "delivered")
-        self.assertEqual(self.outcome(to_member)["o"], "delivered")      # steering into a working member stays
-        self.assertEqual(sorted(sends), sorted([(operator, None), (term, None)]))
+        self.assertEqual(self.outcome(to_member)["why"], "busy")        # both roles (#173)
+        self.assertEqual(self.inputs(term, None), [])
+        self.fake.set_status(term, "idle", app="codex")
+        self.deliver()
+        self.assertEqual(self.outcome(to_member)["o"], "delivered")
+        self.assertEqual(sorted(sends), sorted([(operator, None), (term, "idle")]))
+
+    @fake_only
+    def test_a_claude_code_member_still_takes_messages_mid_turn(self):
+        term, _ = self.member()
+        self.fake.set_status(term, "working", app="claude-code")
+        ident = self.add("lead-dev", "steer")
+        self.deliver()
+        self.assertEqual(self.outcome(ident)["o"], "delivered")          # the steering control
 
     @fake_only
     def test_blocked_queues_the_head_once_then_delivers(self):
@@ -6951,7 +6987,8 @@ class QualifyJudgeTests(unittest.TestCase):
         import live
         self.assertTrue(live._between_needed(4, "mid-turn", "operator", "codex", {}))
         self.assertFalse(live._between_needed(4, "mid-turn", "operator", "claude", {}))
-        self.assertFalse(live._between_needed(4, "mid-turn", "member", "codex", {}))
+        self.assertTrue(live._between_needed(4, "mid-turn", "member", "codex", {}))      # both roles (#173)
+        self.assertFalse(live._between_needed(4, "mid-turn", "member", "claude", {}))
         self.assertTrue(live._between_needed(7, "upgrade", "member", "omp", {"peer": "codex"}))
         self.assertFalse(live._between_needed(7, "upgrade", "member", "omp", {"peer": "claude"}))
         old = {"turn_at_start": 1, "order": ["started", "second", "finished"], "second_count": 1}

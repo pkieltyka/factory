@@ -2140,7 +2140,9 @@ class FixtureAdapter:
                                'id="thread-$(od -An -N4 -tx1 /dev/urandom | tr -d \' \\n\')"\n'
                                'while [ "$#" -gt 0 ]; do [ "$1" = resume ] && id="$2"; shift; done\n'
                                f'export CODEX_THREAD_ID="$id" FAKE_MEMORY_DIR={shlex.quote(str(memory))} FAKE_ECHO=1\n'
-                               f"exec {agent}\n")
+                               + (f"export FAKE_APP={harness}\n" if harness_table().get(harness, {}).get("deliver")
+                                  else "")                  # reported as the real one is: Factory's rule applies
+                               + f"exec {agent}\n")
             wrapper.chmod(0o755)
         codex = self.team.home / ".codex"
         codex.mkdir(parents=True, exist_ok=True)
@@ -2383,7 +2385,7 @@ class QATeam:
         if not self.real:
             params["env"]["FAKE_LOG"] = str(self.dir / "operator-input.jsonl")   # every input the fake received
             params["env"]["FAKE_ECHO"] = "1"
-            if harness_table().get(operator, {}).get("operator_deliver"):
+            if harness_table().get(operator, {}).get("deliver"):
                 params["env"]["FAKE_APP"] = operator      # reported as the real one is, so Factory's rule applies
             params["env"]["CODEX_THREAD_ID"] = f"thread-{token().lower()}"   # the fake operator's conversation
         self.operator_command = None
@@ -3190,10 +3192,25 @@ def _case_7_two_senders(run, role, harness, adapter_class):
         committed = sorted((i, s) for s, i in ids.items() if i is not None)
         ok = (all(c == 1 for c in counts.values()) and None not in ids.values()
               and acted == [s for _, s in committed] and all((o or ("",))[0] == "delivered" for o in outcomes.values()))
+        records, box = log.read_box()
+        target = team.operator if role == "operator" else team.member("lead-dev")
+        deliveries = {s: {k: box.outcome(i, recipient).get(k) for k in ("o", "term", "turn", "started")}
+                      for s, i in ids.items() if i}
+        histories = {s: [[r["o"], r.get("why")] for r in records if r["t"] == "out" and r["id"] == i
+                         and r["to"] == recipient] for s, i in ids.items() if i}
+        between = between_turns(harness, role)
+        if between:     # keeper.md §9: each typed into a turn of its own on the recipient, in committed order
+            turns = [deliveries.get(s, {}).get("turn") for _, s in committed]
+            ok = ok and all(d.get("term") == target and d.get("started") is True for d in deliveries.values()) \
+                and len(deliveries) == len(senders) and all(isinstance(t, int) for t in turns) \
+                and turns == sorted(set(turns))
         run.row(7, "two-senders", role, harness, "pass" if ok else "fail",
-                "two senders at once to one recipient: both acted on exactly once, in committed order",
+                "two senders at once to one recipient: both acted on exactly once, in committed order"
+                + (", each typed between turns" if between else ""),
                 proof={"senders": senders, "ids": ids, "outcomes": outcomes, "counts": counts, "acted_order": acted,
-                       "peer": peer}, reason=None if ok else "a message was missing, repeated or out of order")
+                       "recipient_terminal": target, "deliveries": deliveries, "histories": histories,
+                       "between_turns": between, "peer": peer},
+                reason=None if ok else "a message was missing, repeated, out of order or typed into a working turn")
 
 
 def _case_7_pending_restart(run, role, harness, adapter_class):
@@ -4008,13 +4025,15 @@ def case_6(run, role, harness, adapter_class):
 
 
 def between_turns(harness, role):
-    """Whether Factory delivers to this profile only between turns (keeper.md §9): Codex as operator."""
-    return role == "operator" and harness_table().get(harness, {}).get("operator_deliver") == "idle"
+    """Whether Factory delivers to this profile only between turns (keeper.md §9): Codex, in either role."""
+    return harness_table().get(harness, {}).get("deliver") == "idle"
 
 
 def _app_selects(app):
     """Whether a live status app selects between-turns delivery in the table (keeper.md §9's lookup)."""
-    return bool(app) and harness_table().get(app, {}).get("operator_deliver") == "idle"
+    table = harness_table()
+    harness = app if app in table else next((k for k, t in table.items() if app and t.get("status_app") == app), None)
+    return table.get(harness or "", {}).get("deliver") == "idle"
 
 
 def _ask_later(team, role, text):

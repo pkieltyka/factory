@@ -548,7 +548,7 @@ def resolve_listed(model, listed, harness):
 LOG_KINDS = ("say", "brief", "note")
 OUTCOMES = ("sending", "delivered", "queued", "unconfirmed", "dropped")
 FINAL = ("delivered", "unconfirmed", "dropped")
-QUEUE_REASONS = ("waiting", "blocked", "not ready", "gone", "busy")   # busy: a between-turns operator is working
+QUEUE_REASONS = ("waiting", "blocked", "not ready", "gone", "busy")   # busy: a between-turns recipient is working
 READ_QUEUE_REASONS = QUEUE_REASONS
 MOVES = {"sending": ("queued",), "delivered": ("sending",), "unconfirmed": ("sending",),
          "queued": ("queued", "sending"), "dropped": ("queued", "sending")}   # new outcome: allowed from these
@@ -1755,6 +1755,16 @@ def _quiet_or_ready_note(msg):
     return msg["kind"] == "note" and (msg.get("meta") or {}).get("what") in ("quiet", "ready")
 
 
+def harness_for_app(app):
+    """The harness a live status.app names: its table key, or the key whose status_app it is (agy reports
+    "antigravity", Claude Code "claude-code"); None for an app no harness claims."""
+    if not app:
+        return None
+    if app in TABLE:
+        return app
+    return next((key for key, t in TABLE.items() if t.get("status_app") == app), None)
+
+
 def decide(name, msg, view, box, cfg, now, op_null_since, still_true=True):
     """Choose the first matching delivery action from keeper.md's decision table."""
     if name == cfg.operator["name"]:
@@ -1770,15 +1780,7 @@ def decide(name, msg, view, box, cfg, now, op_null_since, still_true=True):
             return "hold",
         if status["state"] == "blocked":
             return "queue", "blocked"
-        # keeper.md §9: an operator harness that may ignore text typed into a working turn (Codex, #173) gets
-        # Factory's messages between turns. The live app decides, the formation's harness when none is reported.
-        app = status.get("app") or cfg.operator.get("harness")
-        if TABLE.get(app, {}).get("operator_deliver") == "idle":
-            if status["state"] == "working":
-                return "queue", "busy"
-            if status["state"] == "idle":
-                return "send", terminal["address"], "idle"   # hc refuses, typing nothing, if it starts working
-        return "send", terminal["address"]
+        return between_turns(status, cfg.operator.get("harness"), terminal["address"])
 
     state = view.state(name)
     if state == "not started":
@@ -1792,7 +1794,21 @@ def decide(name, msg, view, box, cfg, now, op_null_since, still_true=True):
         return "queue", "not ready"
     if state == "blocked":
         return "queue", "blocked"
-    return "send", terminal["address"]
+    return between_turns(terminal.get("status") or {}, (getattr(cfg, "members", {}).get(name) or {}).get("harness"),
+                         terminal["address"])
+
+
+def between_turns(status, formed, address):
+    """keeper.md §9, in either role: a harness that may ignore text typed into a working turn (Codex, #173, as
+    operator and as member) gets Factory's messages between turns. The live app names the harness, the formation's
+    only when none is reported. -> the send or busy action."""
+    harness = harness_for_app(status["app"]) if status.get("app") else formed
+    if TABLE.get(harness or "", {}).get("deliver") == "idle":
+        if status.get("state") == "working":
+            return "queue", "busy"
+        if status.get("state") == "idle":
+            return "send", address, "idle"         # hc refuses, typing nothing, if it starts working
+    return "send", address
 
 
 def _age(seconds):
@@ -2860,8 +2876,9 @@ def outcome_lines(outcomes, operator, sender):
             missing.append(f"@{name}")
         if name == operator and outcome == "queued" and record["why"] == "gone":
             line += ": operator not running; message queued"
-        if name == operator and outcome == "queued" and record["why"] == "busy":
-            line += ": Factory will deliver it when the operator's turn ends."
+        if outcome == "queued" and record["why"] == "busy":    # the recipient whose turn it waits for
+            line += (": Factory will deliver it when the operator's turn ends." if name == operator
+                     else f": Factory will deliver it when @{name}'s turn ends.")
         lines.append(line)
     if missing:
         instruction = "Do not resend unless asked"
