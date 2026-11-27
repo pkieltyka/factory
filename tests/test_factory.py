@@ -6692,7 +6692,7 @@ class ConfigTests(unittest.TestCase):
         with Env(team_brief('[operator]\nname = "boss"\nharness = "claude"\n' + team, stock)) as e:
             brief = e.run("brief").stdout
             self.assertIn("# Team brief (from @boss)", brief)
-            self.assertIn("1. The operator assigns tasks", brief)  # the shared brief names the role ...
+            self.assertIn("The operator assigns each step", brief)  # the shared brief names the role ...
             self.assertNotIn("@operator", brief)                   # ... never one person's operator
             e.write_brief(team_brief(team, "## Workflow\n\n{operator} and {name} stay as written.\n"))
             self.assertIn("{operator} and {name} stay as written.", e.run("brief").stdout)  # FACTORY.md is sent as it is
