@@ -85,7 +85,7 @@ Work through ready items within the owner’s scope and the workflow in `FACTORY
 - Respect the machine and permission limits in [SKILL.md](../SKILL.md).
 - On stopping, take no new items. Say why you stopped and what comes next in your pane. Reports can still arrive from live members.
 - The owner may set a read-only ready check in their local `factory.toml`. It runs while the team is quiet. See [setup](cmd_setup.md) for the tracker recipes.
-- If your session ends, the user runs `/factory up`; keep the tracker current enough for that.
+- If your session ends, the user runs `/factory2 up`; keep the tracker current enough for that.
 
 ## Keep state current
 

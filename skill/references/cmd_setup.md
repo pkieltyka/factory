@@ -43,7 +43,7 @@ When the formation should be the project's suggestion, copy `factory.toml` to `f
 
 Run `factory.py check`. Resolve each failure without substituting unapproved models or harnesses; unknown Claude IDs only warn. If the check warns about `draft_wait`, tell the owner to set `draft_wait = 600` or more in the file it names. The owner edits the hc config. Preview with `factory.py brief`, show the result, and commit `FACTORY.md` and `factory.toml.sample` when authorized; never `factory.toml`.
 
-Before launching agy in an untrusted workspace, have the owner [back up agy's trust settings](https://github.com/pkieltyka/factory/blob/master/docs/getting-started.md#back-up-agy-trust-settings). Then run `/factory up`.
+Before launching agy in an untrusted workspace, have the owner [back up agy's trust settings](https://github.com/pkieltyka/factory/blob/master/docs/getting-started.md#back-up-agy-trust-settings). Then run `/factory2 up`.
 
 ## Permissions
 
