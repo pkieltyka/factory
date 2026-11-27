@@ -907,7 +907,7 @@ class Harness:
         seconds when it reports none), "dialog: <text>" (when answer is False or the dialog has no keys),
         "finished (...)" or "timeout". With answer, a configured dialog is answered once, as up does."""
         deadline = time.monotonic() + timeout
-        last, since = None, time.monotonic()
+        last, since, seen = None, time.monotonic(), None
         while time.monotonic() < deadline:
             t = self.get()
             if t["state"] == "finished":
@@ -919,12 +919,14 @@ class Harness:
                 text, keys = found
                 if not answer or not keys:
                     return f"dialog: {text}"
-                if text not in self.answered:
+                if text not in self.answered and seen == text:   # as up does: on its second poll
                     self.qa.rpc("terminal.keys", {"terminal": self.term, "keys": keys})
                     self.answered.append(text)
-                time.sleep(1.5)
+                seen = text
+                time.sleep(0.5 if text not in self.answered else 1.5)
                 last = None
                 continue
+            seen = None
             if word == "idle":
                 return "idle"
             if flat != last:

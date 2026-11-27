@@ -5075,6 +5075,7 @@ class ScriptedHc:
 
     def keys(self, address, keys):
         self.keys_sent.append((address, keys))
+        self.keys_at = getattr(self, "keys_at", []) + [self.at[address]]   # on which poll
         if address in self.on_keys:
             self.scripts[address] = self.on_keys.pop(address)
             self.at[address] = 0
@@ -5132,6 +5133,12 @@ class ReadyTests(unittest.TestCase):
                                   "status": None}
         out = factory.await_ready(hc, {"a": ({"address": "a"}, [])}, timeout=5, clock=FakeClock())
         self.assertEqual(out, {"a": "was stopped by signal 9"})
+
+    def test_a_dialog_is_answered_on_its_second_poll_not_as_it_is_drawn(self):
+        out, hc = self.ready({"a": [("live", "blocked", "Yes, I trust this folder")]}, self.CLAUDE,
+                             on_keys={"a": [("live", "idle", "")]})
+        self.assertEqual(out, {"a": None})
+        self.assertEqual(hc.keys_at, [2])
 
     def test_a_dialog_still_shown_after_the_answer_is_named(self):
         out, hc = self.ready({"a": [("live", "blocked", "Yes, I trust this folder")]}, self.CLAUDE)

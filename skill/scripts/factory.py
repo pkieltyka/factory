@@ -2939,6 +2939,7 @@ def await_ready(hc, started, timeout=LAUNCH_TIMEOUT, clock=time):
     is settled or the deadline passes. -> {member: None when ready, else the reason it is not}."""
     deadline = clock.monotonic() + timeout
     outcome, answered, shown, words = {}, {name: set() for name in started}, {}, {}
+    seen = {}                                        # the dialog each member showed at its last poll
     while True:
         for name, (record, dialogs) in started.items():
             if name in outcome:
@@ -2965,10 +2966,12 @@ def await_ready(hc, started, timeout=LAUNCH_TIMEOUT, clock=time):
                     if not keys:
                         outcome[name] = ("waits on its trust dialog: accept it in its pane, then run:"
                                          f" factory.py brief --send {name}")
-                    elif text not in answered[name]:
-                        hc.keys(address, keys)
+                    elif text not in answered[name] and seen.get(name) == text:
+                        hc.keys(address, keys)       # on its second poll: a harness that just drew it may not read yet
                         answered[name].add(text)
+                    seen[name] = text
                     continue
+                seen.pop(name, None)
                 if word == "idle":
                     outcome[name] = None
             except (HcError, HcDown) as error:
