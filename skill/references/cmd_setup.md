@@ -43,11 +43,11 @@ When the formation should be the project's suggestion, copy `factory.toml` to `f
 
 Run `factory.py check`. Resolve each failure without substituting unapproved models or harnesses; unknown Claude IDs only warn. If the check warns about `draft_wait`, tell the owner to set `draft_wait = 600` or more in the file it names. The owner edits the hc config. Preview with `factory.py brief`, show the result, and commit `FACTORY.md` and `factory.toml.sample` when authorized; never `factory.toml`.
 
-Before launching an agy member in an untrusted workspace, have the owner follow [agy workspace trust](https://github.com/pkieltyka/factory/blob/master/docs/getting-started.md#agy-workspace-trust). Then run `/factory up`.
+Before launching agy in an untrusted workspace, have the owner [back up agy's trust settings](https://github.com/pkieltyka/factory/blob/master/docs/getting-started.md#back-up-agy-trust-settings). Then run `/factory up`.
 
 ## Permissions
 
 - Members default to `full`, intended for a safe sandbox/VM. Claude uses bypass-permissions while retaining inherited sandbox settings; Codex disables approvals and its sandbox; pi/omp/OpenCode allow unattended commands. `guarded` uses Claude auto mode or Codex's workspace sandbox with automatic review; it changes nothing for the others.
 - Factory has no guarded mode for agy. Both permission levels use `--mode accept-edits` and the session-only `always-proceed` preset without a sandbox. In agy 1.5.12 a command matching an explicit Ask rule ran without approval, and a command matching Deny was blocked.
 - Full Claude members can reach the hc socket inside an inherited sandbox. Guarded exempts standalone `factory.py say` and `factory.py inbox`. Unknown startup questions and higher-level policy can still block.
-- The owner accepts agy's trust dialog in the member's pane. `up` names any member waiting there and gives the `factory.py brief --send NAME` command to run afterward.
+- The owner handles agy's trust dialog in the member's pane and [checks the settings after accepting](https://github.com/pkieltyka/factory/blob/master/docs/getting-started.md#launch). `up` names any member waiting there and gives the `factory.py brief --send NAME` command to run afterward.

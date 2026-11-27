@@ -52,25 +52,29 @@ python3 /absolute/trusted/install/scripts/factory.py inbox 20 --for operator
 
 Approve `status`, `inbox` or `say` separately as needed. Run each command standalone so the prefix matches. Keep team-changing operations such as `up` and `down` under separate approvals. Writable roots and Unix socket access are separate permissions. [Codex permissions](https://developers.openai.com/codex/permissions) · [Member permissions](../skill/references/cmd_setup.md#permissions)
 
+## Back up agy trust settings
+
+Before starting agy in an untrusted workspace, back up `~/.gemini/antigravity-cli/settings.json` if it exists. Do this before starting an agy operator and before launching agy members in untrusted workspaces, including new worktrees. In agy 1.5.13, accepting a new workspace can rewrite `trustedWorkspaces` and remove unrelated entries.
+
 ## Form the team
 
-From the project directory, run `rodeo --session first-factory`. Start your signed-in harness in its pane and enter `/factory setup` using the spelling for your harness. Give the operator your goal, the available harnesses and the work you want ready. For a first team, use the built-in `TODO.md` tracker and the reviewer's own review. [Default team](README.md#the-team)
+From the project directory, run `rodeo --session first-factory`. Start your signed-in harness in its pane.
+
+If your agy operator shows a trust dialog, accept it yourself only if you trust the workspace. Right after accepting, compare `trustedWorkspaces` with your backup, if you made one. Restore any missing entries and keep the new workspace entry.
+
+Enter `/factory setup` using the spelling for your harness. Give the operator your goal, the available harnesses and the work you want ready. For a first team, use the built-in `TODO.md` tracker and the reviewer's own review. [Default team](README.md#the-team)
 
 To turn off prompt suggestions for your Claude Code operator, set `"promptSuggestionEnabled": false` in your own `.claude/settings.local.json` in this project.
 
 Commit the shared brief `FACTORY.md` and suggested formation `factory.toml.sample`. Setup adds your local `factory.toml` to `.gitignore`.
 
-### agy workspace trust
-
-Before launching agy in an untrusted workspace, back up `~/.gemini/antigravity-cli/settings.json` if it exists. In agy 1.5.13, accepting a new workspace can rewrite `trustedWorkspaces` and remove unrelated entries.
-
-If agy asks whether you trust the workspace, review the dialog and accept it yourself in the member's pane if you trust it. Compare `trustedWorkspaces` with your backup and restore any missing entries while keeping the new one. Then run `/factory brief --send NAME` for that member.
-
 ## Launch
 
-For agy members, follow [agy workspace trust](#agy-workspace-trust) before launch.
+Before `up` starts agy members in untrusted workspaces, [back up agy's trust settings](#back-up-agy-trust-settings).
 
 Enter `/factory up`. It marks your current pane as the operator and adds the members and a narrow keeper pane to the `team` tab. Your pane stays where it is. Check `/factory status` for members, pending messages and keeper state.
+
+If a member's agy trust dialog appears, accept it yourself in that pane only if you trust the workspace. Right after accepting, compare `trustedWorkspaces` with your backup, if you made one. Restore any missing entries and keep the new workspace entry. Back up the resulting settings before accepting another workspace. Then run `/factory brief --send NAME` for that member.
 
 Follow the recovery instructions printed by `up`.
 

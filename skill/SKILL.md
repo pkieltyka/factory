@@ -24,7 +24,7 @@ Use `factory.py say` for every team message. Members send private drafts with `-
 - Run in a rodeo pane with `HC_TERMINAL_ID` set and `hc` 0.1.20 or newer.
 - The operator needs access to `hc`'s socket, the harness config directories, `~/.cache/factory-skill` and any worktree parent. If its sandbox blocks a Factory, `hc` or worktree command, retry that command outside the sandbox only when your harness allows it and say so in your report. Leave the user's sandbox settings alone. Run commands standalone so exemptions match. See [Codex operator access](https://github.com/pkieltyka/factory/blob/master/docs/getting-started.md#codex-operator-access).
 - Members default to `full`, which assumes a safe machine. See [permissions](references/cmd_setup.md#permissions) for `guarded` and harness details.
-- For agy members in an untrusted workspace, have the owner follow [agy workspace trust](https://github.com/pkieltyka/factory/blob/master/docs/getting-started.md#agy-workspace-trust) before launch.
+- Before launching agy in an untrusted workspace, have the owner [back up agy's trust settings](https://github.com/pkieltyka/factory/blob/master/docs/getting-started.md#back-up-agy-trust-settings).
 
 ## Commands
 
@@ -49,6 +49,6 @@ factory.py up reviewer pm
 
 `up` marks your pane as operator, places members and the keeper in the `team` tab, prepares worktrees and sends briefs when members are ready. Running members stay running. For stopped members, `up` tries compatible saved conversations. Use `factory.py up NAME --fresh` for a new conversation.
 
-Exit 2 gives the reason the launch was refused or failed preflight. Resolve the reported problem before retrying and keep the owner's chosen harnesses, models and thinking. Exit 3 names a member that failed to start, get ready or receive its brief. Follow the recovery command it gives. The owner accepts agy's trust dialog in its pane. Wait for each member's ready or pickup report before assigning work.
+Exit 2 gives the reason the launch was refused or failed preflight. Resolve the reported problem before retrying and keep the owner's chosen harnesses, models and thinking. Exit 3 names a member that failed to start, get ready or receive its brief. Follow the recovery command it gives. Have the owner handle agy's trust dialog in the member's pane and [check the settings after accepting](https://github.com/pkieltyka/factory/blob/master/docs/getting-started.md#launch). Wait for each member's ready or pickup report before assigning work.
 
 Add members in `factory.toml` using the role's next name and an explicit harness and model. Set `role` for numbered names. Run `check` and `up NAME`. For changed settings, run `down NAME` and then `up NAME`. Keep member names stable.
