@@ -2051,6 +2051,7 @@ def _team_for(adapter_class, role, harness, **options):
 def _up(team, run, case, role, harness, names):
     """Bring the team up; on failure every listed subcase is not_run with up's output."""
     if team.real:                                     # a real operator first gets past its own startup dialogs
+        _trust_entries(run, team)
         settled = Harness.attach(team.qa, team.operator_harness, team.operator).settle(timeout=120)
         if not settled.startswith("idle"):
             for name in names:
@@ -2068,6 +2069,20 @@ def _up(team, run, case, role, harness, names):
             run.row(case, name, role, harness, "not_run", f"case {case} {name}", reason="the operator never idled")
         return False
     return True
+
+
+TRUST_FILES = {"claude": "~/.claude.json", "codex": "~/.codex/config.toml"}
+
+
+def _trust_entries(run, team):
+    """The per-directory trust a real Claude Code or Codex start may add for this run's scratch project, listed
+    for the owner to remove (@operator's decision; phase_8.md §2)."""
+    entries = run.data.setdefault("trust_entries", [])
+    for harness in {team.operator_harness, *team.members.values()} & set(TRUST_FILES):
+        entry = {"harness": harness, "file": TRUST_FILES[harness], "directory": str(team.work)}
+        if entry not in entries:
+            entries.append(entry)
+    run.checkpoint()
 
 
 def _member_says(team, text, timeout=300):
