@@ -1445,8 +1445,9 @@ def lc8():
 
 
 def rodeo_tabs():
-    """check rodeo_tabs (phase_8.md §2): prefix+1..9 selects a tab by its place in the layout doc, so a marker
-    typed after it reaches only that tab's focused pane."""
+    """check rodeo_tabs (phase_8.md §2): prefix+1..9 selects a tab by its place in the layout doc, and prefix plus
+    h/l moves between its panes, both ways, with the same pane title in both tabs; a marker typed after each move
+    reaches only the expected terminal."""
     result = {"check": "rodeo_tabs", "rodeo": RODEO}
     if not RODEO or not os.path.exists(RODEO):
         result["result"] = "not run: rodeo not found (set RODEO_BIN)"
@@ -1454,19 +1455,22 @@ def rodeo_tabs():
     result["rodeo_version"] = subprocess.run([RODEO, "--version"], capture_output=True, text=True,
                                              check=False).stdout.strip()
     with Core("tabsqa") as qa, Core("tabsdrv") as drv:
-        op, lead, rev = Probe(qa, "op"), Probe(qa, "lead"), Probe(qa, "rev")
+        op, dup1, lead, dup2 = Probe(qa, "op"), Probe(qa, "dup1"), Probe(qa, "lead"), Probe(qa, "dup2")
+        probes = {"op": op, "dup1": dup1, "lead": lead, "dup2": dup2}
         space = "sp" + "7" * 32
 
         def block(n, probe, title):
             return {"id": "p" + str(n) * 32, "type": "block", "title": title, "content": {"terminal": probe.address}}
         doc = {"spaces": [{"id": space, "name": "tabs", "folder": str(qa.dir), "tabs": [
             {"id": "tb" + "1" * 32, "name": "operator", "root": {"id": "s" + "1" * 32, "type": "row",
-                                                                "children": [block(1, op, "@operator")]}},
+                                                                "children": [block(1, op, "@operator"),
+                                                                             block(2, dup1, "@dup")]}},
             {"id": "tb" + "2" * 32, "name": "team", "root": {"id": "s" + "2" * 32, "type": "row",
-                                                            "children": [block(2, lead, "@lead"),
-                                                                         block(3, rev, "@rev")]}}]}]}
+                                                            "children": [block(3, lead, "@lead"),
+                                                                         block(4, dup2, "@dup")]}}]}]}
         qa.rpc("doc.set", {"name": "herdr-app", "value": doc, "version": 0})
-        for probe, tab, name in ((op, "1", "@operator"), (lead, "2", "@lead"), (rev, "2", "@rev")):
+        for probe, tab, name in ((op, "1", "@operator"), (dup1, "1", "@dup"), (lead, "2", "@lead"),
+                                 (dup2, "2", "@dup")):
             qa.rpc("terminal.label", {"terminal": probe.address, "labels": {
                 "herdr.space": space, "herdr.tab": "tb" + tab * 32, "herdr.seen": "0", "name": name}})
         rodeo = Rodeo(qa, drv, "unset_env")
@@ -1475,26 +1479,29 @@ def rodeo_tabs():
                 result["result"] = "fail: rodeo did not render both tabs"
                 return result
             time.sleep(2)
-            seen = {}
-            for tab, marker in (("2", "x"), ("1", "y"), ("2", "z")):
-                before = {name: len(p.text()) for name, p in (("op", op), ("lead", lead), ("rev", rev))}
-                rodeo.keys("ctrl+b")
-                time.sleep(0.2)
-                rodeo.keys(tab)
-                time.sleep(0.6)
+            steps = ((["2"], "a", "lead"), (["l"], "b", "dup2"), (["1"], "c", "op"), (["l"], "d", "dup1"),
+                     (["h"], "e", "op"), (["2"], "f", None), (["h"], "g", "lead"))
+            seen, ok = {}, True
+            for keys, marker, expected in steps:
+                before = {name: len(p.text()) for name, p in probes.items()}
+                for key in keys:
+                    rodeo.keys("ctrl+b")
+                    time.sleep(0.2)
+                    rodeo.keys(key)
+                    time.sleep(0.6)
                 rodeo.keys(marker)
                 time.sleep(0.8)
-                got = [name for name, p in (("op", op), ("lead", lead), ("rev", rev))
-                       if marker in p.text()[before[name]:]]
-                seen[f"prefix+{tab} then {marker}"] = got
+                got = [name for name, p in probes.items() if marker in p.text()[before[name]:]]
+                seen[f"prefix+{'+'.join(keys)} then {marker}"] = got
+                if expected is not None and got != [expected]:
+                    ok = False
+                if expected is None and len(got) != 1:  # tab 2 again: whichever pane rodeo kept focused
+                    ok = False
             result["landed"] = seen
-            ok = (seen["prefix+2 then x"] == ["lead"] and seen["prefix+1 then y"] == ["op"]
-                  and seen["prefix+2 then z"] == ["lead"])
             result["result"] = "pass" if ok else "fail"
         finally:
             rodeo.close()
     return result
-
 
 def smoke():
     """Exercise the real Factory commands and keeper through rodeo on two private cores."""
@@ -2171,7 +2178,8 @@ class QATeam:
 # Qualification (phase_8.md): functional_spec §10's ten cases over eight role profiles, the four cross cases once.
 # One JSON object on stdout (progress on stderr), checkpointed to --json after each case.
 
-EVIDENCE = {"teams": [], "tokens": []}   # the current case's closed teams' diagnostics, and its test markers
+# The current case's closed teams' diagnostics and test markers, and this run's rodeo_tabs probe.
+EVIDENCE = {"teams": [], "tokens": [], "rodeo_tabs": None}
 QUALIFY_HARNESSES = ("claude", "codex", "pi", "omp", "opencode", "agy")
 OPERATOR_HARNESSES = ("claude", "codex")
 CROSS_CASES = ("two-teams", "multi-down", "owner-pane", "other-version")
@@ -2735,6 +2743,10 @@ def _rodeo(team, titles):
     if getattr(team, "view", None) is None:
         if not RODEO:
             raise NotRun("rodeo is not installed: owner input goes through rodeo")
+        if EVIDENCE.get("rodeo_tabs") is None:           # once per run, before any case uses rodeo's keys
+            EVIDENCE["rodeo_tabs"] = rodeo_tabs()
+        if EVIDENCE["rodeo_tabs"].get("result") != "pass":
+            raise NotRun(f"check rodeo_tabs did not pass: {EVIDENCE['rodeo_tabs'].get('result')}")
         team.drv = Core("qualifydrv")
         team.view = Rodeo(team.qa, team.drv)
         team.view.focused_terminal = None
@@ -3424,6 +3436,7 @@ def qualify(target, role=None, cases=None, json_path=None, fixture=False):
         selected = [(r, h, c) for r, h in select_profiles(target, role) for c in cases]
         mode = "fixture" if fixture else "real"
     run = Qualification(mode, json_path, _versions())
+    EVIDENCE["rodeo_tabs"] = None                       # probed once, by the first case that uses rodeo
     if target == "cross":
         for name in CROSS_CASES:
             EVIDENCE.update(teams=[], tokens=[])
@@ -3477,6 +3490,8 @@ def qualify(target, role=None, cases=None, json_path=None, fixture=False):
             _file_evidence(run, first_row)
         run.checkpoint()
     run.data["summary"] = run.summary(selected)
+    if EVIDENCE["rodeo_tabs"] is not None:
+        run.data["rodeo_tabs"] = {k: EVIDENCE["rodeo_tabs"].get(k) for k in ("result", "rodeo_version", "landed")}
     run.checkpoint()
     return run.data, run.exit_code(selected)
 
