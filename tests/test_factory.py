@@ -2217,6 +2217,7 @@ class TeamCommandTests(TeamCase):
         factory.launch_entry(self.state_dir, m, "t-plain", "new", None)
         factory.launch_entry(self.state_dir, m, "t-plain", "id", "assigned-2")          # no say: the ID wins
         factory.launch_entry(self.state_dir, m, "t-plain", "id", "assigned-2")          # and is not repeated
+        factory.launch_entry(self.state_dir, m, "t-plain", "new", None)                 # nor undone by a late new
         lines = (self.state_dir / factory.SESSIONS).read_text().splitlines()
         self.assertEqual(sum('"assigned-2"' in line for line in lines), 1)
         self.assertEqual(factory.saved_sessions(self.state_dir)[0]["frontend-dev"]["value"], "assigned-2")

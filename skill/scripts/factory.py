@@ -2784,8 +2784,9 @@ def launch_entry(state, m, term, how, value):
     terminal, nor repeats one."""
     def decide(newest):
         e = newest.get(m["name"])
-        if e is not None and e["term"] == term and (e["how"] == "env" or (e["how"], e["value"]) == (how, value)):
-            return None
+        if e is not None and e["term"] == term and (how == "new" or e["how"] == "env"
+                                                     or (e["how"], e["value"]) == (how, value)):
+            return None                              # never "new" after anything for this terminal (@architect-3)
         return {"member": m["name"], "harness": m["harness"], "model": m.get("model"), "term": term, "how": how,
                 "value": value, "at": utc_now()}
     _sessions(state, decide)
@@ -2956,6 +2957,7 @@ def await_ready(hc, started, timeout=LAUNCH_TIMEOUT, clock=time):
                     continue
                 word = words[name] = (t.get("status") or {}).get("state")
                 if word == "working":
+                    seen.pop(name, None)             # two observations of a dialog must be consecutive
                     continue
                 screen = "".join(hc.read(address).split())
                 matching = [(text, keys) for text, keys in dialogs if "".join(text.split()) in screen]
