@@ -3384,17 +3384,17 @@ def case_1(run, role, harness, adapter_class):
         proof = {"states": states, "turn": [before.get("turn"), after.get("turn")],
                  "action": receipt.read_text().strip() if receipt.exists() else None,
                  "ready_after_up": getattr(team, "ready_states", None), "subject": subject, "working_app": app,
-                 "working_turn": working_turn}
+                 "working_harness": app_harness(app), "working_turn": working_turn}     # raw and mapped
         ok = (states[0] in READY and "working" in states and states[-1] in READY
               and after.get("turn", 0) > before.get("turn", 0) and proof["action"] == "exit 0")
         # a new operator's live app must be its own table key: Factory's between-turns rule selects by it, and the
         # formation's fallback cannot show which harness hc observed (phase_10.md §2)
         app_required = team.real and role == "operator" and harness in ("pi", "omp", "opencode", "agy")
-        app_ok = not app_required or app == harness
+        app_ok = not app_required or app_harness(app) == harness     # agy reports "antigravity" (status_app)
         run.row(1, "states", role, harness, "pass" if ok and app_ok else "fail",
                 "idle, working through a real tool action, idle again with the turn advanced", proof=proof,
                 reason=None if ok and app_ok else "the states or the action were not as expected" if not ok
-                else f"the working operator reported app {app!r}, not its table key {harness!r}")
+                else f"the working operator reported app {app!r}, which the table does not map to {harness!r}")
         dialog_row(proof["action"] == "exit 0")
 
 
@@ -4394,10 +4394,15 @@ def between_turns(harness, role):
     return harness_table().get(harness, {}).get("deliver") == "idle"
 
 
+def app_harness(app):
+    """The harness a live status.app names: Factory's own harness_for_app, the one lookup product and qualification
+    share (its key, or the key whose status_app it is)."""
+    return factory_module(ROOT / "skill" / "scripts" / "factory.py").harness_for_app(app)
+
+
 def _app_selects(app):
     """Whether a live status app selects between-turns delivery in the table (keeper.md §9's lookup)."""
-    harness = factory_module(ROOT / "skill" / "scripts" / "factory.py").harness_for_app(app)   # Factory's own lookup
-    return harness_table().get(harness or "", {}).get("deliver") == "idle"
+    return harness_table().get(app_harness(app) or "", {}).get("deliver") == "idle"
 
 
 def _ask_later(team, role, text):

@@ -1761,6 +1761,19 @@ class DeliveryDecisionTests(unittest.TestCase):
         self.assertEqual((lines, code), (["@lead-dev: queued (busy): Factory will deliver it when @lead-dev's turn"
                                           " ends."], 0))
 
+    def test_a_live_app_maps_to_its_harness_through_status_app(self):
+        """agy reports "antigravity" and Claude Code "claude-code" (@operator's decision on agy as operator at
+        5cdcbd4): decide finds the harness through status_app, so a between-turns rule would apply to them."""
+        self.assertEqual([factory.harness_for_app(a) for a in ("codex", "antigravity", "claude-code", "fake", None)],
+                         ["codex", "agy", "claude", None, None])
+        record = self.terminal("operator", "working", kind="operator")
+        record["status"]["app"] = "antigravity"
+        with patch.dict(factory.TABLE["agy"], deliver="idle"):
+            self.assertEqual(factory.decide("operator", {"kind": "say"}, factory.View([record]), self.box, self.cfg,
+                                            10, None), ("queue", "busy"))
+        self.assertEqual(factory.decide("operator", {"kind": "say"}, factory.View([record]), self.box, self.cfg, 10,
+                                        None), ("send", "t-operator"))
+
     def test_stale_note_takes_precedence_over_an_absent_operator(self):
         note = {"kind": "note", "meta": {"what": "quiet"}}
         self.assertEqual(factory.decide("operator", note, factory.View([]), self.box, self.cfg, 10, None,
@@ -7659,6 +7672,11 @@ class QualifyFrameworkTests(unittest.TestCase):
                 self.assertEqual(shlex.split(typed), launch)
             else:
                 self.assertEqual(run["argv"], launch)
+
+    def test_case_1_maps_a_live_app_through_the_table(self):
+        import live
+        self.assertEqual([live.app_harness(a) for a in ("agy", "antigravity", "claude-code", "pi", "fake", "")],
+                         ["agy", "agy", "claude", "pi", None, None])
 
     def test_defaults_and_scope(self):
         """Phase 10: every harness in both roles; an omitted role runs operator then member."""
