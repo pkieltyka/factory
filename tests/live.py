@@ -2012,23 +2012,24 @@ class RealAdapter(FixtureAdapter):
         quit command if it is still reporting."""
         if not self.team.operator_command:
             raise NotRun("this team's operator was not started from a shell")
-        for _ in range(2):
+        for _ in range(2):                  # inside the harness's "press again to exit" window
             qa.rpc("terminal.keys", {"terminal": terminal, "keys": ["ctrl+c"]})
-            time.sleep(1)
+            time.sleep(0.3)
         if not self.team.until(lambda: self.team.state(terminal) is None, 15):
             qa.rpc("terminal.send", {"terminal": terminal, "text": {"claude": "/exit"}.get(self.team.operator_harness,
                                                                                          "/quit")}, timeout=60)
 
     def quit_keys_only(self, qa, terminal, stop=lambda: False):
-        """Quit with the owner's keys alone, Ctrl+C twice: no typed /exit, which a held send could merge with. The
-        second press is skipped once stop() is true (the harness has gone), so it cannot reach the sink."""
+        """The owner's quit, Ctrl+C twice 0.3 s apart (@lead-dev-3's probe: Claude Code and Codex exit only when the
+        second press comes inside their "press again" window, under 1 s). The first press also clears any draft.
+        No typed /exit, which a held send could merge with; the second press is skipped once stop() is true."""
         for _ in range(2):
             if stop():
                 return
             qa.rpc("terminal.keys", {"terminal": terminal, "keys": ["ctrl+c"]})
-            deadline = time.monotonic() + 1
+            deadline = time.monotonic() + 0.3
             while time.monotonic() < deadline and not stop():
-                time.sleep(0.05)
+                time.sleep(0.02)
 
     def restart(self, qa, terminal):
         """Type the same command at the shell prompt in that pane."""

@@ -1,0 +1,30 @@
+{
+ "mode": "real",
+ "source_head": null,
+ "utc": "2026-11-27T13:50:00Z",
+ "imported": "manual shell-start and Ctrl+C probes (@lead-dev-3)",
+ "rows": [],
+ "profiles": [],
+ "trust_entries": [
+  {
+   "harness": "claude",
+   "file": "~/.claude.json",
+   "directory": "/tmp/factory-qa-claude-probe-wvkf1gzb"
+  },
+  {
+   "harness": "claude",
+   "file": "~/.claude.json",
+   "directory": "/tmp/factory-qa-claude-probe-3u0lk0y_"
+  },
+  {
+   "harness": "claude",
+   "file": "~/.claude.json",
+   "directory": "/tmp/factory-qa-cc-fast-ihe_5tci"
+  },
+  {
+   "harness": "codex",
+   "file": "~/.codex/config.toml",
+   "directory": "/tmp/factory-qa-cx-fast-yxjmu6tb"
+  }
+ ]
+}
