@@ -304,8 +304,9 @@ def tool_calls(text, pairing=False):
                 if job:                          # omp ran it as a job: its own result comes later, by job name
                     jobs[job.group(1)] = node["toolCallId"]
                     results[node["toolCallId"]] = None
-            for key in ("text", "content"):      # omp's async-result notice: a plain string
-                done = OMP_JOB_DONE.search(node[key]) if isinstance(node.get(key), str) else None
+            if kind == "custom_message" and node.get("customType") == "async-result" \
+                    and isinstance(node.get("content"), str):   # omp's own notice, never a quote (@lead-dev)
+                done = OMP_JOB_DONE.search(node["content"])
                 if done and done.group(1) in jobs and calls.get(jobs[done.group(1)]) == done.group(2):
                     results[jobs.pop(done.group(1))] = done.group(3)
             ident = node.get("id") if kind == "tool_use" else node.get("call_id")

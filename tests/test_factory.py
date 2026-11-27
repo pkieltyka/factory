@@ -7045,6 +7045,9 @@ class QualifyJudgeTests(unittest.TestCase):
         self.assertEqual(live.tool_calls("\n".join(json.dumps(x) for x in omp[:2])), [(status, None)])   # not yet
         other = {**omp[2], "content": omp[2]["content"].replace(status, "python3 /qa/other.py")}
         self.assertEqual(live.tool_calls("\n".join(json.dumps(x) for x in [*omp[:2], other])), [(status, None)])
+        quote = {"type": "message", "message": {"role": "assistant", "content": [{"type": "text", "text":
+                 omp[2]["content"]}]}}                     # the model quoting the notice is not the notice
+        self.assertEqual(live.tool_calls("\n".join(json.dumps(x) for x in [*omp[:2], quote])), [(status, None)])
 
     def test_claude_code_bash_output_is_read_from_its_native_result(self):
         """claude-op-2-a65a1fe (@lead-dev): a successful Bash call's tool_result content is empty, and its output is
