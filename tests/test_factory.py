@@ -6956,6 +6956,22 @@ class SkillTextTests(unittest.TestCase):
             self.assertIn(hint, source)
         self.assertIn("first brief {", source)
 
+    def test_note_table_matches_the_keeper(self):
+        leading = (factory.SKILL / "references/leading.md").read_text()
+        table = leading.split("| Note | Action |", 1)[1].split("\n\n", 1)[0]
+        names = {name.removeprefix("@x ") for row in table.splitlines() if row.startswith("|")
+                 for name in re.findall(r"`([^`]+)`", row.split("|", 2)[1])}
+        producers = {
+            factory.Keeper._episode: {"is blocked", "hit an error"},
+            factory.end_cause: {"exited", "was killed", "hc stopped", "was lost", "its harness ended"},
+            factory.quiet_text: {"team quiet"},
+            factory.Keeper._ready_result: {"ready work"},
+        }
+        self.assertEqual(names, set().union(*producers.values()))
+        for producer, phrases in producers.items():
+            for phrase in phrases:
+                self.assertIn(phrase, inspect.getsource(producer), producer.__name__)
+
     def test_outcome_words_are_the_real_ones(self):
         diagnostics = {"nothing sent", "not stored", "not confirmed stored"}
         for name in ("references/leading.md", "templates/member-prompt.md"):

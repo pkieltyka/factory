@@ -86,7 +86,7 @@ One list, so every file says the same thing. Each item is checked against the co
 |---|---|
 | `@x is blocked (…)` | Resolve it if you can; ask the owner when only they can. |
 | `@x hit an error` | Reassign, or retry after the provider's delay. |
-| `@x exited` / `was lost` | `factory.py up x`. When it reports back, reconcile its pickup report with the tracker and your inbox before you give it its task again or reassign: a resumed member may already be on it. |
+| Member exit (`exited`, `was killed`, `hc stopped`, `was lost`, or `its harness ended`) | `factory.py up x`. When it reports back, reconcile its pickup report with the tracker and your inbox before you give it its task again or reassign: a resumed member may already be on it. |
 | `team quiet` | The note may be late: check `status` and the tracker first. Then ask whoever still owes you a report. Otherwise take the next ready item. Otherwise end your turn; do not answer the note. |
 | `ready work` | The note may be late and its list is in no order: check the tracker, ownership and work in progress, then take the next ready item, as the workflow says. |
 
@@ -218,7 +218,7 @@ In `tests/test_factory.py`. The text files are the unit under test; no `hc` is n
 - `test_template_ready_check_command`: uncommented, loaded as TOML and run by `sh -c`: in a directory with the template `TODO.md`, exit 1 and no output; with an item only in another section, exit 1; with one item under `## Ready`, exit 0 and that line; with no `TODO.md`, exit 2.
 - `test_template_workflow_is_the_spec_default`: the `## Workflow` section of `templates/FACTORY.md` equals the block in cli_skill.md §4.
 - `test_team_brief_says_pane_not_herdr`.
-- After #171 merges (§6): `test_note_table_matches_the_keeper`: each note name in `leading.md`'s note table (`is blocked`, `hit an error`, `exited`, `was lost`, `team quiet`, `ready work`) is a string the keeper writes.
+- `test_note_table_matches_the_keeper`: each note name in `leading.md`'s note table, including all five member exit phrases, is a string the keeper writes.
 
 **Existing classes**
 - `DocumentationTests.test_relative_links_and_headings` also walks `skill/SKILL.md` and `skill/references/*.md`, `skill/recipes/*.md`, so a link to a removed heading fails.
@@ -227,9 +227,9 @@ In `tests/test_factory.py`. The text files are the unit under test; no `hc` is n
 - `InstalledCopyTests`: unchanged; it already runs `harnesses`, `init`, `check` and `brief NAME` from a copy of `skill/` alone.
 - Any test that asserts text this phase changes (the brief's sentences, the sample formation) is updated in the same commit as the text.
 
-## 6. What waits for Phase 6
+## 6. Phase 6 integration
 
-Written now against keeper.md §5 and §6 and phase_6.md, and checked again after #171 merges and this branch is rebased: the note table and its test; the words "team quiet" and "ready work"; the three `factory.toml` keys and their minimums; `SKILL.md`'s keeper sentence; the "Not handled" list. If #171 changes a note's wording, the text follows the code.
+The note table, `[from factory]` sender, the three `factory.toml` keys and their minimums, and the limits in the user guide were checked against the merged keeper at `333f61d`. The note table lists every exit phrase from `end_cause`.
 
 ## 7. Build order, risks and questions
 
@@ -246,7 +246,6 @@ One commit per step; the suite green at each.
 
 Risks and gaps:
 - **The text is checked by tests for words, not for sense.** A sentence can pass every test and still mislead an operator. The follower reads each file as its reader; the Phase 8 qualification runs with a real operator are the real test.
-- **Phase 6 is not merged.** Note names and the autonomy keys may still move (§6).
 - **Recipes' ready-check commands** are only as good as the run the writer records; the `todos` one depends on that tool's current flags.
 - **No claim about operator harnesses.** Until Phases 8 and 10, the docs do not say which harnesses are qualified as operator.
 
