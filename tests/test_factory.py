@@ -7423,6 +7423,53 @@ class E2EJudgeTests(unittest.TestCase):
 
 
 class E2EObserverTests(unittest.TestCase):
+    def test_interrupted_run_checkpoints_collected_evidence_before_down(self):
+        for interruption in (KeyboardInterrupt(), SystemExit(1)):
+            with self.subTest(interruption=type(interruption).__name__), tempfile.TemporaryDirectory() as directory:
+                root = pathlib.Path(directory)
+                report = root / "result.json"
+                parser = argparse.ArgumentParser()
+                e2e.add_arguments(parser)
+                args = parser.parse_args(["--tracker", "file", "--json", str(report)])
+
+                def down(command, *, timeout):
+                    self.assertEqual(command, "down")
+                    saved = json.loads(report.read_text())
+                    self.assertEqual(saved["status"], "fail")
+                    self.assertIn("runner interrupted", saved["detail"])
+                    self.assertTrue(saved["cutoff_utc"])
+                    rows = {row["name"]: row["status"] for row in saved["rows"]}
+                    self.assertEqual(rows["one-prompt"], "pass")
+                    self.assertEqual(rows["loaded-version"], "pass")
+                    self.assertEqual(saved["faults"][0]["terminal"], "t3")
+                    return 0, ""
+
+                team = types.SimpleNamespace(
+                    dir=root, skill=factory.SKILL, script=factory.SCRIPT, operator_start={},
+                    adapter=types.SimpleNamespace(model=lambda _: "qa", version=lambda _: "test"),
+                    qa=types.SimpleNamespace(id="12345678"), env={"XDG_CACHE_HOME": str(root / "cache")},
+                    call=unittest.mock.Mock(side_effect=down),
+                )
+
+                @contextlib.contextmanager
+                def real_team(*_args, setup, **_kwargs):
+                    setup(team)
+                    yield team
+
+                def collect(_collector, observer, _move, _deadline, _checkpoint):
+                    observer.evidence.loaded = True
+                    observer.evidence.interrupt = e2e.Fault("(1)", "t3", 2, 1, 2, 10)
+                    raise interruption
+
+                rodeo = types.SimpleNamespace(paste=unittest.mock.Mock())
+                with (patch.object(live, "QATeam", real_team), patch.object(live, "_versions", return_value={}),
+                      patch.object(live, "_operator_start", return_value=True), patch.object(live, "_operator_tab"),
+                      patch.object(live, "_rodeo", return_value=rodeo), patch.object(e2e, "collect_run", collect),
+                      contextlib.redirect_stdout(io.StringIO())):
+                    self.assertEqual(e2e.run(args, None, None, None, None, live), 1)
+                team.call.assert_called_once_with("down", timeout=60)
+                rodeo.paste.assert_called_once()
+
     def test_observation_uses_only_log_and_core_reads(self):
         state = pathlib.Path("/scratch/factory-skill/team/core")
         idle = {"address": "t5", "state": "live", "turn": 4, "created_ms": 5, "status": {"state": "idle"},

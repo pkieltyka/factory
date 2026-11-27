@@ -1315,19 +1315,21 @@ def run_real(args, live):
                       "You are the operator of the team in this repository. Run up, then work through every ready "
                       "item in the tracker as FACTORY.md says until none is left. I am away: do not wait for me.")
             started = time.monotonic()
-            rows = judge(evidence)
             try:
                 view.paste(prompt)
                 evidence.prompts = 1
                 result["status"] = "running"
                 rows = collect_run(collector, observer, move, started + budget * 60, checkpoint)
                 result["status"] = "pass" if all(r["status"] in {"pass", "measured"} for r in rows) else "fail"
+            except (KeyboardInterrupt, SystemExit):
+                result.update(status="fail", detail="the runner interrupted the run before a verdict")
             except (OSError, RuntimeError, live.HcDown, live.HcError, subprocess.SubprocessError,
                     factory.LogDamage) as error:
                 result.update(status="fail", detail=str(error))
-                rows = judge(evidence)
             finally:
-                checkpoint(rows)
+                if result["status"] == "running":
+                    result.update(status="fail", detail="the runner ended the run before a verdict")
+                checkpoint(judge(evidence))
                 try:
                     code, out = team.call("down", timeout=60)
                     if code != 0:
