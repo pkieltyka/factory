@@ -1916,8 +1916,9 @@ class FixtureAdapter:
     def switch_request(self, harness):
         return "ACT switch"
 
-    def quit_request(self):
-        return "FAKE: quits"
+    def quit(self, qa, terminal):
+        """The fake operator quits to its loop: it reports state=clear, as a harness returning to its shell."""
+        qa.rpc("terminal.send", {"terminal": terminal, "text": "FAKE: quits"}, timeout=60)
 
     def restart(self, qa, terminal):
         """Start the fake operator again in its open pane (its loop waits for Enter)."""
@@ -1985,18 +1986,31 @@ class RealAdapter(FixtureAdapter):
             raise NotRun(f"no known way to start a new conversation in {harness}")
         return command
 
-    def quit_request(self):
-        raise NotRun("quitting and restarting a real operator in the same pane is not automated yet")
+    def quit(self, qa, terminal):
+        """Quit the harness as its owner would, Ctrl+C twice, back to the shell (hc then clears the status); its own
+        quit command if it is still reporting."""
+        if not self.team.operator_command:
+            raise NotRun("this team's operator was not started from a shell")
+        for _ in range(2):
+            qa.rpc("terminal.keys", {"terminal": terminal, "keys": ["ctrl+c"]})
+            time.sleep(1)
+        if not self.team.until(lambda: self.team.state(terminal) is None, 15):
+            qa.rpc("terminal.send", {"terminal": terminal, "text": {"claude": "/exit"}.get(self.team.operator_harness,
+                                                                                         "/quit")}, timeout=60)
 
     def restart(self, qa, terminal):
-        raise NotRun("quitting and restarting a real operator in the same pane is not automated yet")
+        """Type the same command at the shell prompt in that pane."""
+        if not self.team.operator_command:
+            raise NotRun("this team's operator was not started from a shell")
+        self.team.send(terminal, self.team.operator_command)
+        Harness.attach(qa, self.team.operator_harness, terminal).settle(timeout=120)
 
 
 class QATeam:
     """A scratch project, a private QA core, a team with an operator terminal, and Factory's real commands from a
     private copy of the skill (phase_8.md §2)."""
 
-    def __init__(self, adapter_class, operator, members, draft_wait=None, permissions="full"):
+    def __init__(self, adapter_class, operator, members, draft_wait=None, permissions="full", operator_shell=False):
         self.operator_harness, self.members, self.permissions = operator, members, permissions
         self.real = adapter_class is RealAdapter
         home = os.path.expanduser("~")
@@ -2033,7 +2047,14 @@ class QATeam:
         if not self.real:
             params["env"]["FAKE_LOG"] = str(self.dir / "operator-input.jsonl")   # every input the fake received
             params["env"]["FAKE_ECHO"] = "1"
+        self.operator_command = None
+        if self.real and operator_shell:    # an owner's shell: quitting the harness leaves the pane at its prompt
+            self.operator_command = shlex.join(params["argv"])
+            params["argv"] = ["bash", "--norc", "--noprofile", "-i"]
+            params["env"]["PS1"] = "qa$ "
         self.operator = self.qa.rpc("terminal.run", params)["address"]
+        if self.operator_command:
+            self.send(self.operator, self.operator_command)
         self.env = {**self.qa.env, **shared, "HC_TERMINAL_ID": self.operator}
 
     def call(self, *args, terminal=None, timeout=60):
@@ -2665,7 +2686,7 @@ def _say_id(out):
 def case_8(run, role, harness, adapter_class):
     """dead-member, operator-gone and same-pane; unconfirmed-brief and quit-during-hold are not built yet
     (phase_8.md §3.8)."""
-    team, peer = _team_for(adapter_class, role, harness)
+    team, peer = _team_for(adapter_class, role, harness, operator_shell=role == "operator")
     with team:
         names = [n for n, _ in subcases(8, role)]
         if not _up(team, run, 8, role, harness, names):
@@ -2702,7 +2723,7 @@ def case_8(run, role, harness, adapter_class):
             return
         operator = team.operator
         # operator-gone: the harness stops reporting in an open pane; messages queue until up.
-        team.send(operator, team.adapter.quit_request())
+        team.adapter.quit(team.qa, operator)
         stopped = team.until(lambda: team.state(operator) is None, 120)
         receipt, toks, ids = team.receipt("gone"), [token(), token()], []
         for tok in toks:
@@ -2726,7 +2747,7 @@ def case_8(run, role, harness, adapter_class):
                 "an operator gone from an open pane: messages queue until up, then arrive in order",
                 proof=proof, reason=None if ok else "see proof")
         # same-pane: a quick quit and restart with nothing pending, then a message succeeds without up.
-        team.send(operator, team.adapter.quit_request())
+        team.adapter.quit(team.qa, operator)
         team.until(lambda: team.state(operator) is None, 60)
         team.adapter.restart(team.qa, operator)
         team.until(lambda: team.state(operator) in READY, 60)
