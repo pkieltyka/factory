@@ -305,6 +305,7 @@ Claude Code and Codex may record per-directory trust for each QA scratch project
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-takeover-3j54dOla/scratch/factory-qa-5dg9zdye/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-takeover-3j54dOla/scratch/factory-qa-5ks081bq/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-takeover-3j54dOla/scratch/factory-qa-5oy_h61q/work` |
+| codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-takeover-3j54dOla/scratch/factory-qa-6as5h19l/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-takeover-3j54dOla/scratch/factory-qa-72j4wvse/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-takeover-3j54dOla/scratch/factory-qa-7ih1qupv/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-takeover-3j54dOla/scratch/factory-qa-85xulu_s/work` |
@@ -373,6 +374,7 @@ Claude Code and Codex may record per-directory trust for each QA scratch project
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-takeover-3j54dOla/scratch/factory-qa-n4rp2kin/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-takeover-3j54dOla/scratch/factory-qa-nmon641k/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-takeover-3j54dOla/scratch/factory-qa-nmt20sg_/work` |
+| codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-takeover-3j54dOla/scratch/factory-qa-nobmw0ug/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-takeover-3j54dOla/scratch/factory-qa-nq4ax1aa/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-takeover-3j54dOla/scratch/factory-qa-ny5xi6ct/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-takeover-3j54dOla/scratch/factory-qa-o51ksn4f/work` |
