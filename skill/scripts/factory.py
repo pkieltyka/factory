@@ -4041,12 +4041,18 @@ def _down(cfg, hc, team, state, names):
     except (HcDown, HcError) as error:
         print(f"could not check whether any member still runs: {error}")
         return 1
-    last = not any(r["labels"].get("factory.kind") == "member" and r["labels"].get("factory.member") in cfg.members
-                   for r in after)
+    members = [r for r in after if r["labels"].get("factory.kind") == "member"]
+    last = not any(r["labels"].get("factory.member") in cfg.members for r in members)
     if recorded or last:
         keeper = View(after).keeper if last else None
         _unplace_team(state, hc, recorded, last, keeper["address"] if keeper else None)
     if last:
+        for record in members:
+            if record["state"] == "live":
+                name, address = record["labels"].get("factory.member"), record["address"]
+                print(f"@{name} ({address}) is still running outside factory.toml. Run hc kill {address} to stop it.",
+                      file=sys.stderr)
+                code = 1
         try:
             update_team(state, up=False)
         except (Problem, ValueError, OSError, LogDamage) as error:

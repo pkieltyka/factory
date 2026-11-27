@@ -2661,11 +2661,19 @@ class IntegratedTeamTests(TeamCase):
         keeper = factory.team_view(self.hc, self.team).keeper["address"]
         self.env.write_brief(formation({"lead-dev": CATALOG_MEMBERS["lead-dev"]}))
         code, out, err = self.cmd("down")
-        self.assertEqual(code, 0, out + err)
+        self.assertEqual(code, 1, out + err)
         self.assertIn("run factory.py up to bring members back", out)
-        self.assertEqual(self.members(), {"reviewer": members["reviewer"]})
+        old = members["reviewer"]
+        self.assertIn(f"@reviewer ({old}) is still running outside factory.toml.", err)
+        self.assertIn(f"Run hc kill {old} to stop it.", err)
+        self.assertEqual(self.members(), {"reviewer": old})
         self.assertFalse(factory.read_team(self.state_dir)["up"])
         self.until(lambda: self.hc.get(keeper)["state"] == "finished", "the keeper to exit")
+        self.hc.kill(old)
+        self.until(lambda: self.hc.get(old)["state"] == "finished", "the removed member to exit")
+        code, out, err = self.cmd("down")
+        self.assertEqual(code, 0, out + err)
+        self.assertNotIn("still running", err)
 
     def test_a_team_runs_end_to_end(self):
         code, out, err = self.cmd("check", "lead-dev", "reviewer")

@@ -36,7 +36,7 @@ def find_team(args) -> tuple[Config, pathlib.Path | None, dict | None]
 | `brief` | `[NAME]` | no | anyone | 0 |
 | `brief --send` | `[all | names…]` | yes | operator | 0; 1 a brief not `delivered`; 2 refused |
 | `up` | `[names…] [--fresh] [--timeout S]` | yes | operator pane | 0; 2 refused, preflight failed or the team lock is held (nothing changed); 3 a member not started, not ready or not briefed |
-| `down` | `[names…]` | yes | operator | 0; 1 a member could not be stopped; 2 refused or the team lock is held |
+| `down` | `[names…]` | yes | operator | 0; 1 a member could not be stopped or a removed member is still running after shutdown; 2 refused or the team lock is held |
 | `status` | | yes | anyone | 0; 2 `hc` unreachable |
 | `say` | `NAME [NAME…] (--file PATH | TEXT)` | yes | operator or member | 0; 1; 2 (below) |
 | `keeper` | `--state DIR` | yes | Factory | 0 |
