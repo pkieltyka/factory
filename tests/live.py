@@ -3814,9 +3814,12 @@ def _upgrade(team, peer):
         return "".join(team.qa.rpc("terminal.read", {"terminal": keeper, "lines": 0}).get("text", "").split())
     draining = team.until(lambda: f"keeper{new}installed" in keeper_screen(), 90)
     still_held = not first.exists()
-    second, tok2, said = team.receipt("second"), token(), {}
-    _member_says(team, team.adapter.act_append(second, tok2), record=said)   # queued during the drain, before release
-    queued = _say_id(said.get("out") or "")
+    second, tok2 = team.receipt("second"), token()
+    # queued during the drain, before release: a driver-run say from the member's terminal, instant, so the owner's
+    # hold cannot lapse while a slow harness runs it (agy's own say took long enough for the keeper to finish)
+    _, out = team.call("say", "operator", "--file", str(_note(team, team.adapter.act_append(second, tok2))),
+                       terminal=team.member("lead-dev"), timeout=60)
+    queued = _say_id(out)
     queued_while_draining = bool(queued) and _outcome(log, queued, "operator")[0] == "queued" and not second.exists()
     module = sys.modules["factory_under_test"]
     claimed_under = {}
@@ -4308,7 +4311,16 @@ def _esc_trials_hold(proof):
 
 
 REJUDGE = {(6, "resume"): _cycled, (6, "member-switch"): lambda p: p.get("switched") is True and _cycled(p),
-           (4, "owner-interrupt"): _esc_trials_hold}
+           (4, "owner-interrupt"): _esc_trials_hold,
+           # both queued observations, required since 7038415 (@architect-2)
+           (7, "pending-restart"): lambda p: p.get("queued_blocked_before_kill") is True
+           and p.get("queued_after_restart") is True,
+           # the queued message claimed under the new image, required since 7038415
+           (7, "upgrade"): lambda p: p.get("queued_claimed_under") is not None
+           and p.get("queued_claimed_under") == p.get("new_version"),
+           # say returned at its wait, not at once, required since 7038415
+           (10, "held-sender-exit"): lambda p: isinstance(p.get("say_seconds"), (int, float))
+           and p["say_seconds"] >= SAY_WAIT - 1}
 
 REPORT_BEGIN, REPORT_END = "<!-- qualify report: generated, do not edit -->", "<!-- end of generated report -->"
 

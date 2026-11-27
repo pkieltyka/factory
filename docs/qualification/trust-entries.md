@@ -171,6 +171,7 @@ Claude Code and Codex may record per-directory trust for each QA scratch project
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-lead-dev-3/scratch/factory-qa-1doqol2a/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-lead-dev-3/scratch/factory-qa-1yp3o8er/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-lead-dev-3/scratch/factory-qa-21qz0p9h/work` |
+| codex | `~/.codex/config.toml` | `/tmp/factory-qa-lead-dev-3/scratch/factory-qa-2j7z_cc8/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-lead-dev-3/scratch/factory-qa-2jhsxmfg/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-lead-dev-3/scratch/factory-qa-4o795hti/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-lead-dev-3/scratch/factory-qa-52tnt_06/work` |
@@ -179,6 +180,7 @@ Claude Code and Codex may record per-directory trust for each QA scratch project
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-lead-dev-3/scratch/factory-qa-6qgefbkt/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-lead-dev-3/scratch/factory-qa-71lihp5t/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-lead-dev-3/scratch/factory-qa-7n82jwpz/work` |
+| codex | `~/.codex/config.toml` | `/tmp/factory-qa-lead-dev-3/scratch/factory-qa-8_c3hdmc/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-lead-dev-3/scratch/factory-qa-8_v9drze/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-lead-dev-3/scratch/factory-qa-8krjpibh/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-lead-dev-3/scratch/factory-qa-_332mtfo/work` |
@@ -190,12 +192,14 @@ Claude Code and Codex may record per-directory trust for each QA scratch project
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-lead-dev-3/scratch/factory-qa-bp2bj2tm/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-lead-dev-3/scratch/factory-qa-c5rjdb_p/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-lead-dev-3/scratch/factory-qa-czwj6xcm/work` |
+| codex | `~/.codex/config.toml` | `/tmp/factory-qa-lead-dev-3/scratch/factory-qa-diig3s5n/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-lead-dev-3/scratch/factory-qa-dm__76mb/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-lead-dev-3/scratch/factory-qa-dw5st7lg/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-lead-dev-3/scratch/factory-qa-e_eh_86a/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-lead-dev-3/scratch/factory-qa-eb8fbr1r/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-lead-dev-3/scratch/factory-qa-ebnlxn54/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-lead-dev-3/scratch/factory-qa-ehhk183x/work` |
+| codex | `~/.codex/config.toml` | `/tmp/factory-qa-lead-dev-3/scratch/factory-qa-ew3hza2m/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-lead-dev-3/scratch/factory-qa-fojon7x6/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-lead-dev-3/scratch/factory-qa-g2wsis03/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-lead-dev-3/scratch/factory-qa-hepiews3/work` |
@@ -213,6 +217,7 @@ Claude Code and Codex may record per-directory trust for each QA scratch project
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-lead-dev-3/scratch/factory-qa-n08igqoy/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-lead-dev-3/scratch/factory-qa-nt497oky/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-lead-dev-3/scratch/factory-qa-obobnn6b/work` |
+| codex | `~/.codex/config.toml` | `/tmp/factory-qa-lead-dev-3/scratch/factory-qa-odfmvysr/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-lead-dev-3/scratch/factory-qa-p60xusx5/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-lead-dev-3/scratch/factory-qa-pu5cis6f/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-lead-dev-3/scratch/factory-qa-q4fvkx8z/work` |
@@ -237,3 +242,5 @@ Claude Code and Codex may record per-directory trust for each QA scratch project
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-lead-dev-3/scratch/factory-qa-xflgi7sg/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-lead-dev-3/scratch/factory-qa-xkp2h5az/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-lead-dev-3/scratch/factory-qa-yg2p2egq/work` |
+| codex | `~/.codex/config.toml` | `/tmp/factory-qa-lead-dev-3/scratch/factory-qa-yza3a392/work` |
+| codex | `~/.codex/config.toml` | `/tmp/factory-qa-lead-dev-3/scratch/factory-qa-zu88zzhk/work` |

@@ -6715,6 +6715,19 @@ class QualifyReportTests(unittest.TestCase):
             text = (out / "codex.md").read_text()
             self.assertIn("| 6 | member-switch | unproved (its proof does not meet today's check)", text)
             self.assertIn("| 4 | owner-interrupt | unproved (its proof does not meet today's check)", text)
+            data = json.loads(pathlib.Path(later).read_text())         # passes from before 7038415's checks
+            data["rows"] += [{"case": 7, "subcase": "pending-restart", "role": "member", "harness": "codex",
+                              "status": "pass", "proof": {"keeper_replaced": True, "counts": [1, 1]}},
+                             {"case": 7, "subcase": "upgrade", "role": "member", "harness": "codex",
+                              "status": "pass", "proof": {"new_version": "abc", "new_image_running": True}},
+                             {"case": 10, "subcase": "held-sender-exit", "role": "member", "harness": "codex",
+                              "status": "pass", "proof": {"say_seconds": 0.4}}]
+            pathlib.Path(later).write_text(json.dumps(data))
+            live.report([first, later], out)
+            text = (out / "codex.md").read_text()
+            for case, subcase in ((7, "pending-restart"), (7, "upgrade"), (10, "held-sender-exit")):
+                self.assertIn(f"| {case} | {subcase} | unproved (its proof does not meet today's check)", text)
+            self.assertIn("7 pending-restart", text.split("Unresolved as member:")[1].split("\n")[0])
             live.report([later], out)                                     # a partial import: only b's evidence
             trust = (out / "trust-entries.md").read_text()
             self.assertIn("/tmp/factory-qa-a/work", trust)
