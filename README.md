@@ -34,7 +34,7 @@ The default member permissions assume a safe machine such as a sandbox or VM. Ch
 ## Development
 
 - [skill/](skill/) contains the installable skill, roles, templates, recipes and `scripts/factory.py`.
-- [tests/](tests/) covers the fake harnesses and fake `hc`, a private real `hc` core, Git and recovery. Run `python3 tests/test_factory.py`; set `FACTORY_TEST_HC=real` for the private core suite.
+- [tests/](tests/) covers the fake harnesses and fake `hc`, a private real `hc` core, Git and recovery. Run `python3 tests/test_factory.py`. Set `FACTORY_TEST_HC=real` for the private core suite.
 - Run `python3 tests/live.py smoke` for the private-core rodeo smoke test.
 
 ## License

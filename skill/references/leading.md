@@ -24,7 +24,7 @@ To message several teammates, address each with `@name` in one draft and send it
 
 ## Messages and status
 
-Team messages arrive in your pane with `[from @name]`. Use `factory.py inbox [N]` after compaction or to reread your last messages and their outcomes. Members send private drafts with `--file`; Factory removes a draft when every recipient has it. A cold `up` lists undelivered files to check before resending or discarding. A member's local final reply stays in its pane.
+Team messages arrive in your pane with `[from @name]`. Use `factory.py inbox [N]` after compaction or to reread your last messages and their outcomes. Members send private drafts with `--file`. Factory removes a draft when every recipient has it. A cold `up` lists undelivered files to check before resending or discarding. A member's local final reply stays in its pane.
 
 Check the reported tests before accepting work. `say` prints a message ID and one outcome per recipient.
 
@@ -32,7 +32,7 @@ Check the reported tests before accepting work. `say` prints a message ID and on
 |---|---|
 | `delivered` | The message was typed and submitted. |
 | `sending` or `queued` | Factory finishes delivery. Never resend it. Reasons include `waiting`, `blocked`, `not ready` and `gone`. |
-| `unconfirmed` or `dropped` | Check the recipient before retrying. Members tell you the message ID and recipient and resend only when asked. |
+| `unconfirmed` or `dropped` | Check the recipient before deciding whether to retry. Members tell you the message ID and recipient and resend only when asked. |
 | `nothing sent` | Fix the reported cause, then send again. |
 | `not stored` or `not confirmed stored` | Follow the diagnostic. Respect any instruction to check the inbox or leave the send alone. |
 
