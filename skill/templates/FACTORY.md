@@ -32,7 +32,7 @@ The team works through the ready items on its own. The owner sets direction; the
 | 6. Integrate | The operator | Confirms the approval and the checks, then integrates and has the tracker updated. |
 | 7. Next | The operator | Takes the next ready item without asking. |
 
-- The operator assigns each step with acceptance criteria and records owner, criteria, branch or commit, verdict and next step in the tracker.
+- The operator assigns each step with acceptance criteria. Only @pm writes the tracker when present. Without @pm, the operator writes it. Record owner, criteria, branch or commit, verdict and next step.
 - One item is in progress at a time. Its tasks may run in parallel when each writer has its own worktree; in a shared checkout only one task writes at a time.
 - Every member reports to whoever assigned its work when it finishes, is blocked, or needs a decision. A member that is rate-limited or stuck says so; the operator reassigns.
 

@@ -41,7 +41,9 @@ Edit `FACTORY.md`, the shared brief, as plain Markdown without comments. Paste t
 
 When the formation should be the project's suggestion, copy `factory.toml` to `factory.toml.sample` and make the copy portable: omit the operator’s `harness`, `model` and `thinking`, along with `user`, `worktree_dir`, active ready-check settings and any worktree branch or path that carries a person’s name.
 
-Run `factory.py check`. Resolve each failure without substituting unapproved models or harnesses; unknown Claude IDs only warn. If the check warns about `draft_wait`, tell the owner to set `draft_wait = 600` or more in the file it names. The owner edits the hc config. Preview with `factory.py brief`, show the result, and commit `FACTORY.md` and `factory.toml.sample` when authorized; never `factory.toml`. Next: `/factory up`.
+Run `factory.py check`. Resolve each failure without substituting unapproved models or harnesses; unknown Claude IDs only warn. If the check warns about `draft_wait`, tell the owner to set `draft_wait = 600` or more in the file it names. The owner edits the hc config. Preview with `factory.py brief`, show the result, and commit `FACTORY.md` and `factory.toml.sample` when authorized; never `factory.toml`.
+
+Before launching an agy member in an untrusted workspace, have the owner follow [agy workspace trust](https://github.com/pkieltyka/factory/blob/master/docs/getting-started.md#agy-workspace-trust). Then run `/factory up`.
 
 ## Permissions
 

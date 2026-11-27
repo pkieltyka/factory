@@ -60,11 +60,19 @@ To turn off prompt suggestions for your Claude Code operator, set `"promptSugges
 
 Commit the shared brief `FACTORY.md` and suggested formation `factory.toml.sample`. Setup adds your local `factory.toml` to `.gitignore`.
 
+### agy workspace trust
+
+Before launching agy in an untrusted workspace, back up `~/.gemini/antigravity-cli/settings.json` if it exists. In agy 1.5.13, accepting a new workspace can rewrite `trustedWorkspaces` and remove unrelated entries.
+
+If agy asks whether you trust the workspace, review the dialog and accept it yourself in the member's pane if you trust it. Compare `trustedWorkspaces` with your backup and restore any missing entries while keeping the new one. Then run `/factory brief --send NAME` for that member.
+
 ## Launch
+
+For agy members, follow [agy workspace trust](#agy-workspace-trust) before launch.
 
 Enter `/factory up`. It marks your current pane as the operator and adds the members and a narrow keeper pane to the `team` tab. Your pane stays where it is. Check `/factory status` for members, pending messages and keeper state.
 
-If agy asks whether you trust the workspace, accept the dialog in its pane. Then run `/factory brief --send NAME` for that member. Follow any other recovery instruction printed by `up`.
+Follow the recovery instructions printed by `up`.
 
 ## Give it one task
 

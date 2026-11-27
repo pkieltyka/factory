@@ -7017,6 +7017,7 @@ class SkillTextTests(unittest.TestCase):
         brief = (factory.SKILL / "templates/FACTORY.md").read_text()
         workflow = brief.split("## Workflow", 1)[1].split("## Notes", 1)[0].strip()
         self.assertEqual(workflow, expected)
+        self.assertIn("Only @pm writes the tracker when present. Without @pm, the operator writes it.", workflow)
 
     def test_team_brief_uses_pane_titles(self):
         with Env() as env:

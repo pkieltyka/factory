@@ -24,6 +24,7 @@ Use `factory.py say` for every team message. Members send private drafts with `-
 - Run in a rodeo pane with `HC_TERMINAL_ID` set and `hc` 0.1.20 or newer.
 - The operator needs access to `hc`'s socket, the harness config directories, `~/.cache/factory-skill` and any worktree parent. If its sandbox blocks a Factory, `hc` or worktree command, retry that command outside the sandbox only when your harness allows it and say so in your report. Leave the user's sandbox settings alone. Run commands standalone so exemptions match. See [Codex operator access](https://github.com/pkieltyka/factory/blob/master/docs/getting-started.md#codex-operator-access).
 - Members default to `full`, which assumes a safe machine. See [permissions](references/cmd_setup.md#permissions) for `guarded` and harness details.
+- For agy members in an untrusted workspace, have the owner follow [agy workspace trust](https://github.com/pkieltyka/factory/blob/master/docs/getting-started.md#agy-workspace-trust) before launch.
 
 ## Commands
 
