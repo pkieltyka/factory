@@ -27,7 +27,7 @@ After 5a the team runs with no panes. This phase puts it on screen and closes th
 | `live.py smoke` and `Rodeo.focus` | testing.md §6 |
 | Simplification pass | implementation_plan.md Phase 5b, §8 below |
 
-**Not in this phase:** member notes, the quiet rule, the ready check, the keeper's terminal title and re-exec (Phase 6); the skill text (Phase 7); the Herdr desktop app's half of LC-8, which nobody has run (§10).
+**Not in this phase:** member notes, the quiet rule, the ready check, the keeper's terminal title and re-exec (Phase 6); the skill text (Phase 7).
 
 **Decided here**
 - The existing team tab wins over the operator's current space (§2.1): a new operator in another space adopts the tab where it is.
@@ -258,12 +258,11 @@ Each step is one commit, green in fake mode; real mode before review.
 - `_brief_send` gets its `settle_launches` call after its outcome loop (line 3815). It does not hold `up.lock`, which is why `launch_entry` decides under the journal's lock (§5).
 
 Risks and gaps:
-- **The Herdr desktop app has not been checked** (LC-8 passed on rodeo only). If it drops `size.weight` or adopts differently, the keeper pane's width or a pane's `keep` flag may differ there; the keeper's keep-off rule (Phase 6) covers the second. Not required for v2.0 (decision below): the docs say the desktop app is unverified.
 - **Stale blocks Factory cannot see.** If the owner removes a member's terminal record by hand, or a `down` could not update the layout, a block with a dead terminal stays until a client removes it or the owner closes it. Factory does not guess which blocks are its own.
 - **A pane closed in a client.** What rodeo does to the terminal when the owner closes a Factory pane is not known. If the terminal lives on with its `herdr.space` label, the client re-adopts it; if it dies, the member is `gone` and `up` restarts it. To observe during the smoke run and record.
 - **5a's names.** `start_member`, `launch_entry`, `session_plan`, `saved_sessions` and the shape of `up`'s steps are taken from the plan, not from merged code. Confirmed by @lead-dev-2 on 27 November 2026: `start_member` builds the terminal's labels in one dict at its `hc.run` call, where `factory.launch` joins; `session_plan` returns `{"args", "resume", "assigned", "notice"}`; `launch_entry` skips a terminal whose newest entry is its own.
 
 Decided by @operator on 27 November 2026; no question is open:
+- v2 is tested with `hc` and rodeo only (owner's direction). No other client and no other operating system is tested, qualified or listed, in this plan, its pull requests or the qualification docs; they are not gaps.
 - The simplification pass is its own pull request on #170, after the layout pull request merges.
-- LC-8 against the Herdr desktop app is not required for v2.0. rodeo is the verified client; the desktop app is recorded as unverified (architecture.md §10) and the owner checks it when convenient.
 - The v2-only edits to the owner-approved spec files go in this ticket's pull requests; each pull request body lists the files and sentences it changed.

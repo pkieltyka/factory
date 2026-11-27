@@ -3199,8 +3199,15 @@ def start_member(cfg, state, hc, m, operator, sess):
         for fd in opened:
             os.close(fd)
     argv, env = launch_argv(m, prompt_file, sess)
+    sess = sess or {"resume": False}
     labels = {"factory.team": team_key(cfg.root), "factory.kind": "member", "factory.member": name,
               "factory.dir": str(state), "name": "@" + name}
+    fact = _launch_fact(m, state, sess)
+    if fact is not None:
+        how, value = fact
+        labels["factory.launch"] = json.dumps({"how": how, "value": value, "fresh": not sess["resume"],
+                                               "harness": harness, "model": m.get("model")},
+                                              separators=(",", ":"))
     try:
         return hc.run([exe, *argv], cwd=m["dir"], env={"PATH": os.environ.get("PATH", ""), **env}, labels=labels)
     except (HcError, HcDown) as error:
@@ -3598,12 +3605,80 @@ def interrupted_line(name, record, box):
 
 
 def _launch_fact(m, state, sess):
-    """(how, value) for launch_entry once m's brief is delivered, or None for a resumed launch."""
-    if sess["assigned"]:
+    """The fact to settle for this launch, or None when it resumed by ID."""
+    if sess.get("assigned"):
         return "id", sess["assigned"]
     if TABLE[m["harness"]].get("session") == "dir":
         return "dir", str(session_folder(state, m))
     return None if sess["resume"] else ("new", None)
+
+
+def _valid_launch_fact(fact):
+    if not isinstance(fact, dict) or "model" not in fact or "value" not in fact \
+            or type(fact.get("fresh")) is not bool \
+            or not isinstance(fact.get("harness"), str) \
+            or not (fact.get("model") is None or isinstance(fact["model"], str)):
+        return False
+    how, value = fact.get("how"), fact.get("value")
+    if how == "new":
+        return value is None and fact["fresh"]
+    if not isinstance(value, str):
+        return False
+    if how == "dir":
+        return os.path.isabs(value)
+    return how == "id" and bool(SESSION_VALUE.fullmatch(value))
+
+
+def settle_launches(cfg, state, hc, view, box):
+    """Save the launch facts owed by live or finished members. Return unsaved members and warning lines."""
+    failed, warnings = {}, []
+    briefed = box.briefed()
+    for name in cfg.members:
+        record = view.terminal(name) or view.finished(name)
+        raw = record["labels"].get("factory.launch") if record else None
+        if not raw:
+            continue
+        try:
+            fact = json.loads(raw, parse_constant=_reject_constant)
+        except (TypeError, ValueError):
+            fact = None
+        if not _valid_launch_fact(fact):
+            warnings.append(f"@{name}: malformed factory.launch label on {record['address']}; left in place")
+            continue
+        member = {"name": name, "harness": fact["harness"], "model": fact["model"]}
+        address, how = record["address"], fact["how"]
+        try:
+            if fact["fresh"]:
+                launch_entry(state, member, address, "new", None)
+            if how != "new":
+                if address not in briefed:
+                    continue
+                launch_entry(state, member, address, how, fact["value"])
+        except (OSError, LogDamage, Problem) as error:
+            failed[name] = str(error)
+            continue
+        try:
+            hc.label(address, {"factory.launch": ""})
+        except (HcDown, HcError) as error:
+            warnings.append(f"@{name}: its conversation was saved, but the launch label could not be cleared: {error}")
+    return failed, warnings
+
+
+def _settle_current_launches(cfg, state, hc, team, log):
+    try:
+        view, box = team_view(hc, team), log.read_box()[1]
+    except (HcDown, HcError, LogDamage, OSError) as error:
+        print(f"warning: could not check for unsaved conversations: {error}", file=sys.stderr)
+        return {}
+    failed, warnings = settle_launches(cfg, state, hc, view, box)
+    for warning in warnings:
+        print(f"warning: {warning}", file=sys.stderr)
+    return failed
+
+
+def _warn_unsaved_launches(failed):
+    for name, why in failed.items():
+        print(f"warning: @{name}: its conversation could not be saved yet: {why}", file=sys.stderr)
 
 
 def _brief_lines(name, ident, outcome):
@@ -3689,6 +3764,13 @@ def _up(cfg, args, hc, team, operator, state, names, me_id):
     mark_operator(cfg, hc, team, me, view, state)
     facts = {"v": 1, "root": str(cfg.root), "team": team, "core": hc.core, "up": True}
     update_team(state, reset=current is None, **facts)
+    unsaved = _settle_current_launches(cfg, state, hc, team, log)
+    failed, fixes = {}, {}                           # per-member launch failures and their recovery commands
+    for name, why in unsaved.items():
+        if name in targets:
+            failed[name] = f"its conversation could not be saved ({why}); not restarted"
+        else:
+            _warn_unsaved_launches({name: why})
     was_live = [n for n in cfg.members if view.terminal(n) is not None and view.state(n) != "gone"]
     for m in plans:
         old = view.terminal(m["name"]) or view.finished(m["name"])
@@ -3696,6 +3778,15 @@ def _up(cfg, args, hc, team, operator, state, names, me_id):
             print(interrupted_line(m["name"], old, box))
     if not was_live:
         print("\n".join(pending_lines(state, operator)))
+        try:
+            rows, warnings = log.leftovers()
+        except (LogDamage, OSError) as error:
+            print(f"warning: leftover message files could not be checked: {error}", file=sys.stderr)
+        else:
+            for line in format_leftovers(rows):
+                print(line)
+            for warning in warnings:
+                print(f"warning: {warning}", file=sys.stderr)
     try:
         keeper = ensure_keeper(cfg, state, hc, view, force=True)   # also when every member runs: delivery comes back
     except (Problem, HcDown, HcError, OSError, LogDamage) as error:
@@ -3703,10 +3794,9 @@ def _up(cfg, args, hc, team, operator, state, names, me_id):
     if not plans:
         _place_team(cfg, state, hc, team, me, keeper, {})
         return
-    failed, fixes = {}, {}                           # fixes: a member's fix when it is neither up nor brief --send
     replacements = {}
     for m in plans:
-        if m["branch"]:
+        if m["branch"] and m["name"] not in failed:
             err = ensure_worktree(cfg, m)
             if err:
                 failed[m["name"]] = err
@@ -3779,7 +3869,7 @@ def _up(cfg, args, hc, team, operator, state, names, me_id):
     roster = [plan(cfg, n, state) for n in cfg.members]
     briefs = {}
     for n in [n for n in starts if ready.get(n) is None]:
-        m, sess, record = starts[n]
+        m, sess, _ = starts[n]
         ran_before = newest.get(n) is not None or view.terminal(n) is not None or view.finished(n) is not None
         closing = pickup_text if sess["resume"] else fresh_text if ran_before else ready_text
         try:
@@ -3800,7 +3890,7 @@ def _up(cfg, args, hc, team, operator, state, names, me_id):
         briefs[n] = (ident, offset)
     deadline = time.monotonic() + SAY_WAIT
     for n, (ident, offset) in briefs.items():
-        m, sess, record = starts[n]
+        _, _, record = starts[n]
         try:
             outcome = wait_outcomes(log, ident, [n], offset, max(0.0, deadline - time.monotonic()))[n]
         except (LogDamage, OSError) as error:
@@ -3814,15 +3904,9 @@ def _up(cfg, args, hc, team, operator, state, names, me_id):
         elif confirmed and outcome.get("term") != record["address"]:
             confirmed = False
             failed[n] = f"brief {ident} went to another terminal ({outcome.get('term')})"
-        if confirmed:
-            fact = _launch_fact(m, state, sess)
-            if fact:
-                try:
-                    launch_entry(state, m, record["address"], *fact)
-                except (OSError, LogDamage, Problem) as error:
-                    print(f"warning: @{n}'s session was not saved: {error}", file=sys.stderr)
-        elif not confirmed and n not in failed:
+        if not confirmed and n not in failed:
             failed[n] = f"brief {ident} was not confirmed"
+    _warn_unsaved_launches(_settle_current_launches(cfg, state, hc, team, log))
     joined = [starts[n][0] for n in briefs if n not in failed and starts[n][0]["name"] not in newest
               and view.terminal(n) is None and view.finished(n) is None]
     others = [n for n in was_live if n not in starts]
@@ -3902,7 +3986,20 @@ def _down(cfg, hc, team, state, names):
         print(f"sessions cannot be saved ({problem}): members left running")
         return 1
     log, code, stopped, recorded = open_log(state), 0, {}, []
+    try:
+        box = log.read_box()[1]
+    except (LogDamage, OSError) as error:
+        print(f"sessions cannot be saved ({error}): members left running")
+        return 1
+    unsaved, warnings = settle_launches(cfg, state, hc, view, box)
+    for warning in warnings:
+        print(f"warning: {warning}", file=sys.stderr)
     for name in names:
+        if name in unsaved:
+            kept = f"@{name} left running" if view.terminal(name) else f"@{name}'s record kept"
+            print(f"sessions cannot be saved ({unsaved[name]}): {kept}")
+            code = 1
+            continue
         current = view.terminal(name) or view.finished(name)
         earlier = [r for r in records if r["state"] == "finished" and r["labels"].get("factory.down")
                    and r["labels"].get("factory.kind") == "member" and r["labels"].get("factory.member") == name]
@@ -4062,7 +4159,8 @@ def _brief_send(args, names):
     hc = Hc()
     try:
         cfg, state, me = resolve_team(args, hc)
-        view = team_view(hc, team_key(cfg.root))
+        team = team_key(cfg.root)
+        view = team_view(hc, team)
     except HcDown as error:
         stop_with(f"hc is not reachable: {error}")
     except Problem as error:
@@ -4126,6 +4224,7 @@ def _brief_send(args, names):
         lines, confirmed = _brief_lines(name, ident, outcome)
         print("\n".join(lines))
         code = code or (0 if confirmed else 1)
+    _warn_unsaved_launches(_settle_current_launches(cfg, state, hc, team, log))
     return code
 
 

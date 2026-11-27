@@ -4,6 +4,7 @@ Two test classes touch real tools and skip when they cannot: HerdrContract reads
 schema, and LiveFlags (FACTORY_LIVE=1, outside any sandbox) greps each installed harness's --help for the
 flags factory.py passes."""
 import importlib.util
+import concurrent.futures
 import contextlib
 from concurrent.futures import ThreadPoolExecutor
 import datetime
@@ -2375,6 +2376,151 @@ class TeamCommandTests(TeamCase):
         news = [m for m in self.log.read_box()[1].msgs.values() if m.get("text", "").startswith("Joined the team:")]
         self.assertEqual([m["to"] for m in news], [["lead-dev"]])
         self.assertIn("@reviewer (reviewer, Codex gpt-6-luna)", news[0]["text"])
+
+    def launch_fact(self, terminal, how, value, *, fresh=True, harness="claude", model=None):
+        raw = json.dumps({"how": how, "value": value, "fresh": fresh, "harness": harness, "model": model})
+        self.hc.label(terminal, {"factory.launch": raw})
+
+    def test_late_briefed_member_that_exited_keeps_its_conversation(self):
+        folder = factory.session_folder(self.state_dir, {"name": "pm", "harness": "pi"})
+        with patch.dict(factory.TABLE["pi"], session="dir"):
+            with patch.object(factory, "wait_outcomes", return_value={"pm": {"o": "queued", "why": "waiting"}}):
+                self.assertEqual(self.cmd(self.operator, "up", "pm")[0], 3)
+            old = self.member_terms()["pm"]
+            self.assertEqual(factory.saved_sessions(self.state_dir)[0]["pm"]["how"], "new")
+            self.deliver()
+            self.fake.finish(old)
+            code, out, err = self.cmd(self.operator, "up", "pm")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("resumed @pm", out)
+        self.assertIn("--continue", self.fake.calls("terminal.run")[-1]["params"]["argv"])
+        new = self.member_terms()["pm"]
+        entry = factory.saved_sessions(self.state_dir)[0]["pm"]
+        self.assertEqual((entry["term"], entry["how"], entry["value"]), (new, "dir", str(folder)))
+        self.assertFalse(self.hc.get(new)["labels"].get("factory.launch"))
+
+    def test_a_fresh_launch_without_a_journal_entry_blocks_an_older_resume(self):
+        lead = self.terminal("lead-dev")[0]
+        factory.record_session(self.cfg, self.state_dir, "lead-dev", "previous", {"CODEX_THREAD_ID": "old-id"})
+        self.launch_fact(lead, "new", None, harness="codex")
+        self.fake.finish(lead)
+        code, out, err = self.cmd(self.operator, "up", "lead-dev")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("none was recorded for it", out)
+        self.assertNotIn("resume", self.fake.calls("terminal.run")[-1]["params"]["argv"])
+
+    def test_up_does_not_restart_a_member_whose_launch_cannot_be_saved(self):
+        term = self.terminal("lead-dev")[0]
+        self.launch_fact(term, "id", "old-id", harness="codex")
+        self.briefed("lead-dev", term)
+        self.fake.finish(term)
+        with patch.object(factory, "launch_entry", side_effect=OSError("no space")):
+            code, out, err = self.cmd(self.operator, "up", "lead-dev")
+        self.assertEqual(code, 3, out + err)
+        self.assertIn("conversation could not be saved (no space); not restarted", err)
+        self.assertFalse(self.fake.calls("terminal.run"))
+        self.assertTrue(self.hc.get(term)["labels"]["factory.launch"])
+        code, out, err = self.cmd(self.operator, "up", "lead-dev")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("resumed @lead-dev", out)
+        self.assertEqual(self.fake.calls("terminal.run")[-1]["params"]["argv"][1:3], ["resume", "old-id"])
+
+    def test_rebrief_saves_the_original_model_and_preserves_a_ready_line_session(self):
+        self.assertEqual(self.cmd(self.operator, "up", "lead-dev")[0], 0)
+        term = self.terminal("frontend-dev")[0]
+        for from_say in (False, True):
+            with self.subTest(from_say=from_say):
+                self.launch_fact(term, "id", "from-launch", harness="claude", model=None)
+                if from_say:
+                    factory.record_session(self.cfg, self.state_dir, "frontend-dev", term,
+                                           {"CLAUDE_CODE_SESSION_ID": "from-say"})
+                code, out, err = self.cmd(self.operator, "brief", "--send", "frontend-dev")
+                self.assertEqual(code, 0, out + err)
+                entry = factory.saved_sessions(self.state_dir)[0]["frontend-dev"]
+                self.assertEqual(entry["value"], "from-say" if from_say else "from-launch")
+                if not from_say:
+                    self.assertIsNone(entry["model"])
+                    self.assertEqual(entry["harness"], "claude")
+                self.assertFalse(self.hc.get(term)["labels"].get("factory.launch"))
+
+    def test_launch_fact_does_not_follow_a_formation_change(self):
+        lead = self.terminal("lead-dev")[0]
+        self.launch_fact(lead, "id", "claude-id", model="claude-opus-5-5")
+        self.briefed("lead-dev", lead)
+        code, out, err = self.cmd(self.operator, "up", "lead-dev")  # no launches needed
+        self.assertEqual(code, 0, out + err)
+        entry = factory.saved_sessions(self.state_dir)[0]["lead-dev"]
+        m = factory.plan(self.cfg, "lead-dev", self.state_dir)
+        self.assertIn("saved conversation is for claude claude-opus-5-5",
+                      factory.session_plan(m, self.state_dir, entry, False)["notice"])
+        self.launch_fact(lead, "dir", str(self.root), harness="pi", model="openai/gpt-6-astra")
+        self.assertEqual(self.cmd(self.operator, "up", "lead-dev")[0], 0)
+        entry = factory.saved_sessions(self.state_dir)[0]["lead-dev"]
+        with patch.dict(factory.TABLE["pi"], session="dir", resume_model="provider"):
+            m = {**m, "harness": "pi", "model": "deepseek/some-model"}
+            self.assertIn("saved conversation is for pi openai/gpt-6-astra",
+                          factory.session_plan(m, self.state_dir, entry, False)["notice"])
+
+    def test_down_preserves_live_or_finished_members_whose_launch_cannot_be_saved(self):
+        for finished in (False, True):
+            with self.subTest(finished=finished):
+                self.assertEqual(self.cmd(self.operator, "up", "lead-dev", "reviewer")[0], 0)
+                term = self.member_terms()["lead-dev"]
+                self.launch_fact(term, "id", "assigned", harness="codex")
+                if finished:
+                    self.fake.finish(term)
+                with patch.object(factory, "launch_entry", side_effect=OSError("no space")):
+                    code, out, err = self.cmd(self.operator, "down")
+                self.assertEqual(code, 1, out + err)
+                self.assertIn("@lead-dev's record kept" if finished else "@lead-dev left running", out)
+                self.assertIn("stopped @reviewer", out)
+                self.assertTrue(self.hc.get(term)["labels"]["factory.launch"])
+                self.assertEqual(self.cmd(self.operator, "down")[0], 0)
+                self.assertEqual(factory.saved_sessions(self.state_dir)[0]["lead-dev"]["value"], "assigned")
+
+    def test_malformed_or_unclearable_launch_label_is_only_a_warning(self):
+        lead = self.terminal("lead-dev")[0]
+        self.hc.label(lead, {"factory.launch": '{"how":"new","fresh":true,"harness":"codex","value":null}'})
+        code, out, err = self.cmd(self.operator, "up", "lead-dev")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("malformed factory.launch label", err)
+        self.launch_fact(lead, "new", None, harness="codex")
+        label = factory.Hc.label
+
+        def refuse_clear(hc, address, labels):
+            if labels == {"factory.launch": ""}:
+                raise factory.HcDown("terminal.label", "test")
+            return label(hc, address, labels)
+
+        with patch.object(factory.Hc, "label", refuse_clear):
+            code, out, err = self.cmd(self.operator, "up", "lead-dev")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("launch label could not be cleared", err)
+        data = (self.state_dir / factory.SESSIONS).read_bytes()
+        self.assertEqual(self.cmd(self.operator, "up", "lead-dev")[0], 0)
+        self.assertEqual((self.state_dir / factory.SESSIONS).read_bytes(), data)
+        self.assertFalse(self.hc.get(lead)["labels"].get("factory.launch"))
+
+    def test_cold_up_lists_undelivered_files_and_warm_up_leaves_them_alone(self):
+        folder = self.state_dir / "messages" / "pm"
+        folder.mkdir(parents=True)
+        delivered, pending = folder / "lead-dev-done-1.md", folder / "lead-dev-later-2.md"
+        delivered.write_text("done")
+        pending.write_text("later")
+        ident = self.add("lead-dev", "done", file=str(delivered))
+        box = self.log.read_box()[1]
+        self.log.out(box, ident, "lead-dev", "sending", term="old")
+        self.log.out(box, ident, "lead-dev", "delivered", term="old", started=True, turn=1)
+        self.add("lead-dev", "later", file=str(pending))
+        code, out, err = self.cmd(self.operator, "up", "reviewer")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn(str(pending), out)
+        self.assertNotIn(str(delivered), out)
+        self.assertTrue(pending.exists())
+        self.assertFalse(delivered.exists())
+        code, out, err = self.cmd(self.operator, "up", "reviewer")
+        self.assertEqual(code, 0, out + err)
+        self.assertNotIn("leftover message file", out)
 
     def test_down_records_the_stop_then_removes_and_drops(self):
         self.cmd(self.operator, "up", "lead-dev")
@@ -5368,6 +5514,28 @@ class SessionTests(unittest.TestCase):
         self.assertEqual((sess["args"], sess["resume"]), ([], False))
         self.assertIn("starts in a new conversation: none was recorded", sess["notice"])
 
+    def test_launch_entry_never_replaces_a_current_session_with_new(self):
+        m = self.m("pi-dev")
+        for i, (how, value) in enumerate((("id", "abc"), ("dir", "/private/folder"), ("env", "xyz"))):
+            with self.subTest(how=how):
+                term = f"t{i}"
+                factory.launch_entry(self.state, m, term, how, value)
+                before = self.lines()
+                factory.launch_entry(self.state, m, term, "new", None)
+                self.assertEqual(self.lines(), before)
+        m = self.m("codex-dev")
+        start = threading.Barrier(2)
+
+        def write(how, value):
+            start.wait(timeout=5)
+            factory.launch_entry(self.state, m, "race", how, value)
+
+        with concurrent.futures.ThreadPoolExecutor(2) as workers:
+            calls = [workers.submit(write, how, value) for how, value in (("new", None), ("id", "latest"))]
+            for call in calls:
+                call.result(timeout=5)
+        self.assertEqual(factory.saved_sessions(self.state)[0]["codex-dev"]["value"], "latest")
+
     def test_values_that_could_be_options_or_too_long_are_not_recorded(self):
         for value in ("-rf", "", "a" * 129, "a b", "x;y", None):
             self.assertIsNone(self.record("codex-dev", "t1", value))
@@ -5690,6 +5858,32 @@ class StartMemberTests(unittest.TestCase):
             self.start(name)
         folder = self.state / "sessions" / f"{name}-pi"
         self.assertEqual(stat.S_IMODE(folder.stat().st_mode), 0o700)
+
+    def test_start_member_labels_the_session_plan_it_runs(self):
+        for name, member in self.cfg.members.items():
+            harness = member["harness"]
+            for fallback in (False, True):
+                for resume in (False, True):
+                    with self.subTest(harness=harness, fallback=fallback, resume=resume):
+                        table = factory.TABLE[harness]
+                        mode = "env" if fallback else table.get("session")
+                        with patch.dict(table, session=mode):
+                            m = factory.plan(self.cfg, name)
+                            entry = {"harness": harness, "model": m["model"],
+                                     "how": "dir" if mode == "dir" else "id",
+                                     "value": str(factory.session_folder(self.state, m)) if mode == "dir" else "saved"}
+                            sess = factory.session_plan(m, self.state, entry if resume else None, False)
+                            _, record = self.start(name, sess)
+                        raw = record["labels"].get("factory.launch")
+                        self.assertEqual(self.fake.calls("terminal.run")[-1]["params"]["labels"].get("factory.launch"),
+                                         raw)
+                        if resume and mode != "dir":
+                            self.assertIsNone(raw)
+                            continue
+                        how = "dir" if mode == "dir" else "id" if mode == "id" else "new"
+                        value = entry["value"] if how == "dir" else sess["assigned"]
+                        self.assertEqual(json.loads(raw), {"how": how, "value": value, "fresh": not resume,
+                                                           "harness": harness, "model": m["model"]})
 
     def test_a_missing_binary_or_a_refused_run_is_a_problem(self):
         name = next(iter(self.cfg.members))
