@@ -881,10 +881,8 @@ def run_real(args, live):
     try:
         with live.QATeam(live.RealAdapter, args.operator, members, setup=setup,
                          operator_model=args.operator_model) as team:
-            if args.developer in live.TRUST_FILES:
-                result.setdefault("trust_entries", []).append({"harness": args.developer,
-                    "file": live.TRUST_FILES[args.developer], "directory": str(fixture.developer)})
-            if not live._operator_start(team, report, 0, "operator", args.operator, ["startup"]):
+            if not live._operator_start(team, report, 0, "operator", args.operator, ["startup"],
+                                        trust_directories={"lead-dev": fixture.developer}):
                 result["detail"] = result["rows"][0]["reason"]
                 return result
             result["operator_start"] = team.operator_start

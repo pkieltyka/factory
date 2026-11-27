@@ -7212,6 +7212,18 @@ class ListingTests(unittest.TestCase):
 
 
 class E2EFixtureTests(unittest.TestCase):
+    def test_trust_entries_use_each_profile_working_directory(self):
+        repo = pathlib.Path("/tmp/factory-qa-fixture/repo")
+        worktree = repo.parent / "worktrees/qa-lead-dev"
+        team = types.SimpleNamespace(work=repo, operator_harness="claude",
+                                     members={"lead-dev": "codex", "reviewer": "claude"})
+        report = live.Qualification("real")
+        live._trust_entries(report, team, {"lead-dev": worktree})
+        entries = report.data["trust_entries"]
+        self.assertEqual({(e["harness"], e["directory"]) for e in entries},
+                         {("claude", str(repo)), ("codex", str(worktree))})
+        self.assertEqual(len(entries), 2)
+
     def test_local_tracker_fixture(self):
         command = e2e.ready_command(factory.SKILL)
         for empty, count in ((False, 3), (True, 0)):

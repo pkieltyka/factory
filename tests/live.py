@@ -2360,14 +2360,17 @@ def _team_quiet(team, hold, timeout):
 TRUST_FILES = {"claude": "~/.claude.json", "codex": "~/.codex/config.toml"}
 
 
-def _trust_entries(run, team):
+def _trust_entries(run, team, directories=None):
     """The per-directory trust a real Claude Code or Codex start may add for this run's scratch project, listed
     for the owner to remove (@operator's decision; phase_8.md §2)."""
     entries = run.data.setdefault("trust_entries", [])
-    for harness in {team.operator_harness, *team.members.values()} & set(TRUST_FILES):
-        entry = {"harness": harness, "file": TRUST_FILES[harness], "directory": str(team.work)}
-        if entry not in entries:
-            entries.append(entry)
+    profiles = {"operator": team.operator_harness, **team.members}
+    for name, harness in profiles.items():
+        if harness in TRUST_FILES:
+            directory = directories.get(name, team.work) if directories is not None else team.work
+            entry = {"harness": harness, "file": TRUST_FILES[harness], "directory": str(directory)}
+            if entry not in entries:
+                entries.append(entry)
     run.checkpoint()
 
 
@@ -2467,11 +2470,11 @@ def judge_switch(before, after):
     return before != after, None if before != after else "the session variable did not change"
 
 
-def _operator_start(team, run, case, role, harness, names):
+def _operator_start(team, run, case, role, harness, names, trust_directories=None):
     """The operator past its own startup dialogs before the owner's first input, answered on the second poll as up
     does (a fake one shows one only for case 1)."""
     if team.real:
-        _trust_entries(run, team)
+        _trust_entries(run, team, trust_directories)
     watcher = Harness.attach(team.qa, team.operator_harness, team.operator)
     settled = watcher.settle(timeout=120)
     team.operator_start = {"settled": settled, "answered": watcher.answered}
