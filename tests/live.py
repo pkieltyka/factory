@@ -243,6 +243,15 @@ def installed_needles(installed):
 
 
 CODE_EXEC = re.compile(r'exec_command\(\{\s*cmd\s*:\s*("(?:[^"\\]|\\.)*")')
+# a statement that calls it directly, at the start of a line (@architect-2 at fd65f71)
+CODE_EXEC_DIRECT = re.compile(r'^[ \t]*(?:(?:const|let|var)\s+\w+\s*=\s*)?(?:await\s+)?(?:tools\.)?'
+                              r'exec_command\(\{\s*cmd\s*:\s*("(?:[^"\\]|\\.)*")', re.M)
+
+
+def _uncommented(code):
+    """Code-mode input without its /* */ blocks and its // comment lines, which run nothing."""
+    code = re.sub(r"/\*.*?\*/", "", code, flags=re.S)
+    return "\n".join(line for line in code.splitlines() if not line.lstrip().startswith("//"))
 
 
 def tool_calls(text, pairing=False):
@@ -263,9 +272,10 @@ def tool_calls(text, pairing=False):
                 return None
             cmd = args.get("cmd", args.get("command"))
             return " ".join(cmd) if isinstance(cmd, list) else cmd
-        if kind == "custom_tool_call":
-            found = CODE_EXEC.findall(node.get("input") or "")
-            if len(found) == 1 and (node.get("input") or "").count("exec_command(") == 1:
+        if kind == "custom_tool_call":       # code mode: one exec_command called directly, outside comments
+            code = _uncommented(node.get("input") or "")
+            found = CODE_EXEC_DIRECT.findall(code)
+            if len(found) == 1 and code.count("exec_command(") == 1:
                 try:
                     return json.loads(found[0])
                 except ValueError:
@@ -321,12 +331,30 @@ SHELLS = ("sh", "bash", "zsh", "dash")
 WRAPPERS = ("env", "exec", "nohup", "command", "time")
 
 
+HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+
+
+def _without_heredocs(command):
+    """A shell line with each here-document's body left out: its lines are data, not commands (@architect-2)."""
+    kept, end = [], None
+    for line in command.split("\n"):
+        if end is not None:
+            if line.strip() == end:
+                end = None
+            continue
+        kept.append(line)
+        found = HEREDOC.search(line)
+        if found:
+            end = found.group(2)
+    return "\n".join(kept)
+
+
 def invoked(command):
     """The programs or scripts a shell command line runs: for each simple command, the script operand of a python
     interpreter or else the program itself, after VAR=value prefixes and plain wrappers; a sh -c or bash -lc script
     is read in turn. A file that is only an argument (ls, cat, rg) is not run (@architect-2, @lead-dev at daa3b35)."""
     try:
-        lex = shlex.shlex(command.replace("\n", " ; "), posix=True, punctuation_chars=True)
+        lex = shlex.shlex(_without_heredocs(command).replace("\n", " ; "), posix=True, punctuation_chars=True)
         lex.whitespace_split = True
         tokens = list(lex)
     except ValueError:

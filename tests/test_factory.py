@@ -7372,6 +7372,19 @@ class QualifyFrameworkTests(unittest.TestCase):
         self.assertEqual(transcript((f"python3 {installed} status", None)), [False])        # called, no result
         self.assertEqual(transcript((f"python3 {installed} status", "Exit code: 2\nno team")), [True])   # it ran
         self.assertEqual(transcript((f"python3 '{installed}' up lead-dev", "Exit code: 0\nok")), [True])
+        # @architect-2 at fd65f71: a here-document's body is data, and a commented code-mode call ran nothing
+        self.assertEqual(transcript((f"cat <<'EOF'\npython3 {installed} status\nEOF", "python3 ... status")), [False])
+        self.assertIn(script, live.invoked(f"cat <<EOF\nx\nEOF\npython3 {script} status"))        # after it, a run
+        commented = {"type": "custom_tool_call", "call_id": "k1", "input": (
+            f'// await tools.exec_command({{cmd:"python3 {installed} status"}});\ntext("nothing executed")')}
+        direct = {"type": "custom_tool_call", "call_id": "k1", "input": (
+            f'const r = await tools.exec_command({{cmd:"python3 {installed} status"}});\ntext(r.output)')}
+        output = {"type": "custom_tool_call_output", "call_id": "k1", "output": "nothing executed"}
+        for node, expected in ((commented, [False]), (direct, [True])):
+            lines = [{"payload": {"cwd": str(root / "work")}}, node, output]
+            (day / "rollout-1.jsonl").write_text("".join(json.dumps(line) + "\n" for line in lines))
+            with self.subTest(code=node["input"][:12]):
+                self.assertEqual([run for _, _, run in core.installed_seen([root])], expected)
 
     def test_a_search_that_lists_an_installed_script_is_only_observed(self):
         """@operator (#173 pi member case 8 at a198b9c): the Codex peer's rg --files listed the installed v1
