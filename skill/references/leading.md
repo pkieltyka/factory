@@ -31,12 +31,14 @@ Check the reported tests before accepting work. `say` prints a message ID and on
 | Outcome | Action |
 |---|---|
 | `delivered` | The message was typed and submitted. |
-| `sending` or `queued` | Factory finishes delivery. Never resend it. Reasons include `waiting`, `blocked`, `not ready`, `gone` and `busy` (for an operator that takes messages between turns: delivered when its turn ends). In your own `inbox`, `queued` means not yet given to you: leave it, and Factory types it when your turn ends. |
+| `sending` or `queued` | Factory finishes delivery. Never resend it. Reasons include `waiting`, `blocked`, `not ready`, `gone` and `busy` (for a recipient that takes messages between turns, a Codex operator or member: delivered when its turn ends). In your own `inbox`, `queued` means not yet given to you: leave it, and Factory types it when your turn ends. |
 | `unconfirmed` or `dropped` | Check the recipient before deciding whether to retry. Members tell you the message ID and recipient and resend only when asked. |
 | `nothing sent` | Fix the reported cause, then send again. |
 | `not stored` or `not confirmed stored` | Follow the diagnostic. Respect any instruction to check the inbox or leave the send alone. |
 
 `factory.py status` lists configured members, their states, pending recipients and the oldest pending age. Check its version and path if you might be running another installed copy.
+
+After you press Esc in a working Claude Code member’s pane, check `factory.py inbox --for NAME` for messages delivered during the interrupted turn. Check the work or ask the member what it completed before reassigning anything.
 
 | Status | Action |
 |---|---|

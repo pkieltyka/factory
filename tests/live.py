@@ -299,10 +299,26 @@ def tool_calls(text):
                 walk(value)
     for line in text.splitlines():
         try:
-            walk(json.loads(line))
+            record = json.loads(line)
         except ValueError:
             continue
+        before = set(results)
+        walk(record)
+        native = record.get("toolUseResult") if isinstance(record, dict) else None
+        if isinstance(native, dict) and isinstance(native.get("stdout"), str):
+            # Claude Code keeps a successful Bash call's output here, on the line of its paired tool_result,
+            # whose own content is empty (@lead-dev's claude-op-2-a65a1fe record)
+            for key in set(results) - before:
+                if results[key] in (None, '""', "") and not _errored(record, key):
+                    results[key] = native["stdout"] + (f"\n{native['stderr']}" if native.get("stderr") else "")
     return [(command, results.get(ident)) for ident, command in calls.items()]
+
+
+def _errored(record, key):
+    """Whether the tool_result for key in this transcript line says it failed."""
+    content = ((record.get("message") or {}).get("content")) if isinstance(record, dict) else None
+    return any(isinstance(c, dict) and c.get("tool_use_id") == key and c.get("is_error") is True
+               for c in (content if isinstance(content, list) else []))
 
 
 def qa_transcripts(roots, labelled=False):
@@ -2124,7 +2140,9 @@ class FixtureAdapter:
                                'id="thread-$(od -An -N4 -tx1 /dev/urandom | tr -d \' \\n\')"\n'
                                'while [ "$#" -gt 0 ]; do [ "$1" = resume ] && id="$2"; shift; done\n'
                                f'export CODEX_THREAD_ID="$id" FAKE_MEMORY_DIR={shlex.quote(str(memory))} FAKE_ECHO=1\n'
-                               f"exec {agent}\n")
+                               + (f"export FAKE_APP={harness}\n" if harness_table().get(harness, {}).get("deliver")
+                                  else "")                  # reported as the real one is: Factory's rule applies
+                               + f"exec {agent}\n")
             wrapper.chmod(0o755)
         codex = self.team.home / ".codex"
         codex.mkdir(parents=True, exist_ok=True)
@@ -2274,7 +2292,7 @@ class RealAdapter(FixtureAdapter):
 
     def switch_request(self, harness):
         command = {"claude": "/clear", "codex": "/new", "opencode": "/new", "pi": "/new",
-                   "omp": "/new"}.get(harness)
+                   "omp": "/new", "agy": "/clear"}.get(harness)   # agy: "Clear conversation and start a new one"
         if command is None:
             raise NotRun(f"no known way to start a new conversation in {harness}")
         return command
@@ -2367,7 +2385,7 @@ class QATeam:
         if not self.real:
             params["env"]["FAKE_LOG"] = str(self.dir / "operator-input.jsonl")   # every input the fake received
             params["env"]["FAKE_ECHO"] = "1"
-            if harness_table().get(operator, {}).get("operator_deliver"):
+            if harness_table().get(operator, {}).get("deliver"):
                 params["env"]["FAKE_APP"] = operator      # reported as the real one is, so Factory's rule applies
             params["env"]["CODEX_THREAD_ID"] = f"thread-{token().lower()}"   # the fake operator's conversation
         self.operator_command = None
@@ -3152,6 +3170,26 @@ def _case_7_two_senders(run, role, harness, adapter_class):
         senders = (["lead-dev", "reviewer"] if role == "operator" else ["operator", "reviewer"])
         receipt, toks = team.receipt("two"), {s: token() for s in senders}
         start, outs = threading.Barrier(len(senders)), {}
+        authorized = None
+        if role == "member":    # a member may rightly refuse a peer's assignment (5fb3fb9): @operator assigns both
+            subject = team.member(recipient)    # receipt steps first, without their tokens, then waits (@architect-2)
+            code, out = team.call("say", recipient, (
+                f"Assignment from @operator for this QA trial: two messages will follow, one from @reviewer and one"
+                f" from @operator. Each asks you to append one token to {receipt}. Do each as it arrives; this is"
+                " your assignment for both. Nothing to append now: reply with the single word done."), timeout=120)
+            ident = _say_id(out)
+            authorized = {"id": int(ident.group(1)) if ident else None, "code": code}
+            team.until(lambda: ident is not None
+                       and (_outcome(factory_log(team), ident, recipient) or ("",))[0] == "delivered"
+                       and team.state(subject) in ("idle", "done"), 300)
+            authorized.update(outcome=_outcome(factory_log(team), ident, recipient) if ident else None,
+                              state=team.state(subject), receipt_empty=not (receipt.exists() and receipt.read_text()))
+            if (authorized["outcome"] != ("delivered", None) or authorized["state"] not in ("idle", "done")
+                    or not authorized["receipt_empty"]):     # settled: delivered, idle or done (@lead-dev at 8428e8a)
+                run.row(7, "two-senders", role, harness, "not_run", "case 7 two-senders",
+                        proof={"authorized": authorized}, reason="the assignment was not delivered and settled"
+                        " with the receipt empty")
+                return
 
         def send(sender):
             body = _note(team, team.adapter.act_append(receipt, toks[sender]))
@@ -3174,10 +3212,25 @@ def _case_7_two_senders(run, role, harness, adapter_class):
         committed = sorted((i, s) for s, i in ids.items() if i is not None)
         ok = (all(c == 1 for c in counts.values()) and None not in ids.values()
               and acted == [s for _, s in committed] and all((o or ("",))[0] == "delivered" for o in outcomes.values()))
+        records, box = log.read_box()
+        target = team.operator if role == "operator" else team.member("lead-dev")
+        deliveries = {s: {k: box.outcome(i, recipient).get(k) for k in ("o", "term", "turn", "started")}
+                      for s, i in ids.items() if i}
+        histories = {s: [[r["o"], r.get("why")] for r in records if r["t"] == "out" and r["id"] == i
+                         and r["to"] == recipient] for s, i in ids.items() if i}
+        between = between_turns(harness, role)
+        if between:     # keeper.md §9: each typed into a turn of its own on the recipient, in committed order
+            turns = [deliveries.get(s, {}).get("turn") for _, s in committed]
+            ok = ok and all(d.get("term") == target and d.get("started") is True for d in deliveries.values()) \
+                and len(deliveries) == len(senders) and all(isinstance(t, int) for t in turns) \
+                and turns == sorted(set(turns))
         run.row(7, "two-senders", role, harness, "pass" if ok else "fail",
-                "two senders at once to one recipient: both acted on exactly once, in committed order",
+                "two senders at once to one recipient: both acted on exactly once, in committed order"
+                + (", each typed between turns" if between else ""),
                 proof={"senders": senders, "ids": ids, "outcomes": outcomes, "counts": counts, "acted_order": acted,
-                       "peer": peer}, reason=None if ok else "a message was missing, repeated or out of order")
+                       "recipient_terminal": target, "deliveries": deliveries, "histories": histories,
+                       "between_turns": between, "authorized": authorized, "peer": peer},
+                reason=None if ok else "a message was missing, repeated, out of order or typed into a working turn")
 
 
 def _case_7_pending_restart(run, role, harness, adapter_class):
@@ -3461,15 +3514,21 @@ def case_5(run, role, harness, adapter_class):
                 " message delivered and acted on exactly once after the answer", proof=proof, reason=reason)
 
 
-def factory_log(team):
-    """The team's message log, read-only, from the private copy of Factory (phase_8.md §1)."""
+def factory_module(script):
+    """The private copy of Factory as a module, loaded once (phase_8.md §1)."""
     import importlib.util
-    spec = importlib.util.spec_from_file_location("factory_under_test", team.script)
     module = sys.modules.get("factory_under_test")
     if module is None:
+        spec = importlib.util.spec_from_file_location("factory_under_test", script)
         module = importlib.util.module_from_spec(spec)
         sys.modules["factory_under_test"] = module
         spec.loader.exec_module(module)
+    return module
+
+
+def factory_log(team):
+    """The team's message log, read-only, from the private copy of Factory (phase_8.md §1)."""
+    module = factory_module(team.script)
     state = next((r["labels"]["factory.dir"] for r in team.qa.rpc("terminal.list", {"all": True})["terminals"]
                   if (r.get("labels") or {}).get("factory.dir")), None)
     if state is None:
@@ -3880,13 +3939,22 @@ def case_6(run, role, harness, adapter_class):
             view.keys("enter")
         variable = harness_table().get(harness, {}).get("session_env")
 
+        probe_retries = []
+
         def session(terminal):
             """The harness's own session variable, as its tool sees it (observation through hc)."""
             if not variable:
                 return None
             out, done = team.receipt("session"), team.receipt("session-run")
-            team.send(terminal, adapter.act_run(done, f'printf "%s\\n" "${{{variable}:-}}" > {shlex.quote(str(out))}'))
-            team.until(lambda: done.exists() and "exit" in done.read_text(), 300)
+            ask = adapter.act_run(done, f'printf "%s\\n" "${{{variable}:-}}" > {shlex.quote(str(out))}')
+            team.send(terminal, ask)
+            if not team.until(lambda: done.exists() and "exit" in done.read_text(), 120):
+                # keys typed while a harness redraws after a native switch can be lost (Codex /new at a65a1fe:
+                # the probe never reached the new conversation); it only prints a variable, so ask again once
+                team.until(lambda: team.state(terminal) in READY, 60)
+                team.send(terminal, ask)
+                probe_retries.append(terminal)
+                team.until(lambda: done.exists() and "exit" in done.read_text(), 180)
             team.until(lambda: team.state(terminal) in READY, 120)
             return out.read_text().strip() if out.exists() else None
         if role == "operator":
@@ -3903,7 +3971,8 @@ def case_6(run, role, harness, adapter_class):
             run.row(6, "operator-switch", role, harness, status,
                     "after the operator switches conversation natively in its terminal (its session variable changes),"
                     " a member's report reaches it and is acted on once",
-                    proof={"variable": variable, "switched": switched, "member_say": said, "action_count": count},
+                    proof={"variable": variable, "switched": switched, "member_say": said, "action_count": count,
+                           "probe_retries": len(probe_retries)},
                     reason=None if status == "pass" else why or f"the action ran {count} times" if switched
                     else why or f"no {variable or 'session variable'} to show the switch")
             return
@@ -3982,13 +4051,14 @@ def case_6(run, role, harness, adapter_class):
 
 
 def between_turns(harness, role):
-    """Whether Factory delivers to this profile only between turns (keeper.md §9): Codex as operator."""
-    return role == "operator" and harness_table().get(harness, {}).get("operator_deliver") == "idle"
+    """Whether Factory delivers to this profile only between turns (keeper.md §9): Codex, in either role."""
+    return harness_table().get(harness, {}).get("deliver") == "idle"
 
 
 def _app_selects(app):
     """Whether a live status app selects between-turns delivery in the table (keeper.md §9's lookup)."""
-    return bool(app) and harness_table().get(app, {}).get("operator_deliver") == "idle"
+    harness = factory_module(ROOT / "skill" / "scripts" / "factory.py").harness_for_app(app)   # Factory's own lookup
+    return harness_table().get(harness or "", {}).get("deliver") == "idle"
 
 
 def _ask_later(team, role, text):
@@ -3999,7 +4069,7 @@ def _ask_later(team, role, text):
     def ask():
         if role == "member":
             code, out = team.call("say", "lead-dev", text, timeout=600)
-            box.update(out=out, code=code)
+            box.update(out=out, code=code, done=True)     # the say has returned (@lead-dev: busy-mode gates)
         else:
             box.update(_member_says(team, text, timeout=600) or {"id": None}, done=True)   # this job's own
     thread = threading.Thread(target=ask, daemon=True)
