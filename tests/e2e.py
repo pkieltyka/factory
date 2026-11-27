@@ -389,9 +389,10 @@ class Observer:
                 self.operator = term
             elif kind == "keeper" and not self.evidence.loaded:
                 beat = self.factory.read_beat(self.state)
-                self.evidence.loaded = bool(beat and beat[1:3] == (self.factory.VERSION, term["address"])
-                                            and labels.get("factory.version") == self.factory.VERSION
-                                            and term["argv"][1:3] == [str(self.factory.SCRIPT), "keeper"])
+                if (labels.get("factory.version") != self.factory.VERSION
+                        or term["argv"][1:3] != [str(self.factory.SCRIPT), "keeper"]):
+                    raise RuntimeError("another Factory was loaded")
+                self.evidence.loaded = bool(beat and beat[1:3] == (self.factory.VERSION, term["address"]))
             elif kind == "member" and labels.get("factory.member") == "lead-dev":
                 self.evidence.recovered.setdefault(term["address"], order)
                 status = (term.get("status") or {}).get("state")
@@ -796,12 +797,147 @@ def rehearse(args, core, rodeo, skill, hc):
     return result
 
 
-def run(args, core, rodeo, skill, hc):
+def collect_run(collector, observer, move, deadline, checkpoint):
+    """Observe a real team, injecting only the specified faults or empty-board move."""
+    evidence = observer.evidence
+    quiet_since = moved_at = None
+    last_summary = None
+    while True:
+        collector.collect()
+        now = time.monotonic()
+        evidence.within_budget = now <= deadline
+        if evidence.empty and evidence.within_budget:
+            quiet = next((m for m in evidence.messages if is_note(m, "quiet") and m.delivered is not None), None)
+            if quiet and quiet_since is None:
+                quiet_since = now
+            if quiet_since is not None and evidence.moved is None and now - quiet_since >= SILENCE_SECONDS:
+                evidence.quiet_seconds = now - quiet_since
+                evidence.moved = observer.stamp()
+                moved_at = time.monotonic()
+                move()
+            if moved_at is not None and evidence.ready_seconds == float("inf"):
+                if any(is_note(m, "ready") and ordered(evidence.moved, m.delivered) for m in evidence.messages):
+                    evidence.ready_seconds = now - moved_at
+        elif not evidence.empty and evidence.within_budget:
+            if evidence.interrupt is None:
+                observer.trigger()
+            if evidence.kill is None:
+                observer.trigger(kill=True)
+        rows = judge(evidence)
+        summary = tuple(r["status"] for r in rows)
+        if summary != last_summary:
+            checkpoint(rows)
+            last_summary = summary
+        if all(status in {"pass", "measured"} for status in summary) or not evidence.within_budget:
+            return rows
+        time.sleep(0.25)
+
+
+def evidence_result(observer, rows, started):
+    evidence = observer.evidence
+    return {"rows": rows, "cutoff_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "elapsed_seconds": round(time.monotonic() - started, 2),
+            "faults": [asdict(fault) for fault in (evidence.interrupt, evidence.kill) if fault is not None],
+            "messages": [{"id": msg.ident, "kind": msg.kind, "sender": msg.sender, "recipient": msg.recipient,
+                          "outcome": msg.outcome, "committed": msg.committed, "delivered": msg.delivered,
+                          "terminal": msg.terminal, "turn": msg.turn,
+                          "items": [ticket.item for ticket in evidence.tickets if names_item(msg, ticket.item)]}
+                         for msg in evidence.messages],
+            "log_offset": observer.offset, "owner_inputs": evidence.prompts}
+
+
+def run_real(args, live):
+    """Launch the private team through the Phase 8 adapter and submit the single owner prompt."""
+    report = live.Qualification("real", args.json, versions=live._versions())
+    result = report.data
+    result.update(tracker=args.tracker, empty=args.empty, status="not_run")
+    budget = args.budget if args.budget is not None else 45 if args.empty else 60
+    members = {"lead-dev": args.developer, "reviewer": args.reviewer}
+    if args.tracker != "file":
+        result["detail"] = "GitHub fixture is not available yet"
+        return result
+    if set(members.values()) - set(live.QUALIFY_HARNESSES):
+        result["detail"] = "choose developer and reviewer harnesses from the qualification table"
+        return result
+
+    def setup(team):
+        nonlocal fixture
+        profiles = [("operator", args.operator, args.operator_model),
+                    ("lead-dev", args.developer, args.developer_model),
+                    ("reviewer", args.reviewer, args.reviewer_model)]
+        agents = []
+        for role, harness, requested in profiles:
+            model = requested or team.adapter.model(harness)
+            section = role if role == "operator" else f"members.{role}"
+            agents.append((section, harness, model))
+            report.profile(role, harness, model=model, version=team.adapter.version(harness),
+                           thinking=None if role == "operator" else "medium")
+        fixture = make_local(team.dir, team.skill, empty=args.empty)
+        write_formation(fixture.root, ready_command(team.skill), agents, worktree=True)
+        result["fixture"] = {"root": str(fixture.root), "initial": fixture.initial, "developer_worktree": True}
+        return fixture.root
+
+    fixture = None
+    try:
+        with live.QATeam(live.RealAdapter, args.operator, members, setup=setup,
+                         operator_model=args.operator_model) as team:
+            if args.developer in live.TRUST_FILES:
+                result.setdefault("trust_entries", []).append({"harness": args.developer,
+                    "file": live.TRUST_FILES[args.developer], "directory": str(fixture.developer)})
+            if not live._operator_start(team, report, 0, "operator", args.operator, ["startup"]):
+                result["detail"] = result["rows"][0]["reason"]
+                return result
+            result["operator_start"] = team.operator_start
+            live._operator_tab(team)
+            view = live._rodeo(team, ["operator"])
+            factory = load_factory(team.skill)
+            # This process can have another cache base. The operator and members share the QA cache.
+            state = (pathlib.Path(team.env["XDG_CACHE_HOME"]) / "factory-skill"
+                     / factory.team_key(fixture.root) / team.qa.id[:8])
+            evidence = Evidence(tuple(Ticket(f"({n})") for n in range(1, 2 if args.empty else 4)), empty=args.empty)
+            observer = Observer(team.qa, factory, state, evidence)
+            collector = LocalEvidence(fixture, observer)
+
+            def move():
+                move_file_item(fixture.root, "(1)", "Ready")
+
+            def checkpoint(rows):
+                result.update(evidence_result(observer, rows, started))
+                report.checkpoint()
+
+            prompt = (f"Read {team.skill / 'SKILL.md'} and follow it. Use {team.script} for all Factory commands. "
+                      "You are the operator of the team in this repository. Run up, then work through every ready "
+                      "item in the tracker as FACTORY.md says until none is left. I am away: do not wait for me.")
+            started = time.monotonic()
+            rows = judge(evidence)
+            try:
+                view.paste(prompt)
+                evidence.prompts = 1
+                result["status"] = "running"
+                rows = collect_run(collector, observer, move, started + budget * 60, checkpoint)
+                result["status"] = "pass" if all(r["status"] in {"pass", "measured"} for r in rows) else "fail"
+            except (OSError, RuntimeError, live.HcDown, live.HcError, subprocess.SubprocessError,
+                    factory.LogDamage) as error:
+                result.update(status="fail", detail=str(error))
+                rows = judge(evidence)
+            finally:
+                checkpoint(rows)
+                try:
+                    code, out = team.call("down", timeout=60)
+                    if code != 0:
+                        result["teardown"] = {"exit": code, "output": live._bounded(out)}
+                except (OSError, subprocess.SubprocessError) as error:
+                    result["teardown"] = {"error": str(error)}
+    except (live.NotRun, live.HcDown, live.HcError, OSError, subprocess.SubprocessError) as error:
+        result.update(status="not_run", detail=str(error))
+    return result
+
+
+def run(args, core, rodeo, skill, hc, live=None):
     if args.rehearse:
         result = rehearse(args, core, rodeo, skill, hc)
     else:
-        result = {"mode": "real", "tracker": args.tracker, "empty": args.empty, "status": "not_run",
-                  "detail": "The real runs use Phase 8's authenticated harness adapter."}
+        result = run_real(args, live)
     payload = json.dumps(result, indent=2) + "\n"
     if args.json:
         args.json.write_text(payload)

@@ -7422,10 +7422,12 @@ class E2EObserverTests(unittest.TestCase):
         fixture = parser.parse_args(["--tracker", "file", "--rehearse"])
         self.assertTrue(real.empty)
         self.assertEqual(real.operator, "codex")
-        with patch.object(e2e, "rehearse", return_value={"mode": "fixture", "status": "pass"}) as rehearsal:
+        with (patch.object(e2e, "rehearse", return_value={"mode": "fixture", "status": "pass"}) as rehearsal,
+              patch.object(e2e, "run_real", return_value={"mode": "real", "status": "not_run"}) as actual):
             with contextlib.redirect_stdout(io.StringIO()) as output:
                 self.assertEqual(e2e.run(real, None, None, None, None), 2)
                 self.assertEqual(json.loads(output.getvalue())["mode"], "real")
+            actual.assert_called_once()
             rehearsal.assert_not_called()
             with contextlib.redirect_stdout(io.StringIO()) as output:
                 self.assertEqual(e2e.run(fixture, None, None, None, None), 0)

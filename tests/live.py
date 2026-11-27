@@ -1962,9 +1962,10 @@ class RealAdapter(FixtureAdapter):
         if missing:
             raise NotRun(f"{', '.join(missing)} not on PATH")
 
-    def operator_argv(self, harness):
+    def operator_argv(self, harness, model=None):
         """The operator as the owner would start it, with the profile's model pinned (as Factory pins a member's)."""
-        return [shutil.which(harness), "--model", self.model(harness), *harness_table()[harness]["permissions"]["full"]]
+        return [shutil.which(harness), "--model", model or self.model(harness),
+                *harness_table()[harness]["permissions"]["full"]]
 
     def act_append(self, path, token):
         return (f"Using your shell tool, append one line containing exactly {token} to the file {path}"
@@ -2031,7 +2032,7 @@ class QATeam:
     private copy of the skill (phase_8.md §2)."""
 
     def __init__(self, adapter_class, operator, members, draft_wait=None, permissions="full", operator_shell=False,
-                 startup_dialog=None, quiet_grace=None):
+                 startup_dialog=None, quiet_grace=None, setup=None, operator_model=None):
         self.operator_harness, self.members, self.permissions = operator, members, permissions
         self.startup_dialog = startup_dialog    # fixture only: the harness whose fake shows its declared dialog
         self.real = adapter_class is RealAdapter
@@ -2045,27 +2046,25 @@ class QATeam:
         self.skill = self.dir / "skill"
         shutil.copytree(ROOT / "skill", self.skill, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
         self.script = self.skill / "scripts" / "factory.py"
-        self.work = self.dir / "work"
-        self.work.mkdir()
-        subprocess.run(["git", "init", "-q", "-b", "main", str(self.work)], check=True)
         self.adapter = adapter_class(self)
-        self.adapter.prepare({operator, *members.values()})
-        (self.work / "FACTORY.md").write_text("Qualification team: answer every request exactly as asked.\n")
-        lines = ([f"quiet_grace = {quiet_grace}\n"] if quiet_grace else []) + [f'[operator]\nharness = "{operator}"\n']
-        for name, harness in members.items():
-            lines.append(f'[members.{name}]\nharness = "{harness}"\nmodel = "{self.adapter.model(harness)}"\n'
-                         f'permissions = "{permissions}"\n')
-        (self.work / "factory.toml").write_text("\n".join(lines))
-        subprocess.run(["git", "-C", str(self.work), "add", "-A"], check=True)
-        subprocess.run(["git", "-C", str(self.work), "-c", "user.name=qa", "-c", "user.email=qa@example.invalid",
-                        "-c", "commit.gpgsign=false", "commit", "-q", "-m", "qa"], check=True)
+        try:
+            self.adapter.prepare({operator, *members.values()})
+            self.work = setup(self) if setup is not None else self._qualification_workspace(quiet_grace)
+        except BaseException:
+            try:
+                self.qa.stop()
+            finally:
+                shutil.rmtree(self.dir, ignore_errors=True)
+            raise
         # What Factory's commands see, from the driver or from the operator's own tool: the private Factory cache
         # (never the owner's), the fixture's wrappers first on PATH, and the fake Codex home.
         shared = {"HC_BIN": shutil.which(HC) or HC, "PATH": f"{self.bin}:{os.environ.get('PATH', '')}",
                   "XDG_CACHE_HOME": str(self.dir / "cache"), "HOME": str(self.home)}
         if not self.real:
             shared["CODEX_HOME"] = str(self.home / ".codex")
-        params = {"argv": self.adapter.operator_argv(operator), "cwd": str(self.work), "env": dict(shared)}
+        argv = (self.adapter.operator_argv(operator, operator_model) if self.real
+                else self.adapter.operator_argv(operator))
+        params = {"argv": argv, "cwd": str(self.work), "env": dict(shared)}
         if not self.real:
             params["env"]["FAKE_LOG"] = str(self.dir / "operator-input.jsonl")   # every input the fake received
             params["env"]["FAKE_ECHO"] = "1"
@@ -2079,6 +2078,23 @@ class QATeam:
         if self.operator_command:
             self.send(self.operator, self.operator_command)
         self.env = {**self.qa.env, **shared, "HC_TERMINAL_ID": self.operator}
+
+    def _qualification_workspace(self, quiet_grace):
+        work = self.dir / "work"
+        work.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "main", str(work)], check=True)
+        (work / "FACTORY.md").write_text("Qualification team: answer every request exactly as asked.\n")
+        lines = [f'[operator]\nharness = "{self.operator_harness}"\n']
+        if quiet_grace:
+            lines.insert(0, f"quiet_grace = {quiet_grace}\n")
+        for name, harness in self.members.items():
+            lines.append(f'[members.{name}]\nharness = "{harness}"\nmodel = "{self.adapter.model(harness)}"\n'
+                         f'permissions = "{self.permissions}"\n')
+        (work / "factory.toml").write_text("\n".join(lines))
+        subprocess.run(["git", "-C", str(work), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(work), "-c", "user.name=qa", "-c", "user.email=qa@example.invalid",
+                        "-c", "commit.gpgsign=false", "commit", "-q", "-m", "qa"], check=True)
+        return work
 
     def call(self, *args, terminal=None, timeout=60):
         """A Factory command as the operator (or as terminal): (exit code, output)."""
@@ -4400,10 +4416,10 @@ def main(argv=None):
             parser.error("the rehearsal uses the file tracker")
         if args.budget is not None and not 0 < args.budget < float("inf"):
             parser.error("--budget must be positive and finite")
-        if args.rehearse and not RODEO:
+        if not RODEO:
             parser.exit(2, "rodeo not found (set RODEO_BIN)\n")
         try:
-            return e2e.run(args, Core, Rodeo, ROOT / "skill", shutil.which(HC) or HC)
+            return e2e.run(args, Core, Rodeo, ROOT / "skill", shutil.which(HC) or HC, sys.modules[__name__])
         except (RuntimeError, HcError, HcDown, subprocess.SubprocessError) as error:
             parser.exit(1, f"FAIL {error}\n")
     if args.command == "smoke":
