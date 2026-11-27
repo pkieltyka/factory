@@ -3279,7 +3279,55 @@ def case_3(run, role, harness, adapter_class):
                 "a report is held while the owner has an unsent draft; the draft arrives byte for byte, then the report",
                 proof=proof, reason=None if ok else "see proof")
         if role == "operator":
-            _not_built(run, 3, role, harness, ["draft-cleared"])
+            _case_3_draft_cleared(run, team, harness, view, peer)
+
+
+def _case_3_draft_cleared(run, team, harness, view, peer):
+    """draft-cleared (phase_8.md §3.3), once per operator profile: a new draft, a member's report held by it, then
+    the owner deletes the whole draft through rodeo without sending it. The report is then acted on, the cleared
+    draft causes no action, and the next line the owner sends arrives with no stray characters."""
+    team.until(lambda: team.state(team.operator) in READY, 300)
+    time.sleep(3)
+    name = f"draft-{random.randrange(16 ** 6):06x}.txt"
+    cleared, literal = team.dir / name, f"cleared draft {token()}"
+    draft = team.adapter.draft_request(f"../{name}", literal)
+    view.focused_terminal = team.operator
+    view.type(draft)
+    time.sleep(1)
+    receipt, tok, said = team.receipt("report-cleared"), token(), {}
+    _member_says(team, team.adapter.act_append(receipt, tok), record=said)
+    found = _say_id(said.get("out") or "")
+    log = factory_log(team)
+    claimed = team.until(lambda: found and _outcome(log, found, "operator") == ("sending", None), 60) or (
+        found and _outcome(log, found, "operator")[0] == "sending")
+    time.sleep(8)                                    # past hc's quiet pause: only the draft holds it
+    held = tok not in _lines(receipt)
+    cleared_at = time.monotonic()
+    for _ in draft:                                  # the owner deletes the whole draft, one key per character
+        view.keys("backspace")
+    acted = team.until(lambda: tok in _lines(receipt), 300)
+    released_after = round(time.monotonic() - cleared_at, 1) if acted else None
+    team.until(lambda: team.state(team.operator) in READY, 300)
+    time.sleep(10)
+    no_draft_action = not cleared.exists()
+    name2 = f"next-{random.randrange(16 ** 6):06x}.txt"     # the next deliberate input
+    nxt, literal2 = team.dir / name2, f"next line {token()}"
+    view.type(team.adapter.draft_request(f"../{name2}", literal2))
+    time.sleep(0.5)
+    view.keys("enter")
+    seen = team.until(lambda: nxt.exists() and nxt.read_text(), 300)
+    exact = seen == literal2 + "\n"
+    count = _lines(receipt).count(tok)
+    ok = bool(claimed) and held and count == 1 and no_draft_action and exact
+    run.row(3, "draft-cleared", "operator", harness, "pass" if ok else "fail",
+            "a report held by a draft the owner then deletes without sending: the report is acted on once, the"
+            " deleted draft does nothing, and the next sent line has no stray characters",
+            observed=f"report acted on {released_after} s after the draft was deleted" if acted else None,
+            proof={"report_id": int(found.group(1)) if found else None, "claimed": bool(claimed),
+                   "held_past_8s": held, "keyboard": f"backspace x{len(draft)}",
+                   "released_after_clear_s": released_after,
+                   "report_count": count, "cleared_draft_acted": not no_draft_action, "next_line_exact": exact,
+                   "peer": peer}, reason=None if ok else "see proof")
 
 
 def case_6(run, role, harness, adapter_class):

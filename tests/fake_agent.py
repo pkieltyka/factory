@@ -48,6 +48,16 @@ def run_tool(command):
     return proc.returncode
 
 
+def add_typed(pending, data):
+    """Typed input into the composer: a backspace (DEL or BS) removes the character before it."""
+    for byte in data:
+        if byte in (0x7f, 0x08):
+            if pending:
+                pending.pop()
+        else:
+            pending.append(byte)
+
+
 def submitted_lines():
     """Accept bracketed paste with embedded newlines, and Enter outside a paste."""
     pending = bytearray()
@@ -69,10 +79,10 @@ def submitted_lines():
                 continue
             control = CONTROL.search(incoming)
             if control is None:
-                pending.extend(incoming)
+                add_typed(pending, incoming)
                 incoming = b""
                 continue
-            pending.extend(incoming[:control.start()])
+            add_typed(pending, incoming[:control.start()])
             incoming = incoming[control.start():]
             if incoming.startswith(START):
                 incoming = incoming[len(START):]
