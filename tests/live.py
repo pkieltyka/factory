@@ -1860,7 +1860,8 @@ class FixtureAdapter:
                                                                      ("low", "medium", "high", "xhigh")]}]}))
 
     def operator_argv(self, harness):
-        return list(self.agent)
+        """The fake operator in a loop that waits for Enter between runs: quitting it leaves its pane open."""
+        return ["sh", "-c", f"while :; do {shlex.join(self.agent)}; stty sane; read line; done"]
 
     def act_append(self, path, token):
         return f"ACT append {path} {token}"
@@ -1870,6 +1871,16 @@ class FixtureAdapter:
 
     def blocked_request(self):
         return "FAKE: blocks_once"
+
+    def end_request(self):
+        return "FAKE: crashes"
+
+    def quit_request(self):
+        return "FAKE: quits"
+
+    def restart(self, qa, terminal):
+        """Start the fake operator again in its open pane (its loop waits for Enter)."""
+        qa.rpc("terminal.keys", {"terminal": terminal, "keys": ["enter"]})
 
 
 class RealAdapter(FixtureAdapter):
@@ -1903,6 +1914,15 @@ class RealAdapter(FixtureAdapter):
     def blocked_request(self):
         return ("Before doing anything else, ask me one multiple-choice question with your question tool, and"
                 " wait for my answer. Do nothing else.")
+
+    def end_request(self):
+        return "Exit your session now: quit this program."
+
+    def quit_request(self):
+        raise NotRun("quitting and restarting a real operator in the same pane is not automated yet")
+
+    def restart(self, qa, terminal):
+        raise NotRun("quitting and restarting a real operator in the same pane is not automated yet")
 
 
 class QATeam:
@@ -2398,7 +2418,8 @@ def case_5(run, role, harness, adapter_class):
         final = _outcome(log, ident, "lead-dev") if ident else None
         proof = {"queued": bool(queued), "notes": len(notes), "typed_while_blocked": typed_while_blocked,
                  "outcome_after": final, "acted": bool(acted), "peer": peer}
-        ok = bool(queued) and len(notes) == 1 and not typed_while_blocked and acted and final and final[0] == "delivered"
+        ok = (bool(queued) and len(notes) == 1 and not typed_while_blocked and acted and bool(final)
+              and final[0] == "delivered")
         run.row(5, "blocked", role, harness, "pass" if ok else "fail",
                 "blocked: nothing typed, one note, the queued message delivered and acted on once after the answer",
                 proof=proof, reason=None if ok else "see proof")
@@ -2425,7 +2446,84 @@ def _outcome(log, ident, name):
     return record["o"], record.get("why")
 
 
-CASE_FUNCTIONS = {1: case_1, 2: case_2, 5: case_5, 7: case_7, 9: case_9, 10: case_10}
+def _say_id(out):
+    found = re.search(r"^message (\d+)$", out, re.M)
+    return found
+
+
+def case_8(run, role, harness, adapter_class):
+    """dead-member, operator-gone and same-pane; unconfirmed-brief and quit-during-hold are not built yet
+    (phase_8.md §3.8)."""
+    team, peer = _team_for(adapter_class, role, harness)
+    with team:
+        names = [n for n, _ in subcases(8, role)]
+        if not _up(team, run, 8, role, harness, names):
+            return
+        log = factory_log(team)
+        if role == "member":
+            member = team.member("lead-dev")
+            team.call("say", "lead-dev", team.adapter.end_request(), timeout=60)
+            ended = team.until(lambda: team.get(member)["state"] == "finished" or team.state(member) is None, 120)
+            receipt, tok = team.receipt("dead"), token()
+            code, out = team.call("say", "lead-dev", team.adapter.act_append(receipt, tok), timeout=60)
+            ident = _say_id(out)
+            gone = team.until(lambda: _outcome(log, ident, "lead-dev") == ("queued", "gone"), 30)
+            nothing = not receipt.exists()
+            up_code, up_out = team.call("up", "lead-dev", timeout=240)
+            acted = team.until(lambda: receipt.exists() and tok in receipt.read_text(), 300)
+            fresh = team.member("lead-dev")
+            proof = {"ended": bool(ended), "queued_gone": bool(gone), "nothing_typed": nothing,
+                     "up_exit": up_code, "new_terminal": fresh not in (None, member), "acted_after_up": bool(acted)}
+            ok = bool(ended) and bool(gone) and nothing and up_code == 0 and fresh not in (None, member) and acted
+            run.row(8, "dead-member", role, harness, "pass" if ok else "fail",
+                    "a member whose harness ended gets nothing typed; up brings a new terminal that gets the message",
+                    proof=proof, reason=None if ok else "see proof")
+            _not_built(run, 8, role, harness, ["unconfirmed-brief", "quit-during-hold"])
+            return
+        operator = team.operator
+        # operator-gone: the harness stops reporting in an open pane; messages queue until up.
+        team.qa.rpc("terminal.send", {"terminal": operator, "text": team.adapter.quit_request()}, timeout=60)
+        stopped = team.until(lambda: team.state(operator) is None, 120)
+        receipt, toks, ids = team.receipt("gone"), [token(), token()], []
+        for tok in toks:
+            code, out = team.call("say", "operator", "--file", str(_note(team, team.adapter.act_append(receipt, tok))),
+                                  terminal=team.member("lead-dev"), timeout=60)
+            ids.append(_say_id(out))
+        latched = team.until(lambda: (team.get(operator).get("labels") or {}).get("factory.kind")
+                             == "operator-lost", 60)
+        team.adapter.restart(team.qa, operator)
+        back = team.until(lambda: team.state(operator) == "idle", 120)
+        time.sleep(5)
+        held = not receipt.exists()
+        up_code, _ = team.call("up", timeout=240)
+        acted = team.until(lambda: receipt.exists() and all(t in receipt.read_text() for t in toks) and
+                           receipt.read_text(), 300)
+        order = [line for line in (acted or "").split() if line in toks]
+        proof = {"stopped_reporting": bool(stopped), "latched_lost": bool(latched), "restarted": bool(back),
+                 "held_until_up": held, "up_exit": up_code, "order": [toks.index(t) for t in order]}
+        ok = bool(stopped) and bool(latched) and bool(back) and held and up_code == 0 and order == toks
+        run.row(8, "operator-gone", role, harness, "pass" if ok else "fail",
+                "an operator gone from an open pane: messages queue until up, then arrive in order",
+                proof=proof, reason=None if ok else "see proof")
+        # same-pane: a quick quit and restart with nothing pending, then a message succeeds without up.
+        team.qa.rpc("terminal.send", {"terminal": operator, "text": team.adapter.quit_request()}, timeout=60)
+        team.until(lambda: team.state(operator) is None, 60)
+        team.adapter.restart(team.qa, operator)
+        team.until(lambda: team.state(operator) == "idle", 60)
+        receipt2, tok2 = team.receipt("same-pane"), token()
+        code, out = team.call("say", "operator", "--file", str(_note(team, team.adapter.act_append(receipt2, tok2))),
+                              terminal=team.member("lead-dev"), timeout=60)
+        acted2 = team.until(lambda: receipt2.exists() and tok2 in receipt2.read_text(), 300)
+        same = team.get(operator)["address"] == operator
+        ok2 = bool(acted2) and same and "@operator: delivered" in out
+        run.row(8, "same-pane", role, harness, "pass" if ok2 else "fail",
+                "an operator restarted in the same pane with nothing pending: the next say is delivered without up",
+                proof={"same_terminal": same, "say": out.strip().splitlines()[-1:], "acted": bool(acted2)},
+                reason=None if ok2 else "see proof")
+        _not_built(run, 8, role, harness, ["quit-during-hold"])
+
+
+CASE_FUNCTIONS = {1: case_1, 2: case_2, 5: case_5, 7: case_7, 8: case_8, 9: case_9, 10: case_10}
 
 
 def _source_head():
@@ -2480,6 +2578,7 @@ def qualify(target, role=None, cases=None, json_path=None, fixture=False):
                                 reason=f"the driver stopped: {type(error).__name__}: {error}")
         run.checkpoint()
     run.data["summary"] = run.summary(selected)
+    run.checkpoint()
     return run.data, run.exit_code(selected)
 
 

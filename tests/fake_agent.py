@@ -11,7 +11,7 @@ import sys
 import time
 import tty
 
-SCRIPTS = ("reports", "forgets", "works_forever", "blocks", "blocks_once", "crashes", "silent", "dialog")
+SCRIPTS = ("reports", "forgets", "works_forever", "blocks", "blocks_once", "crashes", "quits", "silent", "dialog")
 START, END = b"\x1b[200~", b"\x1b[201~"
 CONTROL = re.compile(rb"[\x1b\r\n]")
 
@@ -122,6 +122,9 @@ def main():
         if script in ("silent", "works_forever"):
             report("working" if script == "works_forever" else None)
             continue
+        if script == "quits":       # a harness quitting to its shell: hc clears the status, the pane stays
+            report("clear")
+            return 0
         report("working")
         if script == "crashes":
             return 1
