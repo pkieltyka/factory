@@ -476,10 +476,11 @@ def plan(cfg, name, state=None):
 
 # ================================================================ availability checks
 
-def run_probe(argv, env=None):
+def run_probe(argv, env=None, hide=()):
+    """argv's output, with env added to this process's environment and the names in hide left out."""
     try:
         p = subprocess.run(argv, capture_output=True, text=True, timeout=PROBE_TIMEOUT,
-                           env={**os.environ, **(env or {})})
+                           env={k: v for k, v in {**os.environ, **(env or {})}.items() if k not in hide})
     except (OSError, subprocess.TimeoutExpired) as e:
         raise Problem(f"`{' '.join(argv[:3])}` failed: {e}",
                       "Run factory.py outside any sandbox, or check that the harness starts on its own.")
@@ -3235,8 +3236,15 @@ def agy_choice(member):
     return model, str(member.get("thinking") or agy_effort(model) or default)
 
 
+# agy 1.5.18 answers "Please sign in" while any of these is set (an SSH login), even when it is signed in
+# (@lead-dev's bisect on the real HOME, db85120). Its model list is read without them. A launch needs nothing:
+# hc 0.1.20 already leaves these three out of every terminal it starts.
+AGY_HIDDEN_ENV = ("SSH_CLIENT", "SSH_CONNECTION", "SSH_TTY")
+
+
 def agy_models():
-    return {line.partition("\t")[0] for line in run_probe(["agy", "models"]).splitlines() if "\t" in line}
+    return {line.partition("\t")[0] for line in run_probe(["agy", "models"], hide=AGY_HIDDEN_ENV).splitlines()
+            if "\t" in line}
 
 
 def model_agy(checker, model, harness):

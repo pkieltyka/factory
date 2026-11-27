@@ -6271,6 +6271,24 @@ class SessionTests(unittest.TestCase):
             self.assertEqual(factory.session_plan(m, self.state, None, False)["args"],
                              [f"--session-dir={self.state / 'sessions' / 'omp-dev-omp'}"])
 
+    def test_agy_models_is_read_without_the_ssh_login_variables(self):
+        """agy 1.5.18 says "Please sign in" while SSH_CLIENT, SSH_CONNECTION or SSH_TTY is set, signed in or not
+        (@lead-dev's bisect, db85120). Factory's model probe leaves exactly those out and keeps the rest."""
+        seen = {}
+
+        def run(argv, **kwargs):
+            seen.update(kwargs["env"])
+            return subprocess.CompletedProcess(argv, 0, "gemini-4-neon\tGemini 4 Neon\n", "")
+        ssh = {"SSH_CLIENT": "a", "SSH_CONNECTION": "b", "SSH_TTY": "c", "SSH_AUTH_SOCK": "d", "KEEP": "e"}
+        with patch.dict(os.environ, ssh), patch.object(factory.subprocess, "run", run):
+            self.assertEqual(factory.agy_models(), {"gemini-4-neon"})
+        self.assertFalse({"SSH_CLIENT", "SSH_CONNECTION", "SSH_TTY"} & seen.keys())
+        self.assertEqual((seen["SSH_AUTH_SOCK"], seen["KEEP"]), ("d", "e"))
+        seen.clear()
+        with patch.dict(os.environ, ssh), patch.object(factory.subprocess, "run", run):
+            factory.run_probe(["other"])
+        self.assertEqual(seen["SSH_TTY"], "c")                  # other harnesses' probes keep the whole environment
+
     def test_omp_resumes_from_its_own_session_folder(self):
         """LC-6 at db85120: omp stores each member's conversation in --session-dir and --continue reopens that
         folder's newest one, so the shipped table resumes omp that way (launch_layout.md §4). pi keeps its
