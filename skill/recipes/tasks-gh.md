@@ -33,6 +33,14 @@ Only a person adds READY_LABEL; the team never adds it. It means the operator ma
 Never delete issues. Reconcile an uncertain write before retrying.
 ```
 
+## Ready check
+
+Set this read-only command as `ready_check` in your local `factory.toml`. Replace the capitalized names with your tracker settings. Increase the limit if the ready label can cover more than 100 open issues.
+
+`ids=$(gh issue list --repo 'OWNER/REPO' --state open --label 'READY_LABEL' --limit 100 --json number --jq 'sort_by(.number) | .[].number') || exit 2; [ -n "$ids" ] || exit 1; printf '%s\n' "$ids"`
+
 ## Tested with
 
 2026-11-18: gh 2.104.0; the repository check returned `hasIssuesEnabled: true` and `viewerPermission: ADMIN`; authentication, label-filtered list (using an existing label) and issue view also ran in this repository. Edit, comment, create and close flags were checked in help, not executed. The label-based ready flow has not been trialled by a team.
+
+2026-11-27 UTC, gh 2.105.0. Ready check: an existing open label returned IDs and exit 0, a label with no matches returned exit 1, and an invalid repository returned exit 2.

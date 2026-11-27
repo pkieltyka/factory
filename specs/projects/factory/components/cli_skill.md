@@ -152,17 +152,19 @@ Every file below is product (the agents read it). The rule for all of them: dele
 
 Outcome paragraph for `member-prompt.md`:
 
-> Run the send command alone (no `cd &&`, pipe, redirect or trailing `echo`). Factory adds your sender line and prints a message ID and one outcome per recipient. `delivered`: it was typed into their pane. `sending` or `queued`: Factory will finish it; do nothing more and never resend. `unconfirmed` or `dropped`: it may not have arrived; tell {operator} which message and recipient, and resend only when asked. `nothing sent` or `not stored`: fix what the line says, then send again. Factory removes your file once every recipient has the message.
+> Run the send command alone (no `cd &&`, pipe, redirect or trailing `echo`). Factory adds your sender line and prints a message ID and one outcome per recipient. `delivered`: it was typed into their pane. `sending` or `queued`: Factory will finish it; do nothing more and never resend. `unconfirmed` or `dropped`: it may not have arrived; tell {operator} which message and recipient, and resend only when asked. `nothing sent`: nothing was stored. Fix what the line says, then send again. `not stored` or `not confirmed stored`: follow the diagnostic. When it says not to resend, tell {operator}. Factory removes your file once every recipient has the message.
 
-Note table for `leading.md`:
+Note table for `leading.md`.
 
-| Note from `[from factory]` | Do |
+Notes from `[from factory]` describe an observation that may have changed while delivery was held. Check `status`, the tracker and active work before acting.
+
+| Note | Action |
 |---|---|
-| `@x is blocked (…)` | Resolve it if you can; ask the owner when only they can. |
+| `@x is blocked` | Resolve the current block, or ask the owner when only they can. |
 | `@x hit an error` | Reassign, or retry after the provider's delay. |
-| `@x exited` / `was lost` | `factory.py up x`, then give it its task again, or reassign. |
-| `team quiet` | Ask whoever owes you a report. Otherwise take the next ready item. Otherwise end your turn; do not answer the note. |
-| `ready work` | Take the first item it lists, as the workflow says. |
+| `@x exited` or `was lost` | Run `factory.py up NAME` or reassign. Reconcile the pickup report, tracker and inbox before assigning the task again. |
+| `team quiet` | Check who owes a report, then check for ready work. If neither needs action, end your turn without replying. |
+| `ready work` | Read the current tracker and take its next ready item if you can assign it. |
 
 Default `## Workflow` for `templates/FACTORY.md`:
 
@@ -175,7 +177,7 @@ The team works through the ready items on its own. The owner sets direction; the
 | 2. Items | The pm, or the operator without one | Items with acceptance criteria; a current tracker. |
 | 3. Plan | An architect, when the team has one | A plan for the item: interfaces, edge cases, tests, files. Small fixes skip this step. |
 | 4. Build | Developers | Code and tests, following the plan. |
-| 5. Review | The reviewer | A verdict on the exact diff. Fixes until approved; after three rounds on one item the operator decides. |
+| 5. Review | The reviewer | A verdict on the exact diff. Fixes until approved; after two rounds on one item the operator decides. |
 | 6. Integrate | The operator | Confirms the approval and the checks, then integrates and has the tracker updated. |
 | 7. Next | The operator | Takes the next ready item without asking. |
 
@@ -192,7 +194,7 @@ Depends on: every other component. Used by: `main`.
 
 ## Test plan
 
-- `test_parser_commands`: the eleven commands parse; `wait`, `prompt`, `--restart`, `--no-brief` are rejected; `continue` prints the pointer and exits 2.
+- `test_parser_commands`: the v2 commands parse; retired commands and flags are rejected.
 - `test_resolve_team_from_caller_labels`, `…_from_checkout_when_caller_is_outside`, `…_offline_single_dir`, `…_offline_newest_of_several`; `test_two_cache_homes_share_one_log` (the member's environment has another `XDG_CACHE_HOME`; its `say` lands in the operator's log).
 - One test per row of the `say` refusal table, each asserting exit 2 and that the log is unchanged.
 - `test_say_all_expands_to_live_members_only`; `test_say_names_split_on_commas_and_spaces`; `test_say_to_gone_member_is_queued`.

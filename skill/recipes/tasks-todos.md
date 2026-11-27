@@ -24,6 +24,14 @@ Only a person moves an issue into READY_COLUMN. That column means the operator m
 Check the board with `todos board --json`; pass `--project BOARD_OWNER/BOARD_NUMBER` if it shows another. Check failures with `todos doctor --json`; reconcile an uncertain write before retrying. Never run `todos rm`; close instead, after confirmed integration. With pull requests enabled, link the PR and close only after its merge is confirmed.
 ```
 
+## Ready check
+
+Set this read-only command as `ready_check` in your local `factory.toml`. Replace the capitalized names with your tracker settings. This example uses `jq`.
+
+`board=$(todos board --repo 'OWNER/REPO' --project 'BOARD_OWNER/BOARD_NUMBER' --json --fresh) || exit 2; ids=$(printf '%s\n' "$board" | jq -er --arg ready 'READY_COLUMN' 'if .truncated != false then error("incomplete board") else [.columns[] | select(.status == $ready)] | if length != 1 then error("ready column not found") else .[0].cards | map(select(.state == "open") | .number) | sort | join("\n") end end') || exit 2; [ -n "$ids" ] || exit 1; printf '%s\n' "$ids"`
+
 ## Tested with
 
 2026-11-18: todos `v0.0.0-20261116234621-e210174be96c`, gh 2.104.0; this repository's GitHub Issues and project board.
+
+2026-11-27 UTC, todos v0.0.0-20261120175034-0216833acf6b. Ready check: the Todo column returned IDs and exit 0, Done had no open items and exit 1, and a missing column or an invalid repository returned exit 2.

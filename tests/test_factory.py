@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import tomllib
 import threading
 import time
 import types
@@ -4582,7 +4583,8 @@ class MemberPromptTests(unittest.TestCase):
         prompt = self.env.run("brief", "lead-dev").stdout
         self.assertIn(f"python3 {SCRIPT} say NAME --file", prompt)
         self.assertNotIn("say --cwd", prompt)
-        for word in ("delivered", "sending", "queued", "unconfirmed", "dropped", "nothing sent", "not stored"):
+        for word in ("delivered", "sending", "queued", "unconfirmed", "dropped", "nothing sent", "not stored",
+                     "not confirmed stored"):
             self.assertIn(f"`{word}`", prompt)
         self.assertIn("resend only when asked", prompt)
 
@@ -6882,6 +6884,51 @@ class ListingTests(unittest.TestCase):
         self.assertEqual(factory.listed_models(omp), ["openrouter/z-ai/glm-5.3", "openrouter/z-ai/glm-5.3-flash", "ollama/qwen3:8b"])
 
 
+class SkillTextTests(unittest.TestCase):
+    def test_template_formation_has_no_active_autonomy_key(self):
+        sample = (factory.SKILL / "templates/factory.toml").read_text()
+        before_tables = sample.split("\n[operator]", 1)[0]
+        parsed = tomllib.loads(sample)
+        for key in ("quiet_grace", "ready_check", "ready_check_every"):
+            with self.subTest(key=key):
+                self.assertNotIn(key, parsed)
+                self.assertRegex(before_tables, rf"(?m)^# {key} = ")
+
+    def test_template_ready_check_command(self):
+        sample = (factory.SKILL / "templates/factory.toml").read_text()
+        setting = next(line[2:] for line in sample.splitlines() if line.startswith("# ready_check = "))
+        command = tomllib.loads(setting)["ready_check"]
+        template = (factory.SKILL / "templates/TODO.md").read_text()
+        item = "- [ ] (7) Check the ready queue"
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "TODO.md"
+            for contents, code, output in (
+                (None, 2, ""),
+                (template, 1, ""),
+                (template.replace("## Backlog", f"## Backlog\n\n{item}"), 1, ""),
+                (template.replace("## Ready", f"## Ready\n\n{item}"), 0, item + "\n"),
+            ):
+                if contents is not None:
+                    path.write_text(contents)
+                with self.subTest(code=code, contents=contents):
+                    result = subprocess.run(["sh", "-c", command], cwd=directory, text=True, capture_output=True)
+                    self.assertEqual((result.returncode, result.stdout), (code, output))
+
+    def test_template_workflow_is_the_spec_default(self):
+        spec = factory.SKILL.parent / "specs/projects/factory/components/cli_skill.md"
+        default = spec.read_text().split("Default `## Workflow` for `templates/FACTORY.md`:", 1)[1]
+        expected = default.split("```markdown", 1)[1].split("```", 1)[0].strip()
+        brief = (factory.SKILL / "templates/FACTORY.md").read_text()
+        workflow = brief.split("## Workflow", 1)[1].split("## Notes", 1)[0].strip()
+        self.assertEqual(workflow, expected)
+
+    def test_team_brief_uses_pane_titles(self):
+        with Env() as env:
+            brief = env.run("brief").stdout
+        self.assertIn("each in its own pane", brief)
+        self.assertIn("their pane's title", brief)
+
+
 class DocumentationTests(unittest.TestCase):
     def test_relative_links_and_headings(self):
         root = factory.SKILL.parent
@@ -6931,8 +6978,12 @@ class RecipeTests(unittest.TestCase):
                 self.assertIn(f"`{section}`", setup)
                 self.assertTrue(headings[0].startswith(f"# {section[3:]}: "))
                 expected = ["## Needs", "## Check", "## FACTORY.md section"]
-                if "## Ready check" in headings and path.name in ("tasks-gh.md", "tasks-todos.md"):
+                if path.name in ("tasks-gh.md", "tasks-todos.md"):
                     expected.append("## Ready check")
+                    ready_check = path.read_text().split("## Ready check", 1)[1].split("## Tested with", 1)[0]
+                    commands = [span for span in re.findall(r"`([^`]+)`", ready_check)
+                                if span.startswith(("board=", "ids="))]
+                    self.assertEqual(len(commands), 1)
                 self.assertEqual(headings[1:], [*expected, "## Tested with"])
                 self.assertIn(f"(../skill/recipes/{path.name})", overview)
 
