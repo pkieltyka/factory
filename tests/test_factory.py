@@ -2722,6 +2722,116 @@ class IntegratedTeamTests(TeamCase):
         self.assertEqual(box.outcome(task, "lead-dev")["o"], "delivered")      # the team's history persists
 
 
+@fake_only
+class MemberNoteTests(TeamCase):
+    """keeper.md §5 and phase_6.md §2: one note per observed episode, housekeeping on briefed members."""
+
+    def setUp(self):
+        super().setUp()
+        self.operator = self.terminal("operator", kind="operator")[0]
+        self.lead = self.terminal("lead-dev")[0]
+        self.briefed("lead-dev", self.lead)
+
+    def notes(self):
+        _, box = self.log.read_box()
+        return [m for m in box.msgs.values() if m["kind"] == "note"]
+
+    def status(self, term, state, kind=None, msg=None):
+        time.sleep(0.003)                    # a new status_ms for a re-entered state
+        self.fake.set_status(term, state, kind, msg)
+        self.keeper.tick()
+
+    def test_each_blocked_episode_is_noted_once(self):
+        self.status(self.lead, "blocked", "permission", "run tests?")
+        self.keeper.tick()
+        self.status(self.lead, "blocked", "question")
+        self.status(self.lead, "blocked", "permission")
+        self.status(self.lead, "idle")
+        self.status(self.lead, "blocked", "permission")
+        notes = self.notes()
+        self.assertEqual([n["meta"]["what"] for n in notes],
+                         ["blocked:permission", "blocked:question", "blocked:permission", "blocked:permission"])
+        self.assertEqual(notes[0]["text"], "@lead-dev is blocked (permission): run tests?. It needs an answer in"
+                                           " its pane.")
+        self.assertEqual((notes[0]["from"], notes[0]["to"], notes[0]["meta"]["about"], notes[0]["meta"]["term"]),
+                         ("factory", ["operator"], "lead-dev", self.lead))
+        self.assertNotEqual(notes[2]["meta"]["since"], notes[3]["meta"]["since"])
+
+    def test_a_restarted_keeper_repeats_nothing(self):
+        self.status(self.lead, "blocked", "permission")
+        again = factory.Keeper(self.state_dir, self.hc, self.clock, self.pane.append, self.jobs.append)
+        again.tick()
+        again.tick()
+        self.assertEqual(len(self.notes()), 1)
+
+    def test_errors_and_exits_are_noted_with_their_facts(self):
+        self.status(self.lead, "working")
+        task = self.log.add("operator", ["lead-dev"], "do it")[0]
+        _, box = self.log.read_box()
+        self.log.out(box, task, "lead-dev", "sending", term=self.lead)
+        self.log.out(box, task, "lead-dev", "delivered", term=self.lead, started=True, turn=1)
+        self.status(self.lead, "error", msg="login expired")
+        self.fake.finish(self.lead, exit_code=1)
+        self.keeper.tick()
+        self.keeper.tick()
+        error, exit_note = self.notes()
+        self.assertEqual(error["text"], "@lead-dev hit an error: login expired.")
+        self.assertEqual(exit_note["meta"], {"what": "exit", "about": "lead-dev", "term": self.lead})
+        self.assertEqual(exit_note["text"], f"@lead-dev exited (code 1) while error. Its last message from you was"
+                                            f" #{task}. Run: factory.py up lead-dev")
+
+    def test_nothing_for_unbriefed_stopping_or_unwatched_members(self):
+        reviewer = self.terminal("reviewer")[0]                          # never briefed
+        self.status(reviewer, "blocked", "permission")
+        self.hc.label(self.lead, {"factory.down": "1"})
+        self.status(self.lead, "blocked", "permission")
+        self.assertEqual(self.notes(), [])
+        self.hc.label(self.lead, {"factory.down": ""})
+        self.fake.set_status(self.operator, None)                         # no reachable operator
+        self.keeper.tick()
+        self.assertEqual(self.notes(), [])
+        self.fake.set_status(self.operator, "idle")                       # back: the current episode
+        self.keeper.tick()
+        self.assertEqual([n["meta"]["what"] for n in self.notes()], ["blocked:permission"])
+
+    def test_housekeeping_changes_only_what_changed(self):
+        self.hc.call("terminal.keep", {"terminal": self.lead, "keep": True})
+        self.status(self.lead, "working")
+        self.keeper.tick()
+        labels = [c["params"] for c in self.fake.calls("terminal.label") if c["params"]["terminal"] == self.lead]
+        keeps = [c["params"] for c in self.fake.calls("terminal.keep") if c["params"]["terminal"] == self.lead]
+        self.assertEqual(labels, [{"terminal": self.lead, "labels": {"factory.last": "working"}}])
+        self.assertEqual(keeps[-1], {"terminal": self.lead, "keep": False})
+        self.assertFalse(self.hc.get(self.lead)["keep"])
+
+    def test_the_operator_cannot_be_named_factory(self):
+        self.env.write_brief(formation({"lead-dev": CATALOG_MEMBERS["lead-dev"]}, operator={"name": "factory"}))
+        with self.assertRaisesRegex(SystemExit, "'factory' is reserved for Factory's own notes"):
+            factory.Config(self.root)
+
+    def test_the_note_reaches_the_operator_from_factory(self):
+        self.status(self.lead, "blocked", "permission")
+        self.keeper.tick()
+        self.run_jobs()
+        self.keeper.tick()
+        self.assertTrue(self.fake.sent(self.operator)[0].startswith("[from factory]\n@lead-dev is blocked"))
+
+    def test_the_delivery_count_replays_the_same(self):
+        ident = self.log.add("pm", ["lead-dev", "reviewer"], "two recipients")[0]
+        note = self.log.add("factory", ["operator"], "a note", kind="note", meta={"what": "quiet"})[0]
+        _, box = self.log.read_box()
+        base = box.deliveries
+        for to, term in (("lead-dev", self.lead), ("reviewer", "t-r")):
+            self.log.out(box, ident, to, "sending", term=term)
+            self.log.out(box, ident, to, "delivered", term=term, started=True, turn=0)
+        self.log.out(box, note, "operator", "sending", term=self.operator)
+        self.log.out(box, note, "operator", "delivered", term=self.operator, started=True, turn=0)
+        self.assertEqual(box.deliveries, base + 2)                       # notes never count
+        self.assertEqual(self.log.read_box()[1].deliveries, base + 2)     # a full replay counts the same
+        partial = factory.Box.for_message(self.log.path, ident, ["lead-dev"], 0)
+        self.assertEqual(partial.deliveries, 0)
+
+
 class KeeperTests(TeamCase):
     def member(self, *, status="idle", briefed=True):
         term, agent_log = self.terminal("lead-dev", status=status)

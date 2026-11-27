@@ -404,6 +404,8 @@ class Config:
         if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", str(self.operator["name"])) or self.operator["name"] in self.members:
             raise SystemExit(f"{self.conf_file}: [operator] name {self.operator['name']!r} must be lowercase letters,"
                              " digits, - or _ (32 at most) and not a member's name")
+        if self.operator["name"] == "factory":
+            raise SystemExit(f"{self.conf_file}: [operator] name 'factory' is reserved for Factory's own notes")
         try:  # whose team this is: the first part of its worktree branches, so two people's never collide
             self.user = str(self.team.get("user") or getpass.getuser())
         except (KeyError, OSError):
@@ -719,6 +721,7 @@ class Box:
         self._only = None                   # for_message: the one id this partial view follows
         self._lineage = None                # the checkpoint lineage this box's view was proven in, by Log.out
         self._damage = None                 # set when an apply failed: the box is unusable until rebuilt
+        self.deliveries = 0                 # delivered outcomes of messages that are not notes (a full box only)
 
     @classmethod
     def for_message(cls, path, ident, recipients, offset):
@@ -785,6 +788,8 @@ class Box:
         if current["o"] not in MOVES[new]:
             return f"illegal outcome {current['o']} -> {new} for @{to} of message {ident}"
         self.outcomes[(ident, to)] = dict(rec)
+        if new == "delivered" and self._only is None and msg.get("kind") != "note":
+            self.deliveries += 1            # quiet's activity count (keeper.md §6): the same on every replay
         if "text" in msg and all(self.outcome(ident, r)["o"] in FINAL for r in msg["to"]):
             msg.pop("text")
         return None
@@ -1944,6 +1949,8 @@ class Keeper:
         if self.cfg is None or self.stop:
             return
         try:
+            if self.damaged is None and self.team.get("up") is True:
+                self._member_notes(view)
             if self.damaged is None:
                 self._deliver(view, now)
             operator = self.cfg.operator["name"]
@@ -1952,6 +1959,58 @@ class Keeper:
                 self.stop = "team is down"
         except (LogDamage, NotStored, OSError) as error:
             self._log_failed(error)
+
+    def _member_notes(self, view):
+        """keeper.md §5: housekeeping on briefed member terminals, then one note per new episode for the operator."""
+        operator = self.cfg.operator["name"]
+        reachable = view.operator is not None and view.operator.get("status") is not None
+        briefed = self.box.briefed()
+        for name in self.cfg.members:
+            live = view.terminal(name)
+            record = live or view.finished(name)
+            if record is None or record["labels"].get("factory.down") or record["address"] not in briefed:
+                continue
+            address, status = record["address"], (live or {}).get("status")
+            try:
+                if live and live.get("keep"):
+                    self.hc.keep_off(address)
+                if status and status["state"] != record["labels"].get("factory.last"):
+                    self.hc.label(address, {"factory.last": status["state"]})
+            except (HcError, HcDown) as error:
+                self._report(f"member {address}", f"@{name} ({address}): {error}")
+            if not reachable:
+                continue
+            note = self._episode(name, record, status, view)
+            if note is None:
+                continue
+            meta, text = note
+            last = self.box.last_note(address)
+            if last is not None and last.get("what") == meta["what"] and last.get("since") == meta.get("since"):
+                continue                     # the same episode: noted already, maybe before a restart
+            ident = self.log.add("factory", [operator], text, kind="note", meta=meta)[0]
+            self.log.refresh(self.box)
+            stamp = time.strftime("%H:%M:%S", time.localtime(self.clock.time()))
+            self.emit(f"{stamp} #{ident} note: @{name} {meta['what']}")
+
+    def _episode(self, name, record, status, view):
+        """(meta, text) of the note the member's current state calls for, or None."""
+        address = record["address"]
+        if view.state(name) == "gone":
+            cause, word = end_cause(record)
+            text = f"@{name} {cause} " + (f"while {word}." if word else "(state unknown).")
+            last = self.box.last_to(name, sender=self.cfg.operator["name"])
+            if last:
+                text += f" Its last message from you was #{last['id']}."
+            return {"what": "exit", "about": name, "term": address}, text + f" Run: factory.py up {name}"
+        if status is None or status["state"] not in ("blocked", "error"):
+            return None
+        detail = f": {status['msg']}" if status.get("msg") else ""
+        meta = {"about": name, "term": address, "since": record.get("status_ms")}
+        if status["state"] == "blocked":
+            kind = status.get("kind") or ""
+            text = f"@{name} is blocked" + (f" ({kind})" if kind else "") + detail + ". It needs an answer in its pane."
+            return {"what": "blocked:" + kind, **meta}, text
+        return {"what": "error", **meta}, f"@{name} hit an error{detail}."
 
     def _emit_outcome(self, msg, recipient, outcome, why=None):
         stamp = time.strftime("%H:%M:%S", time.localtime(self.clock.time()))
@@ -3585,14 +3644,19 @@ def lifecycle_lock(state):
     return fd
 
 
-def interrupted_line(name, record, box):
-    """§8: why a gone member stopped, and the last message it got."""
+def end_cause(record):
+    """Why a gone member's terminal stopped (launch_layout.md §8), and its last observed state or None."""
     reason = record.get("reason")
     cause = ("its harness ended" if record["state"] == "live"
              else f"exited (code {record.get('exit_code')})" if reason == "exited"
              else "was killed" if reason == "killed" else "hc stopped" if reason == "server_stop"
              else f"was lost ({reason})")
-    word = (record.get("labels") or {}).get("factory.last")
+    return cause, (record.get("labels") or {}).get("factory.last")
+
+
+def interrupted_line(name, record, box):
+    """§8: why a gone member stopped, and the last message it got."""
+    cause, word = end_cause(record)
     line = f"@{name} interrupted: {cause} " + (f"while {word}." if word else "(state unknown).")
     msg = box.last_to(name) if box is not None else None
     if msg:
