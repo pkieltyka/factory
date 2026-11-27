@@ -13,7 +13,7 @@
   - up resolves the formation's `openai/gpt-6-astra` to `openrouter/openai/gpt-6-astra` and records that for the launch. But pi's own `say` saved the formation's unresolved model with the session ID.
   - The next `up`'s provider check compared `openai` with `openrouter` and started pi fresh, despite the saved ID.
   - The saved session now keeps the model of the terminal's own launch. pi's resume needs a rerun.
-  - @operator's earlier decision to document "no resume for pi" assumed the LC-6 cause. It is back with @operator.
+  - @operator withdrew the earlier "no resume for pi" limit, which assumed the LC-6 cause. pi case 6 is to be rerun at 50faa5f and decided from that; #208 (pi's own session flags) stays in the backlog.
 - **Blocked (case 5): not run.** pi never reported `blocked`.
 - **owner-interrupt at 4954e2f:** next-delivery held: both effects once, with M1 acting 68.54 s after Esc, after the next delivery.
   - The owner-line trial failed only on the driver's before-Enter screen check: pi's screen did not show the whole pasted line. M1 acted once after Enter, at 125.57 s, and the owner's receipt was byte-exact.
