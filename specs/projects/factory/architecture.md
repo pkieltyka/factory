@@ -249,15 +249,15 @@ Each step is mergeable alone and ends with its tests green ([testing.md](compone
 
 ### Still owed
 
-| # | Question | Needed by |
+| # | Question | Needed by | Fallback |
 |---|---|---|---|
-| LC-2 | Codex: does `-c 'projects."<dir>".trust_level="trusted"'` suppress the trust dialog without writing `config.toml`? | launch |
-| LC-3 | Claude Code: is `--session-id <uuid>` accepted together with `--append-system-prompt-file` and `--settings`, and does `--resume <id>` reopen that conversation? | sessions |
-| LC-4 | OpenCode: which ID format does `--session <id>` accept for a session that does not exist yet? | sessions |
-| LC-6 | pi and omp: does `--session-dir <dir> --continue` resume the newest conversation in that directory, and start a new one without `--continue`? | sessions |
-| LC-7 | agy: does `--settings '{"trustedWorkspaces": ["<dir>"]}'` suppress the trust dialog for that session without writing the global list? | launch |
-| LC-11 | OpenCode: is there a variable like the others in its tool environment? | sessions |
-| LC-12 | Claude Code, Codex, agy: does a `say` run by a sub-agent or sub-thread carry the parent conversation's ID in the variable? | sessions |
+| LC-2 | Codex: does `-c 'projects."<dir>".trust_level="trusted"'` suppress the trust dialog without writing `config.toml`? | launch | Answer the dialog with `enter`, as v1 |
+| LC-3 | Claude Code: is `--session-id <uuid>` accepted together with `--append-system-prompt-file` and `--settings`, and does `--resume <id>` reopen that conversation? | sessions | Drop the flag; the ID recorded by `say` is enough |
+| LC-4 | OpenCode: which ID format does `--session <id>` accept for a session that does not exist yet? | sessions | Its variable if LC-11 finds one; else OpenCode starts fresh with a notice |
+| LC-6 | pi and omp: does `--session-dir <dir> --continue` resume the newest conversation in that directory, and start a new one without `--continue`? | sessions | pi: record `PI_SESSION_ID` and resume with `--session <id>`; omp: fresh with a notice |
+| LC-7 | agy: does `--settings '{"trustedWorkspaces": ["<dir>"]}'` suppress the trust dialog for that session without writing the global list? | launch | The dialog is left to the owner (§6.3) |
+| LC-11 | OpenCode: is there a variable like the others in its tool environment? | sessions | Its launch flag only (`--session`) |
+| LC-12 | Claude Code, Codex, agy: does a `say` run by a sub-agent or sub-thread carry the parent conversation's ID in the variable? | sessions | `session_follow = false` for that harness: record once per launch, from the ready line |
 
 ### Resolved (Phase 1 and Phase 5a, 26 November 2026, [docs/qualification/hc-checks.md](../../../docs/qualification/hc-checks.md))
 
