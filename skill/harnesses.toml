@@ -105,7 +105,7 @@ never = []
 prompt = "message"
 session_env = "ANTIGRAVITY_CONVERSATION_ID"
 session_follow = false   # LC-12 not shown yet
-dialogs = [["Do you trust the contents of this project?", []]]   # the owner's to accept until LC-7 passes
+dialogs = [["Do you trust the contents of this project?", []]]   # a fallback: LC-7 trusts the member's folder per launch
 
 [agy.permissions]   # Factory has no guarded mode for agy. Both levels use the same flags.
 full = ["--mode", "accept-edits", "--settings", '{"toolPermission":"always-proceed"}']

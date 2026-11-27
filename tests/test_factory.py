@@ -1332,6 +1332,12 @@ class UpTests(unittest.TestCase):
             self.assertIn("# Team brief", text)
 
 
+    def test_agy_trusted_merges_into_the_settings_it_already_passes(self):
+        self.assertEqual(factory.agy_trusted(["--mode", "x", "--settings", '{"a":1}'], "/w"),
+                         ["--mode", "x", "--settings", '{"a":1,"trustedWorkspaces":["/w"]}'])
+        self.assertEqual(factory.agy_trusted(["--mode", "x"], "/w"),
+                         ["--mode", "x", "--settings", '{"trustedWorkspaces":["/w"]}'])
+
     def test_agy_model_variants_and_guarded_permissions(self):
         cases = {"pm": ("gemini-4-neon", "low", "gemini-4-neon-low"),
                  "reviewer": ("gemini-4-neon-low", None, "gemini-4-neon-low"),
@@ -1340,9 +1346,16 @@ class UpTests(unittest.TestCase):
                           **({"thinking": level} if level else {})} for name, (model, level, _) in cases.items()}
         with Env(formation(members)) as e:
             launches = self.launches(e)
+            with patch.dict(os.environ, e.env, clear=True):
+                cfg = factory.Config(e.repo)
+                dirs = {m["name"]: m["dir"] for m in factory.checked(cfg, [factory.plan(cfg, n) for n in cfg.members])}
             for name, (_, _, wanted) in cases.items():
-                self.assertEqual(launches[name][0], ["--model", wanted, "--mode", "accept-edits",
-                                 "--settings", '{"toolPermission":"always-proceed"}'])
+                argv = launches[name][0]
+                self.assertEqual(argv[:5], ["--model", wanted, "--mode", "accept-edits", "--settings"])
+                # LC-7: the member's own folder is trusted for this launch only, in the session-only settings
+                self.assertEqual(json.loads(argv[5]), {"toolPermission": "always-proceed",
+                                                       "trustedWorkspaces": [str(dirs[name])]})
+                self.assertEqual(argv.count("--settings"), 1)
             brief = e.run("brief").stdout
             self.assertIn("gemini-4-neon-low, low", brief)
             self.assertIn("gemini-pro-orchestrator-neon, default", brief)

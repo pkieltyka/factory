@@ -3271,7 +3271,27 @@ def launch_argv(m, prompt_file, sess=None):
     """-> (native argv, env): the harness's own arguments with the session plan's, then the member's permission
     level and any extra `args` from factory.toml."""
     argv, env = CODE[m["harness"]].argv(m, prompt_file, sess)
-    return argv + TABLE[m["harness"]]["permissions"][m["permissions"]] + m["args"], env
+    permissions = list(TABLE[m["harness"]]["permissions"][m["permissions"]])
+    if m["harness"] == "agy":
+        permissions = agy_trusted(permissions, m["dir"])
+    return argv + permissions + m["args"], env
+
+
+def agy_trusted(args, folder):
+    """agy trusts the member's own folder for this launch only, through the session-only --settings it already
+    takes: LC-7 showed its trust dialog then does not appear and no trust list is written (spec §6.3: a launch
+    argument that avoids the dialog, never accepting it into the global list). The dialog entry stays as the
+    fallback."""
+    out = list(args)
+    at = out.index("--settings") if "--settings" in out else None
+    settings = json.loads(out[at + 1]) if at is not None else {}
+    settings["trustedWorkspaces"] = [str(folder)]
+    value = json.dumps(settings, separators=(",", ":"))
+    if at is None:
+        out += ["--settings", value]
+    else:
+        out[at + 1] = value
+    return out
 
 
 # ================================================================ sessions (launch_layout.md §3)

@@ -116,7 +116,7 @@ A switch inside a harness after its last `say` is outside this recovery path.
 
 ### agy's trust dialog
 
-Candidate from the team (LC-7): agy's session-only `--settings` accepts `trustedWorkspaces`. `argv_agy` then builds one `--settings` value itself: the JSON object from the permission level in `harnesses.toml` with `"trustedWorkspaces": [m["dir"]]` added, replacing the static `--settings` argument. Nothing is written to agy's global settings (§3 of the spec). If LC-7 fails, the dialog stays in `dialogs` with no keys and is left to the owner (§6.3).
+LC-7 passed (Phase 8, agy 1.5.18, in an isolated HOME). With `trustedWorkspaces` in agy's session-only `--settings`, the trust dialog does not appear, and agy writes no trust list. `launch_argv` therefore passes agy one `--settings` value, through `agy_trusted`: the JSON object from the permission level in `harnesses.toml` with `"trustedWorkspaces": [m["dir"]]` added, replacing the static `--settings` argument. Nothing is written to agy's global settings (§3 of the spec). The dialog stays in `dialogs` with no keys as the fallback: if it still shows, it is left to the owner (§6.3).
 
 ## 4. Starting a member and readiness
 
