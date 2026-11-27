@@ -111,24 +111,28 @@ Verified facts about `hc` and `rodeo`, collected on isolated private cores (neve
 
 ## Cross cases (Phase 8, phase_8.md §4)
 
-- **Run:** `python3 tests/live.py qualify cross` at `b06c253` (Factory `31d3e84d827b`), hc 0.1.20, rodeo 0.2.1, Linux, 2026-11-27, run ID `20261127T101539Z-8`.
+- **Run:** `python3 tests/live.py qualify cross` at `5d36f88` (Factory `31d3e84d827b`), hc 0.1.20, rodeo 0.2.1, Linux, 2026-11-27, run ID `20261127T104137Z-95`.
 - **Setup:** real private hc cores and rodeo, with scripted fake agents. These cases test Factory itself, and §1 allows a named scripted peer. The run probed `rodeo_tabs` first, and it passed.
 - **Results:**
   - **two-teams: pass.** Two checkouts with the same member names ran on one core, each with its own key, state, keeper and operator.
-    - Concurrent says reached only their own team's member.
-    - Each layout tab held one team's terminals.
-    - After team A's `down` (exit 0), team B still said and its member acted.
+    - Each concurrent say's action recorded the terminal that ran it, and each was its own team's member.
+    - The two members' blocks sat in distinct tabs, and each team's inbox held only its own token.
+    - After team A's `down` (exit 0), team B's own member still acted on a new say.
   - **multi-down: pass.** Two briefed members were stopped together.
     - No member-exit or lost note followed, and the terminals went.
     - A message queued for the blocked one ended `dropped (stopped by down)`.
-  - **owner-pane: pass.** An owner block was seeded beside the operator in the layout doc.
-    - It kept its identity, terminal and seeded contents through `up`, a repeated `up`, and `down` of one member and then the last.
-    - Afterwards it still took a marker typed through rodeo, and Factory's blocks were gone.
-    - An earlier run at `dbd7fcd` failed on a race in the test itself: the seed was typed before the owner's program read input. Fixed in `b06c253`.
+  - **owner-pane: pass.** After the first `up`, the owner added a block of their own to the team tab that holds the members.
+    - Through a repeated `up`, `down` of one member and `down` of the last, the block stayed in that tab with its terminal and seeded contents, and each stopped member's block went.
+    - Afterwards a marker typed into the owner's pane through rodeo arrived.
   - **other-version: pass.** A comment-only copy of the script was installed atomically under a live keeper while the owner's draft held a send.
-    - The old send finished delivered, and the keeper restarted in the same terminal (one keeper before and after).
-    - The next message was delivered once by the new image, with no wakeup.
+    - A second message was queued during the drain. The held send finished delivered.
+    - The same keeper terminal's beat and `factory.version` label then showed the new version (one keeper before and after), and the queued message was delivered and acted on once, with no wakeup.
     - Case 7's `upgrade` runs the same trial with each real profile.
+- **Earlier runs:** the cross runs at `dbd7fcd` and `b06c253` used weaker checks, which @architect-2's review replaced:
+  - two-teams: actions were not attributed to the terminal that ran them;
+  - owner-pane: the owner's block was seeded in the operator's tab;
+  - other-version: the restart line counted as proof, and the second say came after it.
+  This run supersedes both.
 
 ## LC-7 again: agy's session-only trust, isolated (Phase 8)
 
