@@ -38,7 +38,7 @@ Check the reported tests before accepting work. `say` prints a message ID and on
 
 `factory.py status` lists configured members, their states, pending recipients and the oldest pending age. Check its version and path if you might be running another installed copy.
 
-After you press Esc in a working Claude Code member’s pane, check `factory.py inbox --for NAME N` for messages delivered during the interrupted turn. The default shows only the last 10, so choose N to reach back past the turn’s start, and raise it until the oldest message shown was sent before that turn began. Check the work or ask the member what it completed before reassigning anything.
+After you press Esc in a working Claude Code member’s pane, check `factory.py inbox --for NAME N` for messages delivered during the interrupted turn. The default shows only the last 10, and a message sent before the turn can still have been delivered during it, since only send times are shown. So read the member’s complete available history: raise N until no older messages remain. Check the work or ask the member what it completed before reassigning anything.
 
 | Status | Action |
 |---|---|

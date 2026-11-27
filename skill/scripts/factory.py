@@ -42,11 +42,17 @@ import uuid
 SCRIPT = pathlib.Path(__file__).resolve()
 
 
+TEAM_COMMANDS = ("up", "down", "status", "inbox", "brief", "check")   # they act on one checkout's team
+TEAM_ROOT = None    # the checkout this process found its team in (Config), for the commands it prints
+
+
 def factory_command(*args):
     """A Factory command an agent can run as printed: python3 and this script's absolute path, shell-quoted (#173 pi
     case 8: a bare factory.py from a keeper note was not found, and with factory and factory2 installed side by side
-    it can name another copy). Prose keeps the name factory.py."""
-    return shlex.join(["python3", str(SCRIPT), *map(str, args)])
+    it can name another copy). A command that acts on a team adds --cwd and the team's checkout once this process
+    knows it, so it reaches that team from any directory (@reviewer on #234). Prose keeps the name factory.py."""
+    where = ["--cwd", str(TEAM_ROOT)] if TEAM_ROOT is not None and args and args[0] in TEAM_COMMANDS else []
+    return shlex.join(["python3", str(SCRIPT), *map(str, args), *where])
 SKILL = SCRIPT.parent.parent
 TABLE = tomllib.loads((SKILL / "harnesses.toml").read_text())  # harness -> its data
 HARNESSES = tuple(TABLE)
@@ -393,7 +399,8 @@ def parse_role(path):
 
 class Config:
     def __init__(self, cwd, require=True):
-        self.root = find_root(cwd)
+        global TEAM_ROOT
+        self.root = TEAM_ROOT = find_root(cwd)
         self.brief_file, self.conf_file = self.root / BRIEF, self.root / CONF
         self.roles = {p.stem: parse_role(p) for p in sorted((SKILL / "roles").glob("*.md"))}
         missing = [f.name for f in (self.brief_file, self.conf_file) if not f.is_file()]

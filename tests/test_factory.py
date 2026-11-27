@@ -1951,6 +1951,32 @@ class TeamCommandTests(TeamCase):
         self.assertEqual(len([m for m in self.log.read_box()[1].msgs.values() if m["kind"] == "brief"]), 4)
         self.assertEqual(sum(1 for c in self.mutations()[before:] if c["method"] == "terminal.run"), 2)
 
+    def test_the_exit_note_command_reaches_its_team_from_another_directory(self):
+        """@reviewer on #234: the note's command carries --cwd and the team's checkout, so an operator that runs it
+        from another directory recovers this team, not whatever checkout it stands in."""
+        code, out, err = self.cmd(self.operator, "up", "lead-dev")
+        self.assertEqual(code, 0, out + err)
+        record = {"address": "t9", "state": "finished", "reason": "killed", "labels": {"factory.last": "done"}}
+        _, text = self.keeper._episode("lead-dev", record, None, types.SimpleNamespace(state=lambda name: "gone"))
+        argv = shlex.split(text.split(" Run: ", 1)[1])
+        root = str(self.root.resolve())
+        self.assertEqual((argv[:2], argv[2:4], argv[-2:]), (["python3", str(factory.SCRIPT)], ["up", "lead-dev"],
+                                                              ["--cwd", root]))
+        elsewhere = self.enterContext(tempfile.TemporaryDirectory())
+        out, err = io.StringIO(), io.StringIO()
+        with (contextlib.chdir(elsewhere), patch.dict(os.environ, {"HC_TERMINAL_ID": self.operator,
+                                                                    "HC_BIN": self.hc.bin or factory.HC}),
+              patch.object(factory, "HC", self.hc.bin or factory.HC),
+              contextlib.redirect_stdout(out), contextlib.redirect_stderr(err)):
+            try:
+                factory.main(argv[2:])
+            except SystemExit as error:
+                self.assertFalse(error.code, out.getvalue() + err.getvalue())
+        self.assertIn("already running: @lead-dev", out.getvalue())
+        for args in (("inbox", "--for", "operator"), ("brief", "--send", "pm"), ("status",), ("down", "a")):
+            self.assertEqual(shlex.split(factory.factory_command(*args))[-2:], ["--cwd", root])   # the pending-inbox
+        self.assertNotIn("--cwd", factory.factory_command("say", "operator"))    # and trust hints; say has none
+
     def test_up_labels_are_written_after_doc_set(self):
         term = self.terminal("lead-dev")[0]
         self.hc.label(term, {"herdr.seen": "9"})
