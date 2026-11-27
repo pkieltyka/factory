@@ -7091,6 +7091,12 @@ class QualifyFrameworkTests(unittest.TestCase):
         self.assertEqual(live.skills_off("codex", []), [])
         self.assertEqual((live.skills_off("opencode", installed), live.skills_off("agy", installed)), ([], []))
         self.assertEqual(set(live.SKILLS_SWITCH), {"claude", "codex", "pi", "omp"})
+        # case 6 needs Claude Code's /clear, which the switch turns off (pilot at 0748216): exempt, and observed
+        self.assertEqual(live.skills_off("claude", installed, exempt=("claude",)), [])
+        self.assertEqual(live.skills_off("codex", installed, exempt=("claude",))[0], "-c")
+        seen = [("claude", "t3 screen: x"), ("codex", "t1 screen: y")]
+        self.assertEqual(live.split_seen(seen, exempt=("claude",)), (["t1 screen: y"], ["claude: t3 screen: x"]))
+        self.assertEqual(live.split_seen(seen), (["t3 screen: x", "t1 screen: y"], []))
 
     def test_restart_waits_for_the_shell_prompt(self):
         """claude-op-8 at 7a90602: a harness clears its status before it has exited, and a restart typed then is

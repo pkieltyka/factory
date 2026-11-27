@@ -203,11 +203,13 @@ def installed_factory_skills(home, exclude=(), depth=4):
 SKILLS_SWITCH = ("claude", "codex", "pi", "omp")   # harnesses whose user skill discovery a launch switch turns off
 
 
-def skills_off(harness, installed):
+def skills_off(harness, installed, exempt=()):
     """QA launch arguments that turn off a harness's user skill discovery, where it has a switch (the owner's
     decision; each read from its own --help, Codex's checked offline with codex debug prompt-input on 0.172.0).
     [] for OpenCode and agy, which have none: their installed copy may run, harmless with no HERDR_* and the herdr
-    stub, and is recorded, not failed."""
+    stub, and is recorded, not failed. exempt: harnesses a case needs with their commands on (case 6's /clear)."""
+    if harness in exempt:
+        return []
     if harness in ("pi", "omp"):
         return ["--no-skills"]
     if harness == "claude":
@@ -1278,12 +1280,12 @@ def harness_version(name):
     return text.splitlines()[0] if text else "unknown"
 
 
-def split_seen(seen):
+def split_seen(seen, exempt=()):
     """(failures, observations): a sighting fails where the harness's skill discovery was switched off (or the
-    harness is unknown), and is only recorded for one without a switch (the owner's decision)."""
-    failed = [text for harness, text in seen if harness is None or harness in SKILLS_SWITCH]
-    return failed, [f"{harness}: {text}" for harness, text in seen if harness is not None
-                    and harness not in SKILLS_SWITCH]
+    harness is unknown), and is only recorded for one without a switch or exempt from it (the owner's decision)."""
+    off = [h for h in SKILLS_SWITCH if h not in exempt]
+    failed = [text for harness, text in seen if harness is None or harness in off]
+    return failed, [f"{harness}: {text}" for harness, text in seen if harness is not None and harness not in off]
 
 
 def lc_harness(record):
@@ -2126,7 +2128,7 @@ class RealAdapter(FixtureAdapter):
 
     def operator_argv(self, harness, model=None):
         """The operator as the owner would start it, with the profile's model pinned (as Factory pins a member's)."""
-        return [shutil.which(harness), *skills_off(harness, self.team.qa.installed), "--model",
+        return [shutil.which(harness), *skills_off(harness, self.team.qa.installed, self.team.skills_exempt), "--model",
                 model or self.model(harness), *harness_table()[harness]["permissions"]["full"]]
 
     def act_append(self, path, token):
@@ -2218,8 +2220,10 @@ class QATeam:
     private copy of the skill (phase_8.md §2)."""
 
     def __init__(self, adapter_class, operator, members, draft_wait=None, permissions="full", operator_shell=False,
-                 startup_dialog=None, quiet_grace=None, setup=None, operator_model=None, operator_sink=False):
+                 startup_dialog=None, quiet_grace=None, setup=None, operator_model=None, operator_sink=False,
+                 skills_exempt=()):
         self.operator_harness, self.members, self.permissions = operator, members, permissions
+        self.skills_exempt = tuple(skills_exempt)   # harnesses started with their commands on (case 6's /clear)
         self.startup_dialog = startup_dialog    # fixture only: the harness whose fake shows its declared dialog
         # agy on the real HOME (@operator): its settings files' size and mtime before and after, never contents
         self.agy_roots = ([os.path.expanduser(p) for p in AGY_SETTINGS]
@@ -2291,7 +2295,7 @@ class QATeam:
         if quiet_grace:
             lines.insert(0, f"quiet_grace = {quiet_grace}\n")
         for name, harness in self.members.items():
-            off = skills_off(harness, self.qa.installed) if self.real else []
+            off = skills_off(harness, self.qa.installed, self.skills_exempt) if self.real else []
             lines.append(f'[members.{name}]\nharness = "{harness}"\nmodel = "{self.adapter.model(harness)}"\n'
                          f'permissions = "{self.permissions}"\n' + (f"args = {json.dumps(off)}\n" if off else ""))
         (work / "factory.toml").write_text("\n".join(lines))
@@ -2371,7 +2375,7 @@ class QATeam:
 
     def close(self):
         try:
-            failed, observed = split_seen(self.qa.installed_seen([self.dir], self.harness_of))
+            failed, observed = split_seen(self.qa.installed_seen([self.dir], self.harness_of), self.skills_exempt)
             EVIDENCE.setdefault("installed_factory_seen", []).extend(failed)
             EVIDENCE.setdefault("installed_factory_observed", []).extend(observed)
         except (OSError, HcError, HcDown) as error:
@@ -3731,7 +3735,9 @@ def _case_3_draft_cleared(run, team, harness, view, peer):
 
 def case_6(run, role, harness, adapter_class):
     """resume and member-switch for a member; operator-switch for an operator (phase_8.md §3.6)."""
-    team, peer = _team_for(adapter_class, role, harness)
+    # Claude Code's skills switch also turns off its native /clear (@lead-dev's pilot at 0748216: "Unknown command"),
+    # which the switch trials need: its teams here start with commands on, and a sighting is recorded, not failed
+    team, peer = _team_for(adapter_class, role, harness, skills_exempt=("claude",))
     with team:
         names = [n for n, _ in subcases(6, role)]
         if role == "operator":
