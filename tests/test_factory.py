@@ -931,6 +931,9 @@ class HcBackendTests(HcBackend, HcAssertions, unittest.TestCase):
         self.assert_hc_error("invalid_params", hc.call, "terminal.send", target)
         self.state(term, "idle")
         self.assert_hc_error("status_mismatch", hc.call, "terminal.send", {**target, "text": "x", "if": "working"})
+        for word in ("done", "error", "blocked"):      # if takes idle or working only (@architect-2 on hc 0.1.20)
+            with self.subTest(guard=word):
+                self.assert_hc_error("invalid_params", hc.call, "terminal.send", {**target, "text": "x", "if": word})
         self.checked_call(hc, "terminal.kill", target)
         self.assert_hc_error("finished", hc.send, term, "x")
         self.checked_call(hc, "terminal.rm", target)
