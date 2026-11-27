@@ -6870,12 +6870,17 @@ class QualifyFrameworkTests(unittest.TestCase):
             (home / other).mkdir(parents=True)
             (home / other / "SKILL.md").write_text("x")
         (home / ".agents" / "skills" / "factory").mkdir(parents=True)      # empty: not a skill
+        elsewhere = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory())) / "dotfiles"
+        (elsewhere / "skills" / "factory").mkdir(parents=True)
+        (elsewhere / "skills" / "factory" / "SKILL.md").write_text("x")
+        (home / ".linked").symlink_to(elsewhere)                          # a symlinked dot-directory is walked
         found = dict(live.installed_factory_skills(home))
         self.assertEqual(found, {str(store): str(store), str(home / ".claude/skills/factory"): str(store),
                                  str(home / ".gemini/config/skills/factory"): str(store),
-                                 str(home / ".codex/skills/factory"): str(home / ".codex/skills/factory")})
-        self.assertEqual(dict(live.installed_factory_skills(home, exclude=(store,))),
-                         {str(home / ".codex/skills/factory"): str(home / ".codex/skills/factory")})
+                                 str(home / ".codex/skills/factory"): str(home / ".codex/skills/factory"),
+                                 str(home / ".linked/skills/factory"): str((elsewhere / "skills/factory").resolve())})
+        self.assertEqual(set(dict(live.installed_factory_skills(home, exclude=(store,)))),
+                         {str(home / ".codex/skills/factory"), str(home / ".linked/skills/factory")})
 
     def test_a_hiding_core_starts_its_server_inside_bwrap(self):
         import live
@@ -6897,15 +6902,14 @@ class QualifyFrameworkTests(unittest.TestCase):
     def test_the_tripwire_records_a_run_and_refuses(self):
         import live
         work = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
-        team = types.SimpleNamespace(dir=work, tripwire_log=work / "runs.jsonl")
-        folder = live.QATeam._tripwire(team)
+        folder = live.make_tripwire(work / "installed-skill", work / "runs.jsonl")
         self.assertTrue((folder / live.TRIPWIRE_MARK).exists())
         self.assertIn("name: factory", (folder / "SKILL.md").read_text())
         run = subprocess.run([sys.executable, str(folder / "scripts/factory.py"), "say", "operator", "hi"],
                              capture_output=True, text=True, cwd=work)
         self.assertEqual(run.returncode, 3)
         self.assertIn("not available", run.stderr)
-        self.assertEqual(json.loads(team.tripwire_log.read_text())["argv"], ["say", "operator", "hi"])
+        self.assertEqual(json.loads((work / "runs.jsonl").read_text())["argv"], ["say", "operator", "hi"])
 
     def test_a_run_of_an_installed_factory_fails_the_case(self):
         import live
@@ -6916,15 +6920,64 @@ class QualifyFrameworkTests(unittest.TestCase):
         self.assertEqual(run.data["rows"][0]["status"], "fail")
         self.assertIn("installed Factory skill", run.data["rows"][0]["reason"])
 
-    def test_a_real_team_does_not_start_when_the_installed_skill_cannot_be_hidden(self):
+    def test_a_protected_core_does_not_start_when_the_installed_skill_cannot_be_hidden(self):
+        """No bwrap, or a mount that the core's own terminal does not see: NotRun, and for a login check its body
+        never runs (the owner's rule, no fallback)."""
         import live
         found = [("/home/o/.codex/skills/factory", "/store/factory")]
-        which = lambda name, *a, **k: None if name == "bwrap" else shutil.which(name, *a, **k)   # noqa: E731
+        real_which = shutil.which
+        which = lambda name, *a, **k: None if name == "bwrap" else real_which(name, *a, **k)   # noqa: E731
+        scratch = self.enterContext(tempfile.TemporaryDirectory())
+        self.enterContext(patch.object(live, "harness_version", return_value="1.0"))
+        started = []
         with patch.object(live, "installed_factory_skills", return_value=found), \
-                patch.object(live.shutil, "which", which), patch.object(live, "Core") as core:
+                patch.object(live.shutil, "which", which), \
+                patch.object(live.tempfile, "gettempdir", return_value=scratch), \
+                patch.object(live.Core, "start", lambda core: started.append(core)):
             with self.assertRaises(live.NotRun):
-                live.QATeam(live.RealAdapter, "codex", {"lead-dev": "codex"})
-        core.assert_not_called()
+                live.Core("qualify", protect=True)
+            ran = []
+            result = live.harness_check("LC-6", ["sh"], lambda qa, result: ran.append(qa))
+        self.assertEqual((started, ran), ([], []))
+        self.assertIn("not run: bwrap is needed", result["result"])
+        self.assertEqual(os.listdir(scratch), [])
+        with patch.object(live, "installed_factory_skills", return_value=found), \
+                patch.object(live.shutil, "which", return_value="/bin/bwrap"), \
+                patch.object(live.tempfile, "gettempdir", return_value=scratch), \
+                patch.object(live.Core, "start", lambda core: None), \
+                patch.object(live.Core, "stop", lambda core: None), \
+                patch.object(live.Core, "_check_hidden", side_effect=live.NotRun("still visible")):
+            result = live.harness_check("LC-12", ["sh"], lambda qa, result: ran.append(qa))
+        self.assertEqual(ran, [])
+        self.assertEqual(result["result"], "not run: still visible")
+
+    def test_a_login_check_that_ran_an_installed_factory_fails(self):
+        import live
+        scratch = self.enterContext(tempfile.TemporaryDirectory())
+        self.enterContext(patch.object(live, "harness_version", return_value="1.0"))
+
+        def body(qa, result):
+            subprocess.run([sys.executable, str(qa.dir / "installed-skill/scripts/factory.py"), "wait"], check=False,
+                           capture_output=True)
+            result["result"] = "pass"
+        with patch.object(live, "installed_factory_skills", return_value=[("/i/factory", "/store/factory")]), \
+                patch.object(live.shutil, "which", return_value="/bin/bwrap"), \
+                patch.object(live.tempfile, "gettempdir", return_value=scratch), \
+                patch.object(live.Core, "start", lambda core: None), \
+                patch.object(live.Core, "stop", lambda core: None), \
+                patch.object(live.Core, "_check_hidden", lambda core, paths: None):
+            result = live.harness_check("LC-6", ["sh"], body)
+        self.assertEqual(result["result"], "fail: a QA terminal ran an installed Factory skill")
+        self.assertIn('"wait"', result["installed_factory_runs"][0])
+
+    def test_an_e2e_run_that_ran_an_installed_factory_fails(self):
+        import e2e
+        result = {"status": "pass"}
+        self.assertFalse(e2e.tripwire_verdict(result, []))
+        self.assertEqual(result, {"status": "pass"})
+        self.assertTrue(e2e.tripwire_verdict(result, ['{"argv": ["up"]}']))
+        self.assertEqual(result["status"], "fail")
+        self.assertIn("installed Factory skill", result["detail"])
 
     def test_restart_waits_for_the_shell_prompt(self):
         """claude-op-8 at 7a90602: a harness clears its status before it has exited, and a restart typed then is
@@ -7739,7 +7792,8 @@ class E2EObserverTests(unittest.TestCase):
                 team = types.SimpleNamespace(
                     dir=root, skill=factory.SKILL, script=factory.SCRIPT, operator_start={},
                     adapter=types.SimpleNamespace(model=lambda _: "qa", version=lambda _: "test"),
-                    qa=types.SimpleNamespace(id="12345678"), env={"XDG_CACHE_HOME": str(root / "cache")},
+                    qa=types.SimpleNamespace(id="12345678", tripwire_runs=lambda: []),
+                    env={"XDG_CACHE_HOME": str(root / "cache")},
                     call=unittest.mock.Mock(side_effect=down),
                 )
 

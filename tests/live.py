@@ -191,11 +191,14 @@ def installed_factory_skills(home, exclude=(), depth=4):
     home, found, seen = pathlib.Path(home), [], set()
     excluded = [pathlib.Path(e).resolve() for e in exclude]
     try:
-        tops = [t for t in home.iterdir() if t.name.startswith(".") and t.is_dir() and not t.is_symlink()
-                and t.name not in (".cache", ".npm")]
+        tops = [t for t in home.iterdir() if t.name.startswith(".") and t.is_dir() and t.name not in (".cache", ".npm")]
     except OSError:
         return found
-    for top in tops:
+    walked = set()
+    for top in tops:                       # a symlinked dot-directory is walked too, once per target
+        if top.resolve() in walked:
+            continue
+        walked.add(top.resolve())
         for dirpath, dirnames, _ in os.walk(top, onerror=lambda error: None):
             here = pathlib.Path(dirpath)
             if here.name == "skills" and "factory" in dirnames:
@@ -210,10 +213,26 @@ def installed_factory_skills(home, exclude=(), depth=4):
     return found
 
 
+def make_tripwire(folder, log):
+    """What a protected core's terminals find in place of an installed Factory skill: a skill that says to use
+    FACTORY.md's command, and a scripts/factory.py that records its own run in log and refuses."""
+    (folder / "scripts").mkdir(parents=True)
+    (folder / "SKILL.md").write_text(TRIPWIRE_SKILL)
+    (folder / TRIPWIRE_MARK).write_text("")
+    script = folder / "scripts" / "factory.py"
+    script.write_text(TRIPWIRE_SCRIPT.format(log=str(log)))
+    script.chmod(0o755)
+    return folder
+
+
 class Core:
     """A private hc core in its own temporary directory."""
 
-    def __init__(self, tag, config="", extra_env=None, hide=()):
+    def __init__(self, tag, config="", extra_env=None, hide=(), protect=False):
+        """protect: a core for real harnesses under the owner's rule that no QA terminal may find or run an
+        installed Factory skill. Every installed copy is scanned for, and the server runs under bwrap with a
+        tripwire bound over each one; a herdr stub that always fails is first on PATH; the tripwire is proved
+        from inside before anything starts, and the core is NotRun when it cannot be (no fallback)."""
         self.hide = list(hide)      # [(folder, over)]: bound read-only over each path for this core's terminals only
         self.dir = pathlib.Path(tempfile.mkdtemp(prefix=f"hc-{tag}-", dir=tempfile.gettempdir()))
         d = self.dir
@@ -222,7 +241,23 @@ class Core:
         os.chmod(d / "run", 0o700)
         if config:
             (d / "config/herdr-core/config.toml").write_text(config)
+        self.bin, self.tripwire_log, installed = None, None, []
+        if protect:
+            self.bin, self.tripwire_log = d / "bin", d / "installed-factory-runs.jsonl"
+            self.bin.mkdir()
+            stub = self.bin / "herdr"
+            stub.write_text(HERDR_STUB)
+            stub.chmod(0o755)
+            installed = installed_factory_skills(os.path.expanduser("~"), exclude=(ROOT, d))
+            if installed and not shutil.which("bwrap"):
+                shutil.rmtree(d, ignore_errors=True)
+                raise NotRun("bwrap is needed to hide the installed Factory skill from the QA terminals")
+            if installed:
+                trip = make_tripwire(d / "installed-skill", self.tripwire_log)
+                self.hide += [(str(trip), over) for over in sorted({r for _, r in installed})]
         env = qa_environ(os.environ)
+        if self.bin is not None:
+            env["PATH"] = f"{self.bin}:{env.get('PATH', '')}"
         env.update(HC_SESSION=f"factory-{tag}-{os.getpid()}", HC_SOCKET=str(d / "hc.sock"),
                    XDG_RUNTIME_DIR=str(d / "run"), XDG_STATE_HOME=str(d / "state"),
                    XDG_CONFIG_HOME=str(d / "config"), HOME=str(d / "home"))
@@ -237,9 +272,31 @@ class Core:
         self.id = None
         try:
             self.start()
+            if installed:
+                self._check_hidden([p for p, _ in installed])
         except BaseException:
             self.stop()   # stops only a core whose id was verified; otherwise leaves the directory and says so
             raise
+
+    def _check_hidden(self, paths):
+        """Prove from a terminal of this core that each installed path shows the tripwire."""
+        ok = self.dir / "tripwire-checked"
+        test = " && ".join(f"test -e {shlex.quote(str(pathlib.Path(p) / TRIPWIRE_MARK))}" for p in paths)
+        self.rpc("terminal.run", {"argv": ["sh", "-c", f"{test} && : > {shlex.quote(str(ok))}"],
+                                  "cwd": str(self.dir), "env": {"PATH": os.environ.get("PATH", "")},
+                                  "no_parent": True, "no_notify": True})
+        deadline = time.monotonic() + 15
+        while not ok.exists() and time.monotonic() < deadline:
+            time.sleep(0.2)
+        if not ok.exists():
+            raise NotRun("an installed Factory skill is still visible inside the QA core: "
+                         + ", ".join(p.replace(os.path.expanduser("~"), "~", 1) for p in paths))
+
+    def tripwire_runs(self):
+        """Bounded records of every run of an installed Factory skill's script from this core's terminals."""
+        if self.tripwire_log is None or not self.tripwire_log.exists():
+            return []
+        return [_bounded(line) for line in self.tripwire_log.read_text().splitlines()[:5] if line.strip()]
 
     def start(self):
         argv = [HC, "server", "start", "--json"]
@@ -1055,7 +1112,10 @@ class Harness:
         self.qa, self.harness = qa, harness
         self.dialogs = harness_table().get(harness, {}).get("dialogs", [])
         self.argv = [exe, *args]
-        self.record = qa.rpc("terminal.run", {"argv": self.argv, "cwd": str(cwd), "env": {**owner_env(), **(env or {})},
+        env = {**owner_env(), **(env or {})}
+        if getattr(qa, "bin", None) is not None:          # a protected core's herdr stub first
+            env["PATH"] = f"{qa.bin}:{env.get('PATH', '')}"
+        self.record = qa.rpc("terminal.run", {"argv": self.argv, "cwd": str(cwd), "env": env,
                                               "size": {"cols": cols, "rows": rows}, "labels": {"name": "@lc-" + harness}})
         self.term = self.record["address"]
         self.answered = []
@@ -1203,10 +1263,17 @@ def harness_check(name, harnesses, body):
         result["result"] = f"not run: {', '.join(missing)} not on PATH"
         return result
     try:
-        with Core(name.lower().replace("-", "").replace("+", ""), config="draft_wait = 0\n") as qa:
-            body(qa, result)
+        with Core(name.lower().replace("-", "").replace("+", ""), config="draft_wait = 0\n", protect=True) as qa:
+            try:
+                body(qa, result)
+            finally:
+                runs = qa.tripwire_runs()
+                if runs:              # the owner's rule was broken: the check fails whatever it observed
+                    result.update(result="fail: a QA terminal ran an installed Factory skill",
+                                  installed_factory_runs=runs)
     except NotRun as why:
-        result["result"] = f"not run: {why}"
+        if "installed_factory_runs" not in result:
+            result["result"] = f"not run: {why}"
     return result
 
 
@@ -2110,23 +2177,10 @@ class QATeam:
         self.real = adapter_class is RealAdapter
         home = os.path.expanduser("~")
         extra = {"HOME": home} if self.real else None   # a real harness needs the owner's login (testing.md §6)
+        # a real harness: the protected core (the owner's rule: no QA terminal may find or run an installed Factory)
+        self.qa = Core("qualify", config=f"draft_wait = {draft_wait}\n" if draft_wait is not None else "",
+                       extra_env=extra, protect=self.real)
         self.dir = pathlib.Path(tempfile.mkdtemp(prefix=QA_PREFIX, dir=tempfile.gettempdir()))
-        self.tripwire_log, hide, installed = self.dir / "installed-factory-runs.jsonl", [], []
-        if self.real:      # the owner's rule: no QA terminal may find or run an installed Factory skill
-            installed = installed_factory_skills(home, exclude=(ROOT, self.dir))
-            if installed and not shutil.which("bwrap"):
-                shutil.rmtree(self.dir, ignore_errors=True)
-                raise NotRun("bwrap is needed to hide the installed Factory skill from the QA terminals")
-            if installed:
-                hide = [(str(self._tripwire()), over) for over in sorted({r for _, r in installed})]
-        try:
-            self.qa = Core("qualify", config=f"draft_wait = {draft_wait}\n" if draft_wait is not None else "",
-                           extra_env=extra, hide=hide)
-            if installed:
-                self._check_hidden([p for p, _ in installed])
-        except BaseException:
-            shutil.rmtree(self.dir, ignore_errors=True)
-            raise
         self.bin, self.home = self.dir / "bin", (pathlib.Path(home) if self.real else self.dir / "home")
         self.bin.mkdir()
         stub = self.bin / "herdr"          # first on every QA PATH: no QA agent reaches the owner's herdr
@@ -2242,38 +2296,8 @@ class QATeam:
     def receipt(self, name):
         return self.dir / f"receipt-{name}-{random.randrange(16 ** 6):06x}.txt"
 
-    def _tripwire(self):
-        """What a QA terminal finds in place of an installed Factory skill: a skill that says to use FACTORY.md's
-        command, and a scripts/factory.py that records its own run and refuses."""
-        folder = self.dir / "installed-skill"
-        (folder / "scripts").mkdir(parents=True)
-        (folder / "SKILL.md").write_text(TRIPWIRE_SKILL)
-        (folder / TRIPWIRE_MARK).write_text("")
-        script = folder / "scripts" / "factory.py"
-        script.write_text(TRIPWIRE_SCRIPT.format(log=str(self.tripwire_log)))
-        script.chmod(0o755)
-        return folder
-
-    def _check_hidden(self, paths):
-        """Prove inside the QA core, before anything starts, that each installed path shows the tripwire; else the
-        run does not start (no fallback: the owner's rule is that a QA run may never reach an installed copy)."""
-        ok = self.dir / "tripwire-checked"
-        test = " && ".join(f"test -e {shlex.quote(str(pathlib.Path(p) / TRIPWIRE_MARK))}" for p in paths)
-        self.qa.rpc("terminal.run", {"argv": ["sh", "-c", f"{test} && : > {shlex.quote(str(ok))}"],
-                                     "cwd": str(self.dir), "env": {"PATH": os.environ.get("PATH", "")},
-                                     "no_parent": True, "no_notify": True})
-        deadline = time.monotonic() + 15
-        while not ok.exists() and time.monotonic() < deadline:
-            time.sleep(0.2)
-        if not ok.exists():
-            self.qa.stop()
-            raise NotRun("an installed Factory skill is still visible inside the QA core: "
-                         + ", ".join(p.replace(os.path.expanduser("~"), "~", 1) for p in paths))
-
     def close(self):
-        if self.tripwire_log.exists() and self.tripwire_log.read_text().strip():
-            EVIDENCE.setdefault("installed_factory_runs", []).extend(
-                _bounded(line) for line in self.tripwire_log.read_text().splitlines()[:5])
+        EVIDENCE.setdefault("installed_factory_runs", []).extend(self.qa.tripwire_runs())
         if self.agy_roots:
             home = os.path.expanduser("~")
             touched = [p for p in changed(self.agy_before, stamps(self.agy_roots))
@@ -2518,10 +2542,19 @@ def _member_says(team, text, timeout=300, record=None):
     member = team.member("lead-dev")
     body = team.dir / f"report-{random.randrange(16 ** 6):06x}.md"
     body.write_text(text)
-    out = team.dir / f"say-out-{random.randrange(16 ** 6):06x}.txt"     # the say's own output: its message ID
+    # What the member writes stays in its own work directory, where a guarded sandbox lets it write (case 9 at
+    # 1819b5d: Read-only file system for receipts in the QA folder). Left out of git status.
+    scratch = team.work / ".factory-qa"
+    if not scratch.exists():
+        scratch.mkdir()
+        exclude = team.work / ".git" / "info" / "exclude"
+        if exclude.parent.is_dir():
+            with exclude.open("a") as stream:
+                stream.write(".factory-qa/\n")
+    out = scratch / f"say-out-{random.randrange(16 ** 6):06x}.txt"     # the say's own output: its message ID
     command = (f"python3 {shlex.quote(str(team.script))} say operator --file {shlex.quote(str(body))}"
                f" > {shlex.quote(str(out))} 2>&1")
-    done = team.receipt("member-say")
+    done = scratch / f"receipt-member-say-{random.randrange(16 ** 6):06x}.txt"
     team.send(member, team.adapter.act_run(done, command))
     result = team.until(lambda: done.exists() and "exit" in done.read_text() and done.read_text().strip(), timeout)
     team.last_say = out.read_text() if out.exists() else None
