@@ -77,8 +77,10 @@ Notes from `[from factory]` describe an observation that may have changed while 
 Work through ready items within the owner’s scope and the workflow in `FACTORY.md`. Record the goal, priority and constraints on the tracker.
 
 - Take only items the tracker marks ready, as many at a time as `FACTORY.md` allows. Assign, receive reports, review and integrate as above, then take the next.
-- Stop at the first item whose criteria you cannot meet as written, including when an input, capability or permission is missing. Keep its criteria unchanged and record the observed blocker on the tracker. Take no later item, even an independent one, until the user decides how to proceed. Do not try to run a task command outside your sandbox.
-- Also stop when a decision is the user's, no ready item is left, a task is not approved within the review rounds `FACTORY.md` allows, or a member cannot be recovered.
+- When an item's criteria cannot be met, keep them as written and have the tracker owner record the blocker. Use authorized recovery or reassignment first. When those options are exhausted, or only the owner can decide, ask the owner once in your pane and set the item aside. Keep task commands inside your sandbox.
+- Continue with ready items independent of the blocker and any pending owner decision.
+- When the review rounds in `FACTORY.md` are exhausted, decide how to resolve the remaining findings and carry on.
+- Stop taking items when no independent work is ready, the owner's scope or `FACTORY.md` calls for stopping, or the remaining work needs a member you cannot recover or replace.
 - Always the user's, whatever the goal says: pushing, deploying, destructive operations, spending money, and anything sent outside the team. The exception is standing permission in a `## Pull requests` section of `FACTORY.md`: to push ticket branches and open pull requests, and separately to merge.
 - Respect the machine and permission limits in [SKILL.md](../SKILL.md).
 - On stopping, take no new items. Say why you stopped and what comes next in your pane. Reports can still arrive from live members.
