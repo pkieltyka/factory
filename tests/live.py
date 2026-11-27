@@ -2420,6 +2420,15 @@ def judge_blocked(notes, member, term, queued, typed_while_blocked, final, count
     return ("pass", None) if not facts else ("fail", "; ".join(facts))
 
 
+def judge_member_switch(switched, launch, recalled_right):
+    """member-switch: a proved native switch, then a down/up that replaced the terminal (both exits 0), then the
+    expected conversation's word. Without the replacement a still-running session would recall its own word."""
+    if not switched:
+        return "not_run"
+    cycled = launch["down_exit"] == 0 and launch["up_exit"] == 0 and launch["replaced"]
+    return "pass" if cycled and recalled_right else "fail"
+
+
 def judge_switch(before, after):
     """A native conversation switch is shown by the harness's own session variable changing in its tool's
     environment: both values seen, and different."""
@@ -3072,13 +3081,17 @@ def case_6(run, role, harness, adapter_class):
         follow = harness_table()[harness].get("session_follow", True) if team.real else False
         expected = second if follow else first
         which = "second" if got == second[::-1] else "first" if got == first[::-1] else repr(got)
-        status = "pass" if switched and got == expected[::-1] else "not_run" if not switched else "fail"
+        status = judge_member_switch(switched, launch, got == expected[::-1])
         run.row(6, "member-switch", role, harness, status,
                 f"after a native switch (its session variable changes) and a say, up resumes the"
                 f" {'switched' if follow else 'launch'} conversation (session_follow = {str(follow).lower()})",
                 observed=f"recalled the {which} word", proof=dict(launch, session_follow=follow, variable=variable,
                                                                switched=switched),
-                reason=None if status == "pass" else why if not switched else "another conversation")
+                reason=None if status == "pass" else why if not switched
+                else "down or up failed, or the same terminal stayed" if not (launch["down_exit"] == 0
+                                                                              and launch["up_exit"] == 0
+                                                                              and launch["replaced"])
+                else "another conversation")
 
 
 def _ask_later(team, role, text):

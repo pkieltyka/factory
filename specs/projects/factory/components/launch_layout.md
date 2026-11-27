@@ -79,7 +79,7 @@ Right after the caller is identified as a member, before anything else: `var = T
 - `value` is set and matches `[A-Za-z0-9][A-Za-z0-9._:-]{0,127}`. The saved value later becomes one argument of the harness's command line (never a shell string), so a value that could be read as an option is refused;
 - the newest entry is for another terminal, or for another harness, or holds another value.
 
-The entry's `model` is the one in the newest entry for the same terminal: the model `up` resolved for that launch, e.g. `openrouter/openai/…` for a formation's `openai/…`. With no entry for that terminal, it is the formation's model. So the next launch's `resume_model` check compares like with like (Phase 8, a real pi member).
+The entry's `model` is the model `up` resolved for that launch, e.g. `openrouter/openai/…` for a formation's `openai/…`. It is taken from the terminal's `factory.model` label, which every launch sets, a resume by ID included. Without the label, it comes from the newest entry for the same terminal; with neither, it is the formation's model. So the next launch's `resume_model` check compares like with like (Phase 8, a real pi member).
 
 Consequences: the first `say` a member runs is its ready line, so the ID is recorded there without the model being involved; a failed write prints `warning: could not record your session: <error>` on stderr and `say` goes on, and the next `say` tries again; `say` from the operator records nothing.
 

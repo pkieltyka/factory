@@ -6584,6 +6584,16 @@ class QualifyJudgeTests(unittest.TestCase):
                 bad[index] = value
                 self.assertEqual(live.judge_blocked(*bad)[0], "fail")
 
+    def test_member_switch_needs_a_replacement(self):
+        good = {"down_exit": 0, "up_exit": 0, "replaced": True}
+        self.assertEqual(live.judge_member_switch(True, good, True), "pass")
+        for launch in (dict(good, replaced=False), dict(good, down_exit=1, replaced=False), dict(good, up_exit=3),
+                       {"down_exit": 1, "up_exit": 2, "replaced": False}):
+            with self.subTest(launch=launch):                      # the same session still running recalls its word
+                self.assertEqual(live.judge_member_switch(True, launch, True), "fail")
+        self.assertEqual(live.judge_member_switch(True, good, False), "fail")
+        self.assertEqual(live.judge_member_switch(False, good, True), "not_run")
+
     def test_switch(self):
         self.assertEqual(live.judge_switch("a", "b"), (True, None))
         self.assertFalse(live.judge_switch("a", "a")[0])                                # switch() did nothing
