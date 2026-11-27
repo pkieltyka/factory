@@ -6521,6 +6521,41 @@ class HcCheckTests(unittest.TestCase):
             self.assertIn("too old", p.stdout)
 
 
+class QualifyReportTests(unittest.TestCase):
+    def test_newest_run_wins_and_hand_text_is_kept(self):
+        head = subprocess.run(["git", "-C", str(live.ROOT), "rev-parse", "HEAD"], capture_output=True,
+                              text=True).stdout.strip()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+
+            def run(name, source, status, mode="real"):
+                row = {"case": 1, "subcase": "states", "role": "member", "harness": "claude", "status": status,
+                       "observed": f"seen at {name}", "proof": {"peer": "codex"}}
+                data = {"mode": mode, "source_head": source, "utc": "2026-11-27T00:00:00Z", "rows": [row],
+                        "factory_version": "abc", "hc_version": "hc 0.1.20", "rodeo_version": "rodeo 0.2.1",
+                        "profiles": [{"role": "member", "harness": "claude", "version": "2.1", "model": "m"}],
+                        "trust_entries": [{"harness": "claude", "file": "~/.claude.json", "directory": f"/tmp/{name}"}]}
+                (tmp / f"{name}.json").write_text(json.dumps(data))
+                return str(tmp / f"{name}.json")
+            paths = [run("new", head, "pass"), run("old", "0" * 40, "fail"), run("fake", head, "fail", "fixture")]
+            out = tmp / "out"
+            out.mkdir()
+            (out / "claude.md").write_text(f"# Claude Code\n\nNotes kept.\n\n{live.REPORT_BEGIN}\nold\n"
+                                           f"{live.REPORT_END}\n\nAfter, kept.\n")
+            live.report(paths, out)
+            text = (out / "claude.md").read_text()
+            self.assertIn("| 1 | states | pass | seen at new; partner codex |", text)
+            self.assertNotIn("seen at old", text)
+            self.assertNotIn("\nold\n", text)
+            self.assertTrue(text.startswith("# Claude Code\n\nNotes kept."))
+            self.assertTrue(text.endswith("After, kept.\n"))
+            self.assertIn("1 startup-dialog (no run)", text)
+            trust = (out / "trust-entries.md").read_text()
+            self.assertIn("`/tmp/new`", trust)
+            self.assertIn("`/tmp/old`", trust)
+            self.assertNotIn("/tmp/fake", trust)
+
+
 class QualifyFrameworkTests(unittest.TestCase):
     """phase_8.md §1 and §5.1: selection, rows, the case rule, exit precedence and checkpoints, with no login."""
 
