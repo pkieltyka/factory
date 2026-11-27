@@ -6,6 +6,7 @@ import json
 import os
 import pathlib
 import re
+import select
 import subprocess
 import sys
 import time
@@ -14,6 +15,7 @@ import tty
 SCRIPTS = ("reports", "forgets", "works_forever", "blocks", "blocks_once", "crashes", "quits", "silent", "dialog")
 START, END = b"\x1b[200~", b"\x1b[201~"
 CONTROL = re.compile(rb"[\x1b\r\n]")
+PUSHBACK = bytearray()   # input that arrived while a tool ran, read before the terminal again
 
 
 def report(state, kind=None):
@@ -22,12 +24,36 @@ def report(state, kind=None):
         os.write(1, f"\x1b]7501;state={state}:app=fake{extra}\x1b\\".encode())
 
 
+def read_input():
+    if PUSHBACK:
+        data = bytes(PUSHBACK)
+        PUSHBACK.clear()
+        return data
+    return os.read(0, 4096)
+
+
+def run_tool(command):
+    """Run a shell command as this agent's tool: input arriving meanwhile waits for the next turn, except a lone
+    Esc, which interrupts the turn (the command is killed). Returns the exit code, or None when interrupted."""
+    proc = subprocess.Popen(["sh", "-c", command], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
+    while proc.poll() is None:
+        if select.select([0], [], [], 0.2)[0]:
+            chunk = os.read(0, 4096)
+            if chunk == b"\x1b":
+                proc.kill()
+                proc.wait()
+                return None
+            PUSHBACK.extend(chunk)
+    return proc.returncode
+
+
 def submitted_lines():
     """Accept bracketed paste with embedded newlines, and Enter outside a paste."""
     pending = bytearray()
     incoming = b""
     paste = False
-    while chunk := os.read(0, 4096):
+    while chunk := read_input():
         incoming += chunk
         while incoming:
             if paste:
@@ -61,7 +87,8 @@ def submitted_lines():
 
 def act(text):
     """Test-only action protocol (phase_8.md §2): a line "ACT append <path> <text>" appends the text, and
-    "ACT run <path> <shell command>" runs the command, as this agent's own tool would, and appends its exit."""
+    "ACT run <path> <shell command>" runs the command, as this agent's own tool would, and appends its exit.
+    An Esc during a run interrupts the turn: its later lines are not acted on."""
     for line in text.splitlines():
         parts = line.split(" ", 3)
         if len(parts) < 4 or parts[0] != "ACT":
@@ -71,9 +98,11 @@ def act(text):
             with path.open("a") as stream:
                 stream.write(rest + "\n")
         elif verb == "run":
-            done = subprocess.run(["sh", "-c", rest], stdin=subprocess.DEVNULL, capture_output=True, text=True)
+            code = run_tool(rest)
+            if code is None:
+                return
             with path.open("a") as stream:
-                stream.write(f"exit {done.returncode}\n")
+                stream.write(f"exit {code}\n")
     for line in text.splitlines():   # a fake conversation: memory kept per thread, in FAKE_MEMORY_DIR
         parts = line.split(" ", 2)
         if parts[0] != "ACT" or len(parts) < 2 or parts[1] not in ("remember", "recall", "switch"):

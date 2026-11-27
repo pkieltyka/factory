@@ -1886,6 +1886,13 @@ class FixtureAdapter:
     def remember(self, word):
         return f"ACT remember {word}"
 
+    def long_task(self, path, started, release, finished):
+        wait = f"while [ ! -f {shlex.quote(str(release))} ]; do sleep 0.2; done"
+        return f"ACT append {path} {started}\nACT run {path}.run {wait}\nACT append {path} {finished}"
+
+    def interrupt_keys(self, harness):
+        return ["esc"]
+
     def recall(self, path):
         return f"ACT recall {path}"
 
@@ -1941,6 +1948,15 @@ class RealAdapter(FixtureAdapter):
 
     def remember(self, word):
         return REMEMBER.format(token=word)
+
+    def long_task(self, path, started, release, finished):
+        return (f"Using your shell tool, do these three steps in order. 1: append one line containing exactly {started}"
+                f" to the file {path}. 2: run exactly this command and wait for it to end, however long it takes:"
+                f" while [ ! -f {release} ]; do sleep 1; done  3: append one line containing exactly {finished} to"
+                f" {path}. Then reply with the single word done.")
+
+    def interrupt_keys(self, harness):
+        return ["esc"]
 
     def recall(self, path):
         return ("Append the code word I gave you earlier in this conversation, spelled backwards in capital letters,"
@@ -2208,14 +2224,34 @@ def _up(team, run, case, role, harness, names):
         return False
     waiting = [name for name in team.members                 # members past their startup before any case sends
                if not team.until(lambda: team.member(name) and team.state(team.member(name)) in READY, 180)]
-    team.ready_states = {"operator": team.state(team.operator),
+    quiet = _team_quiet(team, hold=8, timeout=300)    # the startup reports handled before any case samples
+    team.ready_states = {"operator": team.state(team.operator), "quiet_after_up": quiet,
                          **{name: team.state(team.member(name)) for name in team.members if team.member(name)}}
+    if quiet is None:
+        waiting = waiting or ["the team (not quiet for 8 s within 300 s)"]
     if waiting:
         for name in names:
             run.row(case, name, role, harness, "not_run", f"case {case} {name}",
                     reason=f"never idle after up: {', '.join(waiting)}")
         return False
     return True
+
+
+def _team_quiet(team, hold, timeout):
+    """Wait until the operator and every member have been ready (idle or done) for hold seconds together, so
+    the members' ready reports and the operator's turns on them are over. Returns the seconds it took, or None."""
+    start = time.monotonic()
+    since = None
+    while time.monotonic() - start < timeout:
+        terminals = [team.operator, *(team.member(name) for name in team.members)]
+        if all(t and team.state(t) in READY for t in terminals):
+            since = since or time.monotonic()
+            if time.monotonic() - since >= hold:
+                return round(time.monotonic() - start, 1)
+        else:
+            since = None
+        time.sleep(0.5)
+    return None
 
 
 TRUST_FILES = {"claude": "~/.claude.json", "codex": "~/.codex/config.toml"}
@@ -2344,7 +2380,8 @@ def case_1(run, role, harness, adapter_class):
         states.append(team.state(subject))
         after = team.get(subject)
         proof = {"states": states, "turn": [before.get("turn"), after.get("turn")],
-                 "action": receipt.read_text().strip() if receipt.exists() else None}
+                 "action": receipt.read_text().strip() if receipt.exists() else None,
+                 "ready_after_up": getattr(team, "ready_states", None)}
         ok = (states[0] in READY and "working" in states and states[-1] in READY
               and after.get("turn", 0) > before.get("turn", 0) and proof["action"] == "exit 0")
         run.row(1, "states", role, harness, "pass" if ok else "fail",
@@ -2631,7 +2668,16 @@ def case_3(run, role, harness, adapter_class):
         team.send(member, team.adapter.act_run(said, command))
         log = factory_log(team)
         claimed = team.until(lambda: any(rec["o"] == "sending" and to == "operator"
-                                         for (ident, to), rec in log.read_box()[1].outcomes.items()), 60)
+                                         for (ident, to), rec in log.read_box()[1].outcomes.items()), 300)
+        if not claimed:                                 # the member never said: nothing about the draft hold is shown
+            run.row(3, "draft", role, harness, "not_run", "a report held by the owner's draft",
+                    proof={"member_say": said.read_text().strip() if said.exists() else None,
+                           "member_state": team.state(member), "peer": peer},
+                    reason="the member's say was never claimed for the operator within 300 s")
+            view.keys("enter")
+            if role == "operator":
+                _not_built(run, 3, role, harness, ["draft-cleared"])
+            return
         time.sleep(8)                                   # past hc's quiet pause: only the draft can hold it now
         held = not receipt.exists() and not draft_receipt.exists()
         view.keys("enter")                              # the owner sends the draft
@@ -2715,7 +2761,91 @@ def case_6(run, role, harness, adapter_class):
                 proof={"session_follow": follow}, reason=None if got == expected[::-1] else "another conversation")
 
 
-CASE_FUNCTIONS = {1: case_1, 2: case_2, 3: case_3, 5: case_5, 6: case_6, 7: case_7, 8: case_8, 9: case_9,
+def _ask_later(team, role, text):
+    """_ask in a thread: a say to a working recipient may wait for delivery, and the case must go on meanwhile."""
+    box = {}
+    thread = threading.Thread(target=lambda: box.update(result=_ask(team, role, text)), daemon=True)
+    thread.start()
+    return thread, box
+
+
+def _lines(path):
+    return path.read_text().splitlines() if path.exists() else []
+
+
+def case_4(run, role, harness, adapter_class):
+    """mid-turn and owner-interrupt (phase_8.md §3.4): a second instruction while the subject works on a task
+    held open by an external release; then, in a fresh team, a pending message across an owner's interrupt."""
+    for trial in ("mid-turn", "owner-interrupt"):
+        team, peer = _team_for(adapter_class, role, harness)
+        with team:
+            if role == "operator":
+                _operator_tab(team)
+            if not _up(team, run, 4, role, harness, [trial]):
+                continue
+            subject = _subject(team, role)
+            work, release = team.receipt("task"), team.dir / f"release-{token()}"
+            started, finished, second = token(), token(), token()
+            try:
+                task = team.adapter.long_task(work, started, release, finished)
+                first = _ask_later(team, role, task)
+                began = team.until(lambda: started in _lines(work) and team.state(subject) == "working", 300)
+                if not began:
+                    run.row(4, trial, role, harness, "not_run", f"case 4 {trial}",
+                            reason=f"the task never started (state {team.state(subject)})")
+                    continue
+                turn = team.get(subject)["turn"]
+                later = _ask_later(team, role, team.adapter.act_append(work, second))
+                time.sleep(10)
+                pending = second not in _lines(work)
+                if trial == "owner-interrupt":
+                    view = _rodeo(team, ["operator", "team"] if role == "operator" else ["team", "@lead-dev"])
+                    view.keys("ctrl+b")
+                    time.sleep(0.2)
+                    view.keys("1")
+                    time.sleep(0.8)
+                    if role == "operator":
+                        view.focused_terminal = team.operator
+                    else:
+                        view.focus("@lead-dev")
+                    view.keys(*team.adapter.interrupt_keys(harness))
+                    team.until(lambda: team.state(subject) in READY, 120)
+                release.write_text("go\n")
+                acted = team.until(lambda: second in _lines(work), 300)
+                if trial == "mid-turn":
+                    team.until(lambda: finished in _lines(work), 300)
+                team.until(lambda: team.state(subject) in READY, 120)
+                time.sleep(15)                               # time for a duplicate to show
+                for thread, _ in (first, later):
+                    thread.join(timeout=60)
+                lines = _lines(work)
+                count = lines.count(second)
+                order = [{started: "started", finished: "finished", second: "second"}[line]
+                         for line in lines if line in (started, finished, second)]
+                proof = {"turn": [turn, team.get(subject)["turn"]], "order": order, "pending_after_10s": pending,
+                         "second_count": count, "peer": peer}
+                if trial == "mid-turn":
+                    ok = count == 1 and finished in lines
+                    how = ("steered this turn" if ok and order.index("second") < order.index("finished")
+                           else "queued for the next turn" if ok else "lost or duplicated")
+                    proof["classification"] = how
+                    run.row(4, "mid-turn", role, harness, "pass" if ok else "fail",
+                            "a second instruction while working: both effects, the second exactly once",
+                            observed=how, proof=proof, reason=None if ok else "an effect was lost or repeated")
+                else:
+                    proof["original_task"] = "completed" if finished in lines else "cancelled by the interrupt"
+                    proof["interrupt_keys"] = team.adapter.interrupt_keys(harness)
+                    proof["acted"] = bool(acted)
+                    ok = count == 1
+                    run.row(4, "owner-interrupt", role, harness, "pass" if ok else "fail",
+                            "a message pending when the owner interrupts through rodeo is acted on exactly once",
+                            observed=proof["original_task"], proof=proof,
+                            reason=None if ok else f"the pending action ran {count} times")
+            finally:
+                release.write_text("go\n")                   # never leave the subject's tool waiting
+
+
+CASE_FUNCTIONS = {1: case_1, 2: case_2, 3: case_3, 4: case_4, 5: case_5, 6: case_6, 7: case_7, 8: case_8, 9: case_9,
                   10: case_10}
 
 
