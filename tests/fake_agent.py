@@ -6,14 +6,16 @@ import json
 import os
 import pathlib
 import re
+import select
 import subprocess
 import sys
 import time
 import tty
 
-SCRIPTS = ("reports", "forgets", "works_forever", "blocks", "crashes", "silent", "dialog")
+SCRIPTS = ("reports", "forgets", "works_forever", "blocks", "blocks_once", "crashes", "quits", "silent", "dialog")
 START, END = b"\x1b[200~", b"\x1b[201~"
 CONTROL = re.compile(rb"[\x1b\r\n]")
+PUSHBACK = bytearray()   # input that arrived while a tool ran, read before the terminal again
 
 
 def report(state, kind=None):
@@ -22,13 +24,40 @@ def report(state, kind=None):
         os.write(1, f"\x1b]7501;state={state}:app=fake{extra}\x1b\\".encode())
 
 
+def read_input():
+    if PUSHBACK:
+        data = bytes(PUSHBACK)
+        PUSHBACK.clear()
+        return data
+    return os.read(0, 4096)
+
+
+def run_tool(command):
+    """Run a shell command as this agent's tool: input arriving meanwhile waits for the next turn, except a lone
+    Esc, which interrupts the turn (the command is killed). Returns the exit code, or None when interrupted."""
+    proc = subprocess.Popen(["sh", "-c", command], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
+    while proc.poll() is None:
+        if select.select([0], [], [], 0.2)[0]:
+            chunk = os.read(0, 4096)
+            if chunk == b"\x1b":
+                proc.kill()
+                proc.wait()
+                return None
+            PUSHBACK.extend(chunk)
+    return proc.returncode
+
+
 def submitted_lines():
     """Accept bracketed paste with embedded newlines, and Enter outside a paste."""
     pending = bytearray()
     incoming = b""
     paste = False
-    while chunk := os.read(0, 4096):
+    echo = bool(os.environ.get("FAKE_ECHO"))
+    while chunk := read_input():
         incoming += chunk
+        if echo:   # show the unsubmitted input, as a harness's composer would
+            os.write(1, b"\r\x1b[K> " + bytes(pending) + CONTROL.sub(b" ", incoming))
         while incoming:
             if paste:
                 end = incoming.find(END)
@@ -59,6 +88,40 @@ def submitted_lines():
                 incoming = incoming[1:]
 
 
+def act(text):
+    """Test-only action protocol (phase_8.md §2): a line "ACT append <path> <text>" appends the text, and
+    "ACT run <path> <shell command>" runs the command, as this agent's own tool would, and appends its exit.
+    An Esc during a run interrupts the turn: its later lines are not acted on."""
+    for line in text.splitlines():
+        parts = line.split(" ", 3)
+        if len(parts) < 4 or parts[0] != "ACT":
+            continue
+        verb, path, rest = parts[1], pathlib.Path(parts[2]), parts[3]
+        if verb == "append":
+            with path.open("a") as stream:
+                stream.write(rest + "\n")
+        elif verb == "run":
+            code = run_tool(rest)
+            if code is None:
+                return
+            with path.open("a") as stream:
+                stream.write(f"exit {code}\n")
+    for line in text.splitlines():   # a fake conversation: memory kept per thread, in FAKE_MEMORY_DIR
+        parts = line.split(" ", 2)
+        if parts[0] != "ACT" or len(parts) < 2 or parts[1] not in ("remember", "recall", "switch"):
+            continue
+        thread = os.environ.get("CODEX_THREAD_ID", "none")
+        memory = pathlib.Path(os.environ.get("FAKE_MEMORY_DIR", ".")) / f"{thread}.mem"
+        if parts[1] == "remember":
+            memory.write_text(parts[2])
+        elif parts[1] == "recall":
+            word = memory.read_text().strip() if memory.exists() else "NONE"
+            with pathlib.Path(parts[2]).open("a") as stream:
+                stream.write((word[::-1] if word != "NONE" else word) + "\n")
+        else:                          # a new conversation in the same terminal: later commands see its ID
+            os.environ["CODEX_THREAD_ID"] = f"thread-{os.urandom(4).hex()}"
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("script", nargs="?", choices=SCRIPTS, default="reports")
@@ -87,11 +150,14 @@ def main():
         if script == "dialog":
             if text == os.environ.get("FAKE_DIALOG_KEYS", ""):
                 script = "reports"
+                os.write(1, b"\x1b[2J\x1b[Hfake agent ready\r\n")   # the dialog is gone, as a harness redraws
                 report("idle")
             continue
         if waiting:
             if not text:
                 waiting = False
+                if script == "blocks_once":   # answered: back to ordinary turns
+                    script = "reports"
                 report("idle")
             continue
         for line in text.splitlines():
@@ -103,14 +169,18 @@ def main():
         if script in ("silent", "works_forever"):
             report("working" if script == "works_forever" else None)
             continue
+        if script == "quits":       # a harness quitting to its shell: hc clears the status, the pane stays
+            report("clear")
+            return 0
         report("working")
         if script == "crashes":
             return 1
-        if script == "blocks":
+        if script in ("blocks", "blocks_once"):
             report("blocked", "permission")
             waiting = True
             continue
         time.sleep(work)
+        act(text)
         if script == "reports" and reply:
             subprocess.run(reply, input=text.partition("\n")[0] + "\n", text=True, check=True)
         report("idle")

@@ -1576,6 +1576,13 @@ def mark_stopped(state, terms, box):
         _write_team_file(directory, team)
 
 
+def _unsettled_refusal(error, term):
+    """hc's refusal to type into a fresh terminal whose output has not settled yet. hc settles before it types
+    (0.1.20 input.rs) and says "nothing was typed", so the message is still unsent. Any other unavailable reply
+    may follow a partial write and stays unconfirmed."""
+    return error.kind == "unavailable" and error.message == f"{term} is still starting: its output has not settled"
+
+
 def settle_refusal(log, box, ident, to, term, why):
     """Settle a member's definite pre-typing refusal against stop evidence under the same lock."""
     with log.locked(exclusive=True) as directory:
@@ -2397,6 +2404,8 @@ class Keeper:
             why = "waiting"
         elif isinstance(result, HcError):
             why = {"blocked": "blocked", "not_found": "gone", "finished": "gone"}.get(result.kind)
+            if why is None and _unsettled_refusal(result, term):
+                why = "waiting"                      # nothing was typed: send it again once the output settles
         if why is None:
             detail = " ".join(str(result).split())[:200] or type(result).__name__
             self._record(msg, name, "unconfirmed", why=detail, term=term)
@@ -2901,7 +2910,7 @@ def cmd_say(args):
     if kind == "member" and sender not in cfg.members:
         refuse(f"@{sender} is no longer in factory.toml")
     if kind == "member":   # before anything else can refuse: a refused say still saves the session (§3)
-        warning = record_session(cfg, state, sender, me["address"])
+        warning = record_session(cfg, state, sender, me["address"], model=labels.get("factory.model"))
         if warning:
             print(warning, file=sys.stderr)
     names = list(dict.fromkeys(name.lstrip("@") for name in re.findall(r"[^,\s]+", " ".join(args.to))))
@@ -3361,8 +3370,9 @@ def _member_model(m):
     return agy_choice(m)[0] if m["harness"] == "agy" else m.get("model")
 
 
-def record_session(cfg, state, member, term, environ=os.environ):
-    """Called by say for a member: save the harness's session_env value when it should. -> a warning or None."""
+def record_session(cfg, state, member, term, environ=os.environ, model=None):
+    """Called by say for a member: save the harness's session_env value when it should, with the model its
+    terminal was launched with (its factory.model label). -> a warning or None."""
     m = cfg.members[member]
     harness, t = m["harness"], TABLE[m["harness"]]
     value = environ.get(t["session_env"]) if t.get("session_env") else None
@@ -3377,7 +3387,11 @@ def record_session(cfg, state, member, term, environ=os.environ):
                 return None    # once per launch: later captures from this terminal are ignored
             if follow and e["harness"] == harness and e["value"] == value:
                 return None
-        return {"member": member, "harness": harness, "model": _member_model(m), "term": term, "how": "env",
+        # the model this terminal was launched with, as up resolved it (an "openrouter/..." for a formation's
+        # "openai/..."), so the next up's provider check compares like with like: its label, else its launch's
+        # entry, else the formation's
+        launched = model or (e["model"] if e is not None and e["term"] == term and e.get("model") else None)
+        return {"member": member, "harness": harness, "model": launched or _member_model(m), "term": term, "how": "env",
                 "value": value, "at": utc_now()}
     try:
         _sessions(state, decide)
@@ -3530,6 +3544,8 @@ def start_member(cfg, state, hc, m, operator, sess):
     sess = sess or {"resume": False}
     labels = {"factory.team": team_key(cfg.root), "factory.kind": "member", "factory.member": name,
               "factory.dir": str(state), "name": "@" + name}
+    if m.get("model"):
+        labels["factory.model"] = m["model"]     # as resolved for this launch, for the sessions say records
     fact = _launch_fact(m, state, sess)
     if fact is not None:
         how, value = fact

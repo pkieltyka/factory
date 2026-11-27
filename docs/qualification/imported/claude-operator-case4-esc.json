@@ -1,0 +1,179 @@
+{
+ "mode": "real",
+ "source_head": "670dd76441d8855567ca116312707db78b87a1d1",
+ "utc": "2026-11-27T06:55:00Z",
+ "hc_version": "hc 0.1.20",
+ "rodeo_version": "rodeo 0.2.1",
+ "factory_version": "a775c89ae322",
+ "imported": "claude-esc-genuine-v2",
+ "profiles": [
+  {
+   "role": "operator",
+   "harness": "claude",
+   "version": "2.1.332 (Claude Code)",
+   "model": "claude-fable-5-2"
+  }
+ ],
+ "rows": [
+  {
+   "case": 4,
+   "subcase": "owner-interrupt",
+   "role": "operator",
+   "harness": "claude",
+   "status": "pass",
+   "expected": "a message pending at the owner's Esc is acted on exactly once, and the owner's next line arrives intact",
+   "observed": "Esc left the composer empty; the queued message ran by itself as the next turn, once, in three base trials (20.854 s, 18.353 s, 7.35 s to the observed action after Esc); a line the owner typed straight after Esc stayed whole and arrived exactly once after one Enter (5.362 s to M1's action)",
+   "reason": null,
+   "proof": {
+    "trials": {
+     "base-1": {
+      "m1": 4,
+      "m1_log": {
+       "id": 4,
+       "outcome": "delivered",
+       "history": [
+        {
+         "o": "sending",
+         "term": "t1",
+         "at": "2026-11-27T06:47:30Z"
+        },
+        {
+         "o": "delivered",
+         "term": "t1",
+         "started": true,
+         "turn": 1,
+         "at": "2026-11-27T06:47:30Z"
+        }
+       ]
+      },
+      "queued_before_esc": true,
+      "app_showed_interrupt": true,
+      "m1_count_before_enter": 1,
+      "m1_effect_observed_after_esc_s": 20.854,
+      "turns": [
+       1,
+       1,
+       1
+      ],
+      "classification": "still queued and acted",
+      "sender": "real Codex member ran the exact say command",
+      "draft_wait": 20,
+      "status": "pass"
+     },
+     "base-2": {
+      "m1": 4,
+      "m1_log": {
+       "id": 4,
+       "outcome": "delivered",
+       "history": [
+        {
+         "o": "sending",
+         "term": "t1",
+         "at": "2026-11-27T06:49:05Z"
+        },
+        {
+         "o": "delivered",
+         "term": "t1",
+         "started": true,
+         "turn": 1,
+         "at": "2026-11-27T06:49:05Z"
+        }
+       ]
+      },
+      "queued_before_esc": true,
+      "app_showed_interrupt": true,
+      "m1_count_before_enter": 1,
+      "m1_effect_observed_after_esc_s": 18.353,
+      "turns": [
+       1,
+       1,
+       1
+      ],
+      "classification": "still queued and acted",
+      "sender": "real Codex member ran the exact say command",
+      "draft_wait": 20,
+      "status": "pass"
+     },
+     "base-3": {
+      "m1": 4,
+      "m1_log": {
+       "id": 4,
+       "outcome": "delivered",
+       "history": [
+        {
+         "o": "sending",
+         "term": "t1",
+         "at": "2026-11-27T06:50:31Z"
+        },
+        {
+         "o": "delivered",
+         "term": "t1",
+         "started": true,
+         "turn": 1,
+         "at": "2026-11-27T06:50:31Z"
+        }
+       ]
+      },
+      "queued_before_esc": true,
+      "app_showed_interrupt": true,
+      "m1_count_before_enter": 1,
+      "m1_effect_observed_after_esc_s": 7.35,
+      "turns": [
+       1,
+       1,
+       1
+      ],
+      "classification": "still queued and acted",
+      "sender": "real Codex member ran the exact say command",
+      "draft_wait": 20,
+      "status": "pass"
+     },
+     "owner-draft": {
+      "m1": 4,
+      "m1_log": {
+       "id": 4,
+       "outcome": "delivered",
+       "history": [
+        {
+         "o": "sending",
+         "term": "t1",
+         "at": "2026-11-27T06:51:47Z"
+        },
+        {
+         "o": "delivered",
+         "term": "t1",
+         "started": true,
+         "turn": 1,
+         "at": "2026-11-27T06:51:47Z"
+        }
+       ]
+      },
+      "queued_before_esc": true,
+      "app_showed_interrupt": true,
+      "m1_count_before_enter": 1,
+      "m1_effect_observed_after_esc_s": 5.362,
+      "turns": [
+       1,
+       1,
+       2
+      ],
+      "owner_typed_before_m1_effect": true,
+      "owner_line_whole_after_m1": true,
+      "owner_count_before_enter": 0,
+      "owner_exact_count": 1,
+      "m1_final_count": 1,
+      "classification": "still queued and acted",
+      "sender": "real Codex member ran the exact say command",
+      "draft_wait": 20,
+      "status": "pass"
+     }
+    },
+    "peer": "codex",
+    "runner": "@lead-dev's focused Esc trials (phase_8.md \u00a73, the owner decision)",
+    "verified_by": "@architect-2",
+    "decision": "@operator: pass with the behaviour written out"
+   }
+  }
+ ],
+ "trust_entries": []
+}

@@ -81,6 +81,36 @@ Verified facts about `hc` and `rodeo`, collected on isolated private cores (neve
 
 ---
 
+## rodeo_tabs: selecting a tab by its place (Phase 8)
+
+- **Command:** `python3 tests/live.py check rodeo_tabs` (`hc 0.1.20`, `rodeo 0.2.1`, Linux, 27 November 2026, branch `peter/173-qualification`).
+- **Setup:** two private cores. On the QA core a `herdr-app` doc with two tabs, `operator` (one OSC 7501 probe) and `team` (two probes), with each terminal's `herdr.*` labels written; rodeo on the driver core.
+- **Observed:** `ctrl+b` then `2` put the next marker only in the team tab's focused probe; `ctrl+b` then `1`, only in the operator tab's; `ctrl+b` then `2` again, only in the team tab's.
+- **Verdict:** **Pass.** The qualification driver selects a tab with `prefix+N` by the tab's place in the layout doc (phase_8.md §2).
+
+---
+
+## LC-3, LC-4/LC-11, LC-6, LC-7, LC-12: the login checks (Phase 8)
+
+@lead-dev-3 ran these at `325223a` with the owner's own logins, on private cores, Linux 7.3.5. Each was run as its own command except where noted.
+
+- **LC-3, Claude Code 2.1.332: pass** on the standalone rerun. A fresh start with the assigned `--session-id` reached idle, and the environment's ID matched the assigned one. The ID was stored; a resume reached idle and recalled the word; the ID still matched after the resume.
+  - The first attempt, inside `check login`, timed out on a trust-dialog race ("Enter to confirm · Esc to cancel").
+- **LC-4 and LC-11, OpenCode v2.4.1: pass.**
+  - A UUID4 session ID is rejected (`finished (code 1): at ["sessionID"]`).
+  - A `ses_`-prefixed ID starts, is stored and reopens with recall.
+  - `OPENCODE_SESSION_ID` equals the ID. After `/new` it no longer does, so `session_follow` stays false.
+- **LC-6, pi 1.6.1 and omp 19.2.1: fail.** For both harnesses, neither of the two member directories stored anything (`stored=false` on the first and the second fresh launch), and `continue` held nothing. pi's `PI_SESSION_ID` was not set.
+  - Consequence: neither directory/continue route can be enabled. pi's case 6 resume fails at 670dd76, consistent with this (see pi.md).
+- **LC-7, agy 1.5.18: not counted.** The baseline showed the trust dialog, and the session-only `--settings` suppressed it. But the run used the owner's real settings roots, and agy wrote under `~/.gemini/antigravity-cli/` during it.
+  - phase_8.md §4 requires mutable trust state to be isolated before launch, so this LC-7 run does not count. It is to be rerun under an isolated HOME overlay.
+- **LC-12, Claude Code, Codex and agy: partial.**
+  - Claude Code: the child and the parent both ran, and the child's ID equals the parent's.
+  - Codex: both ran, but the child's ID differs, so `session_follow = false` stays.
+  - agy: neither the child nor the parent ran.
+
+---
+
 ## Fixtures (`tests/hc_fixtures.json`)
 
 - **Command:** `python3 tests/live.py fixtures --out tests/hc_fixtures.json`

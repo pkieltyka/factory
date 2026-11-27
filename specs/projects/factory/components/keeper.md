@@ -138,6 +138,7 @@ Settled results free the recipient's slot in `inflight`. A withheld result holds
 | `HcError` `blocked` | `queued`, `blocked` | Members use the stop check below |
 | `HcError` `not_found` or `finished` | `queued`, `gone` | Members use the stop check below |
 | `HcDown(sent=False)` | `queued`, `waiting` | Members use the stop check below |
+| `HcError` `unavailable` with exactly `<term> is still starting: its output has not settled` | `queued`, `waiting` | hc refuses before typing anything (0.1.20 `input.rs`; its hint says nothing was typed); the pair is sent again once the terminal settles. Members use the stop check below. Any other `unavailable` stays `unconfirmed` |
 | any other failure or an unexpected result | `unconfirmed`, with the reason | Final. Later messages to that recipient can go on |
 
 For a member's definite refusal, `settle_refusal` checks the claimed terminal against `team.json`'s `stopped` list and appends the outcome under the same directory `LOCK_EX`. An explicit stop produces `dropped (stopped by down)`. A lost terminal with no recorded stop can be retried after its replacement is briefed. If the metadata is unreadable or missing, the keeper withholds settlement and retries each tick. A restart during this wait makes the pair `unconfirmed`.
@@ -303,6 +304,7 @@ Delivery
 
 Send results (one per row of §4)
 - `test_result_delivered`; `test_result_blocked_requeues`; `test_result_unsent_failure_retries`; `test_result_connection_lost_is_unconfirmed`; `test_unconfirmed_does_not_hold_the_queue`.
+- `test_unsettled_terminal_refusal_requeues_and_the_next_send_delivers_once`; `test_other_unavailable_replies_stay_unconfirmed` (Phase 8 case 8 on a real Codex member).
 - `test_result_finished_with_record_is_gone`; `test_result_finished_after_down_is_dropped`; `test_result_finished_for_operator_is_always_gone`.
 - `test_unsynced_sending_record_sends_nothing`: the fake records no send; the keeper is `damaged`; after a restart the pair is `unconfirmed`.
 - `test_down_then_up_during_send_does_not_resurrect`: the old terminal is downed and a new one for the same member is ready before the result arrives; the pair ends `dropped` and the new terminal receives nothing.

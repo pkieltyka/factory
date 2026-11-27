@@ -1027,6 +1027,12 @@ class FakeAgentTests(HcBackend, unittest.TestCase):
         self.hc.send(term, "first line\nFAKE: blocks")
         self.state(term, "blocked")
 
+    def test_act_lines_append_and_run(self):
+        receipt = self.directory / "receipt.txt"
+        term, _ = self.launch("reports")
+        self.hc.send(term, f"[from @x]\nACT append {receipt} tok-1\nACT run {receipt} exit 3")
+        self.until(lambda: receipt.exists() and receipt.read_text() == "tok-1\nexit 3\n", "both actions")
+
     def test_log_has_every_input(self):
         term, log = self.launch("silent")
         self.hc.send(term, "first\nsecond")
@@ -1834,6 +1840,8 @@ class TeamCommandTests(TeamCase):
         newest = factory.saved_sessions(self.state_dir)[0]
         self.assertEqual({n: (e["term"], e["how"]) for n, e in newest.items()},
                          {n: (t, "new") for n, t in terms.items()})
+        for name, term in terms.items():                               # the launch's model, for say's sessions
+            self.assertEqual(self.hc.get(term)["labels"].get("factory.model"), newest[name]["model"])
         self.assertTrue(factory.read_team(self.state_dir)["up"])
         runs = self.fake.calls("terminal.run")
         self.assertTrue(all(not any(k.startswith("herdr.") for k in r["params"]["labels"]) for r in runs))
@@ -3439,6 +3447,39 @@ class KeeperTests(TeamCase):
         self.keeper.tick()
         self.assertEqual(self.outcome(ident, "operator")["why"], "operator could not take it")
         self.assertFalse(self.inputs(operator, None))
+
+    @fake_only
+    def test_unsettled_terminal_refusal_requeues_and_the_next_send_delivers_once(self):
+        """hc 0.1.20 refuses a fresh terminal whose output has not settled before typing anything (case 8 on a
+        real Codex member): the pair waits and is sent again, never unconfirmed."""
+        term, _ = self.member()
+        refusal = factory.HcError("unavailable", f"{term} is still starting: its output has not settled",
+                                  f"nothing was typed; check hc read {term}, then retry")
+        ident = self.add("lead-dev")
+        self.keeper.tick()
+        with patch.object(self.hc, "send", side_effect=[refusal]):
+            self.run_jobs()
+        self.keeper.tick()                          # settles the refusal and claims the pair again
+        records = [(r["o"], r.get("why")) for r in self.log.read_box()[0] if r["t"] == "out" and r["id"] == ident]
+        self.assertEqual(records, [("sending", None), ("queued", "waiting"), ("sending", None)])
+        self.assertFalse(self.inputs(term, None))
+        self.run_jobs()
+        self.keeper.tick()
+        self.assertEqual(self.outcome(ident)["o"], "delivered")
+        self.assertEqual(self.inputs(term, None), ["[from @pm]\nfirst\n"])
+
+    @fake_only
+    def test_other_unavailable_replies_stay_unconfirmed(self):
+        term, _ = self.member()
+        for message in ("the core is shutting down", f"{term} is still starting",
+                        "t999 is still starting: its output has not settled"):
+            with self.subTest(message=message):
+                ident = self.add("lead-dev")
+                self.keeper.tick()
+                with patch.object(self.hc, "send", side_effect=[factory.HcError("unavailable", message)]):
+                    self.run_jobs()
+                self.keeper.tick()
+                self.assertEqual(self.outcome(ident)["o"], "unconfirmed")
 
     @fake_only
     def test_malformed_send_result_is_unconfirmed_and_frees_the_recipient(self):
@@ -6022,6 +6063,29 @@ class SessionTests(unittest.TestCase):
         self.assertEqual([(e["term"], e["how"], e["value"]) for e in self.lines()],
                          [("t1", "new", None), ("t1", "env", "thread-a"), ("t2", "env", "thread-c")])
 
+    def test_a_say_keeps_the_model_its_launch_resolved(self):
+        """Phase 8 on a real pi member: up resolved openai/gpt-6-astra to openrouter/openai/gpt-6-astra, the say's
+        entry wrote the formation's model, and the next up's provider check started it fresh. Two down/up cycles,
+        each resumed by ID with no launch entry for the new terminal (@lead-dev), keep resuming."""
+        resolved = self.m("pi-dev", model="openrouter/openai/gpt-6-astra")
+
+        def say(term, value, model=resolved["model"]):
+            return factory.record_session(self.cfg, self.state, "pi-dev", term, {"PI_SESSION_ID": value}, model=model)
+        with patch.dict(factory.TABLE["pi"], resume_model="provider"):
+            factory.launch_entry(self.state, resolved, "t3", "new", None)      # a fresh launch
+            say("t3", "pi-1")
+            for term in ("t4", "t5"):                                           # resumed by ID: no entry for term
+                entry = factory.saved_sessions(self.state)[0]["pi-dev"]
+                self.assertTrue(factory.compatible(entry, resolved))
+                self.assertTrue(factory.session_plan(resolved, self.state, entry, fresh=False)["resume"])
+                say(term, "pi-1")
+            self.assertEqual({e["model"] for e in self.lines()}, {"openrouter/openai/gpt-6-astra"})
+            factory.launch_entry(self.state, resolved, "t6", "new", None)
+            say("t6", "pi-2", model=None)                                       # no label: its launch's entry
+            self.assertEqual(self.lines()[-1]["model"], "openrouter/openai/gpt-6-astra")
+            say("t9", "pi-3", model=None)                                       # neither: the formation's
+            self.assertEqual(self.lines()[-1]["model"], "openai/gpt-6-astra")
+
     def test_a_fresh_launch_ends_the_previous_conversation(self):
         m = self.m("codex-dev")
         self.record("codex-dev", "t1", "thread-a")
@@ -6339,7 +6403,8 @@ class StartMemberTests(unittest.TestCase):
         self.assertEqual(run["argv"], ["/opt/bin/claude", *argv])
         self.assertEqual((run["cwd"], run["env"]), (m["dir"], {"PATH": self.path, **env}))
         self.assertEqual(run["labels"], {"factory.team": factory.team_key(self.cfg.root), "factory.kind": "member",
-                                         "factory.member": name, "factory.dir": str(self.state), "name": "@" + name})
+                                         "factory.member": name, "factory.dir": str(self.state), "name": "@" + name,
+                                         "factory.model": m["model"]})      # a resume by ID too: say's sessions
         self.assertTrue(run["no_parent"])
         self.assertFalse(any(k.startswith("herdr.") for k in record["labels"]))
 
@@ -6480,6 +6545,172 @@ class HcCheckTests(unittest.TestCase):
             p = e.run("check", check=False, HC_BIN=str(fake), XDG_CONFIG_HOME=str(e.root / "config"))
             self.assertEqual(p.returncode, 2)
             self.assertIn("too old", p.stdout)
+
+
+class QualifyJudgeTests(unittest.TestCase):
+    """The false-pass paths @architect-2 named in the first PR's review."""
+
+    def trials(self, *seconds, idle=True, outcome="delivered"):
+        return [{"idle": idle, "seconds": s, "outcome": outcome} for s in seconds]
+
+    def test_latency(self):
+        self.assertEqual(live.judge_latency(self.trials(0.7, 0.9, 1.2))[0], "pass")
+        self.assertEqual(live.judge_latency(self.trials(0.7, 0.9, 30))[0], "pass")     # one slow trial, reported
+        self.assertIn("1 over", live.judge_latency(self.trials(0.7, 0.9, 30))[1])
+        self.assertEqual(live.judge_latency(self.trials(30, 30, 30))[0], "fail")       # delivered, but 30 s each
+        self.assertEqual(live.judge_latency(self.trials(1, 1, 1, idle=False))[0], "not_run")
+        self.assertEqual(live.judge_latency(self.trials(1, 1, 1, outcome="queued"))[0], "fail")
+        self.assertEqual(live.judge_latency(self.trials(1, 1))[0], "not_run")
+
+    def test_dialog(self):
+        declared = [["Trust and continue", ["enter"]]]
+        self.assertEqual(live.judge_dialog(declared, "Trust and continue", True)[0], "pass")
+        self.assertEqual(live.judge_dialog(declared, None, True)[0], "not_run")         # up succeeded, none shown
+        self.assertEqual(live.judge_dialog(declared, "Trust and continue", False)[0], "fail")
+        self.assertEqual(live.judge_dialog([], None, True)[0], "pass")
+        owner = [["Do you trust the contents of this project?", []]]
+        self.assertEqual(live.judge_dialog(owner, owner[0][0], False)[0], "pass")
+        self.assertEqual(live.judge_dialog(owner, owner[0][0], True)[0], "fail")
+
+    def test_blocked(self):
+        note = {"about": "lead-dev", "term": "t3", "outcome": "delivered"}
+        good = ([note], "lead-dev", "t3", True, False, "delivered", 1)
+        self.assertEqual(live.judge_blocked(*good)[0], "pass")
+        for index, value in ((0, []), (0, [note, note]), (0, [dict(note, outcome="queued")]),
+                             (0, [dict(note, about="pm")]), (0, [dict(note, term="t9")]), (3, False), (4, True),
+                             (5, "unconfirmed"), (6, 2), (6, 0)):
+            with self.subTest(index=index, value=value):
+                bad = list(good)
+                bad[index] = value
+                self.assertEqual(live.judge_blocked(*bad)[0], "fail")
+
+    def test_member_switch_needs_a_replacement(self):
+        good = {"down_exit": 0, "up_exit": 0, "replaced": True}
+        self.assertEqual(live.judge_member_switch(True, good, True), "pass")
+        for launch in (dict(good, replaced=False), dict(good, down_exit=1, replaced=False), dict(good, up_exit=3),
+                       {"down_exit": 1, "up_exit": 2, "replaced": False}):
+            with self.subTest(launch=launch):                      # the same session still running recalls its word
+                self.assertEqual(live.judge_member_switch(True, launch, True), "fail")
+        self.assertEqual(live.judge_member_switch(True, good, False), "fail")
+        self.assertEqual(live.judge_member_switch(False, good, True), "not_run")
+
+    def test_switch(self):
+        self.assertEqual(live.judge_switch("a", "b"), (True, None))
+        self.assertFalse(live.judge_switch("a", "a")[0])                                # switch() did nothing
+        self.assertFalse(live.judge_switch("", "b")[0])
+        self.assertFalse(live.judge_switch("a", None)[0])
+
+
+class QualifyReportTests(unittest.TestCase):
+    def test_newest_run_wins_and_hand_text_is_kept(self):
+        head = subprocess.run(["git", "-C", str(live.ROOT), "rev-parse", "HEAD"], capture_output=True,
+                              text=True).stdout.strip()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+
+            def run(name, source, status, mode="real"):
+                row = {"case": 1, "subcase": "states", "role": "member", "harness": "claude", "status": status,
+                       "observed": f"seen at {name}", "proof": {"peer": "codex"}}
+                data = {"mode": mode, "source_head": source, "utc": "2026-11-27T00:00:00Z", "rows": [row],
+                        "factory_version": "abc", "hc_version": "hc 0.1.20", "rodeo_version": "rodeo 0.2.1",
+                        "profiles": [{"role": "member", "harness": "claude", "version": "2.1", "model": "m"}],
+                        "trust_entries": [{"harness": "claude", "file": "~/.claude.json", "directory": f"/tmp/{name}"}]}
+                (tmp / f"{name}.json").write_text(json.dumps(data))
+                return str(tmp / f"{name}.json")
+            paths = [run("new", head, "pass"), run("old", "0" * 40, "fail"), run("fake", head, "fail", "fixture")]
+            out = tmp / "out"
+            out.mkdir()
+            (out / "claude.md").write_text(f"# Claude Code\n\nNotes kept.\n\n{live.REPORT_BEGIN}\nold\n"
+                                           f"{live.REPORT_END}\n\nAfter, kept.\n")
+            live.report(paths, out)
+            text = (out / "claude.md").read_text()
+            self.assertIn("| 1 | states | pass | seen at new; partner codex |", text)
+            self.assertNotIn("seen at old", text)
+            self.assertNotIn("\nold\n", text)
+            self.assertTrue(text.startswith("# Claude Code\n\nNotes kept."))
+            self.assertTrue(text.endswith("After, kept.\n"))
+            self.assertIn("1 startup-dialog (no run)", text)
+            trust = (out / "trust-entries.md").read_text()
+            self.assertIn("`/tmp/new`", trust)
+            self.assertIn("`/tmp/old`", trust)
+            self.assertNotIn("/tmp/fake", trust)
+
+
+class QualifyFrameworkTests(unittest.TestCase):
+    """phase_8.md §1 and §5.1: selection, rows, the case rule, exit precedence and checkpoints, with no login."""
+
+    def test_defaults_and_scope(self):
+        self.assertEqual(live.select_profiles("codex", None), [("operator", "codex"), ("member", "codex")])
+        self.assertEqual(live.select_profiles("pi", None), [("member", "pi")])
+        for harness, role, why in (("pi", "operator", "member in this phase"), ("vim", None, "is not one of")):
+            with self.assertRaisesRegex(ValueError, why):
+                live.select_profiles(harness, role)
+
+    def test_bad_choices_are_refused_before_any_core(self):
+        with patch.object(live, "Core", side_effect=AssertionError("no core may start")):
+            for args, why in ((("pi", "operator", None), "member in this phase"), (("codex", None, [11]), "1 to 10"),
+                              (("cross", "member", None), "no --role")):
+                with self.subTest(args=args), self.assertRaisesRegex(ValueError, why):
+                    live.qualify(*args)
+
+    def test_the_case_rule_and_exit_precedence(self):
+        run = live.Qualification("fixture")
+        selected = [("member", "pi", 8)]
+        for name in ("dead-member", "unconfirmed-brief"):
+            run.row(8, name, "member", "pi", "pass", "x")
+        run.row(8, "quit-during-hold", "member", "pi", "measured", "x", observed="late text arrived")
+        self.assertEqual((run.case_status("member", "pi", 8), run.exit_code(selected)), ("pass", 0))
+        partial = live.Qualification("fixture")
+        partial.row(8, "dead-member", "member", "pi", "pass", "x")       # unconfirmed-brief missing
+        self.assertEqual((partial.case_status("member", "pi", 8), partial.exit_code(selected)), ("not_run", 2))
+        partial.row(8, "unconfirmed-brief", "member", "pi", "fail", "x", reason="retyped")
+        self.assertEqual((partial.case_status("member", "pi", 8), partial.exit_code(selected)), ("fail", 1))
+        mixed = selected + [("member", "pi", 9)]                          # one fails, one not run: fail wins
+        self.assertEqual(partial.exit_code(mixed), 1)
+
+    def test_rows_need_reasons_and_stay_bounded(self):
+        run = live.Qualification("real")
+        for status in ("fail", "not_run"):
+            with self.assertRaisesRegex(ValueError, "needs a reason"):
+                run.row(1, "states", "member", "pi", status, "x")
+        with self.assertRaisesRegex(ValueError, "unknown status"):
+            run.row(1, "states", "member", "pi", "passed", "x")
+        row = run.row(1, "states", "member", "pi", "pass", "x", observed="y" * 1000)
+        self.assertEqual(len(row["observed"]), live.BOUND + 1)
+
+    def test_a_fixture_run_says_so_and_checkpoints_each_case(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "evidence.json"
+            with patch.dict(live.CASE_FUNCTIONS, clear=True):             # nothing built: not run, not pass
+                evidence, code = live.qualify("codex", "member", [1, 2], str(path), fixture=True)
+            self.assertEqual(evidence["mode"], "fixture")
+            self.assertEqual(json.loads(path.read_text())["rows"], evidence["rows"])
+            self.assertEqual(code, 2)                                     # nothing built yet: not run, not pass
+            self.assertEqual(evidence["summary"], {"member codex": {1: "not_run", 2: "not_run"}})
+            self.assertEqual(sorted(p.name for p in pathlib.Path(directory).iterdir()), ["evidence.json"])
+
+
+@real_only
+class QualifyFixtureTests(unittest.TestCase):
+    """phase_8.md §5.1-2: the qualification cases on fake agents and the private real hc, no login."""
+
+    def test_cases_2_and_9_pass_on_fake_agents_and_say_so(self):
+        evidence, code = live.qualify("codex", None, [2, 9], fixture=True)
+        commands = "pass" if live.RODEO else "not_run"      # the owner's first prompt goes through rodeo
+        self.assertEqual((evidence["mode"], code), ("fixture", 0 if live.RODEO else 2))
+        self.assertEqual(sorted((r["role"], r["subcase"], r["status"]) for r in evidence["rows"]),
+                         [("member", "guarded", "pass"), ("member", "idle-report", "pass"),
+                          ("operator", "idle-report", commands), ("operator", "operator-commands", commands)])
+
+    def test_an_echoed_token_without_the_action_fails(self):
+        # The report reaches the operator with the token in it, but no action is asked for: no receipt.
+        real_until = live.QATeam.until
+        with patch.object(live.FixtureAdapter, "act_append", lambda self, path, tok: f"please note {tok}"), \
+                patch.object(live.QATeam, "until", lambda self, predicate, timeout: real_until(self, predicate,
+                                                                                               min(timeout, 15))):
+            evidence, code = live.qualify("codex", "member", [2], fixture=True)
+        row, = evidence["rows"]
+        self.assertEqual((row["subcase"], row["status"], code), ("idle-report", "fail", 1))
 
 
 class LiveToolTests(unittest.TestCase):
