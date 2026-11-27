@@ -93,7 +93,7 @@ A line in a message of the form `FAKE: <script>` switches the script, so one tes
 ## 4. Test modes and isolation
 
 - **Fake mode (default).** Each hc test patches `factory.HC` to `tests/fake_hc.py` and sets its own temporary `FAKE_HC_DIR`.
-- **Real mode (`FACTORY_TEST_HC=real`).** `setUpModule` starts a private `live.Core` with its own socket, session, HOME and XDG directories. Each hc test patches its environment to select that core and checks the core ID before issuing requests. A test labels its terminals with a unique team and removes them on cleanup. A test that changes the app doc restores its previous value. Restart coverage uses a separate private core. Teardown confirms the stop on the raw socket before deleting the directory. The v1 tests run in both modes.
+- **Real mode (`FACTORY_TEST_HC=real`).** `setUpModule` starts a private `live.Core` with its own socket, session, HOME and XDG directories. Each hc test patches its environment to select that core and checks the core ID before issuing requests. A test labels its terminals with a unique team and removes them on cleanup. A test that changes the app doc restores its previous value. Restart coverage uses a separate private core. Teardown confirms the stop on the raw socket before deleting the directory. Offline tests run in both modes.
 - **Selection.** `@fake_only` scripts the fake, `@real_only` needs a real core, and unmarked backend tests exercise both. Real mode prints how many tests used the real core.
 - **Contracts.** `tests/live.py fixtures` records replies and the reachable schema in `hc_fixtures.json`. The tests' `conforms()` checks required keys, allows optional keys when present, rejects unknown keys, and checks schema types recursively. It allows null only for fields that support it. For example `Terminal.foreground` may be absent, and `StatusResult.installed_by` can be null (release builds) or a string (Nix, LC-9).
 - **Wire exceptions.** The extract also records version-scoped discrepancies. In 0.1.20 `terminal.list` omits `machines` on a standalone core. The extract makes that field optional and checks its array type if present. Real mode verifies the omission. Re-record and check the contracts when upgrading the pinned release.
@@ -112,23 +112,11 @@ class ManualClock:
 
 and `say`'s wait loop reads the module's own `time` binding, which tests replace on the `factory` module only (v1's lesson: patching `time.sleep` globally also changes subprocess polling). Keeper tests call `tick()` directly and advance the clock between calls.
 
-## 5. What happens to v1's test classes
+## 5. Test coverage
 
-| v1 class | v2 |
-|---|---|
-| `UpTests`, `UpRecoveryTests`, `DownTests` | Rewritten as `LaunchTests`, `SessionTests`, `DownTests` ([launch_layout.md](launch_layout.md)) |
-| `WorktreeTests`, `ConfigTests`, `ListingTests` | Kept; `ConfigTests` gains the three keys |
-| `InboxTests` | Becomes `LogTests` ([message_log.md](message_log.md)); acknowledgement tests are deleted |
-| `StockTransportTests`, `WaitTests` | Deleted with the code |
-| `CacheNameTests` | Becomes `StateDirTests`: team key, core suffix, privacy of the directory |
-| `DocumentationTests`, `RecipeTests`, `InstalledCopyTests`, `GateFixtureTests` | Kept ([cli_skill.md](cli_skill.md)) |
-| `HerdrContract` | `HcContract` |
-| `LiveFlags` | Kept, opt-in (`FACTORY_LIVE=1`): each installed harness still accepts the flags Factory passes, now including the session flags |
-| new | `HcClientTests`, `KeeperTests`, `LayoutTests`, `CliTests`, `AutonomyTests` |
+The suite covers the hc contract, storage, keeper delivery, layout and lifecycle commands, harness adapters, and the installed copy and recovery fixtures.
 
 `AutonomyTests` are the `test_stall_<row>` tests of [keeper.md](keeper.md), the never-loops test, `test_status_leaves_stopped_team_stopped` and the ready check's A → none → A test: the automated half of §10's autonomy tests.
-
-Size: v1's test file is 3,130 lines. Expect about 3,500 for v2, plus the fake `hc` and the fake agent.
 
 Coverage rule: every row of every decision table in the component docs (delivery, send results, refusals, readiness, layout placement) has a test named in that doc's test plan; a reviewer checks a change against the table it touches.
 

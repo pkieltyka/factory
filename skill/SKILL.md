@@ -35,7 +35,7 @@ In Claude Code, OpenCode and agy, handle an immediate or completed watcher resul
 |---|---|
 | `setup` | Read [references/cmd_setup.md](references/cmd_setup.md); form or change the team. |
 | `up` | Start or resume the team as under Launch. When returning to unfinished work, [reconcile before assigning](references/cmd_continue.md#reconcile-before-assigning). |
-| `down` | `factory.py down [names]` stops running members; `up` resumes their conversations. Omit names to stop all members. |
+| `down` | `factory.py down [names]` stops running members; `up` resumes their conversations. Omit names to stop all configured members. If a removed member is still running, use the terminal named in the error to stop it. |
 | `status` | `factory.py status`: members, pending messages, the keeper and the operator; interpret it using [references/leading.md](references/leading.md). |
 | `brief` | `factory.py brief` previews the team brief and `brief NAME` a member's standing instructions; `brief --send [all|names]` sends it to running members. |
 | `say` | `factory.py say NAME [NAME ...] --file <path>`. Separate names with spaces or commas. `all` selects members only. The operator can pass quoted text instead of `--file`. |

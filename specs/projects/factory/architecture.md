@@ -114,7 +114,7 @@ Factory never sets an `hc` terminal name (§6.1) and always addresses a terminal
  "ready_clear": 0}
 ```
 
-`up` is true from the first `up` that passes preflight until `down` stops the last member. `down` records intentionally stopped terminals in `stopped` before removing their records or dropping queued messages. The keeper checks that list under the same lock it uses to settle a definite refusal. A missing or unreadable file withholds settlement until metadata is available again. `ready_clear` is the highest message id at the last ready check that found no work. `up` can rebuild missing or unreadable metadata from the checkout and its terminals.
+`up` is true from the first `up` that passes preflight until `down` stops the last configured member. `down` records intentionally stopped terminals in `stopped` before removing their records or dropping queued messages. The keeper checks that list under the same lock it uses to settle a definite refusal. A missing or unreadable file withholds settlement until metadata is available again. `ready_clear` is the highest message id at the last ready check that found no work. `up` can rebuild missing or unreadable metadata from the checkout and its terminals.
 
 `layout.keeper` names the terminal in the keeper pane. If the keeper is replaced headless, `up` reuses the recorded block and the last `down` removes it.
 
@@ -278,7 +278,7 @@ Decided on 26 November 2026, and built into this design:
 | 1 | After a skill update the keeper finishes its sends and re-executes itself in place (`os.execv`) |
 | 2 | A member's conversation is learned from its harness's environment variable, recorded by each `say` it runs; launch flags are kept where they help; a member with no recorded conversation starts fresh with a notice (spec §9.4, already updated) |
 | 3 | A seventh status word, `starting`, for a live member that has not reported yet |
-| 4 | Three optional `factory.toml` keys (`quiet_grace`, `ready_check`, `ready_check_every`), with a v1 back-port that accepts and ignores them |
+| 4 | Three optional `factory.toml` keys (`quiet_grace`, `ready_check`, `ready_check_every`) |
 | 5 | Message text is limited to 64 KiB |
 | 6 | `down` stops a member that has no recorded conversation and `up` says it starts fresh; `down` stops nobody when sessions cannot be written |
 | 7 | About 2,200 lines is a target, not a cap; delivery only between turns (`busy`) is not built until a harness fails §10.4 |

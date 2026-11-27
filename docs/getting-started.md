@@ -96,15 +96,6 @@ Enter `/factory up` to bring members back. It leaves live members alone and resu
 
 After `herdr session stop first-factory` or a full server restart, herdr restores the panes and can reopen the operator's previous conversation. Use that conversation, or quit the restored harness and start it again in the same pane for a fresh one. Run `/factory down` before stopping herdr so the next `/factory up` starts the members with current factory flags. Use `/factory up --restart` to reapply launch settings to members herdr restored.
 
-## Messages from a v1 team
-
-Use a retained Factory v1 checkout from the original herdr session. The first command shows unread messages without acknowledging them. The second shows acknowledged history. Factory v2 preserves those files and reads its own message log.
-
-```bash
-python3 <v1-checkout>/skill/scripts/factory.py wait --cwd <original-checkout> --timeout 0
-python3 <v1-checkout>/skill/scripts/factory.py inbox 100 --cwd <original-checkout>
-```
-
 ## Where the rules live
 
 The skill references address the operator agent. “You” in those pages means the operator. [Setup](../skill/references/cmd_setup.md) · [Leading the team](../skill/references/leading.md) · [Pull requests](../skill/references/pull-requests.md) · [Returning to the team](../skill/references/cmd_continue.md)

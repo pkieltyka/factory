@@ -36,7 +36,7 @@ def find_team(args) -> tuple[Config, pathlib.Path | None, dict | None]
 | `brief` | `[NAME]` | no | anyone | 0 |
 | `brief --send` | `[all | names…]` | yes | operator | 0; 1 a brief not `delivered`; 2 refused |
 | `up` | `[names…] [--fresh] [--timeout S]` | yes | operator pane | 0; 2 refused, preflight failed or the team lock is held (nothing changed); 3 a member not started, not ready or not briefed |
-| `down` | `[names…]` | yes | operator | 0; 1 a member could not be stopped; 2 refused or the team lock is held |
+| `down` | `[names…]` | yes | operator | 0; 1 a member could not be stopped or a removed member is still running after shutdown; 2 refused or the team lock is held |
 | `status` | | yes | anyone | 0; 2 `hc` unreachable |
 | `say` | `NAME [NAME…] (--file PATH | TEXT)` | yes | operator or member | 0; 1; 2 (below) |
 | `keeper` | `--state DIR` | yes | Factory | 0 |
@@ -107,7 +107,7 @@ operator: reachable
 - Rows: the operator, then every configured member in `factory.toml` order. `Turn` and `Terminal` are empty when there is no live terminal (a `gone` member shows its finished record's ID).
 - `pending`: per recipient, the count of pending pairs, the age of the oldest, and its current reason; `pending: none` otherwise.
 - `keeper`: `running`, `not running`, `hung (last loop <n> s ago), restarted`, or `running version <v>, replacing itself`; `status` calls `ensure_keeper` first (which leaves a stopped team stopped). A keeper with no pane adds `, no pane (run factory.py up)`.
-- `no pane: @x, @y (run factory.py up)` lists live members missing from the layout. For a live member past startup with no delivered first brief, show the pending first brief’s ID and outcome when one exists. Otherwise print `@x has no confirmed brief: run factory.py brief --send x`. A layout read failure suppresses pane hints. A damaged log suppresses brief hints.
+- `no pane: @x, @y (run factory.py up)` lists live members missing from the layout. For a live member past startup whose harness is still reporting and has no delivered first brief, show the pending first brief’s ID and outcome when one exists. Otherwise print `@x has no confirmed brief: run factory.py brief --send x`. A layout read failure suppresses pane hints. A damaged log suppresses brief hints.
 - When the log holds uncommitted entries: `log: <n> uncommitted entries (never delivered)`.
 - `operator`: `reachable`, or `not reachable: run factory.py up in the operator's pane`.
 - Then v1's hint lines for `blocked` and `gone` members, any `strays`, the log-size warning above 64 MiB, and a `LogDamage` diagnosis if the log cannot be read (the table is still printed).
@@ -122,7 +122,7 @@ v1's table, then the `hc` line and warning from [hc_client.md](hc_client.md).
 
 ## 3. `Config` additions
 
-Top-level keys of `factory.toml` accepted in addition to v1's (`user`, `permissions`, `worktree_dir`, `operator`, `members`):
+Additional optional settings in `factory.toml`:
 
 | Key | Type | Check | Default |
 |---|---|---|---|
@@ -203,7 +203,7 @@ Depends on: every other component. Used by: `main`.
 - `test_say_from_operator_accepts_text`; `test_say_keeps_text_exact`.
 - `test_status_table_and_lines`: every line of the sample for a scripted team; `test_status_shows_loaded_version_and_path`; `test_status_prints_table_when_log_damaged`; `test_status_counts_uncommitted_entries`; `test_status_reports_headless_keeper`; `test_status_leaves_stopped_team_stopped`.
 - `test_brief_prints_and_brief_name_prints_instructions`; `test_brief_send_closing_depends_on_ready`; `test_brief_send_refuses_not_running`.
-- `test_config_accepts_new_keys`, `test_config_rejects_bad_quiet_grace`, `test_v1_formation_loads_unchanged` (v1's sample file).
+- `test_config_accepts_new_keys`, `test_config_rejects_bad_quiet_grace`, `test_current_sample_uses_default_ready_check_settings`.
 - `test_init_sample_has_no_active_ready_check`: the template's `ready_check` is a comment.
 - v1's `DocumentationTests`, `RecipeTests` and `InstalledCopyTests` kept, with the command list and file names updated: every command named in `SKILL.md` and the references exists in the parser, and none of `wait`, `--seen`, `--restart`, `herdr` appears in `skill/`.
 - `test_member_prompt_has_no_cwd_and_names_outcomes`.

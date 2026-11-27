@@ -15,7 +15,6 @@ Goals:
 - The team runs autonomously and continuously through ready work, and is never silent for long without the operator being told (§8a).
 - The team shows up in `hc`'s clients, rodeo for one, because Factory writes its panes into the `herdr-app` layout doc.
 - Fewer commands, fewer files and less script than v1, keeping v1's tested guarantees where they still apply.
-- v1's `FACTORY.md` and `factory.toml` work unchanged.
 
 Non-goals for v2.0: remote machines (`hc` machine links); the team dashboard (#2); project knowledge (#62); automatic recovery of interrupted work (§9.3 detects and reports only); herdr 0.9.5 (that is v1, on the `v1` branch).
 
@@ -57,7 +56,7 @@ A harness counts as supported only when its OSC 7501 reports pass §10.1. One kn
 
 ## 4. Configuration
 
-- `FACTORY.md` and `factory.toml` keep v1's schema and meaning; a v1 file is a valid v2 file. If v2 needs a change, it is back-ported to v1.
+- `FACTORY.md` carries the team brief and `factory.toml` carries the local formation.
 - `factory.toml.sample` stays the project's portable suggestion; `init` copies it.
 - Harness facts (model discovery, launch, resume and permission arguments) stay declarative, carried over from v1 and rechecked against installed versions.
 - Runtime state (message log and queue, saved native session IDs) lives outside the repository, per team, readable only by the owner.
@@ -81,7 +80,7 @@ One script, mapped from `/factory <command>` by `SKILL.md` as in v1. A bare `/fa
 | Command | Behavior |
 |---|---|
 | `up [names] [--fresh]` | Run by the operator. Labels the operator's terminal as this team's operator (§7.4). Validates every affected member first (exit 2, nothing changed). Then finds or creates the team tab (§7.1), starts the keeper (§8.5) if it is not running or runs another Factory version, creates worktrees, starts each member that is not running, resumes its saved native conversation unless `--fresh`, and sends its brief once it is ready (§6). Running members are left alone. Reports members flagged by §9.3. Exit 3 names any member that failed to start or to get its brief. |
-| `down [names]` | Run by the operator. Saves each member's native session ID, ends its terminal and removes its pane and its finished `hc` record. Leaves the operator, worktrees, the message log and any pane the owner added to the team tab. Stopping the last member marks the team down; the keeper exits once nothing is pending for the operator (§8.5). |
+| `down [names]` | Run by the operator. Saves each member's native session ID, ends its terminal and removes its pane and its finished `hc` record. Leaves the operator, worktrees, the message log and any pane the owner added to the team tab. Stopping the last configured member marks the team down. The keeper exits once nothing is pending for the operator (§8.5). If a removed member still has a live terminal, report its address and how to stop it, and exit 1. |
 | `status` | One row per configured member: role, harness, model, thinking, state (`starting`, `idle`, `working`, `done`, `blocked`, `error`, `gone`, `not started`; `starting` is a live member that reports no status yet), turn, and any §9.3 flag with Factory's last message to that member. Then pending messages by recipient with the age of the oldest, the keeper (running or not, its version, and how long since its last loop), and whether the operator is reachable. |
 | `keeper` | Runs the team's keeper (§8.5). Internal: `up` starts it; `say`, `status` and `up` restart it as §8.5's "When it runs" says. A second copy exits at once. |
 | `say NAME [NAME ...] --file PATH` | Sends a message from the caller (§8). Members always use `--file`; the operator may also pass quoted text. Names are separated by spaces or commas; `all` means every other live member. Run from a terminal that is not on a team (the owner's shell, or the operator before `up`), it refuses with "run up first". Returns within about ten seconds with a message ID and one outcome per recipient (§8.5). |

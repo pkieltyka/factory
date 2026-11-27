@@ -2839,9 +2839,7 @@ def model_codex(checker, model, harness):
 
 
 def argv_codex(m, prompt_file, sess):
-    # Codex has no way to read developer instructions from a file, and the full text would not fit the line
-    # macOS lets herdr type into a shell. So the system level carries one line that names the file, and the
-    # full text arrives in the member's first message.
+    # Developer instructions point Codex to the private file with its full standing instructions.
     pointer = (f"You are @{m['name']}, the {m['role']} on a team of coding agents. Your standing instructions are in"
                f" {prompt_file}. Read that file before your first task, and again whenever your context was"
                " compacted or you are unsure of the rules.")
@@ -2878,8 +2876,7 @@ def model_opencode(checker, model, harness):
 
 
 def argv_opencode(m, prompt_file, sess):
-    # The interface herdr can watch has no model flag, so the model comes from inline config in the pane's
-    # environment. --standalone: OpenCode's shared background server ignores a client's own config.
+    # Read model configuration from the terminal's environment. The shared server ignores a client's config.
     model = m["model"] + (f"#{m['thinking']}" if m["thinking"] != "default" else "")
     argv = ["--standalone"] + (sess["args"] if sess else [])
     return argv, {"OPENCODE_CONFIG_CONTENT": json.dumps({"model": model})}
@@ -4044,11 +4041,18 @@ def _down(cfg, hc, team, state, names):
     except (HcDown, HcError) as error:
         print(f"could not check whether any member still runs: {error}")
         return 1
-    last = not any(r["labels"].get("factory.kind") == "member" for r in after)
+    members = [r for r in after if r["labels"].get("factory.kind") == "member"]
+    last = not any(r["labels"].get("factory.member") in cfg.members for r in members)
     if recorded or last:
         keeper = View(after).keeper if last else None
         _unplace_team(state, hc, recorded, last, keeper["address"] if keeper else None)
     if last:
+        for record in members:
+            if record["state"] == "live":
+                name, address = record["labels"].get("factory.member"), record["address"]
+                print(f"@{name} ({address}) is still running outside factory.toml. Run hc kill {address} to stop it.",
+                      file=sys.stderr)
+                code = 1
         try:
             update_team(state, up=False)
         except (Problem, ValueError, OSError, LogDamage) as error:
@@ -4116,7 +4120,7 @@ def cmd_status(args):
     if box is not None:
         briefed = box.briefed()
         for name, term in live_members.items():
-            if term not in briefed and view.state(name) != "starting":
+            if term not in briefed and view.state(name) not in ("starting", "gone"):
                 pending = _pending_brief_line(box, name)
                 print(pending or f"@{name} has no confirmed brief: run factory.py brief --send {name}")
     reachable = view.operator is not None and view.operator.get("status") is not None
