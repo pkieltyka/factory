@@ -109,6 +109,37 @@ Verified facts about `hc` and `rodeo`, collected on isolated private cores (neve
   - Codex: both ran, but the child's ID differs, so `session_follow = false` stays.
   - agy: neither the child nor the parent ran.
 
+## Cross cases (Phase 8, phase_8.md §4)
+
+- **Run:** `python3 tests/live.py qualify cross` at `b06c253` (Factory `31d3e84d827b`), hc 0.1.20, rodeo 0.2.1, Linux, 2026-11-27, run ID `20261127T101539Z-8`.
+- **Setup:** real private hc cores and rodeo, with scripted fake agents. These cases test Factory itself, and §1 allows a named scripted peer. The run probed `rodeo_tabs` first, and it passed.
+- **Results:**
+  - **two-teams: pass.** Two checkouts with the same member names ran on one core, each with its own key, state, keeper and operator.
+    - Concurrent says reached only their own team's member.
+    - Each layout tab held one team's terminals.
+    - After team A's `down` (exit 0), team B still said and its member acted.
+  - **multi-down: pass.** Two briefed members were stopped together.
+    - No member-exit or lost note followed, and the terminals went.
+    - A message queued for the blocked one ended `dropped (stopped by down)`.
+  - **owner-pane: pass.** An owner block was seeded beside the operator in the layout doc.
+    - It kept its identity, terminal and seeded contents through `up`, a repeated `up`, and `down` of one member and then the last.
+    - Afterwards it still took a marker typed through rodeo, and Factory's blocks were gone.
+    - An earlier run at `dbd7fcd` failed on a race in the test itself: the seed was typed before the owner's program read input. Fixed in `b06c253`.
+  - **other-version: pass.** A comment-only copy of the script was installed atomically under a live keeper while the owner's draft held a send.
+    - The old send finished delivered, and the keeper restarted in the same terminal (one keeper before and after).
+    - The next message was delivered once by the new image, with no wakeup.
+    - Case 7's `upgrade` runs the same trial with each real profile.
+
+## LC-7 again: agy's session-only trust, isolated (Phase 8)
+
+- **Run:** `python3 tests/live.py check lc7` by @lead-dev-3 at `f4e5ea1`, agy 1.5.18, inside a `bwrap --tmp-overlay "$HOME"` overlay. Nothing reached the real HOME.
+- **Observed:**
+  - Baseline: `dialog: Do you trust the contents of this project?`.
+  - With `--settings '{"toolPermission":"always-proceed","trustedWorkspaces":["<folder>"]}'` in another scratch folder: `idle`, and the stored action ran.
+  - `settings_changed` lists 21 paths, all session state: conversation databases and WALs, caches, `history.jsonl`, logs, crash logs, presence locks, annotations and `~/.config/antigravity/credential-user-scope`. None is `settings.json` or a trust list.
+- **Verdict:** the check reports "inconclusive" because a stat cannot tell a trust list from other state. Reading the path list shows none of them is one.
+- **Consequence:** @operator enabled per-launch `trustedWorkspaces` for agy (spec §6.3; `launch_layout.md` §3, "agy's trust dialog"). The earlier LC-7 at `325223a` does not count: it ran against the owner's real settings.
+
 ---
 
 ## Fixtures (`tests/hc_fixtures.json`)
