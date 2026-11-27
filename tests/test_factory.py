@@ -2936,6 +2936,38 @@ class QuietTests(TeamCase):
         self.run_for(130)
         self.assertEqual(len(self.quiet_notes()), 2)                      # by the count, not by message ID
 
+    def pending_quiet_note(self):
+        self.run_for(10)
+        self.keeper._quiet(factory.team_view(self.hc, self.team), self.clock.monotonic() + 1000)
+        return self.quiet_notes()[0]["id"]
+
+    def test_a_quiet_note_for_a_blocked_operator_is_dropped_not_queued(self):
+        note = self.pending_quiet_note()
+        self.fake.set_status(self.operator, "blocked", "question")
+        self.keeper.tick()
+        self.assertEqual(self.outcome(note, "operator")["o"], "dropped")
+
+    def test_a_quiet_note_for_a_stopped_team_is_dropped_not_sent(self):
+        note = self.pending_quiet_note()
+        factory.update_team(self.state_dir, up=False)
+        self.keeper.tick()
+        self.assertEqual(self.outcome(note, "operator")["o"], "dropped")
+        self.assertEqual(self.fake.sent(self.operator), [])
+
+    def test_work_that_starts_in_the_same_tick_drops_the_note(self):
+        real = factory.Keeper._quiet
+
+        def quiet_then_work(keeper, view, now):
+            real(keeper, view, now)
+            self.fake.set_status(self.lead, "working")          # after the note is appended, before the hand-off
+        self.run_for(10)
+        self.clock.sleep(1000)
+        with patch.object(factory.Keeper, "_quiet", quiet_then_work):
+            self.keeper.tick()
+        note = self.quiet_notes()[0]["id"]
+        self.assertEqual(self.outcome(note, "operator")["o"], "dropped")
+        self.assertEqual(self.fake.sent(self.operator), [])
+
     def test_a_quiet_note_no_longer_true_at_hand_off_is_dropped(self):
         self.fake.set_status(self.operator, "blocked", "question")
         self.run_for(130)
@@ -3033,6 +3065,26 @@ class ReadyCheckTests(TeamCase):
         text = self.records("ready")[0]["text"]
         self.assertEqual(text.splitlines()[1], str(self.root))
         self.assertEqual(len(text.splitlines()), 21)                     # the heading and the first 20 lines
+
+    def test_a_check_that_outlived_an_operator_turn_is_dropped(self):
+        self.run_for(150)
+        for _ in range(20):
+            self.clock.sleep(10)
+            self.keeper.tick()
+            if self.keeper.ready_job is not None:
+                break
+            self.run_jobs()
+        job = self.jobs.pop()
+        self.board.write_text("OLD BEFORE OPERATOR ACTIVITY\n")
+        self.fake.set_status(self.operator, "working")               # an operator-only turn
+        self.keeper.tick()
+        self.fake.set_status(self.operator, "idle")
+        self.keeper.tick()
+        self.assertIsNotNone(self.keeper.ready_job)                   # the slot stays: no second check yet
+        job()
+        self.keeper.tick()
+        self.assertEqual(self.records("ready"), [])
+        self.assertNotIn("ready_clear", factory.read_team(self.state_dir))
 
     def test_a_late_result_for_another_interval_is_dropped(self):
         self.run_for(150)

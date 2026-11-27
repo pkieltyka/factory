@@ -1870,6 +1870,8 @@ class Keeper:
         self._version_at = 0                 # monotonic time of the next look at the installed build
         self._title = None
         self._told = False                   # the operator has a quiet note for this interval
+        self._quiet_epoch = 0                # bumped by every tick that does not see the team quiet and eligible
+        self._eligible = False
         self.title_out = sys.stdout          # OSC 2 goes straight to the pane, not through emit
         self._execv = os.execv
         self._quiet_sample = None            # member turns and the delivery count at the previous quiet tick
@@ -2039,6 +2041,14 @@ class Keeper:
             self.title_out.flush()
 
     def tick(self):
+        self._eligible = False
+        try:
+            self._tick()
+        finally:
+            if not self._eligible:           # any interruption ends the interval a ready check belongs to
+                self._quiet_epoch += 1
+
+    def _tick(self):
         if self._beat_fd is not None:
             os.utime(self._beat_fd)
         self._check_version(self.clock.monotonic())
@@ -2139,6 +2149,7 @@ class Keeper:
         operator = self.cfg.operator["name"]
         if view.operator["status"]["state"] == "blocked":
             return
+        self._eligible = True                # quiet, reachable and unblocked: the interval goes on
         if told:
             self._ready(q, view, now)
             return
@@ -2153,7 +2164,8 @@ class Keeper:
         self.emit(f"{stamp} #{ident} note: team quiet for {_age(now - self.quiet_since)}")
 
     def _ready_key(self, q):
-        return q["id"], self._cfg_stamp, self.cfg.ready_check
+        """A check belongs to its quiet note, the config and command it ran with, and the eligibility interval."""
+        return q["id"], self._cfg_stamp, self.cfg.ready_check, self._quiet_epoch
 
     def _ready(self, q, view, now):
         """keeper.md §6 step 4 and phase_6.md §4: the owner's ready check, once a period while told."""
@@ -2212,7 +2224,18 @@ class Keeper:
         self.emit(f"{stamp} #{ident} note: ready work")
 
     def _still_true(self, msg, view, now):
-        """For a quiet or ready note about to be handed off: whether it still says something true."""
+        """For a quiet or ready note about to be handed off: whether it still says something true, from team.json,
+        the team view and the log read again now, not from what this tick saw earlier."""
+        try:
+            team = read_team(self.state)
+            view = team_view(self.hc, self.team["team"])
+            self.log.refresh(self.box)
+        except (Problem, HcDown, HcError, LogDamage, OSError):
+            return False
+        operator = view.operator
+        if (team.get("up") is not True or operator is None or operator.get("status") is None
+                or operator["status"]["state"] == "blocked"):
+            return False
         if not quiet_now(view, self.box, self.cfg, self.clock.time(), now, self.inflight, self.op_null_since):
             return False
         q = self.box.quiet_note()
