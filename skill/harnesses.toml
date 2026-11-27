@@ -87,7 +87,8 @@ models = ["openrouter/openai/gpt-6-astra", "openrouter/z-ai/glm-5.3", "openroute
 never = []
 prompt = "message"
 session = "id"                       # LC-4: --session ses_<26 letters and digits>, new or existing
-session_env = "OPENCODE_SESSION_ID"  # LC-11: the current conversation, also after /new
+session_env = "OPENCODE_SESSION_ID"  # LC-11: equals the assigned ID
+session_follow = false               # following /new is not shown yet (#190): one capture per launch
 resume_model = "provider"
 
 [opencode.permissions]   # --auto approves whatever the user's own rules do not deny

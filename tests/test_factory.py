@@ -5015,9 +5015,10 @@ class SessionTests(unittest.TestCase):
         cfg = types.SimpleNamespace(members={"oc": m})
         factory.record_session(cfg, self.state, "oc", "t1", {"OPENCODE_SESSION_ID": "ses_abc"})
         factory.record_session(cfg, self.state, "oc", "t1", {"OPENCODE_SESSION_ID": "ses_def"})   # after /new
-        self.assertEqual(factory.saved_sessions(self.state)[0]["oc"]["value"], "ses_def")
+        self.assertFalse(factory.TABLE["opencode"]["session_follow"])           # once per launch (#190)
+        self.assertEqual(factory.saved_sessions(self.state)[0]["oc"]["value"], "ses_abc")
         again = factory.session_plan(m, self.state, factory.saved_sessions(self.state)[0]["oc"], fresh=False)
-        self.assertEqual((again["resume"], again["args"]), (True, ["--session", "ses_def"]))
+        self.assertEqual((again["resume"], again["args"]), (True, ["--session", "ses_abc"]))
 
     def test_codex_runs_without_its_daemon_fresh_or_resumed(self):
         m = {"name": "x", "role": "lead-dev", "harness": "codex", "model": "gpt-6.2-sol", "thinking": "high",
