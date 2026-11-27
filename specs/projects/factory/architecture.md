@@ -143,22 +143,22 @@ The operator is **reachable** when `view.operator` exists and its `status` is no
 
 ## 4. Module layout of `factory.py`
 
-v1 is 1,786 lines. The first estimate for v2 was about 2,200 lines. The message log and hc client grew with strict replay, append read-back, checkpoints, descriptor-relative file handling and deadline-aware transport. Phase 4's keeper section is 480 lines, including startup, single-instance locking and recovery. Team discovery, metadata and pending display are 249 lines. The `say` and `inbox` section, including outcome waits, is 185 lines. The rest of the command estimate includes lifecycle work still to come. The end of Phase 5b removes v1 leftovers and measures the file again.
+There is no line-count target. Code is kept as simple as each change allows; one simplification pass over the whole file comes at the very end of v2, after Phase 10. The table lists the sections in file order.
 
-| Section | Main units | From v1 | Lines |
-|---|---|---|---|
-| Constants, `Problem`, files | `find_root`, `refuse_dangling_links`, `VERSION` | kept | 60 |
-| Config | `Config`, `parse_role`, `plan` | kept; three new optional keys | 135 |
-| Availability checks | `run_probe`, `listed_models`, `resolve_listed`, `Checker`, `check_all`, `checked` | kept | 190 |
-| hc client | `Hc`, `HcError`, `HcDown`, `team_view`, `View` | new | 256 (built) |
-| Message log | `Log`, `Box`, `LogDamage`, `NotStored`, `inbox_rows`, message-file helpers | replaces `Inbox` | 873 (built) |
-| Harness adapters | `CODE`, `launch_argv`, `claude_settings`, session functions | kept; sessions new | 240 |
-| Briefs | `member_prompt`, `render_team_brief`, `message_for` | kept | 80 |
-| Layout | `edit_layout`, `resolve_tab`, `add_panes`, `remove_panes`, `swap_terminal` | new | 120 |
-| Launch | `check_operator`, `mark_operator`, `start_member`, `await_ready` | rewritten | 150 |
-| Keeper | `Keeper`, `decide`, `head_of`, `ensure_keeper`; quiet rules in Phase 6 | new | 480 (Phase 4) |
-| Team state and messaging commands | `resolve_team`, metadata helpers, `cmd_say`, `cmd_inbox`, `wait_outcomes` | replaces v1 messaging | 434 (Phase 4) |
-| Other commands | `cmd_init`, `cmd_up`, `cmd_status`, `main` and remaining lifecycle commands | lifecycle rewritten in Phase 5a | estimated |
+| Section | Main units | From v1 |
+|---|---|---|
+| Constants, `Problem`, files | `find_root`, `refuse_dangling_links`, `VERSION` | kept |
+| Config | `Config`, `parse_role`, `plan` | kept; three new optional keys |
+| Availability checks | `run_probe`, `listed_models`, `resolve_listed`, `Checker`, `check_all`, `checked` | kept |
+| hc client | `Hc`, `HcError`, `HcDown`, `team_view`, `View` | new |
+| Message log | `Log`, `Box`, `LogDamage`, `NotStored`, `inbox_rows`, message-file helpers | replaces `Inbox` |
+| Harness adapters | `CODE`, `launch_argv`, `claude_settings`, session functions | kept; sessions new |
+| Briefs | `member_prompt`, `render_team_brief`, `message_for` | kept |
+| Layout | `edit_layout`, `resolve_tab`, `add_panes`, `remove_panes`, `swap_terminal` | new |
+| Launch | `check_operator`, `mark_operator`, `start_member`, `await_ready` | rewritten |
+| Keeper | `Keeper`, `decide`, `head_of`, `ensure_keeper`; quiet rules in Phase 6 | new |
+| Team state and messaging commands | `resolve_team`, metadata helpers, `cmd_say`, `cmd_inbox`, `wait_outcomes` | replaces v1 messaging |
+| Other commands | `cmd_init`, `cmd_up`, `cmd_status`, `main` and remaining lifecycle commands | lifecycle rewritten in Phase 5a |
 
 Removed from v1: `Inbox`, `cmd_wait`, `operator_wait`, `queue_message`, `herdr()`, integration checks, `Team`, `place`, `launch`'s typed start, `deliver`, `prompt_error`, `report_launch_drift`, `harness_argv`, `print_retry`, `cmd_prompt`, `session_key`, `session_id`, `remember_sessions`' herdr reads.
 
@@ -218,7 +218,6 @@ Each step is mergeable alone and ends with its tests green ([testing.md](compone
 
 ## 8. Risks and gaps
 
-- **Size.** The message log, hc client and keeper are measured in §4. The end of Phase 5b re-measures after removing the v1 lifecycle code.
 - **Log growth.** The log is never compacted in v2.0. At about 0.5 MB a busy day, a full read (keeper start, `status`, `inbox`, `up`) stays under 100 ms for months. `status` warns above 64 MiB. A writer does not read the log at all when the checkpoint matches, so the cost of `say` does not grow.
 - **A state shorter than a second.** Decided by the owner: the keeper polls and sends notes only for states it observes. A block or error that begins and clears inside one tick produces no note; the `turn` counter still shows that work happened, which is all the quiet rule needs. The spec's §8.4 should say so (§11).
 - **Clients and `keep`.** A client may turn `keep` on for a pane it shows; `hc` then leaves a shell when the harness dies. The keeper turns `keep` off when it sees it, a live terminal that stopped reporting counts as `gone`, and nothing is ever typed into a terminal with no status. LC-8 measures how often clients do this.
@@ -250,15 +249,15 @@ Each step is mergeable alone and ends with its tests green ([testing.md](compone
 
 ### Still owed
 
-| # | Question | Needed by | Fallback |
+| # | Question | Needed by |
 |---|---|---|---|
-| LC-2 | Codex: does `-c 'projects."<dir>".trust_level="trusted"'` suppress the trust dialog without writing `config.toml`? | launch | Answer the dialog with `enter`, as v1 |
-| LC-3 | Claude Code: is `--session-id <uuid>` accepted together with `--append-system-prompt-file` and `--settings`, and does `--resume <id>` reopen that conversation? | sessions | Drop the flag; the ID recorded by `say` is enough |
-| LC-4 | OpenCode: which ID format does `--session <id>` accept for a session that does not exist yet? | sessions | Its variable if LC-11 finds one; else OpenCode starts fresh with a notice |
-| LC-6 | pi and omp: does `--session-dir <dir> --continue` resume the newest conversation in that directory, and start a new one without `--continue`? | sessions | pi: record `PI_SESSION_ID` and resume with `--session <id>`; omp: fresh with a notice |
-| LC-7 | agy: does `--settings '{"trustedWorkspaces": ["<dir>"]}'` suppress the trust dialog for that session without writing the global list? | launch | The dialog is left to the owner (§6.3) |
-| LC-11 | OpenCode: is there a variable like the others in its tool environment? | sessions | Its launch flag only (`--session`) |
-| LC-12 | Claude Code, Codex, agy: does a `say` run by a sub-agent or sub-thread carry the parent conversation's ID in the variable? | sessions | `session_follow = false` for that harness: record once per launch, from the ready line |
+| LC-2 | Codex: does `-c 'projects."<dir>".trust_level="trusted"'` suppress the trust dialog without writing `config.toml`? | launch |
+| LC-3 | Claude Code: is `--session-id <uuid>` accepted together with `--append-system-prompt-file` and `--settings`, and does `--resume <id>` reopen that conversation? | sessions |
+| LC-4 | OpenCode: which ID format does `--session <id>` accept for a session that does not exist yet? | sessions |
+| LC-6 | pi and omp: does `--session-dir <dir> --continue` resume the newest conversation in that directory, and start a new one without `--continue`? | sessions |
+| LC-7 | agy: does `--settings '{"trustedWorkspaces": ["<dir>"]}'` suppress the trust dialog for that session without writing the global list? | launch |
+| LC-11 | OpenCode: is there a variable like the others in its tool environment? | sessions |
+| LC-12 | Claude Code, Codex, agy: does a `say` run by a sub-agent or sub-thread carry the parent conversation's ID in the variable? | sessions |
 
 ### Resolved (Phase 1 and Phase 5a, 26 November 2026, [docs/qualification/hc-checks.md](../../../docs/qualification/hc-checks.md))
 
