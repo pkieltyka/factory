@@ -843,8 +843,7 @@ class GitHubEvidence:
         repo.manifest["prs"] = [{"id": pr["node_id"], "number": pr["number"], "url": pr["html_url"]} for pr in prs]
         repo.save_manifest()
         if tracking[repo.base] != self.head:
-            git(self.inspection, "fetch", "--no-tags", "forge", repo.base)
-            self.head = git(self.inspection, "rev-parse", "FETCH_HEAD").stdout.strip()
+            self.head = self.fetch_main()
             commits = git(self.inspection, "rev-list", "--first-parent", f"{repo.initial}..{self.head}").stdout.split()
             evidence.main_code = frozenset(commits)
             evidence.ci_count = LocalEvidence.verify(self.inspection, self.head, lambda root: test_run(root, ci=True))
@@ -866,6 +865,12 @@ class GitHubEvidence:
                     current = self.merge_evidence(current, pr, when, earlier)
             tickets.append(current)
         evidence.tickets = tuple(tickets)
+
+    def fetch_main(self):
+        # Publish the observation in this private bare repository so fresh verification clones can fetch it.
+        observed = "refs/heads/observed"
+        git(self.inspection, "fetch", "--no-tags", "forge", f"+refs/heads/{self.repo.base}:{observed}")
+        return git(self.inspection, "rev-parse", observed).stdout.strip()
 
     def merge_evidence(self, ticket, pr, stamp, earlier):
         repo = self.repo

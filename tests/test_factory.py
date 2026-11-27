@@ -7473,6 +7473,24 @@ class E2EObserverTests(unittest.TestCase):
 
 
 class E2EGitHubEvidenceTests(unittest.TestCase):
+    def test_fresh_verifier_can_fetch_the_latest_integration_commit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            repo = e2e.make_local(root, factory.SKILL)
+            inspection = root / "inspection.git"
+            e2e.git(root, "clone", "--bare", "--no-local", str(repo.origin), str(inspection))
+            collector = e2e.GitHubEvidence.__new__(e2e.GitHubEvidence)
+            collector.repo = types.SimpleNamespace(base="main")
+            collector.inspection = inspection
+            e2e.git(inspection, "remote", "add", "forge", str(repo.origin))
+            e2e.implement_fixture(repo.root, 1)
+            e2e.git(repo.root, "add", "--", "calc", "tests")
+            e2e.git(repo.root, "commit", "-m", "Integrate the clamp change")
+            e2e.git(repo.root, "push", "origin", "main")
+            head = collector.fetch_main()
+            self.assertNotEqual(head, repo.initial)
+            self.assertTrue(e2e.LocalEvidence.verify(inspection, head, lambda checkout: e2e.accepts(checkout, 1)))
+
     def test_fixture_waits_for_the_exact_board_after_recent_writes(self):
         fixture = e2e.GitHubFixture.__new__(e2e.GitHubFixture)
         expected = {1: "Todo", 2: "Todo", 3: "Todo"}
