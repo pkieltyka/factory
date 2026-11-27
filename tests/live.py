@@ -299,10 +299,26 @@ def tool_calls(text):
                 walk(value)
     for line in text.splitlines():
         try:
-            walk(json.loads(line))
+            record = json.loads(line)
         except ValueError:
             continue
+        before = set(results)
+        walk(record)
+        native = record.get("toolUseResult") if isinstance(record, dict) else None
+        if isinstance(native, dict) and isinstance(native.get("stdout"), str):
+            # Claude Code keeps a successful Bash call's output here, on the line of its paired tool_result,
+            # whose own content is empty (@lead-dev's claude-op-2-a65a1fe record)
+            for key in set(results) - before:
+                if results[key] in (None, '""', "") and not _errored(record, key):
+                    results[key] = native["stdout"] + (f"\n{native['stderr']}" if native.get("stderr") else "")
     return [(command, results.get(ident)) for ident, command in calls.items()]
+
+
+def _errored(record, key):
+    """Whether the tool_result for key in this transcript line says it failed."""
+    content = ((record.get("message") or {}).get("content")) if isinstance(record, dict) else None
+    return any(isinstance(c, dict) and c.get("tool_use_id") == key and c.get("is_error") is True
+               for c in (content if isinstance(content, list) else []))
 
 
 def qa_transcripts(roots, labelled=False):

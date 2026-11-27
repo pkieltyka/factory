@@ -6889,6 +6889,30 @@ class QualifyJudgeTests(unittest.TestCase):
         self.assertIn("AttributeError", rows[(3, "draft-cleared")]["reason"])
         self.assertEqual(rows[(5, "blocked")]["status"], "pass")
 
+    def test_claude_code_bash_output_is_read_from_its_native_result(self):
+        """claude-op-2-a65a1fe (@lead-dev): a successful Bash call's tool_result content is empty, and its output is
+        the same line's toolUseResult.stdout. A failed call (is_error, an empty toolUseResult) stays None."""
+        import live
+        status = "python3 /qa/skill/scripts/factory.py status"
+        up = "python3 /qa/skill/scripts/factory.py up"
+
+        def call(ident, command):
+            return {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": ident, "name": "Bash", "input": {"command": command}}]}}
+
+        def result(ident, content, error, native):
+            return {"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": ident, "content": content, "is_error": error}]},
+                "toolUseResult": native}
+        stdout = ("factory 1d42b23d7c6b (/qa/skill/scripts/factory.py), hc 0.1.20, team work-9f5e80b6\n"
+                  "@lead-dev  lead-dev  codex    gpt-6.2-astra  medium    working  1     t3\npending: none")
+        lines = [call("u1", up), result("u1", "Exit code 2\ncannot open the state directory", True, {}),
+                 call("s1", status), result("s1", "", False, {"stdout": stdout, "stderr": "", "interrupted": False,
+                                                              "isImage": False})]
+        calls = dict(live.tool_calls("\n".join(json.dumps(x) for x in lines)))
+        self.assertIn("@lead-dev  lead-dev", calls[status])
+        self.assertIsNone(calls[up])
+
     def test_operator_commands_reads_the_log_only_after_up_made_the_member(self):
         """@architect-2: the log does not exist until up runs; a slow or failed up is a reasoned row."""
         import live
