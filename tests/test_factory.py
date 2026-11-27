@@ -3788,6 +3788,20 @@ class TeamCase(HcBackend, unittest.TestCase):
         for job in reversed(jobs) if reverse else jobs:
             job()
 
+    def say(self, terminal, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        code = 0
+        hc_bin = self.hc.bin or factory.HC
+        with (patch.dict(os.environ, {"HC_TERMINAL_ID": terminal, "HC_BIN": hc_bin}),
+              patch.object(factory, "HC", hc_bin),
+              patch.object(factory, "_cmd_say_v1", factory.cmd_say),
+              contextlib.redirect_stdout(out), contextlib.redirect_stderr(err)):
+            try:
+                factory.main(["say", *argv])
+            except SystemExit as error:
+                code = error.code
+        return code, out.getvalue(), err.getvalue()
+
 
 class KeeperTests(TeamCase):
     def member(self, *, status="idle", briefed=True):
@@ -4444,6 +4458,223 @@ print(f.ensure_keeper(f.Config(sys.argv[2]), Path(sys.argv[3]), f.Hc(), f.View([
             with self.subTest(data=data):
                 path.write_bytes(data)
                 self.assertIsNone(factory.read_beat(self.state_dir))
+
+
+class CliTests(TeamCase):
+    def prepare_sender(self, name="operator", *, kind="operator"):
+        terminal, _ = self.terminal(name, kind=kind)
+        return terminal
+
+    def deliver_during_ensure(self, *args):
+        self.keeper.tick()
+        self.run_jobs()
+        self.keeper.tick()
+        return "keeper"
+
+    @fake_only
+    def test_say_refusals_never_store_or_deliver(self):
+        member = self.prepare_sender("lead-dev", kind="member")
+        operator = self.prepare_sender()
+        keeper = self.prepare_sender("keeper", kind="keeper")
+        former = self.prepare_sender("departed", kind="member")
+        unlabeled = self.fake.add({})
+        nameless = self.fake.add({"factory.team": self.team, "factory.dir": str(self.state_dir),
+                                  "factory.kind": "member"})
+        bad_file = self.state_dir / "messages" / "operator" / "bad_name.md"
+        bad_file.parent.mkdir(parents=True)
+        bad_file.write_text("text")
+        bad_encoding = self.root / "bad.md"
+        bad_encoding.write_bytes(b"\xff")
+        self.add("operator")
+        before = self.log.path.read_bytes()
+        cases = (
+            ("", ["lead-dev", "text"], "run up first"),
+            ("t9999", ["lead-dev", "text"], "run up first"),
+            (unlabeled, ["lead-dev", "text"], "run up first"),
+            (nameless, ["operator", "text"], "run up first"),
+            (keeper, ["operator", "text"], "the keeper cannot send"),
+            (former, ["operator", "text"], "@departed is no longer in factory.toml"),
+            (operator, ["lead-dev", "stranger", "text"], "@stranger is not on the team"),
+            (operator, ["operator", "text"], "choose another teammate as the recipient"),
+            (operator, ["reviewer", "text"], "@reviewer is not running"),
+            (member, ["operator", "text"], "members send with --file"),
+            (operator, ["lead-dev"], "give a message or --file"),
+            (operator, ["lead-dev", "--file", "missing.md"], "cannot read message file missing.md"),
+            (operator, ["lead-dev", "--file", str(bad_encoding)], "cannot read message file"),
+            (operator, ["lead-dev", " \n "], "give a non-empty message"),
+            (operator, ["lead-dev", "é" * 32769], "message is 65538 bytes"),
+            (operator, ["lead-dev", "--file", str(bad_file)], "use letters, digits and dashes"),
+            (operator, ["lead-dev", "text", "--file", str(bad_file)], "@text is not on the team"),
+        )
+        for caller, args, reason in cases:
+            with self.subTest(caller=caller, reason=reason):
+                status, out, err = self.say(caller, *args)
+                self.assertEqual((status, out), (2, ""), err)
+                self.assertTrue(err.startswith("nothing sent: "), err)
+                self.assertIn(reason, err)
+                self.assertEqual(self.log.path.read_bytes(), before)
+        self.fake.remove(member)
+        self.assertIn("no other member is running", self.say(operator, "all", "text")[2])
+        self.assertFalse(self.fake.calls("terminal.send"))
+        self.assertFalse(self.fake.calls("terminal.run"))
+
+    @fake_only
+    def test_invalid_labels_and_metadata_are_refused_without_a_write(self):
+        operator = self.prepare_sender()
+        self.prepare_sender("lead-dev", kind="member")
+        self.add("lead-dev")
+        before = self.log.path.read_bytes()
+        original = factory.read_team(self.state_dir)
+        path = self.state_dir / "team.json"
+        for data in ({"v": 1}, {**original, "core": 8}, {**original, "team": "elsewhere"},
+                     {**original, "core": self.hc.core[:8] + "-other"}):
+            with self.subTest(data=data):
+                path.write_text(json.dumps(data))
+                status, _, err = self.say(operator, "lead-dev", "text")
+                self.assertEqual(status, 2)
+                self.assertTrue(err.startswith("nothing sent: "), err)
+                self.assertEqual(self.log.path.read_bytes(), before)
+        path.write_text(json.dumps(original))
+        self.hc.label(operator, {"factory.dir": str(self.root)})
+        self.assertIn("not a Factory state directory", self.say(operator, "lead-dev", "text")[2])
+        self.assertEqual(self.log.path.read_bytes(), before)
+        self.assertFalse(self.fake.calls("terminal.send"))
+        self.assertFalse(self.fake.calls("terminal.run"))
+
+    @fake_only
+    def test_names_deduplicate_expand_all_and_keep_gone_members_queueable(self):
+        operator = self.prepare_sender()
+        live = self.prepare_sender("lead-dev", kind="member")
+        gone = self.prepare_sender("reviewer", kind="member")
+        self.briefed("lead-dev", live)
+        self.fake.finish(gone)
+        with patch.object(factory, "ensure_keeper", side_effect=self.deliver_during_ensure):
+            status, out, err = self.say(operator, "all", "all body")
+            self.assertEqual((status, err), (0, ""))
+            self.assertEqual(out.splitlines(), ["message 2", "@lead-dev: delivered"])
+            status, out, err = self.say(operator, "@reviewer, lead-dev", "reviewer", "body")
+            self.assertEqual((status, err), (0, ""))
+            self.assertEqual(out.splitlines(), ["message 3", "@reviewer: queued (gone)", "@lead-dev: delivered"])
+        self.assertEqual(self.inputs(live, None), ["[from @operator]\nall body\n", "[from @operator]\nbody\n"])
+
+    @fake_only
+    def test_say_records_dotdot_path_and_never_removes_the_managed_file(self):
+        member = self.prepare_sender("lead-dev", kind="member")
+        operator = self.prepare_sender()
+        outer = self.root / "nonmanaged"
+        (outer / "nested").mkdir(parents=True)
+        (outer / "x.md").write_bytes(b"line 1\r\nline 2\n\n")
+        directory = self.state_dir / "messages" / "lead-dev"
+        directory.mkdir(parents=True)
+        (directory / "link").symlink_to(outer / "nested", target_is_directory=True)
+        (directory / "x.md").write_text("do not remove")
+        recorded = str(directory / "link/../x.md")
+        with patch.object(factory, "ensure_keeper", side_effect=self.deliver_during_ensure):
+            status, out, err = self.say(member, "operator", "--file", recorded)
+        self.assertEqual((status, out, err), (0, "message 1\n@operator: delivered\n", ""))
+        self.assertEqual(self.inputs(operator, None), ["[from @lead-dev]\nline 1\r\nline 2\n\n"])
+        self.assertEqual(self.log.read()[0][0]["file"], recorded)
+        self.assertEqual((directory / "x.md").read_text(), "do not remove")
+
+    @fake_only
+    def test_say_keeps_id_when_keeper_fails_or_outcomes_cannot_be_read(self):
+        operator = self.prepare_sender()
+        self.prepare_sender("lead-dev", kind="member")
+        failure = factory.Problem("startup failed", "run factory.py status")
+        with patch.object(factory, "ensure_keeper", side_effect=failure):
+            status, out, err = self.say(operator, "lead-dev", "text")
+            self.assertEqual((status, out), (0, "message 1\n@lead-dev: queued (waiting)\n"))
+            self.assertIn("Message 1 is stored", err)
+            self.assertNotIn("nothing sent", err)
+            with patch.object(factory, "wait_outcomes", side_effect=OSError("cannot read")):
+                status, out, err = self.say(operator, "lead-dev", "text")
+                self.assertEqual((status, out), (1, "message 2\n"))
+                self.assertIn("message 2 is stored; its outcome could not be read", err)
+                self.assertIn("Do not resend", err)
+
+    @fake_only
+    def test_say_storage_failure_and_warning_outputs(self):
+        operator = self.prepare_sender()
+        member = self.prepare_sender("lead-dev", kind="member")
+        self.briefed("lead-dev", member)
+        cases = (
+            (factory.LogDamage(self.log.path, 1, "bad"), 2, "nothing sent: "),
+            (factory.NotStored(False, "disk full"), 2, "not stored: "),
+            (factory.NotStored(True, "failed rollback"), 2, "not stored, and the log may now need repair: "),
+            (OSError("storage outcome unknown"), 1, "not confirmed stored: "),
+        )
+        for error, exit_code, prefix in cases:
+            with self.subTest(error=error), patch.object(factory.Log, "add", side_effect=error):
+                status, out, err = self.say(operator, "lead-dev", "text")
+                self.assertEqual((status, out), (exit_code, ""))
+                self.assertTrue(err.startswith(prefix), err)
+                if isinstance(error, OSError) or getattr(error, "partial", False):
+                    self.assertIn("Do not resend", err)
+        self.assertFalse(self.fake.calls("terminal.run"))
+        self.assertFalse(self.fake.calls("terminal.send"))
+        add = factory.Log.add
+
+        def add_with_warning(log, *args, **kwargs):
+            ident, offset, _ = add(log, *args, **kwargs)
+            return ident, offset, "stored but disk reported an error. Do not resend."
+
+        with (patch.object(factory.Log, "add", add_with_warning),
+              patch.object(factory, "ensure_keeper", side_effect=self.deliver_during_ensure)):
+            status, out, err = self.say(operator, "lead-dev", "text")
+        self.assertEqual((status, out), (0, "message 2\n@lead-dev: delivered\n"))
+        self.assertTrue(err.startswith("warning: stored but disk reported an error"))
+
+    @fake_only
+    def test_outcomes_format_and_exit_status(self):
+        pairs = {
+            "operator": {"o": "queued", "why": "gone"},
+            "lead-dev": {"o": "sending"},
+            "reviewer": {"o": "unconfirmed", "why": "lost reply"},
+            "pm": {"o": "dropped", "why": "stopped by down"},
+            "frontend-dev": {"o": "delivered"},
+        }
+        lines, code = factory.outcome_lines(pairs, "operator", "architect")
+        self.assertEqual(code, 1)
+        self.assertEqual(lines, [
+            "@operator: queued (gone): operator not running; message queued", "@lead-dev: sending",
+            "@reviewer: unconfirmed (lost reply)", "@pm: dropped (stopped by down)", "@frontend-dev: delivered",
+            "@reviewer, @pm may not have it. Do not resend unless asked; tell @operator.",
+        ])
+        self.assertNotIn("tell @operator", factory.outcome_lines(pairs, "operator", "operator")[0][-1])
+
+    def test_wait_outcomes_zero_always_reads_and_wait_ends_at_deadline(self):
+        ident, offset, _ = self.log.add("operator", ["lead-dev"], "first")
+        _, box = self.log.read_box()
+        self.log.out(box, ident, "lead-dev", "sending", term="t1")
+        with patch.object(self.log, "read", wraps=self.log.read) as read, patch.object(factory, "time", self.clock):
+            outcome = factory.wait_outcomes(self.log, ident, ["lead-dev"], offset, timeout=0)
+            read.assert_called_once_with(offset)
+            self.assertEqual(outcome["lead-dev"]["o"], "sending")
+            self.assertEqual(self.clock.now, 0)
+            outcome = factory.wait_outcomes(self.log, ident, ["lead-dev"], offset, timeout=0.5)
+            self.assertEqual(outcome["lead-dev"]["o"], "sending")
+            self.assertEqual(self.clock.now, 0.5)
+        self.log.out(box, ident, "lead-dev", "delivered", term="t1", started=True, turn=1)
+        with patch.object(factory, "time", self.clock):
+            outcome = factory.wait_outcomes(self.log, ident, ["lead-dev"], offset)
+            self.assertEqual(outcome["lead-dev"]["o"], "delivered")
+            self.assertEqual(self.clock.now, 0.5)
+
+    @real_only
+    def test_real_keeper_types_a_say_and_stops_when_team_is_down(self):
+        operator = self.prepare_sender()
+        member, log = self.terminal("lead-dev")
+        self.briefed("lead-dev", member)
+        status, out, err = self.say(operator, "lead-dev", "real keeper")
+        view = factory.team_view(self.hc, self.team)
+        if view.keeper:
+            self.addCleanup(self.remove, view.keeper["address"])
+        self.assertEqual((status, out, err), (0, "message 2\n@lead-dev: delivered\n", ""))
+        self.assertIsNotNone(view.keeper)
+        terminal = view.keeper["address"]
+        self.until(lambda: self.inputs(member, log) == ["[from @operator]\nreal keeper\n"], "keeper delivery")
+        factory.update_team(self.state_dir, up=False)
+        self.until(lambda: self.hc.get(terminal)["state"] == "finished", "keeper shutdown")
 
 
 class TeamLookupTests(unittest.TestCase):

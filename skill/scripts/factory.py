@@ -2212,6 +2212,160 @@ def ensure_keeper(cfg, state, hc, view, force=False):
         return _wait_for_beat(log.state, hc, terminal)
 
 
+def wait_outcomes(log, ident, recipients, offset, timeout=SAY_WAIT):
+    """Follow only this message from its commit, without rereading the log prefix."""
+    box = Box.for_message(log.path, ident, recipients, offset)
+    deadline = time.monotonic() + timeout
+    while True:
+        records, offset = log.read(offset)
+        box.apply(records)
+        outcomes = {name: box.outcome(ident, name) for name in recipients}
+        if all(record["o"] in FINAL or (record["o"] == "queued" and record["why"] != "waiting")
+               for record in outcomes.values()):
+            return outcomes
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return outcomes
+        time.sleep(min(0.2, remaining))
+
+
+def outcome_lines(outcomes, operator, sender):
+    lines, missing = [], []
+    for name, record in outcomes.items():
+        outcome = record["o"]
+        line = f"@{name}: {outcome_word(record)}"
+        if outcome in ("unconfirmed", "dropped"):
+            line += f" ({record['why']})"
+            missing.append(f"@{name}")
+        if name == operator and outcome == "queued" and record["why"] == "gone":
+            line += ": operator not running; message queued"
+        lines.append(line)
+    if missing:
+        instruction = "Do not resend unless asked"
+        if sender != operator:
+            instruction += f"; tell @{operator}"
+        lines.append(f"{', '.join(missing)} may not have it. {instruction}.")
+    return lines, int(bool(missing))
+
+
+def _say_payload(args, state, sender, is_member):
+    if args.file is None:
+        if args.message is None:
+            raise ValueError("give a message or --file")
+        if is_member:
+            raise ValueError("members send with --file")
+        text, recorded = args.message, None
+    else:
+        path = args.file
+        recorded = path if os.path.isabs(path) else os.path.join(os.getcwd(), path)
+        lexical = lexical_path(recorded)
+        if (lexical is not None and pathlib.Path(lexical).parent == state / "messages" / sender
+                and not MESSAGE_FILE.fullmatch(os.path.basename(lexical))):
+            raise ValueError("use letters, digits and dashes in the draft name, plus a plain extension such as .md")
+        try:
+            text = pathlib.Path(path).read_bytes().decode("utf-8")
+        except (OSError, ValueError) as error:
+            raise ValueError(f"cannot read message file {path}: {error}") from error
+    if not text.strip():
+        raise ValueError("give a non-empty message")
+    size = len(text.encode("utf-8"))
+    if size > MAX_TEXT:
+        raise ValueError(f"message is {size} bytes; the limit is {MAX_TEXT}. Write it to a file and send the path")
+    return text, recorded
+
+
+def cmd_say(args):
+    def refuse(reason):
+        print(f"nothing sent: {reason}", file=sys.stderr)
+        sys.exit(2)
+
+    if not os.environ.get("HC_TERMINAL_ID"):
+        refuse("run up first")
+    hc = Hc()
+    try:
+        cfg, state, me = resolve_team(args, hc)
+    except Problem as error:
+        refuse(f"{error.what}; {error.fix}")
+    except (HcDown, HcError) as error:
+        refuse(str(error))
+    except SystemExit:
+        refuse("run up first")
+    labels = me["labels"] if me else {}
+    if not labels.get("factory.team") or not labels.get("factory.dir"):
+        refuse("run up first")
+    kind = labels.get("factory.kind")
+    if kind == "keeper":
+        refuse("the keeper cannot send")
+    sender = labels.get("factory.member")
+    if kind not in ("member", "operator") or not isinstance(sender, str) or not sender:
+        refuse("run up first")
+    operator = cfg.operator["name"]
+    if kind == "member" and sender not in cfg.members:
+        refuse(f"@{sender} is no longer in factory.toml")
+    # Phase 5a: record_session(cfg, state, sender, me["address"]) for a member, before validation.
+    names = list(dict.fromkeys(name.lstrip("@") for name in re.findall(r"[^,\s]+", " ".join(args.to))))
+    try:
+        view = team_view(hc, labels["factory.team"])
+    except (HcDown, HcError) as error:
+        refuse(str(error))
+    if names == ["all"]:
+        names = [name for name in cfg.members if name != sender and view.terminal(name)]
+        if not names:
+            refuse("no other member is running")
+    if not names:
+        refuse("give a recipient")
+    for name in names:
+        if name != operator and name not in cfg.members:
+            refuse(f"@{name} is not on the team (members: {', '.join(cfg.members)})")
+        if name == sender:
+            refuse("choose another teammate as the recipient")
+        if name != operator and view.state(name) == "not started":
+            refuse(f"@{name} is not running")
+    try:
+        text, recorded = _say_payload(args, state, sender, kind == "member")
+    except ValueError as error:
+        refuse(str(error))
+    log = open_log(state)
+    try:
+        ident, offset, warning = log.add(sender, names, text, kind="say", file=recorded)
+    except LogDamage as error:
+        refuse(str(error))
+    except NotStored as error:
+        if error.partial:
+            print(f"not stored, and the log may now need repair: {error.detail}. Do not resend; tell the operator.",
+                  file=sys.stderr)
+        else:
+            print(f"not stored: {error.detail}. Nothing will be delivered. Check the disk, then send again.",
+                  file=sys.stderr)
+        sys.exit(2)
+    except OSError as error:
+        print(f"not confirmed stored: {error}. Do not resend; check factory.py inbox.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"message {ident}", flush=True)
+    if warning:
+        print(f"warning: {warning}", file=sys.stderr)
+    timeout = SAY_WAIT
+    try:
+        if ensure_keeper(cfg, state, hc, view) is None:
+            print(f"warning: the team is stopped. Message {ident} is stored and waits for factory.py up.",
+                  file=sys.stderr)
+            timeout = 0
+    except (Problem, HcDown, HcError, LogDamage, OSError) as error:
+        print(f"warning: the keeper is not running ({error}). Message {ident} is stored and will be delivered once"
+              " it runs; run factory.py status.", file=sys.stderr)
+        timeout = 0
+    try:
+        outcomes = wait_outcomes(log, ident, names, offset, timeout)
+    except (LogDamage, OSError) as error:
+        print(f"message {ident} is stored; its outcome could not be read: {error}. Do not resend; run factory.py inbox.",
+              file=sys.stderr)
+        sys.exit(1)
+    lines, code = outcome_lines(outcomes, operator, sender)
+    print("\n".join(lines))
+    sys.exit(code)
+
+
 def cmd_inbox(args):
     """Print committed messages addressed to the selected recipient."""
     if args.count < 1:
@@ -3614,7 +3768,7 @@ def cmd_brief(args):
     print(render_team_brief(cfg, [plan(cfg, n) for n in cfg.members], cfg.operator["name"]))
 
 
-def cmd_say(args):
+def _cmd_say_v1(args):
     """Send directly from the invoking member's pane, or as the operator."""
     require_herdr()
     cfg = cfg_of(args)
@@ -3764,7 +3918,7 @@ def main(argv=None):
     if args.cmd == "say":
         args.message = None if args.file else (args.to.pop() if len(args.to) > 1 else None)
     {"init": cmd_init, "harnesses": cmd_harnesses, "check": cmd_check, "up": cmd_up, "down": cmd_down,
-     "status": cmd_status, "wait": cmd_wait, "inbox": _cmd_inbox_v1, "brief": cmd_brief, "say": cmd_say,
+     "status": cmd_status, "wait": cmd_wait, "inbox": _cmd_inbox_v1, "brief": cmd_brief, "say": _cmd_say_v1,
      "prompt": cmd_prompt, "keeper": cmd_keeper}[args.cmd](args)
 
 
