@@ -11,12 +11,15 @@ The command surface of `factory.py` (arguments, who may run what, output, exit c
 ## 1. Finding the team
 
 ```python
-def resolve_team(args, hc: Hc | None) -> tuple[Config, pathlib.Path]    # (config, state directory)
+def resolve_team(args, hc: Hc | None) -> tuple[Config, pathlib.Path | None, dict | None]
+    # config, state directory, caller's terminal record
+def find_team(args) -> tuple[Config, pathlib.Path | None, dict | None]
+    # tries hc when HC_TERMINAL_ID is set; falls back offline on HcDown
 ```
 
 1. `HC_TERMINAL_ID` is set and `hc` answers: `t = hc.get(me)`. If `t.labels` has `factory.team` and `factory.dir`: the state directory is `factory.dir`, the root is `team.json`'s `root`, `Config(root)`.
 2. Otherwise `Config(args.cwd or os.getcwd())`, team key from its root. With `hc`: the `factory.dir` label of any terminal in the team view; none: `<cache base>/factory-skill/<team>/<hc.core[:8]>`.
-3. Without `hc` (offline `inbox`): the only directory under `<cache base>/factory-skill/<team>/`; with several, the one whose `log.jsonl` is newest, named on stderr.
+3. Without `hc` (offline `inbox`): choose a directory under `<cache base>/factory-skill/<team>/` with a `log.jsonl` or `team.json`. Prefer the newest log, or the newest `team.json` when there is no log. Break ties by pathname. State the choice on stderr when several qualify. Ignore symlinked directories and diagnose unsafe log files. No qualifying directory returns None as the state.
 
 `say` uses only step 1 and refuses otherwise. The caller's identity is `(t.labels["factory.kind"], t.labels["factory.member"])`.
 
@@ -44,24 +47,30 @@ Removed: `wait`, `prompt`, `up --restart`, `up --no-brief`, `wait --seen`. `cont
 
 Steps: `resolve_team` → `record_session` when the caller is a member ([launch_layout.md](launch_layout.md) §3) → validate → read text → `log.add` → `ensure_keeper` → wait ([message_log.md](message_log.md)) → print. Every `hc` call uses `Hc(expect_core=<team.json core>)`, so a pane whose environment points at another core is refused before anything is written.
 
-Refusals, all exit 2, nothing stored, printed as `nothing sent: <reason>`:
+Refusals exit 2 and print `nothing sent: <reason>`. A storage failure has the diagnostics below.
 
 | Condition | Reason text |
 |---|---|
 | no `HC_TERMINAL_ID`, or the terminal has no team labels, or its kind is `operator-lost` | `run up first` |
 | the caller is the keeper | `the keeper cannot send` |
+| the caller is a member no longer configured | `@x is no longer in factory.toml` |
 | a name is not the operator's or a configured member's | `@x is not on the team (members: …)` |
 | a name is the sender | `choose another teammate as the recipient` |
 | a named member's state is `not started` | `@x is not running` |
 | `all` and no other member is live | `no other member is running` |
 | a member passes inline text | `members send with --file` |
-| both or neither of `--file` and text; unreadable file; empty text | v1's messages |
+| neither `--file` nor text; unreadable file; empty text | `give a message or --file`; `cannot read message file <path>: <error>`; `give a non-empty message` |
 | text longer than `MAX_TEXT` bytes | `message is <n> bytes; the limit is 65536. Write it to a file and send the path` |
 | a file in the sender's message directory with a bad name | v1's message |
 | `LogDamage` | the diagnosis |
-| `NotStored` | `not stored: <detail>. Nothing will be delivered. Check the disk, then send again.`, or with `partial`: `not stored, and the log may now need repair: <detail>. Do not resend; tell the operator.` |
+
+When `--file` is present, every positional argument is a recipient. Inline text passed beside it is validated as a name.
+
+`NotStored` exits 2 and prints `not stored: <detail>. Nothing will be delivered. Check the disk, then send again.` With `partial` it prints `not stored, and the log may now need repair: <detail>. Do not resend; tell the operator.` An unknown storage outcome prints `not confirmed stored: <detail>. Do not resend; check factory.py inbox.` and exits 1.
 
 When `log.add` returns a warning (the commit record is completely written but the disk reported an error), `say` proceeds normally and prints on stderr: `warning: stored and will be delivered, but the disk reported an error: it may not survive a power loss. Do not resend.`
+
+Once the message is stored, `say` prints its ID before trying the keeper. Startup or outcome-read errors include the ID and leave the stored message available through `inbox`.
 
 Names are split on spaces and commas, `@` stripped, duplicates removed; `all` expands to every other member with a live terminal. One refused name refuses the whole command (§8.5).
 

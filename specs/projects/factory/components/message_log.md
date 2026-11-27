@@ -73,8 +73,14 @@ class NotStored(Exception):
 class Log:
     def __init__(self, state: pathlib.Path, base: pathlib.Path | None = None): ...
         # base: the owner's cache base above state; everything from base down is opened without following links
+    def open_dir(self, create: bool) -> int | None
+        # a no-follow descriptor to the state directory; the caller closes it
+    def locked(self, exclusive: bool)
+        # context manager yielding the directory descriptor; no public Log call inside it may take the lock again
     def read(self, offset: int = 0) -> tuple[list[dict], int]
         # LOCK_SH. Records from byte offset to the end and the new offset. offset == 0: full validation. Raises LogDamage.
+    def refresh(self, box: "Box") -> None
+        # LOCK_SH. Refresh a full box from its proven log lineage, or rebuild it when the lineage changed.
     def add(self, sender: str, to: list[str], text: str, kind: str = "say",
             file: str | None = None, meta: dict | None = None) -> tuple[int, int, str | None]
         # LOCK_EX. Validates the prefix, allocates the id, appends msg then ok. Returns (id, offset after the ok record, warning or None).
@@ -216,7 +222,7 @@ A file is **managed** when its parent directory is exactly `<state>/messages/<se
 
 ### `inbox` output
 
-`inbox_rows(log, name, count)` (Phase 3) selects the rows from one validated snapshot, keeping each message's original text after its outcomes are final; the command itself, its rendering and its caller and checkout resolution arrive with `say` in Phase 4 (until then v1's `inbox` stays).
+`inbox_rows(log, name, count)` selects the rows from one validated snapshot, keeping each message's original text after its outcomes are final.
 
 `inbox [N] [--for NAME]` reads the whole log and prints the last N committed messages whose `to` contains the name, oldest first:
 

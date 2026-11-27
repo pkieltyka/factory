@@ -26,7 +26,7 @@ Facts marked **verified** were run by the architect on an isolated `hc 0.1.20` c
 5. **One append-only log is the only durable memory of what happened.** Messages, their commit records and per-recipient outcomes are appended under one lock, the state directory itself, never held across an `hc` call. A message exists once its commit record is written, whatever fails or dies around it. Every fact the keeper must not forget across a crash (which terminals are briefed, which notes were sent) is derived from the log, never kept in a flag beside it.
 6. **Only the keeper types.** `say`, `up` and `brief --send` append to the log and wait for the outcome records the keeper writes. Briefs are messages of kind `brief`.
 7. **Nothing changes before preflight passes**, and `up` and `down` hold one team lock for their whole run, so two launches cannot claim the same member.
-8. **A small `team.json`** holds the few team-level facts with no terminal or log record to carry them (root, layout ids, the ready check's "cleared" mark). Losing it costs a second team tab or one repeated ready-work note, never a message.
+8. **A small `team.json`** holds the team root, layout ids, the ready check's cleared mark and the terminal IDs explicitly stopped by `down`. Keeper delivery pauses when this file cannot be read.
 9. **A member's conversation is learned from the member itself.** Each harness exports its current conversation ID to the commands it runs (Claude Code, Codex and agy, confirmed live), so every `say` a member runs records it, and a switch made inside the harness is followed from the next `say`. Launch flags that fix the conversation are used where they exist (Claude Code and OpenCode an ID, pi and omp a per-member directory). No harness file is scanned and no screen is read for this.
 
 Rejected:
@@ -106,11 +106,12 @@ Factory never sets an `hc` terminal name (§6.1) and always addresses a terminal
 ```json
 {"v": 1, "root": "/abs/checkout", "team": "factory-ab12cd34", "core": "2b0e89bc…",
  "up": true,
+ "stopped": ["t4"],
  "layout": {"space": "sp…", "tab": "tb…", "made_space": false},
  "ready_clear": 0}
 ```
 
-`up` is true from the first `up` that passes preflight until `down` stops the last member. `ready_clear` is the highest message id at the last ready check that found no work. A missing or unreadable `team.json` is rebuilt by `up` from the checkout and the team's terminals; other commands print "run factory.py up" and exit 2.
+`up` is true from the first `up` that passes preflight until `down` stops the last member. `down` records intentionally stopped terminals in `stopped` before removing their records or dropping queued messages. The keeper checks that list under the same lock it uses to settle a definite refusal. A missing or unreadable file withholds settlement until metadata is available again. `ready_clear` is the highest message id at the last ready check that found no work. `up` can rebuild missing or unreadable metadata from the checkout and its terminals.
 
 ### 3.4 Member and operator state
 
@@ -137,7 +138,7 @@ The operator is **reachable** when `view.operator` exists and its `status` is no
 
 ## 4. Module layout of `factory.py`
 
-Sections in file order. v1 is 1,786 lines. The first estimate for v2 was about 2,200 lines; with two parts built, the expected size at the end of v2 is about 3,200 to 3,400 lines. The message log came to 873 lines against an estimate of 230, and the hc client to 256 against 140, because of behaviour decided in review and by the owner after the estimate was made: validation of every record with strict replay, the append fault matrix with read-back, the checkpoint with lineage and digest, file handling relative to a directory descriptor, the message-file sweep, and deadline-aware transport with a spooled stderr. None of that is to be compressed. The remaining rows of the table are still the original estimates and should be read with the same caution. Phase 5c (simplification), which runs once every main part is in place, cuts duplication, dead paths and v1 leftovers without dropping specified behaviour or tests, measures the file again and records the result here.
+v1 is 1,786 lines. The first estimate for v2 was about 2,200 lines. The message log and hc client grew with strict replay, append read-back, checkpoints, descriptor-relative file handling and deadline-aware transport. Phase 4's keeper section is 480 lines, including startup, single-instance locking and recovery. Team discovery, metadata and pending display are 249 lines. The `say` and `inbox` section, including outcome waits, is 185 lines. The rest of the command estimate includes lifecycle work still to come. The end of Phase 5b removes v1 leftovers and measures the file again.
 
 | Section | Main units | From v1 | Lines |
 |---|---|---|---|
@@ -150,9 +151,9 @@ Sections in file order. v1 is 1,786 lines. The first estimate for v2 was about 2
 | Briefs | `member_prompt`, `render_team_brief`, `message_for` | kept | 80 |
 | Layout | `edit_layout`, `resolve_tab`, `add_panes`, `remove_panes`, `swap_terminal` | new | 120 |
 | Launch | `check_operator`, `mark_operator`, `start_member`, `await_ready` | rewritten | 150 |
-| Keeper | `Keeper`, `decide`, `head_of`, `quiet_now`, `ensure_keeper` | new | 400 |
-| Commands | `cmd_init` … `cmd_keeper`, `resolve_team`, `main` | rewritten except `init`, `harnesses`, `check` | 450 |
-| | | **Total** | **about 3,200 to 3,400 expected; re-measured in Phase 5c** |
+| Keeper | `Keeper`, `decide`, `head_of`, `ensure_keeper`; quiet rules in Phase 6 | new | 480 (Phase 4) |
+| Team state and messaging commands | `resolve_team`, metadata helpers, `cmd_say`, `cmd_inbox`, `wait_outcomes` | replaces v1 messaging | 434 (Phase 4) |
+| Other commands | `cmd_init`, `cmd_up`, `cmd_status`, `main` and remaining lifecycle commands | lifecycle rewritten in Phase 5a | estimated |
 
 Removed from v1: `Inbox`, `cmd_wait`, `operator_wait`, `queue_message`, `herdr()`, integration checks, `Team`, `place`, `launch`'s typed start, `deliver`, `prompt_error`, `report_launch_drift`, `harness_argv`, `print_retry`, `cmd_prompt`, `session_key`, `session_id`, `remember_sessions`' herdr reads.
 
@@ -165,6 +166,7 @@ VERSION = hashlib.sha1(pathlib.Path(__file__).read_bytes()).hexdigest()[:12]   #
 TICK = 1.0                           # keeper period, seconds
 LATCH_AFTER = 5                      # operator with no status this long, and a message pending: unreachable until up
 BEAT_STALE = 30                      # heartbeat older than this: the keeper is hung
+KEEPER_START = 5                     # wait for the new keeper's first beat
 SAY_WAIT = 10                        # say waits this long for outcomes
 LAUNCH_TIMEOUT = 60                  # per member, from terminal.run to ready
 QUIET_GRACE = 120                    # default; factory.toml quiet_grace overrides
@@ -211,7 +213,7 @@ Each step is mergeable alone and ends with its tests green ([testing.md](compone
 
 ## 8. Risks and gaps
 
-- **Size.** About 3,200 to 3,400 lines expected against the first estimate of 2,200 and v1's 1,786 (§4). The growth so far is decided behaviour in the message log and the hc client, not padding. The keeper and the commands are the largest parts still to come and may overrun in the same way. Phase 5c re-measures and simplifies.
+- **Size.** The message log, hc client and keeper are measured in §4. The end of Phase 5b re-measures after removing the v1 lifecycle code.
 - **Log growth.** The log is never compacted in v2.0. At about 0.5 MB a busy day, a full read (keeper start, `status`, `inbox`, `up`) stays under 100 ms for months. `status` warns above 64 MiB. A writer does not read the log at all when the checkpoint matches, so the cost of `say` does not grow.
 - **A state shorter than a second.** Decided by the owner: the keeper polls and sends notes only for states it observes. A block or error that begins and clears inside one tick produces no note; the `turn` counter still shows that work happened, which is all the quiet rule needs. The spec's §8.4 should say so (§11).
 - **Clients and `keep`.** A client may turn `keep` on for a pane it shows; `hc` then leaves a shell when the harness dies. The keeper turns `keep` off when it sees it, a live terminal that stopped reporting counts as `gone`, and nothing is ever typed into a terminal with no status. LC-8 measures how often clients do this.

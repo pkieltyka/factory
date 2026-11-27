@@ -15,16 +15,19 @@ import collections
 import contextlib
 import datetime
 import fcntl
+import functools
 import getpass
 import hashlib
 import json
 import os
 import pathlib
+import queue
 import re
 import selectors
 import shlex
 import secrets
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -33,7 +36,8 @@ import threading
 import time
 import tomllib
 
-SKILL = pathlib.Path(__file__).resolve().parent.parent
+SCRIPT = pathlib.Path(__file__).resolve()
+SKILL = SCRIPT.parent.parent
 HERDR = os.environ.get("HERDR_BIN", "herdr")
 HERDR_TIMEOUT = 90  # seconds for one herdr call, so a herdr that hangs cannot hang a command for ever
 TABLE = tomllib.loads((SKILL / "harnesses.toml").read_text())  # harness -> its data
@@ -48,10 +52,11 @@ OPERATOR = "operator"  # the operator's @name, unless `[operator] name` in facto
 TABS = {"operator": "factory operator", "team": "factory team"}  # herdr tab labels
 HC = os.environ.get("HC_BIN", "hc")
 HC_MIN = (0, 1, 20)
-VERSION = hashlib.sha1(pathlib.Path(__file__).read_bytes()).hexdigest()[:12]
+VERSION = hashlib.sha1(SCRIPT.read_bytes()).hexdigest()[:12]
 TICK = 1.0
 LATCH_AFTER = 5
 BEAT_STALE = 30
+KEEPER_START = 5
 SAY_WAIT = 10
 LAUNCH_TIMEOUT = 60
 QUIET_GRACE = 120
@@ -349,6 +354,18 @@ def session_key():
     return re.sub(r"[^A-Za-z0-9_.-]", "-", session)[:24] + "-" + hashlib.sha1(session.encode()).hexdigest()[:8]
 
 
+def cache_base():
+    return pathlib.Path(os.environ.get("XDG_CACHE_HOME") or pathlib.Path.home() / ".cache")
+
+
+def team_key(root):
+    return f"{root.name[:24]}-{hashlib.sha1(str(root).encode()).hexdigest()[:8]}"
+
+
+def state_dir(root, core):
+    return pathlib.Path(_absolute(cache_base() / "factory-skill" / team_key(root) / core[:8]))
+
+
 def parse_role(path):
     _, head, body = path.read_text().split("---\n", 2)
     meta = {}
@@ -423,9 +440,7 @@ class Config:
     def cache(self):
         """Per-repo scratch outside the repo: members' prompt files and the sessions `up` resumes from.
         The path is short on purpose: it is typed into a shell line that macOS limits to 1024 bytes."""
-        base = pathlib.Path(os.environ.get("XDG_CACHE_HOME") or pathlib.Path.home() / ".cache")
-        key = f"{self.root.name[:24]}-{hashlib.sha1(str(self.root).encode()).hexdigest()[:8]}"
-        return base / "factory-skill" / key
+        return cache_base() / "factory-skill" / team_key(self.root)
 
     @property
     def session_dir(self):
@@ -797,6 +812,10 @@ class Box:
         return [(msg, r) for ident, msg in sorted(self.msgs.items()) for r in msg["to"]
                 if (to is None or r == to) and self.outcome(ident, r)["o"] not in FINAL]
 
+    def sending_terms(self):
+        self._usable()
+        return {rec["term"] for rec in self.outcomes.values() if rec["o"] == "sending"}
+
     # derived facts (message_log.md "Derived facts")
 
     def last_to(self, name, sender=None):
@@ -892,7 +911,7 @@ class Log:
         except FileNotFoundError:
             return False
 
-    def _open_state(self, create):
+    def open_dir(self, create):
         """A no-follow descriptor of the state directory, or None for a reader when it does not exist. The cache
         base may be the owner's symbolic link; every component below it is opened (or created) one at a time
         relative to its parent's descriptor, never through a symbolic link."""
@@ -945,12 +964,15 @@ class Log:
                           " directory, check before resending")
 
     @contextlib.contextmanager
-    def _locked(self, exclusive):
+    def locked(self, exclusive):
         """The team lock is the state directory itself, flocked through the same no-follow descriptor every operation
         uses, so no two writers can append to one log under different locks. A writer then checks that the state path
         still names that directory: one moved or replaced meanwhile is damage, with nothing written. Writers create
-        the private directory; readers create nothing."""
-        directory = self._open_state(create=exclusive)
+        the private directory; readers create nothing.
+
+        Do only descriptor-relative file operations here. Public Log methods and the team metadata helpers
+        take their own lock, so calling them inside this context would wait on the lock already held."""
+        directory = self.open_dir(create=exclusive)
         if directory is None:
             yield None
             return
@@ -1009,7 +1031,7 @@ class Log:
 
     def read_box(self):
         """(records, box): one full, validated read and the box it built. Raises LogDamage."""
-        with self._locked(exclusive=False) as fd:
+        with self.locked(exclusive=False) as fd:
             if fd is None:
                 return [], Box(self.path)
             records, _, box = self._snapshot(0)
@@ -1019,12 +1041,22 @@ class Log:
         """(records, end) from byte offset; offset 0 validates the whole log. Raises LogDamage."""
         if type(offset) is not int or offset < 0:
             raise ValueError(f"offset must be a non-negative integer, not {offset!r}")
-        with self._locked(exclusive=False) as fd:
+        with self.locked(exclusive=False) as fd:
             if fd is None:
                 if offset:
                     raise LogDamage(self.path, None, f"the log was removed (reader was at byte {offset})")
                 return [], 0
             return self._snapshot(offset)[:2]
+
+    def refresh(self, box):
+        """Bring a full box up to the validated log, reading just the tail when its lineage still matches."""
+        if box._only is not None:
+            raise ValueError("a partial box cannot validate the log")
+        with self.locked(exclusive=False) as fd:
+            if fd is None:
+                box._reset()
+            else:
+                self._refresh(box)
 
     # ---------------------------------------------------------------- the checkpoint
 
@@ -1194,7 +1226,7 @@ class Log:
             self._line(rec)   # serializable (no NaN, no foreign objects in meta) before anything is touched
         except (TypeError, ValueError) as error:
             raise ValueError(f"message is not JSON-serializable: {error}") from error
-        with self._locked(exclusive=True):
+        with self.locked(exclusive=True):
             ident = self._prefix() + 1
             self._first_log()
             rec["id"] = ident
@@ -1274,7 +1306,7 @@ class Log:
     def out(self, box, ident, to, o, **extra):
         """Record one outcome if the pair's current outcome allows it; returns whether it wrote."""
         rec = self._check_out(box, ident, to, o, extra)
-        with self._locked(exclusive=True):
+        with self.locked(exclusive=True):
             self._refresh(box)
             return self._out_locked(box, rec)
 
@@ -1283,7 +1315,7 @@ class Log:
         names = set(names)
         if not (isinstance(why, str) and why.strip()):
             raise ValueError("dropped needs a reason")
-        with self._locked(exclusive=True):
+        with self.locked(exclusive=True):
             self._refresh(box)
             written = 0
             for msg, to in box.pending():
@@ -1336,7 +1368,7 @@ class Log:
     def remove_delivered_file(self, box, ident):
         """After a delivered receipt: unlink the message's managed file once every recipient has it.
         Returns a warning naming the path when the unlink failed, else None."""
-        with self._locked(exclusive=True):
+        with self.locked(exclusive=True):
             self._refresh(box)
             msg = box.msgs.get(ident)
             if msg is None or "file" not in msg or self._newest_use(box, msg["from"], msg["file"]) is not msg:
@@ -1359,7 +1391,7 @@ class Log:
         was delivered to every recipient are removed silently. Symbolic links and non-regular entries are ignored."""
         now = time.time() if now is None else now
         rows, warnings = [], []
-        with self._locked(exclusive=True):
+        with self.locked(exclusive=True):
             box = self._full_box()
             try:
                 messages = os.open("messages", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=self._dir)
@@ -1463,193 +1495,918 @@ def format_leftovers(rows):
     return lines
 
 
-class InboxDamage(ValueError):
-    def __init__(self, path, line, reason):
-        super().__init__(f"inbox needs repair: {path}, line {line}: {reason}. Operator messages are unavailable."
-                         " After repairing the file, run factory.py up.")
+# ================================================================ v2 team state
+
+def open_log(state):
+    raw = os.fspath(state)
+    path = pathlib.Path(raw)
+    if lexical_path(raw) != raw or len(path.parents) < 3 or path.parent.parent.name != "factory-skill":
+        raise Problem(f"{state} is not a Factory state directory", "run factory.py up")
+    return Log(path, base=path.parents[2])
 
 
-class Inbox:
-    """Session-local transport. Hold the stable lock for file operations, never while waiting on agents."""
-    def __init__(self, cfg):
-        self.directory = cfg.cache
-        self.path = self.directory / f"inbox-{session_key()}.jsonl"
-        self.state_path = self.path.with_suffix(".json")
-        self.lock_path = self.path.with_suffix(".lock")
+def _validate_team(team):
+    if not isinstance(team, dict) or type(team.get("v")) is not int or team["v"] != 1:
+        raise ValueError("expected a version 1 object")
+    for key in ("root", "team", "core"):
+        if not isinstance(team.get(key), str) or not team[key]:
+            raise ValueError(f"expected a non-empty {key}")
+    if "up" in team and type(team["up"]) is not bool:
+        raise ValueError("expected up to be true or false")
+    if "stopped" in team and (not isinstance(team["stopped"], list)
+                              or not all(isinstance(term, str) and term for term in team["stopped"])):
+        raise ValueError("expected stopped to list terminal IDs")
 
-    private_open = staticmethod(private_open)
 
-    def __enter__(self):
-        for path in (self.directory.parent, self.directory):
-            path.mkdir(parents=True, exist_ok=True, mode=0o700)
-            if not stat.S_ISDIR(path.stat().st_mode):
-                raise OSError(f"not a directory: {path}")
-            if stat.S_IMODE(path.stat().st_mode) != 0o700:
-                path.chmod(0o700)
-        self.lock = self.private_open(self.lock_path, os.O_CREAT | os.O_RDWR)
+def _read_team_file(state, directory):
+    if directory is None:
+        return {}
+    try:
         try:
-            fcntl.flock(self.lock, fcntl.LOCK_EX)
-            self.state = self.read_state()
-            raw = self.read(self.path) or b""
-            if raw and not raw.endswith(b"\n"):
-                raise InboxDamage(self.path, raw.count(b"\n") + 1, "incomplete line")
-            self.rows = [self.decode(line, self.path, n) for n, line in enumerate(raw.splitlines(), 1)]
-            self.validate_rows(self.rows, self.path)
-            return self
-        except BaseException:
-            os.close(self.lock)
-            raise
+            fd = private_open("team.json", os.O_RDONLY, fix_mode=False, dir_fd=directory)
+        except FileNotFoundError:
+            return {}
+        with os.fdopen(fd, "rb") as stream:
+            team = json.load(stream)
+        _validate_team(team)
+        return team
+    except (OSError, ValueError) as error:
+        raise Problem(f"{state}/team.json cannot be read: {error}", "run factory.py up") from error
 
-    def __exit__(self, *_):
-        os.close(self.lock)
 
-    def read(self, path):
+def read_team(state):
+    log = open_log(state)
+    try:
+        with log.locked(exclusive=False) as directory:
+            return _read_team_file(log.state, directory)
+    except (LogDamage, OSError) as error:
+        raise Problem(f"{log.state}/team.json cannot be read: {error}", "run factory.py up") from error
+
+
+def _write_team_file(directory, team):
+    _validate_team(team)
+    data = json.dumps(team, allow_nan=False).encode() + b"\n"
+    temp = f"team.json.{secrets.token_hex(8)}.tmp"
+    fd = private_open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, dir_fd=directory)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp, "team.json", src_dir_fd=directory, dst_dir_fd=directory)
+        os.fsync(directory)
+    except OSError:
+        with contextlib.suppress(OSError):
+            os.unlink(temp, dir_fd=directory)
+        raise
+
+
+def update_team(state, reset=False, **changes):
+    log = open_log(state)
+    with log.locked(exclusive=True) as directory:
+        current = {} if reset else _read_team_file(log.state, directory)
+        team = {"v": 1, **current, **changes}
+        _write_team_file(directory, team)
+        return team
+
+
+def mark_stopped(state, terms, box):
+    """Remember explicit stops before removing those terminals, so delayed refusals do not requeue."""
+    log = open_log(state)
+    with log.locked(exclusive=True) as directory:
+        team = _read_team_file(log.state, directory)
+        if not team:
+            raise Problem(f"no team.json in {log.state}", "run factory.py up")
+        log._refresh(box)
+        claimed = box.sending_terms()
+        keep = [term for term in team.get("stopped", []) if term in claimed]
+        team["stopped"] = list(dict.fromkeys([*keep, *terms]))
+        _write_team_file(directory, team)
+
+
+def settle_refusal(log, box, ident, to, term, why):
+    """Settle a member's definite pre-typing refusal against stop evidence under the same lock."""
+    with log.locked(exclusive=True) as directory:
+        team = _read_team_file(log.state, directory)
+        if not team:
+            raise Problem(f"no team.json in {log.state}", "run factory.py up")
+        log._refresh(box)
+        current = box.outcome(ident, to)
+        if current["o"] != "sending" or current["term"] != term:
+            return None
+        stopped = term in team.get("stopped", [])
+        outcome = "dropped" if stopped else "queued"
+        rec = log._check_out(box, ident, to, outcome, {"why": "stopped by down" if stopped else why})
+        return outcome if log._out_locked(box, rec) else None
+
+
+def _offline_state(cfg):
+    """Find the checkout's newest log, or its newest metadata-only state."""
+    base = pathlib.Path(_absolute(cache_base()))
+    parent = base / "factory-skill" / team_key(cfg.root)
+    candidates = []
+    try:
+        directory = Log(parent, base=base).open_dir(create=False)
+        if directory is None:
+            return None
         try:
-            fd = self.private_open(path, os.O_RDONLY)
+            with os.scandir(directory) as entries:
+                names = [entry.name for entry in entries if entry.is_dir(follow_symlinks=False)]
+            for name in names:
+                state = parent / name
+                try:
+                    child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+                except (FileNotFoundError, NotADirectoryError):
+                    continue
+                try:
+                    for priority, filename in enumerate((Log.LOG, "team.json")):
+                        try:
+                            info = os.stat(filename, dir_fd=child, follow_symlinks=False)
+                        except FileNotFoundError:
+                            continue
+                        if not stat.S_ISREG(info.st_mode):
+                            raise Problem(f"not a regular file: {state / filename}", "run factory.py up")
+                        candidates.append((priority, -info.st_mtime_ns, state))
+                        break
+                finally:
+                    os.close(child)
+        finally:
+            os.close(directory)
+    except OSError as error:
+        raise Problem(f"cannot inspect {parent}: {error}", "run factory.py up") from error
+    if not candidates:
+        return None
+    state = min(candidates)[2]
+    if len(candidates) > 1:
+        print(f"using {state}", file=sys.stderr)
+    return state
+
+
+def state_for(cfg, hc):
+    if hc is None:
+        return _offline_state(cfg)
+    key = team_key(cfg.root)
+    records = hc.list(key)
+    view = View(records)
+    for record in (view.operator, view.keeper, *records):
+        label = record and record.get("labels", {}).get("factory.dir")
+        if label:
+            state = open_log(label).state
+            if state.parent.name != key or state.name != hc.core[:8]:
+                raise Problem(f"{state} does not match this checkout and hc core", "run factory.py up")
+            return state
+    return state_dir(cfg.root, hc.core)
+
+
+def resolve_team(args, hc):
+    """Return the formation, its state path and the caller's terminal when known."""
+    caller = None
+    terminal = os.environ.get("HC_TERMINAL_ID")
+    if hc is not None and terminal:
+        try:
+            caller = hc.get(terminal)
+        except HcError as error:
+            if error.kind != "not_found":
+                raise
+        labels = caller.get("labels", {}) if caller else {}
+        key, label = labels.get("factory.team"), labels.get("factory.dir")
+        if key and label:
+            if not isinstance(key, str) or not isinstance(label, str):
+                raise Problem("this pane has invalid Factory labels", "run factory.py up")
+            state = open_log(label).state
+            team = read_team(state)
+            if not team:
+                raise Problem(f"no team.json in {state}", "run factory.py up")
+            if (team["team"] != key or state.parent.name != key or state.name != team["core"][:8]
+                    or not os.path.isabs(team["root"])):
+                raise Problem(f"this pane's labels do not match {state}/team.json", "run factory.py up")
+            if team["core"] != hc.core:
+                raise Problem("this pane's hc is another core than the team's", "run factory.py up")
+            hc.expect_core = team["core"]
+            try:
+                cfg = Config(team["root"])
+            except SystemExit as error:
+                raise Problem(str(error), "run factory.py up") from error
+            if team_key(cfg.root) != key:
+                raise Problem(f"this pane's checkout does not match {state}/team.json", "run factory.py up")
+            return cfg, state, caller
+    cfg = Config(getattr(args, "cwd", None) or os.getcwd())
+    return cfg, state_for(cfg, hc), caller
+
+
+def find_team(args):
+    hc = Hc() if os.environ.get("HC_TERMINAL_ID") else None
+    try:
+        return resolve_team(args, hc)
+    except HcDown:
+        return resolve_team(args, None)
+
+
+def pending_lines(state, operator, now=None):
+    if state is None:
+        return ["pending: none"]
+    try:
+        _, box = open_log(state).read_box()
+    except LogDamage as error:
+        return [str(error)]
+    except (Problem, OSError) as error:
+        return [f"message log unavailable: {error}"]
+    pairs = collections.defaultdict(list)
+    for msg, name in box.pending():
+        pairs[name].append(msg)
+    now = time.time() if now is None else now
+    parts = []
+    for name, messages in pairs.items():
+        oldest = messages[0]
+        seconds = max(0, int(now - datetime.datetime.fromisoformat(oldest["at"]).timestamp()))
+        minutes, seconds = divmod(seconds, 60)
+        hours, minutes = divmod(minutes, 60)
+        age = f"{hours}h{minutes}m" if hours else f"{minutes}m" if minutes else f"{seconds}s"
+        outcome = box.outcome(oldest["id"], name)
+        reason = outcome["why"] if outcome["o"] == "queued" else outcome["o"]
+        parts.append(f"@{name} {len(messages)} (oldest {age}, {reason})")
+    lines = ["pending: " + ("; ".join(parts) if parts else "none")]
+    if operator in pairs:
+        lines.append(f"read them with: factory.py inbox --for {operator}")
+    if box.uncommitted:
+        noun = "entry" if box.uncommitted == 1 else "entries"
+        lines.append(f"log: {box.uncommitted} uncommitted {noun} (never delivered)")
+    return lines
+
+
+def print_pending(args, operator):
+    """Bridge for the old up/status commands until Phase 5a replaces their launch and pane logic."""
+    try:
+        state = find_team(args)[1]
+    except (Problem, HcError) as error:
+        print(f"pending: unavailable ({error})")
+        return
+    print("\n".join(pending_lines(state, operator)))
+
+
+# ================================================================ keeper delivery
+
+def head_of(name, box, ready):
+    """The next message for a recipient and any older startup briefs it supersedes."""
+    pending = [msg for msg, _ in box.pending(name)]
+    if not ready:
+        briefs = [msg for msg in pending if msg["kind"] == "brief"]
+        if briefs:
+            return briefs[-1], briefs[:-1]
+    return (pending[0] if pending else None), []
+
+
+def _quiet_or_ready_note(msg):
+    return msg["kind"] == "note" and (msg.get("meta") or {}).get("what") in ("quiet", "ready")
+
+
+def decide(name, msg, view, box, cfg, now, op_null_since, still_true=True):
+    """Choose the first matching delivery action from keeper.md's decision table."""
+    if name == cfg.operator["name"]:
+        if _quiet_or_ready_note(msg) and not still_true:
+            return "drop", "no longer true"
+        terminal = view.operator
+        if terminal is None:
+            return "queue", "gone"
+        status = terminal.get("status")
+        if status is None:
+            if op_null_since is not None and now - op_null_since >= LATCH_AFTER:
+                return "latch",
+            return "hold",
+        if status["state"] == "blocked":
+            return "queue", "blocked"
+        return "send", terminal["address"]
+
+    state = view.state(name)
+    if state == "not started":
+        return "drop", "stopped by down"
+    if state == "gone":
+        return "queue", "gone"
+    if state == "starting":
+        return "hold",
+    terminal = view.terminal(name)
+    if msg["kind"] != "brief" and terminal["address"] not in box.briefed():
+        return "queue", "not ready"
+    if state == "blocked":
+        return "queue", "blocked"
+    return "send", terminal["address"]
+
+
+class Keeper:
+    """One delivery loop. Only the main thread changes the log and per-recipient claims."""
+
+    def __init__(self, state, hc, clock=time, emit=print, spawn=None):
+        self.log = open_log(state)
+        self.state = self.log.state
+        self.hc, self.clock, self.emit = hc, clock, emit
+        self.spawn = self._spawn if spawn is None else spawn
+        self.box = Box(self.log.path)
+        self.cfg = None
+        self._cfg_stamp = None
+        self.team = {}
+        self.results = queue.Queue()
+        self.unsettled = []
+        self.inflight = {}
+        self.held = set()
+        self.op_null_since = None
+        self._null_terminal = None
+        self.damaged = None
+        self._retry_log_at = 0
+        self._reported_errors = {}
+        self._beat_fd = None
+        self.stop = None
+
+    @staticmethod
+    def _spawn(job):
+        threading.Thread(target=job, daemon=True).start()
+
+    def _report(self, key, message):
+        now = self.clock.monotonic()
+        prior = self._reported_errors.get(key)
+        if prior is None or now - prior >= 60:
+            self.emit(message)
+            self._reported_errors[key] = now
+
+    def _stop_on_signal(self, *_):
+        self.stop = "signal"
+
+    def run(self):
+        try:
+            with contextlib.ExitStack() as resources:
+                directory = self.log.open_dir(create=False)
+                if directory is None:
+                    self.emit(f"no state directory: {self.state}")
+                    return 0
+                resources.callback(os.close, directory)
+                lock = private_open("keeper.lock", os.O_CREAT | os.O_RDWR, dir_fd=directory)
+                resources.callback(os.close, lock)
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    self.emit("keeper already running")
+                    return 0
+                resources.callback(self.hc.kill_children)
+                if threading.current_thread() is threading.main_thread():
+                    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+                        previous = signal.signal(sig, self._stop_on_signal)
+                        resources.callback(signal.signal, sig, previous)
+                if not self._read_team():
+                    return 0
+                if self._load():
+                    self._recover("keeper restarted during the send")
+                terminal = os.environ["HC_TERMINAL_ID"]
+                beat = private_open("keeper.beat", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, dir_fd=directory)
+                resources.callback(os.close, beat)
+                self._beat_fd = beat
+                with os.fdopen(os.dup(beat), "w") as stream:
+                    stream.write(f"{os.getpid()} {VERSION} {terminal}\n")
+                try:
+                    self.hc.label(terminal, {"factory.version": VERSION})
+                except (HcError, HcDown) as error:
+                    self._report("label", str(error))
+                self.emit(f"keeper {VERSION} started")
+                while not self.stop:
+                    self.tick()
+                    if not self.stop:
+                        try:
+                            result = self.results.get(timeout=TICK)
+                        except queue.Empty:
+                            continue
+                        self.results.put(result)
+        except Exception as error:
+            self.stop = str(error)
+        finally:
+            self._beat_fd = None
+        if self.stop:
+            self.emit(f"keeper stopping: {self.stop}")
+        return 0
+
+    def _read_team(self):
+        try:
+            team = read_team(self.state)
+            if not team:
+                raise Problem(f"no team.json in {self.state}", "run factory.py up")
+            if team["team"] != self.state.parent.name or team["core"][:8] != self.state.name:
+                raise Problem(f"{self.state}/team.json does not match its directory", "run factory.py up")
+        except Problem as error:
+            self._report("team", f"team.json: {error}")
+            return False
+        self.team = team
+        return True
+
+    def _read_config(self):
+        root = self.team["root"]
+        try:
+            stamp = root, (pathlib.Path(root) / CONF).stat().st_mtime_ns
+            if self._cfg_stamp != stamp:
+                self.cfg = Config(root)
+                self._cfg_stamp = stamp
+        except (SystemExit, OSError) as error:
+            self._report("config", f"factory.toml: {error}")
+
+    def _log_failed(self, error):
+        if self.damaged is None:
+            self._retry_log_at = self.clock.monotonic() + 60
+        self.damaged = str(error)
+        self._report("log", self.damaged)
+
+    def _load(self):
+        try:
+            _, self.box = self.log.read_box()
+        except (LogDamage, OSError) as error:
+            self._log_failed(error)
+            return False
+        self.damaged = None
+        return True
+
+    def _recover(self, why):
+        try:
+            for msg, recipient in self.box.pending():
+                ident = msg["id"]
+                if self.inflight.get(recipient) != ident and self.box.outcome(ident, recipient)["o"] == "sending":
+                    self._record(msg, recipient, "unconfirmed", why=why)
+        except (LogDamage, NotStored, OSError) as error:
+            self._log_failed(error)
+
+    def tick(self):
+        if self._beat_fd is not None:
+            os.utime(self._beat_fd)
+        previous = set(self.inflight.items())
+        self._drain_results()
+        if not self._read_team():
+            return
+        self._read_config()
+        try:
+            view = team_view(self.hc, self.team["team"])
+        except (HcDown, HcError) as error:
+            self._report("hc", f"hc unreachable: {error}")
+            return
+        now = self.clock.monotonic()
+        if self.damaged is not None:
+            self._report("log", self.damaged)
+            if now >= self._retry_log_at:
+                self._retry_log_at = now + 60
+                if self._load():
+                    self.emit("message log readable again")
+                    self._recover("keeper could not record the send")
+        else:
+            try:
+                self.log.refresh(self.box)
+            except (LogDamage, OSError) as error:
+                self._log_failed(error)
+        null_terminal = (view.operator["address"] if view.operator and view.operator.get("status") is None else None)
+        if null_terminal != self._null_terminal:
+            self._null_terminal = null_terminal
+            self.op_null_since = now if null_terminal is not None else None
+        for recipient, ident in self.inflight.items():
+            pair = recipient, ident
+            if pair in previous and pair not in self.held and ident in self.box.msgs:
+                self.held.add(pair)
+                self._emit_outcome(self.box.msgs[ident], recipient, "sending (held)")
+        if self.cfg is None or self.stop:
+            return
+        try:
+            if self.damaged is None:
+                self._deliver(view, now)
+            operator = self.cfg.operator["name"]
+            if (self.team.get("up") is not True and not self.inflight
+                    and (not view.operator or view.operator.get("status") is None or not self.box.pending(operator))):
+                self.stop = "team is down"
+        except (LogDamage, NotStored, OSError) as error:
+            self._log_failed(error)
+
+    def _emit_outcome(self, msg, recipient, outcome, why=None):
+        stamp = time.strftime("%H:%M:%S", time.localtime(self.clock.time()))
+        sender = "factory" if msg["kind"] == "note" else f"@{msg['from']}"
+        suffix = f": {why[:80]}" if why else ""
+        self.emit(f"{stamp} #{msg['id']} {sender} -> @{recipient} {outcome}{suffix}")
+
+    def _record(self, msg, name, outcome, **extra):
+        if not self.log.out(self.box, msg["id"], name, outcome, **extra):
+            return False
+        if outcome != "sending":
+            self._emit_outcome(msg, name, outcome, extra.get("why"))
+        return True
+
+    def _deliver(self, view, now):
+        operator = self.cfg.operator["name"]
+        recipients = dict.fromkeys(name for _, name in self.box.pending())
+        briefed = self.box.briefed()
+        for name in recipients:
+            if self.stop:
+                return
+            if name in self.inflight:
+                continue
+            terminal = view.terminal(name)
+            ready = name == operator or (terminal and terminal["address"] in briefed)
+            msg, superseded = head_of(name, self.box, ready)
+            for old in superseded:
+                self._record(old, name, "dropped", why="superseded")
+            if msg is None:
+                continue
+            action, *detail = decide(name, msg, view, self.box, self.cfg, now, self.op_null_since)
+            if action == "hold":
+                continue
+            if action == "latch":
+                try:
+                    self.hc.label(view.operator["address"], {"factory.kind": "operator-lost"})
+                except (HcError, HcDown) as error:
+                    self._report("latch", f"could not mark operator lost: {error}")
+                    continue
+                action, detail = "queue", ["gone"]
+            if action == "send":
+                self._claim(msg, name, detail[0])
+                continue
+            why = detail[0]
+            outcome = "queued" if action == "queue" else "dropped"
+            if why in ("gone", "not ready", "stopped by down"):
+                for pending, _ in self.box.pending(name):
+                    if self.box.outcome(pending["id"], name)["o"] == "queued":
+                        self._record(pending, name, outcome, why=why)
+            else:
+                self._record(msg, name, outcome, why=why)
+
+    def _claim(self, msg, name, term):
+        if self.stop or not self._record(msg, name, "sending", term=term) or self.stop:
+            return
+        ident = msg["id"]
+        current = self.box.msgs[ident]
+        sender = "factory" if current["kind"] == "note" else f"@{current['from']}"
+        wire = f"[from {sender}]\n{current['text']}"
+        if not wire.endswith("\n"):
+            wire += "\n"
+        self.inflight[name] = ident
+        try:
+            self.spawn(functools.partial(self._send, name, ident, term, wire))
+        except RuntimeError as error:
+            self.results.put((name, ident, term, HcDown(False, str(error))))
+
+    def _send(self, name, ident, term, wire):
+        try:
+            if self.stop:
+                raise HcDown(False, "keeper stopped before sending")
+            result = self.hc.send(term, wire)
+        except Exception as error:
+            result = error
+        self.results.put((name, ident, term, result))
+
+    def _drain_results(self):
+        pending, self.unsettled = self.unsettled, []
+        while True:
+            try:
+                pending.append(self.results.get_nowait())
+            except queue.Empty:
+                break
+        for name, ident, term, result in pending:
+            if self.inflight.get(name) != ident:
+                continue
+            try:
+                self._settle_result(name, ident, term, result)
+            except Problem as error:
+                self.unsettled.append((name, ident, term, result))
+                self._report("team", f"team.json: {error}")
+                continue
+            except (LogDamage, NotStored, OSError) as error:
+                self._log_failed(error)
+            self.inflight.pop(name)
+            self.held.discard((name, ident))
+
+    def _settle_result(self, name, ident, term, result):
+        msg = self.box.msgs.get(ident)
+        if msg is None:
+            return
+        if isinstance(result, dict):
+            started = result.get("started")
+            if type(result.get("turn")) is int and (started is None or type(started) is bool):
+                if self._record(msg, name, "delivered", term=term, started=started, turn=result["turn"]):
+                    warning = self.log.remove_delivered_file(self.box, ident)
+                    if warning:
+                        self.emit(warning)
+            else:
+                self._record(msg, name, "unconfirmed", why="hc returned an unexpected result", term=term)
+            return
+        why = None
+        if isinstance(result, HcDown) and not result.sent:
+            why = "waiting"
+        elif isinstance(result, HcError):
+            why = {"blocked": "blocked", "not_found": "gone", "finished": "gone"}.get(result.kind)
+        if why is None:
+            detail = " ".join(str(result).split())[:200] or type(result).__name__
+            self._record(msg, name, "unconfirmed", why=detail, term=term)
+        elif _quiet_or_ready_note(msg):
+            self._record(msg, name, "dropped", why="operator could not take it", term=term)
+        elif name == self.cfg.operator["name"]:
+            self._record(msg, name, "queued", why=why)
+        else:
+            outcome = settle_refusal(self.log, self.box, ident, name, term, why)
+            if outcome:
+                self._emit_outcome(msg, name, outcome, self.box.outcome(ident, name)["why"])
+
+
+def cmd_keeper(args):
+    if not os.environ.get("HC_TERMINAL_ID"):
+        print("the keeper runs only in an hc terminal")
+        return
+    try:
+        team = read_team(args.state)
+    except Problem as error:
+        print(error)
+        return
+    if not team:
+        print(f"no team.json in {args.state}")
+        return
+    Keeper(args.state, Hc(timeout=10, expect_core=team["core"]), emit=functools.partial(print, flush=True)).run()
+
+
+def read_beat(state):
+    """Return the keeper PID, version, terminal ID and age, or None without a valid beat."""
+    directory = open_log(state).open_dir(create=False)
+    if directory is None:
+        return None
+    try:
+        try:
+            fd = private_open("keeper.beat", os.O_RDONLY, fix_mode=False, dir_fd=directory)
         except FileNotFoundError:
             return None
-        with os.fdopen(fd, "rb") as f:
-            return f.read()
+        with os.fdopen(fd, "r", encoding="utf-8") as stream:
+            try:
+                pid, version, terminal = stream.read(1024).split()
+                return int(pid), version, terminal, time.time() - os.fstat(stream.fileno()).st_mtime
+            except ValueError:
+                return None
+    finally:
+        os.close(directory)
 
-    def read_state(self):
-        raw = self.read(self.state_path)
-        if raw is None:
-            return {"seen": 0}
-        state = self.decode(raw, self.state_path, 1)
-        if not isinstance(state, dict) or type(state.get("seen")) is not int or state["seen"] < 0:
-            raise InboxDamage(self.state_path, 1, "expected non-negative integer seen")
-        history = state.get("history", [])
-        self.validate_rows(history, self.state_path)
-        if len(history) > 100 or (history and history[-1]["id"] > state["seen"]):
-            raise InboxDamage(self.state_path, 1, "expected at most 100 acknowledged history entries, none above seen")
-        return {"seen": state["seen"], "history": history}
 
-    @staticmethod
-    def decode(raw, path, line):
+def _take_keeper_start(lock):
+    deadline = time.monotonic() + 15
+    while True:
         try:
-            return json.loads(raw)
-        except (ValueError, UnicodeError) as e:
-            raise InboxDamage(path, line, str(e)) from e
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise Problem("another command is starting the keeper", "run factory.py status") from None
+            time.sleep(0.1)
 
-    @staticmethod
-    def validate_rows(rows, path):
-        if not isinstance(rows, list):
-            raise InboxDamage(path, 1, "expected a list of messages")
-        last = 0
-        for n, row in enumerate(rows, 1):
-            if (not isinstance(row, dict) or type(row.get("id")) is not int or row["id"] <= last
-                    or not all(isinstance(row.get(k), str) for k in ("at", "from", "text"))):
-                raise InboxDamage(path, n, "expected increasing positive id and at/from/text strings")
-            last = row["id"]
 
-    @property
-    def unread(self):
-        return [r for r in self.rows if r["id"] > self.state["seen"]]
+def _wait_for_beat(state, hc, terminal):
+    begin = time.monotonic()
+    next_poll = begin
+    while True:
+        beat = read_beat(state)
+        if beat and beat[2] == terminal:
+            return terminal
+        now = time.monotonic()
+        if now >= next_poll:
+            try:
+                finished = hc.get(terminal)["state"] == "finished"
+            except HcError as error:
+                if error.kind != "not_found":
+                    raise
+                raise Problem("the keeper did not start: terminal disappeared", "run factory.py status") from error
+            if finished:
+                lines = [line.strip() for line in hc.read(terminal).splitlines() if line.strip()]
+                hc.rm(terminal)
+                raise Problem(f"the keeper did not start: {lines[-1] if lines else 'terminal exited'}",
+                              "run factory.py status")
+            next_poll = now + 1
+        if now - begin >= KEEPER_START:
+            return terminal
+        time.sleep(0.1)
 
-    @property
-    def highest(self):
-        return max([self.state["seen"], *(r["id"] for r in self.rows)])
 
-    def sync_directory(self):
-        fd = os.open(self.directory, os.O_RDONLY | os.O_DIRECTORY)
+def ensure_keeper(cfg, state, hc, view, force=False):
+    """Return this team's keeper terminal, starting it headless if it is missing or stale."""
+    team = read_team(state)
+    if not team:
+        raise Problem(f"no team.json in {state}", "run factory.py up")
+    log = open_log(state)
+    if not force and team.get("up") is not True and not log.read_box()[1].pending(cfg.operator["name"]):
+        return None
+    directory = log.open_dir(create=False)
+    if directory is None:
+        raise Problem(f"no state directory: {state}", "run factory.py up")
+    with contextlib.ExitStack() as resources:
+        resources.callback(os.close, directory)
+        lock = private_open("keeper.start", os.O_CREAT | os.O_RDWR, dir_fd=directory)
+        resources.callback(os.close, lock)
+        _take_keeper_start(lock)
+        records = hc.list(team["team"])
+        view = View(records)  # the caller's view preceded acquisition of the start lock
+        if view.keeper is not None:
+            term = view.keeper["address"]
+            beat = read_beat(state)
+            if (beat and beat[2] == term and beat[3] <= BEAT_STALE
+                    or time.time() - view.keeper["created_ms"] / 1000 < BEAT_STALE):
+                return term
+            try:
+                records.append(hc.kill(term))
+            except HcError as error:
+                if error.kind == "finished":
+                    records.append({**view.keeper, "state": "finished"})
+                elif error.kind != "not_found":
+                    raise
+        for record in records:
+            if record["labels"].get("factory.kind") == "keeper" and record["state"] == "finished":
+                try:
+                    hc.rm(record["address"])
+                except HcError as error:
+                    if error.kind != "not_found":
+                        raise
+        argv = [sys.executable, str(SCRIPT), "keeper", "--state", str(log.state)]
+        env = {"PATH": os.environ.get("PATH", "")}
+        if "HC_BIN" in os.environ:
+            env["HC_BIN"] = os.environ["HC_BIN"]
+        labels = {"factory.team": team["team"], "factory.kind": "keeper", "factory.dir": str(log.state),
+                  "factory.version": VERSION, "name": "keeper"}
+        terminal = hc.run(argv, cwd=team["root"], env=env, labels=labels)["address"]
+        return _wait_for_beat(log.state, hc, terminal)
+
+
+def wait_outcomes(log, ident, recipients, offset, timeout=SAY_WAIT):
+    """Follow only this message from its commit, without rereading the log prefix."""
+    box = Box.for_message(log.path, ident, recipients, offset)
+    deadline = time.monotonic() + timeout
+    while True:
+        records, offset = log.read(offset)
+        box.apply(records)
+        outcomes = {name: box.outcome(ident, name) for name in recipients}
+        if all(record["o"] in FINAL or (record["o"] == "queued" and record["why"] != "waiting")
+               for record in outcomes.values()):
+            return outcomes
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return outcomes
+        time.sleep(min(0.2, remaining))
+
+
+def outcome_lines(outcomes, operator, sender):
+    lines, missing = [], []
+    for name, record in outcomes.items():
+        outcome = record["o"]
+        line = f"@{name}: {outcome_word(record)}"
+        if outcome in ("unconfirmed", "dropped"):
+            line += f" ({record['why']})"
+            missing.append(f"@{name}")
+        if name == operator and outcome == "queued" and record["why"] == "gone":
+            line += ": operator not running; message queued"
+        lines.append(line)
+    if missing:
+        instruction = "Do not resend unless asked"
+        if sender != operator:
+            instruction += f"; tell @{operator}"
+        lines.append(f"{', '.join(missing)} may not have it. {instruction}.")
+    return lines, int(bool(missing))
+
+
+def _say_payload(args, state, sender, is_member):
+    if args.file is None:
+        if args.message is None:
+            raise ValueError("give a message or --file")
+        if is_member:
+            raise ValueError("members send with --file")
+        text, recorded = args.message, None
+    else:
+        path = args.file
+        recorded = path if os.path.isabs(path) else os.path.join(os.getcwd(), path)
+        lexical = lexical_path(recorded)
+        if (lexical is not None and pathlib.Path(lexical).parent == state / "messages" / sender
+                and not MESSAGE_FILE.fullmatch(os.path.basename(lexical))):
+            raise ValueError("use letters, digits and dashes in the draft name, plus a plain extension such as .md")
         try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-
-    def replace(self, path, data):
-        fd, name = tempfile.mkstemp(prefix=path.name + ".", dir=self.directory)
-        try:
-            with os.fdopen(fd, "wb") as f:
-                f.write(data)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(name, path)
-            self.sync_directory()
-        finally:
-            pathlib.Path(name).unlink(missing_ok=True)
-
-    def save_state(self):
-        self.replace(self.state_path, (json.dumps(self.state) + "\n").encode())
-
-    def remove_seen(self):
-        unread = self.unread
-        if len(unread) != len(self.rows):
-            self.replace(self.path, b"".join((json.dumps(r, ensure_ascii=False) + "\n").encode() for r in unread))
-            self.rows = unread
-
-    def acknowledge(self, seen):
-        if seen < 0 or seen > self.highest:
-            raise ValueError(f"invalid inbox id {seen}; highest is {self.highest}")
-        if seen > self.state["seen"]:
-            moved = [r for r in self.unread if r["id"] <= seen]
-            self.state["history"] = (self.state.get("history", []) + moved)[-100:]
-            self.state["seen"] = seen
-            self.save_state()  # Save recovery text and seen together before removing inbox rows.
-        self.remove_seen()
+            text = pathlib.Path(path).read_bytes().decode("utf-8")
+        except (OSError, ValueError) as error:
+            raise ValueError(f"cannot read message file {path}: {error}") from error
+    if not text.strip():
+        raise ValueError("give a non-empty message")
+    size = len(text.encode("utf-8"))
+    if size > MAX_TEXT:
+        raise ValueError(f"message is {size} bytes; the limit is {MAX_TEXT}. Write it to a file and send the path")
+    return text, recorded
 
 
-def print_messages(rows):
-    for row in rows:
-        print(f"[Message {row['id']} from @{row['from']} at {row['at']}]:")
-        print("\n".join("    " + line for line in row["text"].splitlines()))
+def cmd_say(args):
+    def refuse(reason):
+        print(f"nothing sent: {reason}", file=sys.stderr)
+        sys.exit(2)
+
+    if not os.environ.get("HC_TERMINAL_ID"):
+        refuse("run up first")
+    hc = Hc()
+    try:
+        cfg, state, me = resolve_team(args, hc)
+    except Problem as error:
+        refuse(f"{error.what}; {error.fix}")
+    except (HcDown, HcError) as error:
+        refuse(str(error))
+    except SystemExit:
+        refuse("run up first")
+    labels = me["labels"] if me else {}
+    if not labels.get("factory.team") or not labels.get("factory.dir"):
+        refuse("run up first")
+    kind = labels.get("factory.kind")
+    if kind == "keeper":
+        refuse("the keeper cannot send")
+    sender = labels.get("factory.member")
+    if kind not in ("member", "operator") or not isinstance(sender, str) or not sender:
+        refuse("run up first")
+    operator = cfg.operator["name"]
+    if kind == "member" and sender not in cfg.members:
+        refuse(f"@{sender} is no longer in factory.toml")
+    # Phase 5a: record_session(cfg, state, sender, me["address"]) for a member, before validation.
+    names = list(dict.fromkeys(name.lstrip("@") for name in re.findall(r"[^,\s]+", " ".join(args.to))))
+    try:
+        view = team_view(hc, labels["factory.team"])
+    except (HcDown, HcError) as error:
+        refuse(str(error))
+    if names == ["all"]:
+        names = [name for name in cfg.members if name != sender and view.terminal(name)]
+        if not names:
+            refuse("no other member is running")
+    if not names:
+        refuse("give a recipient")
+    for name in names:
+        if name != operator and name not in cfg.members:
+            refuse(f"@{name} is not on the team (members: {', '.join(cfg.members)})")
+        if name == sender:
+            refuse("choose another teammate as the recipient")
+        if name != operator and view.state(name) == "not started":
+            refuse(f"@{name} is not running")
+    try:
+        text, recorded = _say_payload(args, state, sender, kind == "member")
+    except ValueError as error:
+        refuse(str(error))
+    log = open_log(state)
+    try:
+        ident, offset, warning = log.add(sender, names, text, kind="say", file=recorded)
+    except LogDamage as error:
+        refuse(str(error))
+    except NotStored as error:
+        if error.partial:
+            print(f"not stored, and the log may now need repair: {error.detail}. Do not resend; tell the operator.",
+                  file=sys.stderr)
+        else:
+            print(f"not stored: {error.detail}. Nothing will be delivered. Check the disk, then send again.",
+                  file=sys.stderr)
+        sys.exit(2)
+    except OSError as error:
+        print(f"not confirmed stored: {error}. Do not resend; check factory.py inbox.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"message {ident}", flush=True)
+    if warning:
+        print(f"warning: {warning}", file=sys.stderr)
+    timeout = SAY_WAIT
+    try:
+        if ensure_keeper(cfg, state, hc, view) is None:
+            print(f"warning: the team is stopped. Message {ident} is stored and waits for factory.py up.",
+                  file=sys.stderr)
+            timeout = 0
+    except (Problem, HcDown, HcError, LogDamage, OSError) as error:
+        print(f"warning: the keeper is not running ({error}). Message {ident} is stored and will be delivered once"
+              " it runs; run factory.py status.", file=sys.stderr)
+        timeout = 0
+    try:
+        outcomes = wait_outcomes(log, ident, names, offset, timeout)
+    except (LogDamage, OSError) as error:
+        print(f"message {ident} is stored; its outcome could not be read: {error}. Do not resend; run factory.py inbox.",
+              file=sys.stderr)
+        sys.exit(1)
+    lines, code = outcome_lines(outcomes, operator, sender)
+    print("\n".join(lines))
+    sys.exit(code)
 
 
 def cmd_inbox(args):
-    require_herdr()
+    """Print committed messages addressed to the selected recipient."""
     if args.count < 1:
-        raise SystemExit("give a positive number of acknowledged messages")
-    cfg = cfg_of(args)
+        print("give a positive number of messages", file=sys.stderr)
+        sys.exit(2)
     try:
-        with Inbox(cfg) as inbox:
-            rows = inbox.state.get("history", [])[-args.count:]
-        print_messages(rows)
-        if not rows:
-            print("no acknowledged messages kept")
-    except (OSError, ValueError) as e:
-        print(e, file=sys.stderr)
-        raise SystemExit(2)
-
-
-def operator_wait(harness):
-    return TABLE.get(harness, {}).get("operator_wait")
-
-
-def report_pending_messages(cfg):
-    try:
-        with Inbox(cfg) as inbox:
-            inbox.remove_seen()
-            unread = inbox.unread
-        if unread:
-            print(f"{len(unread)} unread message{'s' if len(unread) != 1 else ''}"
-                  " from the earlier team; run factory.py wait --timeout 0")
-    except (InboxDamage, OSError) as e:
-        print(str(e) if isinstance(e, InboxDamage) else f"inbox unavailable: {e}")
-
-
-def message_text(args):
-    if bool(args.file) == (args.message is not None):
-        raise SystemExit("give a message or --file, not both")
-    try:
-        text = pathlib.Path(args.file).read_text() if args.file else args.message
-    except (OSError, UnicodeError) as e:
-        raise SystemExit(f"cannot read message file {args.file}: {e}") from None
-    if not text.strip():
-        raise SystemExit("give a non-empty message")
-    return text
-
-
-def remove_delivered_draft(cfg, sender, filename):
-    """Only consume the sender's own managed draft. Other --file inputs belong to the caller."""
-    if not filename:
-        return
-    path = pathlib.Path(filename).absolute()
-    directory = cfg.messages / sender
-    if path.parent == directory and not any(p.is_symlink() for p in (cfg.session_dir, cfg.messages, directory)):
-        try:
-            path.unlink(missing_ok=True)
-        except OSError as e:
-            print(f"delivered, but could not remove {path}: {e}. Discard it without resending.", file=sys.stderr)
+        cfg, state, caller = find_team(args)
+        if state is None:
+            raise Problem(f"no team state for {cfg.root}", "run factory.py up")
+        labels = caller.get("labels", {}) if caller else {}
+        if args.for_name is not None:
+            name = args.for_name.lstrip("@")
+        else:
+            member = labels.get("factory.member") if labels.get("factory.team") and labels.get("factory.dir") else None
+            name = member or cfg.operator["name"]
+        rows = inbox_rows(open_log(state), name, args.count)
+    except Problem as error:
+        print(f"{error.what}. {error.fix}", file=sys.stderr)
+        sys.exit(2)
+    except (LogDamage, HcError, OSError, ValueError) as error:
+        print(str(error), file=sys.stderr)
+        sys.exit(2)
+    if not rows:
+        print(f"no messages for @{name}")
+    for msg, outcome in rows:
+        sender = "factory" if msg["kind"] == "note" else f"@{msg['from']}"
+        print(f"[Message {msg['id']} from {sender} at {msg['at']}: {outcome_word(outcome)}]")
+        for line in msg["text"].splitlines():
+            print(f"    {line}")
 
 
 def report_leftover_drafts(cfg):
@@ -1669,31 +2426,6 @@ def report_leftover_drafts(cfg):
                     print(f"leftover draft for @{directory.name} ({minutes} min old): {path}. Check delivery before resending or discarding.")
         except OSError as e:
             print(f"warning: cannot scan drafts in {directory}: {e}", file=sys.stderr)
-
-
-def queue_message(cfg, sender, text):
-    started = False
-    try:
-        with Inbox(cfg) as inbox:
-            inbox.remove_seen()
-            row = {"id": inbox.highest + 1, "at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                   "from": sender, "text": text}
-            payload = (json.dumps(row, ensure_ascii=False) + "\n").encode()
-            fd = inbox.private_open(inbox.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
-            try:
-                started = True
-                while payload:
-                    written = os.write(fd, payload)
-                    if written == 0:
-                        raise OSError("inbox write made no progress")
-                    payload = payload[written:]
-                os.fsync(fd)
-                inbox.sync_directory()
-            finally:
-                os.close(fd)
-    except (OSError, ValueError) as e:
-        return ("unconfirmed" if started else "refused"), str(e)
-    return "queued", row["id"]
 
 
 class Checker:
@@ -2028,7 +2760,7 @@ def member_prompt(m, operator, cfg):
     for key, value in {"role_rules": cfg.roles[m["role"]][1], "name": m["name"], "role": m["role"], "operator": f"@{operator}",
                        "draft_dir": str(m["draft_dir"]),
                        "draft": shlex.quote(str(m["draft_dir"])) + "/FILENAME",
-                       "say": shlex.join(["python3", str(SKILL / "scripts/factory.py"), "say", "--cwd", str(cfg.root)]),
+                       "say": shlex.join(["python3", str(SCRIPT), "say"]),
                        "brief": str(cfg.brief_file), "where": where, "rules": "\n".join(rules),
                        "instructions": str(cfg.session_dir / f"{m['name']}.md"),
                        "notes": str(SKILL / "references/notes.md")}.items():
@@ -2517,10 +3249,6 @@ def cmd_up(args):
         raise SystemExit(f"no members in {CONF}; add one, then run `factory.py up`")
     require_herdr()
     info = caller_agent()
-    wait = operator_wait(info.get("agent"))
-    if not wait:
-        print(f"{info.get('agent') or 'unknown harness'} is not supported as operator yet.", file=sys.stderr)
-        sys.exit(2)
     # The operator pane may still carry a member name or label from an earlier team.
     team = Team(cfg, exclude_pane=os.environ.get("HERDR_PANE_ID"))
     cold = not any(team.live(n) for n in cfg.members)
@@ -2539,11 +3267,7 @@ def cmd_up(args):
         print(f"already running: {', '.join(running)}")
         report_launch_drift(team, [m for m in plans if m["name"] in running])
     operator = ensure_operator(cfg, tab=True, info=info)
-    if cold and not args.restart:
-        report_pending_messages(cfg)
-    print(f"members reach @{operator} through the inbox. Run factory.py wait"
-          + (" in a native background task." if wait == "background" else
-             " in the foreground during active work. This mode is not qualified for unattended idle delivery."))
+    print_pending(args, operator)
     if not ready:
         return
     pickup_text = ("We are picking up where we left off. Check the tracker the brief above names, then send"
@@ -2716,14 +3440,7 @@ def cmd_status(args):
         rows.append(("@" + name, p["role"], p["harness"], p["model"] or "?", p["thinking"], team.status(name),
                      (pane or {}).get("pane_id", "")))
     print_table(rows)
-    try:
-        with Inbox(cfg) as inbox:
-            unread = len(inbox.unread)
-            suffix = (f"; {unread} unread message{'s' if unread != 1 else ''}"
-                      " (factory.py wait --timeout 0 prints them)") if unread else ""
-            print(f"operator messages: inbox{suffix}")
-    except (OSError, ValueError) as e:
-        print(f"operator messages: unavailable ({e})")
+    print_pending(args, operator)
     for state, hint in (("blocked", "blocked: waiting on an approval or a question."),
                         ("gone", "gone: run `factory.py up {names}` to bring them back.")):
         hit = [r[0] for r in rows[2:] if state in r[5]]
@@ -2731,89 +3448,6 @@ def cmd_status(args):
             print(f"\n{', '.join(hit)} " + hint.format(names=" ".join(n.lstrip("@") for n in hit)))
     if not any(team.pane(n) for n in cfg.members):
         print(f"\nNo member of {CONF} has a pane in this herdr session. Run `factory.py up` to start or resume its members.")
-
-
-def cmd_wait(args):
-    """Read inbox messages or wait for reports and member events."""
-    require_herdr()
-    cfg = cfg_of(args)
-    watch = [n.lstrip("@") for n in args.names]
-    operator = cfg.operator["name"]
-    snapshot = not watch and args.timeout == 0
-    timeout = args.timeout
-    deadline = None if snapshot or timeout is None else time.monotonic() + timeout
-    seen, worked, looks = None, set(), 0
-    warned = False
-    while True:
-        try:
-            with Inbox(cfg) as inbox:
-                if args.seen is not None:
-                    inbox.acknowledge(args.seen)
-                    args.seen = None
-                unread = inbox.unread
-            if unread:
-                print_messages(unread)
-                print(f"{len(unread)} unread message{'s' if len(unread) != 1 else ''}."
-                      " After you have acted on or recorded these messages:"
-                      f" factory.py wait --seen {unread[-1]['id']} --timeout 0")
-            if unread or snapshot:
-                return
-        except (OSError, ValueError) as e:
-            if args.seen is not None or not watch:
-                print(e, file=sys.stderr)
-                raise SystemExit(2)
-            if not warned:
-                print(f"inbox unavailable: {e}" if isinstance(e, OSError) else str(e), flush=True)
-                warned = True
-        team = Team(cfg)
-        pane = team.pane(operator) or {}
-        harness = pane.get("agent")
-        wait = operator_wait(harness)
-        quiet = not watch and wait == "background"
-        state = {n: team.status(n) for n in cfg.members if (not watch or n in watch) and team.pane(n)}
-        if seen is None:  # the members this watch is about: a pane that closes later is noticed
-            if timeout is None:
-                if wait == "foreground" and pane["pane_id"] == team.agent_panes.get(operator):
-                    timeout = TABLE[harness].get("operator_wait_timeout", 60)
-                elif watch:
-                    timeout = 1800
-                if timeout is not None:
-                    deadline = time.monotonic() + timeout
-            missing = [n for n in watch if n not in state]
-            if missing or not state:
-                raise SystemExit(f"not started: {', '.join(missing) or 'any member'}")
-            seen = list(state)
-        looks += 1
-        closed = [n for n in seen if n not in state]
-        needs = [n for n, s in state.items() if s.startswith("blocked") or s == "gone"]
-        working = [n for n, s in state.items() if s.startswith("working")]
-        settled = [n for n, s in state.items() if s.startswith(("idle", "done"))]
-        unclear = [n for n in state if n not in needs + working + settled]  # herdr reports `unknown`, or nothing
-        # A prompt takes a moment to turn into `working`, so a named member counts as stopped, and the team as
-        # idle, only from the second look on. The same goes for a status herdr has not worked out yet.
-        stopped = [] if quiet else [n for n in settled if n in worked or (n in watch and looks > 1)]
-        if closed or needs or stopped or (not quiet and looks > 1 and (unclear or not working)):
-            break
-        if deadline is not None and time.monotonic() >= deadline:
-            activity = "still working: " + ", ".join("@" + n for n in working) if working else "nobody is working"
-            unknown = "; status unknown: " + ", ".join("@" + n for n in unclear) if unclear else ""
-            print(f"timeout after {timeout:g}s; {activity}{unknown}")
-            sys.exit(4)
-        worked.update(working)
-        time.sleep(args.interval)
-    for n in closed:
-        print(f"@{n}'s pane was closed, so it is no longer running. `factory.py up {n}` gives it a new pane.")
-    for n in needs:
-        if state[n] == "gone":
-            print(f"@{n} is gone: its agent exited. `factory.py up {n}` brings it back.")
-            continue
-        print(f"@{n} is {state[n]}: it needs an answer.")
-    for n in unclear:
-        print(f"@{n}: status unknown (herdr reports {state[n]!r}).")
-    for n in stopped:
-        print(f"@{n} stopped ({state[n]}).")
-    if not (closed or needs or unclear or stopped):
-        print(f"nobody is working: {', '.join('@' + n + ' ' + s for n, s in state.items())}")
 
 
 def cmd_brief(args):
@@ -2832,62 +3466,6 @@ def cmd_brief(args):
             sys.exit(1)
         return
     print(render_team_brief(cfg, [plan(cfg, n) for n in cfg.members], cfg.operator["name"]))
-
-
-def cmd_say(args):
-    """Send directly from the invoking member's pane, or as the operator."""
-    require_herdr()
-    cfg = cfg_of(args)
-    team = Team(cfg, record_sessions=False)
-    pane = os.environ.get("HERDR_PANE_ID")
-    member = next((n for n in cfg.members if pane and team.agent_panes.get(n) == pane), None)
-    if member and (team.pane(member) or {}).get("pane_id") != pane:
-        raise SystemExit(f"this @{member} agent is outside its team's labeled pane")
-    if member and args.file:
-        path = pathlib.Path(args.file)
-        if path.parent.resolve() == (cfg.messages / member).resolve() and not re.fullmatch(r"[A-Za-z0-9-]+\.[A-Za-z0-9]+", path.name):
-            raise SystemExit("nothing sent: use letters, digits and dashes in the draft name, plus a plain extension such as .md")
-    text = message_text(args)
-    sender = member or ensure_operator(cfg)
-    targets = re.findall(r"[^,\s]+", " ".join(args.to))
-    names = ([m["name"] for m in team.members() if m["name"] != member] if targets == ["all"]
-             else [n.lstrip("@") for n in targets])
-    operator = cfg.operator["name"]
-    if sender in names:
-        raise SystemExit("choose another teammate as the recipient")
-    if not names:
-        raise SystemExit("not running: any member")
-    refused, unconfirmed = [], False
-    for name in dict.fromkeys(names):
-        if name == operator:
-            outcome, detail = queue_message(cfg, sender, text)
-        elif name not in cfg.members or not team.live(name):
-            outcome, detail = "refused", f"not running: {name}"
-        else:
-            detail = prompt_error(name, f"{tag(sender)} {text}")
-            outcome = "submitted" if detail is None else "refused" if delivery_refused(detail) else "unconfirmed"
-        if outcome == "queued":
-            print(f"queued message {detail} for @{name}")
-        elif outcome == "submitted":
-            print(f"submitted your message to @{name}")
-        elif outcome == "refused":
-            print(f"not sent to @{name}: {detail}")
-            refused.append(name)
-        else:
-            print(f"delivery unconfirmed to @{name}: {detail}")
-            unconfirmed = True
-    if refused or unconfirmed:
-        if unconfirmed:
-            print("Delivery unconfirmed. Keep the draft and report the result without resending.")
-        elif args.file:
-            print_retry(cfg, refused, args.file)
-        sys.exit(1)
-    remove_delivered_draft(cfg, sender, args.file)
-
-
-def print_retry(cfg, names, filename):
-    cmd = ["python3", str(SKILL / "scripts/factory.py"), "say", "--cwd", str(cfg.root), *names, "--file", filename]
-    print(f"Retry once when ready: {shlex.join(cmd)}")
 
 
 def cmd_prompt(args):
@@ -2949,17 +3527,9 @@ def main(argv=None):
     st = sub.add_parser("status", help="members and whether they are running")
     common(st)
 
-    wt = sub.add_parser("wait", help="return for unread inbox messages or a blocked, gone or closed member; "
-                                     "outside a quiet watch also when a member stops or nobody is working")
-    wt.add_argument("names", nargs="*", help="watch only these members (default: every member)")
-    wt.add_argument("--timeout", type=float, help="seconds before giving up (exit 4); 0 without names reads the inbox once")
-    wt.add_argument("--interval", type=float, default=5, help="seconds between looks")
-    wt.add_argument("--seen", type=int, help="acknowledge inbox messages through this id, then wait. "
-                                            "Reread them with factory.py inbox")
-    common(wt)
-
-    ib = sub.add_parser("inbox", help="reprint recent acknowledged inbox messages")
-    ib.add_argument("count", nargs="?", type=int, default=5, help="last N messages (default 5, up to 100 kept)")
+    ib = sub.add_parser("inbox", help="print recent committed messages for a recipient")
+    ib.add_argument("count", nargs="?", type=int, default=10, help="last N messages (default 10)")
+    ib.add_argument("--for", dest="for_name", help="recipient name (default: this member or the operator)")
     common(ib)
 
     bf = sub.add_parser("brief", help="print the team brief as members get it, or --send it")
@@ -2971,18 +3541,20 @@ def main(argv=None):
     sy.add_argument("to", nargs="+", help="recipient names separated by spaces or commas, or all for members only; "
                     "the last argument is the message unless --file")
     sy.add_argument("--file", help="send this file's contents")
-    common(sy)
 
     pr = sub.add_parser("prompt", help="the standing instructions a member gets")
     pr.add_argument("name")
     common(pr)
 
+    keeper = sub.add_parser("keeper", help="run the team's delivery process")
+    keeper.add_argument("--state", required=True)
+
     args = ap.parse_args(argv)
     if args.cmd == "say":
-        args.message = None if args.file else (args.to.pop() if len(args.to) > 1 else None)
+        args.message = args.to.pop() if args.file is None and len(args.to) > 1 else None
     {"init": cmd_init, "harnesses": cmd_harnesses, "check": cmd_check, "up": cmd_up, "down": cmd_down,
-     "status": cmd_status, "wait": cmd_wait, "inbox": cmd_inbox, "brief": cmd_brief, "say": cmd_say,
-     "prompt": cmd_prompt}[args.cmd](args)
+     "status": cmd_status, "inbox": cmd_inbox, "brief": cmd_brief, "say": cmd_say,
+     "prompt": cmd_prompt, "keeper": cmd_keeper}[args.cmd](args)
 
 
 if __name__ == "__main__":
