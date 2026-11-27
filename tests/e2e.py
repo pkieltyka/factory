@@ -792,6 +792,8 @@ class GitHubEvidence:
         self.next_forge_read = 0
         self.previous = ()
         self.first_merges = {}
+        self.open_prs = {}
+        self.approvals = {}
         self.checks = {}
 
     def collect(self):
@@ -799,19 +801,34 @@ class GitHubEvidence:
         evidence, repo = self.observer.evidence, self.repo
         branch = git(repo.root, "symbolic-ref", "--quiet", "--short", "HEAD", check=False).stdout.strip()
         changes = git(repo.root, "status", "--porcelain", "--", *CODE_PATHS).stdout
+        base = f"refs/heads/{repo.base}"
         tickets = []
         for ticket in evidence.tickets:
             name = repo.prefix + ticket.item[1:]
             if ticket.changed is None and ((branch == name and changes)
-                    or git(repo.root, "log", "-1", "--format=%H", f"{repo.initial}..refs/heads/{name}",
+                    or git(repo.root, "log", "-1", "--format=%H", f"{base}..refs/heads/{name}",
                            "--", *CODE_PATHS, check=False).stdout):
                 ticket = replace(ticket, changed=self.observer.stamp())
             tickets.append(ticket)
         evidence.tickets = tuple(tickets)
+        self.observe_approvals()
         if time.monotonic() >= self.next_forge_read:
             self.refresh_forge()
             self.previous = evidence.messages
             self.next_forge_read = time.monotonic() + 8
+
+    def observe_approvals(self):
+        """When a verdict arrives, read the PR before the next whole-board sample."""
+        for number, (item, revision) in self.open_prs.items():
+            key = number, revision
+            if key in self.approvals:
+                continue
+            boundary = Ticket(item, revision=revision, integrated=self.observer.stamp())
+            verdict = approval(boundary, self.observer.evidence.messages)
+            if verdict:
+                pr = self.repo.api(f"repos/{QA_REPO}/pulls/{number}")
+                self.approvals[key] = (verdict,) if (pr["state"] == "open" and not pr.get("merged_at")
+                                                      and pr["head"]["sha"] == revision) else ()
 
     def refresh_forge(self):
         evidence, repo = self.observer.evidence, self.repo
@@ -841,6 +858,8 @@ class GitHubEvidence:
                 raise RuntimeError("pull requests do not match the run's tickets one to one")
             by_issue[number] = pr
         repo.manifest["prs"] = [{"id": pr["node_id"], "number": pr["number"], "url": pr["html_url"]} for pr in prs]
+        self.open_prs = {pr["number"]: (f"#{number}", pr["head"]["sha"])
+                         for number, pr in by_issue.items() if pr["state"] == "open"}
         repo.save_manifest()
         if tracking[repo.base] != self.head:
             self.head = self.fetch_main()
@@ -852,8 +871,6 @@ class GitHubEvidence:
             number = ticket.item[1:]
             current = replace(ticket, state=project[int(number)])
             stamp = self.observer.stamp()
-            if current.changed is None and repo.prefix + number in tracking:
-                current = replace(current, changed=stamp)
             if current.planned is None:
                 comments = repo.api(f"repos/{QA_REPO}/issues/{number}/comments?per_page=100")
                 if any(re.match(r"\s*plan:\s*\S", note["body"], re.I) for note in comments):
@@ -861,6 +878,7 @@ class GitHubEvidence:
             pr = by_issue.get(number)
             if pr and pr.get("merged_at"):
                 when, earlier = self.first_merges.setdefault(pr["number"], (stamp, self.previous))
+                earlier += self.approvals.get((pr["number"], pr["head"]["sha"]), ())
                 if pr.get("merge_commit_sha") in evidence.main_code:
                     current = self.merge_evidence(current, pr, when, earlier)
             tickets.append(current)

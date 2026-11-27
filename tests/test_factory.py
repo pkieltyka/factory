@@ -7473,6 +7473,49 @@ class E2EObserverTests(unittest.TestCase):
 
 
 class E2EGitHubEvidenceTests(unittest.TestCase):
+    def test_open_ticket_branch_does_not_inherit_earlier_implementation_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = e2e.make_local(pathlib.Path(directory), factory.SKILL)
+            e2e.implement_fixture(repo.root, 1)
+            e2e.git(repo.root, "add", "--", "calc", "tests")
+            e2e.git(repo.root, "commit", "-m", "Integrate the first item")
+            e2e.git(repo.root, "switch", "-c", "qa/fixture/2")
+            evidence = e2e.Evidence((e2e.Ticket("#2"),))
+            collector = e2e.GitHubEvidence.__new__(e2e.GitHubEvidence)
+            collector.repo = types.SimpleNamespace(root=repo.root, base="main", prefix="qa/fixture/")
+            collector.observer = types.SimpleNamespace(evidence=evidence, collect=lambda: None, stamp=lambda: 2)
+            collector.open_prs = {}
+            collector.next_forge_read = float("inf")
+            collector.collect()
+            self.assertIsNone(evidence.tickets[0].changed)
+            evidence.tickets = (e2e.Ticket("#2", planned=1),)
+            e2e.implement_fixture(repo.root, 2)
+            e2e.git(repo.root, "add", "--", "calc", "tests")
+            e2e.git(repo.root, "commit", "-m", "Implement the second item")
+            e2e.git(repo.root, "switch", "main")
+            collector.collect()
+            self.assertEqual(evidence.tickets[0].changed, 2)
+
+    def test_approval_between_forge_polls_requires_an_open_pr_at_the_same_head(self):
+        revision = "a" * 40
+        verdict = e2e.Message(7, "reviewer", "operator", f"status: approve; item #2; commit {revision}",
+                              1, delivered=2)
+        for state, head in (("open", revision), ("closed", revision), ("open", "b" * 40)):
+            with self.subTest(state=state, head=head):
+                evidence = e2e.Evidence((e2e.Ticket("#2"),), messages=(verdict,))
+                collector = e2e.GitHubEvidence.__new__(e2e.GitHubEvidence)
+                api = unittest.mock.Mock(return_value={"state": state, "head": {"sha": head},
+                                                       "merged_at": "2026-11-27T11:00:00Z" if state == "closed" else None})
+                collector.repo = types.SimpleNamespace(api=api)
+                collector.observer = types.SimpleNamespace(evidence=evidence, stamp=lambda: 3)
+                collector.open_prs = {10: ("#2", revision)}
+                collector.approvals = {}
+                collector.observe_approvals()
+                collector.observe_approvals()
+                expected = (verdict,) if state == "open" and head == revision else ()
+                self.assertEqual(collector.approvals[10, revision], expected)
+                api.assert_called_once_with(f"repos/{e2e.QA_REPO}/pulls/10")
+
     def test_fresh_verifier_can_fetch_the_latest_integration_commit(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
