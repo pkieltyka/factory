@@ -2644,7 +2644,8 @@ def argv_codex(m, prompt_file, sess):
                " compacted or you are unsure of the rules.")
     # -C: a resumed session goes back to the directory it was started in, whatever the pane's is. Naming the
     # member's directory keeps it where factory.toml says, also after its worktree changed.
-    argv = ["-m", m["model"], "-C", m["dir"], "-c", f"model_reasoning_effort={json.dumps(m['thinking'])}",
+    argv = ["--no-daemon", "-m", m["model"], "-C", m["dir"],
+            "-c", f"model_reasoning_effort={json.dumps(m['thinking'])}",
             "-c", f"developer_instructions={json.dumps(pointer)}"]
     if m["permissions"] == "guarded":
         argv += ["--add-dir", str(m["inbox_dir"])]
@@ -2879,6 +2880,8 @@ def compatible(entry, m):
     with no provider prefix does not tell, and is allowed)."""
     if entry is None or entry["harness"] != m["harness"] or entry["value"] is None:
         return False
+    if entry["how"] == "dir" and TABLE[m["harness"]].get("session") != "dir":
+        return False      # --continue outside the member's own session folder would reopen another conversation
     if TABLE[m["harness"]].get("resume_model", "any") == "provider":
         a, b = _provider(entry.get("model")), _provider(m.get("model"))
         return a is None or b is None or a == b
@@ -3028,13 +3031,17 @@ def await_ready(hc, started, timeout=LAUNCH_TIMEOUT, clock=time):
                 t = hc.get(address)
                 if t["state"] == "finished":
                     last = _last_line(hc, address)
-                    outcome[name] = f"exited (code {t.get('exit_code')})" + (f": {last}" if last else "")
+                    code = t.get("exit_code")
+                    how = (f"exited (code {code})" if code is not None else f"was stopped by signal {t['signal']}"
+                           if t.get("signal") is not None else f"ended ({t.get('reason') or 'unknown'})")
+                    outcome[name] = how + (f": {last}" if last else "")
                     continue
                 word = words[name] = (t.get("status") or {}).get("state")
                 if word == "working":
                     continue
                 screen = "".join(hc.read(address).split())
-                asked = next(((text, keys) for text, keys in dialogs if "".join(text.split()) in screen), None)
+                matching = [(text, keys) for text, keys in dialogs if "".join(text.split()) in screen]
+                asked = next((d for d in matching if d[0] not in answered[name]), matching[0] if matching else None)
                 shown[name] = asked and asked[0]
                 if asked:
                     text, keys = asked

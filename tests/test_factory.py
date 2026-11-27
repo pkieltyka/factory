@@ -5485,6 +5485,20 @@ class SessionTests(unittest.TestCase):
         self.assertEqual((other["resume"], other["args"]), (False, []))
         self.assertIn("is for pi openai/gpt-6-luna", other["notice"])
 
+    def test_a_folder_entry_resumes_only_where_the_harness_uses_folders(self):
+        entry = {"member": "pi-dev", "harness": "pi", "model": "openai/gpt-6-astra", "term": "t1", "how": "dir",
+                 "value": str(self.state / "sessions" / "pi-dev-pi"), "at": "x"}
+        self.assertFalse(factory.TABLE["pi"].get("session"))
+        sess = factory.session_plan(self.m("pi-dev"), self.state, entry, fresh=False)
+        self.assertEqual((sess["resume"], sess["args"]), (False, []))
+
+    def test_codex_runs_without_its_daemon_fresh_or_resumed(self):
+        m = {"name": "x", "role": "lead-dev", "harness": "codex", "model": "gpt-6.2-sol", "thinking": "high",
+             "permissions": "full", "args": [], "dir": "/w", "inbox_dir": "/s"}
+        self.assertEqual(factory.launch_argv(m, pathlib.Path("/p.md"))[0][0], "--no-daemon")
+        argv = factory.launch_argv(m, pathlib.Path("/p.md"), {"args": ["resume", "id1"]})[0]
+        self.assertEqual(argv[:3], ["resume", "id1", "--no-daemon"])
+
     def test_assigned_ids_and_session_folders(self):
         with patch.dict(factory.TABLE["claude"], session="id"):
             sess = factory.session_plan(self.m("claude-dev"), self.state, None, fresh=False)
@@ -5591,6 +5605,20 @@ class ReadyTests(unittest.TestCase):
                                      on_keys={"a": [("live", word, screen), ("live", "idle", "")]})
                 self.assertEqual(out, {"a": None})
                 self.assertEqual(hc.keys_sent, [("a", ["down", "enter"])])
+
+    def test_a_second_dialog_is_answered_while_the_first_is_still_shown(self):
+        first, second = "Yes, I trust this folder", "Yes, I accept"
+        out, hc = self.ready({"a": [("live", "blocked", first)]}, self.CLAUDE,
+                             on_keys={"a": [("live", "blocked", first + "\n" + second)]})
+        self.assertEqual(hc.keys_sent, [("a", ["down", "enter"]), ("a", ["down", "enter"])])
+        self.assertEqual(out, {"a": f'still asks "{first}" after the answer was sent'})
+
+    def test_a_signal_or_another_end_is_named(self):
+        hc = ScriptedHc({"a": [("live", "idle", "")]})
+        hc.get = lambda address: {"address": address, "state": "finished", "exit_code": None, "signal": 9,
+                                  "status": None}
+        out = factory.await_ready(hc, {"a": ({"address": "a"}, [])}, timeout=5, clock=FakeClock())
+        self.assertEqual(out, {"a": "was stopped by signal 9"})
 
     def test_a_dialog_still_shown_after_the_answer_is_named(self):
         out, hc = self.ready({"a": [("live", "blocked", "Yes, I trust this folder")]}, self.CLAUDE)
