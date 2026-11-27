@@ -3447,6 +3447,39 @@ class KeeperTests(TeamCase):
         self.assertFalse(self.inputs(operator, None))
 
     @fake_only
+    def test_unsettled_terminal_refusal_requeues_and_the_next_send_delivers_once(self):
+        """hc 0.1.20 refuses a fresh terminal whose output has not settled before typing anything (case 8 on a
+        real Codex member): the pair waits and is sent again, never unconfirmed."""
+        term, _ = self.member()
+        refusal = factory.HcError("unavailable", f"{term} is still starting: its output has not settled",
+                                  f"nothing was typed; check hc read {term}, then retry")
+        ident = self.add("lead-dev")
+        self.keeper.tick()
+        with patch.object(self.hc, "send", side_effect=[refusal]):
+            self.run_jobs()
+        self.keeper.tick()                          # settles the refusal and claims the pair again
+        records = [(r["o"], r.get("why")) for r in self.log.read_box()[0] if r["t"] == "out" and r["id"] == ident]
+        self.assertEqual(records, [("sending", None), ("queued", "waiting"), ("sending", None)])
+        self.assertFalse(self.inputs(term, None))
+        self.run_jobs()
+        self.keeper.tick()
+        self.assertEqual(self.outcome(ident)["o"], "delivered")
+        self.assertEqual(self.inputs(term, None), ["[from @pm]\nfirst\n"])
+
+    @fake_only
+    def test_other_unavailable_replies_stay_unconfirmed(self):
+        term, _ = self.member()
+        for message in ("the core is shutting down", f"{term} is still starting",
+                        "t999 is still starting: its output has not settled"):
+            with self.subTest(message=message):
+                ident = self.add("lead-dev")
+                self.keeper.tick()
+                with patch.object(self.hc, "send", side_effect=[factory.HcError("unavailable", message)]):
+                    self.run_jobs()
+                self.keeper.tick()
+                self.assertEqual(self.outcome(ident)["o"], "unconfirmed")
+
+    @fake_only
     def test_malformed_send_result_is_unconfirmed_and_frees_the_recipient(self):
         term, _ = self.member()
         results = ({}, {"turn": "1"}, {"turn": True}, {"turn": 1, "started": "yes"},

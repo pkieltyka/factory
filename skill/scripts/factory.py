@@ -1576,6 +1576,13 @@ def mark_stopped(state, terms, box):
         _write_team_file(directory, team)
 
 
+def _unsettled_refusal(error, term):
+    """hc's refusal to type into a fresh terminal whose output has not settled yet. hc settles before it types
+    (0.1.20 input.rs) and says "nothing was typed", so the message is still unsent. Any other unavailable reply
+    may follow a partial write and stays unconfirmed."""
+    return error.kind == "unavailable" and error.message == f"{term} is still starting: its output has not settled"
+
+
 def settle_refusal(log, box, ident, to, term, why):
     """Settle a member's definite pre-typing refusal against stop evidence under the same lock."""
     with log.locked(exclusive=True) as directory:
@@ -2397,6 +2404,8 @@ class Keeper:
             why = "waiting"
         elif isinstance(result, HcError):
             why = {"blocked": "blocked", "not_found": "gone", "finished": "gone"}.get(result.kind)
+            if why is None and _unsettled_refusal(result, term):
+                why = "waiting"                      # nothing was typed: send it again once the output settles
         if why is None:
             detail = " ".join(str(result).split())[:200] or type(result).__name__
             self._record(msg, name, "unconfirmed", why=detail, term=term)
