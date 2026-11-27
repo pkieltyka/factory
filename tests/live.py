@@ -2027,15 +2027,17 @@ class QATeam:
         subprocess.run(["git", "-C", str(self.work), "add", "-A"], check=True)
         subprocess.run(["git", "-C", str(self.work), "-c", "user.name=qa", "-c", "user.email=qa@example.invalid",
                         "-c", "commit.gpgsign=false", "commit", "-q", "-m", "qa"], check=True)
-        params = {"argv": self.adapter.operator_argv(operator), "cwd": str(self.work)}
+        # What Factory's commands see, from the driver or from the operator's own tool: the private Factory cache
+        # (never the owner's), the fixture's wrappers first on PATH, and the fake Codex home.
+        shared = {"HC_BIN": shutil.which(HC) or HC, "PATH": f"{self.bin}:{os.environ.get('PATH', '')}",
+                  "XDG_CACHE_HOME": str(self.dir / "cache"), "HOME": str(self.home)}
         if not self.real:
-            params["env"] = {"FAKE_LOG": str(self.dir / "operator-input.jsonl")}   # every input the fake received
+            shared["CODEX_HOME"] = str(self.home / ".codex")
+        params = {"argv": self.adapter.operator_argv(operator), "cwd": str(self.work), "env": dict(shared)}
+        if not self.real:
+            params["env"]["FAKE_LOG"] = str(self.dir / "operator-input.jsonl")   # every input the fake received
         self.operator = self.qa.rpc("terminal.run", params)["address"]
-        self.env = {**self.qa.env, "HC_TERMINAL_ID": self.operator, "HC_BIN": shutil.which(HC) or HC,
-                    "PATH": f"{self.bin}:{os.environ.get('PATH', '')}", "XDG_CACHE_HOME": str(self.dir / "cache"),
-                    "HOME": str(self.home)}
-        if not self.real:
-            self.env["CODEX_HOME"] = str(self.home / ".codex")
+        self.env = {**self.qa.env, **shared, "HC_TERMINAL_ID": self.operator}
 
     def call(self, *args, terminal=None, timeout=60):
         """A Factory command as the operator (or as terminal): (exit code, output)."""
@@ -2218,16 +2220,8 @@ def _team_for(adapter_class, role, harness, **options):
 
 def _up(team, run, case, role, harness, names):
     """Bring the team up; on failure every listed subcase is not_run with up's output."""
-    if team.real:                                     # a real operator first gets past its own startup dialogs
-        _trust_entries(run, team)
-        watcher = Harness.attach(team.qa, team.operator_harness, team.operator)
-        settled = watcher.settle(timeout=120)
-        team.operator_start = {"settled": settled, "answered": watcher.answered}
-        if not settled.startswith(READY):
-            for name in names:
-                run.row(case, name, role, harness, "not_run", f"case {case} {name}",
-                        reason=f"the operator did not start: {settled}")
-            return False
+    if not _operator_start(team, run, case, role, harness, names):
+        return False
     code, out = team.call("up", timeout=240)
     if code != 0:
         for name in names:
@@ -2284,15 +2278,83 @@ def _trust_entries(run, team):
     run.checkpoint()
 
 
-def _member_says(team, text, timeout=300):
+def _member_says(team, text, timeout=300, record=None):
     """Have the member itself run say to the operator through its own tool, with text in a file."""
     member = team.member("lead-dev")
     body = team.dir / f"report-{random.randrange(16 ** 6):06x}.md"
     body.write_text(text)
-    command = f"python3 {shlex.quote(str(team.script))} say operator --file {shlex.quote(str(body))}"
+    out = team.dir / f"say-out-{random.randrange(16 ** 6):06x}.txt"     # the say's own output: its message ID
+    command = (f"python3 {shlex.quote(str(team.script))} say operator --file {shlex.quote(str(body))}"
+               f" > {shlex.quote(str(out))} 2>&1")
     done = team.receipt("member-say")
     team.send(member, team.adapter.act_run(done, command))
-    return team.until(lambda: done.exists() and "exit" in done.read_text() and done.read_text().strip(), timeout)
+    result = team.until(lambda: done.exists() and "exit" in done.read_text() and done.read_text().strip(), timeout)
+    team.last_say = out.read_text() if out.exists() else None
+    if record is not None:
+        record["out"] = team.last_say
+    return result
+
+
+def _operator_start(team, run, case, role, harness, names):
+    """A real operator past its own startup dialogs before the owner's first input; a fake one needs nothing."""
+    if not team.real:
+        return True
+    _trust_entries(run, team)
+    watcher = Harness.attach(team.qa, team.operator_harness, team.operator)
+    settled = watcher.settle(timeout=120)
+    team.operator_start = {"settled": settled, "answered": watcher.answered}
+    if settled.startswith(READY):
+        return True
+    for name in names:
+        run.row(case, name, role, harness, "not_run", f"case {case} {name}",
+                reason=f"the operator did not start: {settled}")
+    return False
+
+
+def _operator_commands(run, team, harness, peer):
+    """operator-commands (phase_8.md §3.2): the owner's first prompt, pasted through rodeo into a fresh operator,
+    has it run up, say to a member, status and inbox --for itself through its own tool; no driver up."""
+    if not _operator_start(team, run, 2, "operator", harness, ["operator-commands"]):
+        return False
+    exits, tok = team.receipt("operator-commands"), token()
+    member_receipt = team.receipt("member")
+    py = f"python3 {shlex.quote(str(team.script))}"
+    message = shlex.quote(team.adapter.act_append(member_receipt, tok))
+    outs = {name: team.dir / f"out-{name}-{token().lower()}.txt" for name in ("up", "say", "status", "inbox")}
+    commands = {"up": f"{py} up", "say": f"{py} say lead-dev {message}", "status": f"{py} status",
+                "inbox": f"{py} inbox --for operator"}
+    prompt = "\n".join(team.adapter.act_run(exits, f"{commands[name]} > {outs[name]} 2>&1") for name in commands)
+    view = _rodeo(team, ["operator"])
+    view.keys("ctrl+b")
+    time.sleep(0.2)
+    view.keys("1")
+    time.sleep(0.8)
+    view.focused_terminal = team.operator
+    start = time.monotonic()
+    view.paste(prompt)
+    lines = team.until(lambda: exits.exists() and len(exits.read_text().split()) >= 8 and exits.read_text(), 900)
+    codes = [line for line in (lines or "").splitlines() if line.startswith("exit")]
+    reached = bool(codes == ["exit 0"] * 4
+                   and team.until(lambda: member_receipt.exists() and tok in member_receipt.read_text(), 300))
+    full = {name: path.read_text() if path.exists() else None for name, path in outs.items()}
+    text = {name: _bounded(value) if value is not None else None for name, value in full.items()}
+    member = team.member("lead-dev")
+    box = factory_log(team).read_box()[1] if member else None
+    briefed = bool(box) and member in box.briefed()
+    to_operator = sorted({ident for (ident, to) in box.outcomes if to == "operator"}) if box else []
+    listed = sorted({int(n) for n in re.findall(r"^\[Message (\d+) ", full["inbox"] or "", re.M)})
+    inbox_ok = bool(full["inbox"]) and set(listed) <= set(to_operator) and (
+        bool(listed) or "no messages for @operator" in full["inbox"])
+    status_ok = "@lead-dev" in (full["status"] or "")
+    proof = {"exits": codes, "member_acted": reached, "member_briefed": briefed, "status_names_member": status_ok,
+             "inbox_ids": listed, "operator_ids_in_log": to_operator, "outputs": text, "peer": peer,
+             "prompted_by": "the owner's paste and Enter through rodeo into a fresh operator (prefix+1)"}
+    ok = codes == ["exit 0"] * 4 and reached and briefed and status_ok and inbox_ok
+    run.row(2, "operator-commands", "operator", harness, "pass" if ok else "fail",
+            "the owner's first prompt has the operator run up, say, status and inbox --for itself; the brief is"
+            " delivered, the member acts on the say, status names it and the inbox lists the operator's messages",
+            proof=proof, elapsed=time.monotonic() - start, reason=None if ok else "see proof")
+    return True
 
 
 def case_2(run, role, harness, adapter_class):
@@ -2302,46 +2364,36 @@ def case_2(run, role, harness, adapter_class):
     with team:
         if role == "operator":
             _operator_tab(team)
-        if not _up(team, run, 2, role, harness, names):
+            if not _operator_commands(run, team, harness, peer):
+                return
+            if _team_quiet(team, hold=8, timeout=300) is None:     # its setup turn over before the idle report
+                run.row(2, "idle-report", role, harness, "not_run", "case 2 idle-report",
+                        reason="the team was not quiet after the operator's setup turn")
+                return
+        elif not _up(team, run, 2, role, harness, names):
             return
         receipt, tok = team.receipt("operator"), token()
         turn = team.get(team.operator)["turn"]
         start = time.monotonic()
         said = _member_says(team, team.adapter.act_append(receipt, tok))
         acted = team.until(lambda: receipt.exists() and tok in receipt.read_text(), 300)
-        proof = {"member_say": said, "operator_turn": [turn, team.get(team.operator)["turn"]],
-                 "peer": peer, "prompted_by": "hc terminal.send to the member (the report is the member's say)"}
-        if acted:
+        acted_at = time.monotonic() - start
+        ended = team.until(lambda: team.state(team.operator) in READY and team.get(team.operator)["turn"] > turn, 120)
+        found = _say_id(team.last_say or "")
+        ident = int(found.group(1)) if found else None
+        proof = {"member_say": said, "say_output": _bounded(team.last_say or ""), "sender_message_id": ident,
+                 "operator_turn": [turn, team.get(team.operator)["turn"]], "turn_completed": bool(ended),
+                 "action_at_s": round(acted_at, 2), "peer": peer,
+                 "prompted_by": "hc terminal.send to the member (the report is the member's say)"}
+        if acted and not ended:
+            run.row(2, "idle-report", role, harness, "fail", "the operator acts on an idle report with no input",
+                    proof=proof, reason="the action landed but the operator's turn did not complete within 120 s")
+        elif acted:
             run.row(2, "idle-report", role, harness, "pass", "the operator acts on an idle report with no input",
                     observed="token appended by the operator", proof=proof, elapsed=time.monotonic() - start)
         else:
             run.row(2, "idle-report", role, harness, "fail", "the operator acts on an idle report with no input",
                     proof=proof, reason="no action from the operator within 300 s")
-        if role != "operator":
-            return
-        exits, tok2 = team.receipt("operator-commands"), token()
-        member_receipt = team.receipt("member")
-        py = f"python3 {shlex.quote(str(team.script))}"
-        message = shlex.quote(team.adapter.act_append(member_receipt, tok2))
-        commands = [f"{py} status", f"{py} inbox", f"{py} say lead-dev {message}", f"{py} up"]
-        prompt = "\n".join(team.adapter.act_run(exits, command) for command in commands)
-        view = _rodeo(team, ["operator", "team"])        # the owner's first prompt, pasted through rodeo
-        view.keys("ctrl+b")
-        time.sleep(0.2)
-        view.keys("1")
-        time.sleep(0.8)
-        view.focused_terminal = team.operator
-        view.paste(prompt)
-        lines = team.until(lambda: exits.exists() and len(exits.read_text().split()) >= 8 and exits.read_text(), 600)
-        codes = [line for line in (lines or "").splitlines() if line.startswith("exit")]
-        reached = bool(codes == ["exit 0"] * 4         # the member acts on its own turn, after say has returned
-                       and team.until(lambda: member_receipt.exists() and tok2 in member_receipt.read_text(), 300))
-        proof = {"exits": codes, "member_acted": reached,
-                 "prompted_by": "the owner's paste and Enter through rodeo (prefix+1, the operator tab)"}
-        ok = codes == ["exit 0"] * 4 and reached
-        run.row(2, "operator-commands", role, harness, "pass" if ok else "fail",
-                "the operator runs status, inbox, say and up through its own tool; the say reaches the member",
-                proof=proof, reason=None if ok else "a command failed or the member never acted")
 
 
 def case_9(run, role, harness, adapter_class):
@@ -2560,8 +2612,10 @@ def factory_log(team):
         module = importlib.util.module_from_spec(spec)
         sys.modules["factory_under_test"] = module
         spec.loader.exec_module(module)
-    state = next(r["labels"]["factory.dir"] for r in team.qa.rpc("terminal.list", {"all": True})["terminals"]
-                 if (r.get("labels") or {}).get("factory.dir"))
+    state = next((r["labels"]["factory.dir"] for r in team.qa.rpc("terminal.list", {"all": True})["terminals"]
+                  if (r.get("labels") or {}).get("factory.dir")), None)
+    if state is None:
+        raise RuntimeError("no Factory terminal in the QA core: up never ran")
     return module.open_log(state)
 
 
@@ -2786,9 +2840,17 @@ def case_6(run, role, harness, adapter_class):
 
 
 def _ask_later(team, role, text):
-    """_ask in a thread: a say to a working recipient may wait for delivery, and the case must go on meanwhile."""
+    """_ask in a thread: a say to a working recipient may wait for delivery, and the case must go on meanwhile.
+    box["out"] gets the say's own output (its message ID) when it returns."""
     box = {}
-    thread = threading.Thread(target=lambda: box.update(result=_ask(team, role, text)), daemon=True)
+
+    def ask():
+        if role == "member":
+            code, out = team.call("say", "lead-dev", text, timeout=600)
+            box.update(out=out, code=code)
+        else:
+            box["code"] = _member_says(team, text, timeout=600, record=box)
+    thread = threading.Thread(target=ask, daemon=True)
     thread.start()
     return thread, box
 
@@ -2844,10 +2906,18 @@ def case_4(run, role, harness, adapter_class):
                     thread.join(timeout=60)
                 lines = _lines(work)
                 count = lines.count(second)
+                found = _say_id(later[1].get("out") or "")
+                recipient = "operator" if role == "operator" else "lead-dev"
+                outcome = _outcome(factory_log(team), found, recipient) if found else None
+                screen = Harness.attach(team.qa, harness if role == "operator" else team.members["lead-dev"],
+                                        subject).screen().rstrip()
                 order = [{started: "started", finished: "finished", second: "second"}[line]
                          for line in lines if line in (started, finished, second)]
                 proof = {"turn": [turn, team.get(subject)["turn"]], "order": order, "pending_after_10s": pending,
-                         "second_count": count, "peer": peer}
+                         "second_count": count, "peer": peer,
+                         "second_id": int(found.group(1)) if found else None, "second_outcome": outcome,
+                         "second_say": _bounded(later[1].get("out") or ""),
+                         "subject_screen_tail": _bounded(screen[-BOUND:])}
                 if trial == "mid-turn":
                     ok = count == 1 and finished in lines
                     how = ("steered this turn" if ok and order.index("second") < order.index("finished")
