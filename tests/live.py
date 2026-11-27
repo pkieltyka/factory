@@ -2029,7 +2029,7 @@ class QATeam:
     private copy of the skill (phase_8.md §2)."""
 
     def __init__(self, adapter_class, operator, members, draft_wait=None, permissions="full", operator_shell=False,
-                 startup_dialog=None):
+                 startup_dialog=None, quiet_grace=None):
         self.operator_harness, self.members, self.permissions = operator, members, permissions
         self.startup_dialog = startup_dialog    # fixture only: the harness whose fake shows its declared dialog
         self.real = adapter_class is RealAdapter
@@ -2049,7 +2049,7 @@ class QATeam:
         self.adapter = adapter_class(self)
         self.adapter.prepare({operator, *members.values()})
         (self.work / "FACTORY.md").write_text("Qualification team: answer every request exactly as asked.\n")
-        lines = [f'[operator]\nharness = "{operator}"\n']
+        lines = ([f"quiet_grace = {quiet_grace}\n"] if quiet_grace else []) + [f'[operator]\nharness = "{operator}"\n']
         for name, harness in members.items():
             lines.append(f'[members.{name}]\nharness = "{harness}"\nmodel = "{self.adapter.model(harness)}"\n'
                          f'permissions = "{permissions}"\n')
@@ -2656,7 +2656,7 @@ def case_1(run, role, harness, adapter_class):
 
 
 def case_7(run, role, harness, adapter_class):
-    """suffix, multiline, two-senders, pending-restart and upgrade; held-quiet is not built yet (§3.7)."""
+    """suffix and multiline in one team; two-senders, pending-restart, upgrade and held-quiet in their own (§3.7)."""
     team, peer = _team_for(adapter_class, role, harness)
     with team:
         if not _up(team, run, 7, role, harness, ["suffix", "multiline"]):
@@ -2701,7 +2701,7 @@ def case_7(run, role, harness, adapter_class):
     _case_7_two_senders(run, role, harness, adapter_class)
     _case_7_pending_restart(run, role, harness, adapter_class)
     _case_7_upgrade(run, role, harness, adapter_class)
-    _not_built(run, 7, role, harness, ["held-quiet"])
+    _case_7_held_quiet(run, role, harness, adapter_class)
 
 
 def _case_7_two_senders(run, role, harness, adapter_class):
@@ -3737,6 +3737,56 @@ def cross_other_version(run, fixture):
         run.row("cross", "other-version", "system", "system", "pass" if ok else "fail",
                 "a new script under a live keeper: the held send finishes, the keeper restarts in its pane, the next"
                 " message is delivered once by the new image", proof=proof, reason=None if ok else "see proof")
+
+
+def _case_7_held_quiet(run, role, harness, adapter_class):
+    """held-quiet (phase_8.md §3.7): the team's quiet note is claimed and held by the owner's draft in the operator
+    pane; member work resumes; the owner sends the draft. One late informational note is allowed, and it is never
+    delivered twice."""
+    team, peer = _team_for(adapter_class, role, harness, draft_wait=120, quiet_grace=30)
+    with team:
+        _operator_tab(team)
+        if not _up(team, run, 7, role, harness, ["held-quiet"]):
+            return
+        log = factory_log(team)
+        view = _rodeo(team, ["operator", "team"])
+        view.keys("ctrl+b")
+        time.sleep(0.2)
+        view.keys("1")
+        time.sleep(0.8)
+        view.focused_terminal = team.operator
+        view.type(f"owner draft {token()}")
+
+        def quiet_notes():
+            box = log.read_box()[1]
+            return [(i, box.outcome(i, "operator")["o"]) for i, m in box.msgs.items()
+                    if m["kind"] == "note" and (m.get("meta") or {}).get("what") == "quiet"]
+        claimed = team.until(lambda: next((i for i, o in quiet_notes() if o == "sending"), None), 120)
+        if not claimed:
+            view.keys("enter")
+            run.row(7, "held-quiet", role, harness, "not_run", "case 7 held-quiet", proof={"quiet": quiet_notes()},
+                    reason="no quiet note was claimed while the owner's draft was there")
+            return
+        work, tok = team.receipt("resumed"), token()
+        team.call("say", "lead-dev", "--file", str(_note(team, team.adapter.act_append(work, tok))), timeout=60)
+        resumed = team.until(lambda: tok in _lines(work), 300)
+        view.keys("enter")                               # the owner sends the draft: the hold ends
+        time.sleep(20)                                   # shorter than quiet_grace: no new quiet period yet
+        notes = quiet_notes()
+        if team.real:
+            seen = None                                  # a real operator's screen does not count deliveries
+        else:
+            inputs = (team.dir / "operator-input.jsonl").read_text().splitlines()
+            seen = sum(1 for line in inputs if "team quiet" in json.loads(line)["text"])
+        final = dict(notes).get(claimed)
+        delivered = sum(1 for _, o in notes if o == "delivered")
+        ok = bool(resumed) and final in ("delivered", "dropped") and delivered <= 1 and (seen is None or seen <= 1)
+        run.row(7, "held-quiet", role, harness, "pass" if ok else "fail",
+                "a quiet note held by the owner's draft while member work resumes: at most one late note, never"
+                " delivered twice", observed=f"the held note ended {final}",
+                proof={"held_note": claimed, "final": final, "quiet_notes": notes, "delivered": delivered,
+                       "quiet_text_typed": seen, "work_acted": bool(resumed), "peer": peer},
+                reason=None if ok else "see proof")
 
 
 def _case_7_upgrade(run, role, harness, adapter_class):
