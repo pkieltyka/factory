@@ -189,17 +189,17 @@ The quiet state is derived, with `q = box.quiet_note()`:
 def rearmed(q, view, box) -> bool:
     return (any(t is working, or t["address"] not in q["meta"]["turns"], or t["turn"] > q["meta"]["turns"][t["address"]]
                 for t in live member terminals)
-            or any(m["id"] > q["id"] and m["from"] != "factory" and some recipient of m is delivered for m in box.msgs.values()))
+            or box.deliveries > q["meta"]["deliveries"])
 told = q is not None and not rearmed(q, view, box)
 ```
 
-A quiet note that was dropped is not `box.quiet_note()`, so every way a note can fail to arrive puts the rule back to "not told" with no extra step. The operator's own turns never re-arm.
+`box.deliveries` counts the `delivered` outcomes of messages that are not notes, and the quiet note saves the count it saw, so a message delivered after the note re-arms even when its ID is older (one held for a blocked member). A quiet note that was dropped is not `box.quiet_note()`, so every way a note can fail to arrive puts the rule back to "not told" with no extra step. The operator's own turns never re-arm.
 
 Each tick:
 
 1. If not `told`: `ready_next = None`, so each quiet period waits its own full period before the first ready check. If not `quiet_now`: `quiet_since = None`; stop.
 2. If `quiet_since` is None: `quiet_since = clock.monotonic()`.
-3. If not `told`, the grace has passed (`quiet_grace`, default `QUIET_GRACE`), and the operator is not `blocked`: `log.add("factory", [operator], quiet_text, kind="note", meta={"what": "quiet", "turns": {address: turn for each live member terminal}})`. Step 8 of this tick sends it.
+3. If not `told`, the grace has passed (`quiet_grace`, default `QUIET_GRACE`), and the operator is not `blocked`: `log.add("factory", [operator], quiet_text, kind="note", meta={"what": "quiet", "turns": {address: turn for each live member terminal}, "deliveries": box.deliveries})`. Step 8 of this tick sends it.
 4. **Ready check.** Only if `cfg.ready_check` is set, `told`, `q`'s outcome is `delivered` or `unconfirmed` (the attempt is over; a note the operator may not have seen must not stop new work from being noticed), the operator is not `blocked`, and no `ready_job` runs. On the first tick where this holds set `ready_next = now + every`; when `now >= ready_next`: spawn the job and set `ready_next = now + every`. The first run is one period after the quiet note, so a board that already has work produces one note, not two.
 
 After a keeper restart `quiet_since` and `ready_next` start again, so the grace and the period are counted afresh; `told` comes from the log, so nothing is repeated.
@@ -216,12 +216,12 @@ A member whose last received message is newer than anything it sent may owe a re
 
 One line per configured member that has a terminal record; the duration is `now - status_ms`; `none` where there is no message.
 
-Ready-check job: `subprocess.run(["sh", "-c", cmd], cwd=root, stdin=DEVNULL, capture_output=True, text=True, timeout=READY_TIMEOUT)`; `(returncode | "timeout", stdout)` goes on `results`. With `r = box.ready_note()` and `last = r["meta"]["digest"] if r and r["id"] > ready_clear else None`:
+Ready-check job: `subprocess.run(["sh", "-c", cmd], cwd=root, stdin=DEVNULL, stdout=PIPE, stderr=DEVNULL, text=True, timeout=READY_TIMEOUT)`; `("ready", key, (returncode | "timed out" | "failed (…)", stdout))` goes on `results`, where `key` is the quiet note's ID, the config stamp and the command. The main thread applies it after the box is refreshed, and only while that key is still current. The command runs with the keeper's environment: `PATH` from the command that started the keeper, the rest from `hc`'s login environment, so a tool that works in the owner's shell can fail here and show as `ready check: exit <n>`. With `r = box.ready_note()` and `last = r["meta"]["digest"] if r and r["id"] > ready_clear else None`:
 
 | Result | Action |
 |---|---|
-| exit 0, `stdout.strip()` non-empty | `digest = sha1(stdout.strip())`. If `digest != last`, the team is still quiet and the operator can take a message: add a note (`meta={"what": "ready", "digest": digest}`, text `"ready work:\n"` plus the first 20 lines, at most 2,000 characters) |
-| exit 1, or exit 0 with empty output | `ready_clear = box`'s highest message id, written to `team.json` |
+| exit 0, `stdout.strip()` non-empty | `digest = sha1(stdout.strip())`. If `digest != last`, the team is still quiet and the operator can take a message: add a note (`meta={"what": "ready", "digest": digest, "quiet_id": q["id"]}`, text `"ready work:\n"` plus the first 20 lines, at most 2,000 characters) |
+| exit 1, or exit 0 with empty output | `ready_clear = box`'s highest message id, written to `team.json` when a report stands |
 | anything else, or the time limit | emit `ready check: exit <n>` or `ready check: timed out`; change nothing |
 
 A ready note that is dropped is not `box.ready_note()`, so its digest does not suppress the next one.
@@ -246,7 +246,7 @@ Every `out` record the keeper writes prints one line, except `sending`: that pri
 ## 8. Liveness, version and exit rules
 
 - **Heartbeat.** Step 1 of every tick. The keeper's `Hc` has a 10 s timeout on every call except `send`, and sends are off the main thread, so neither a slow call nor a `draft_wait` hold stops the beat for `BEAT_STALE` (30 s).
-- **Version.** Every 30 s: if `sha1(script on disk)[:12] != VERSION`, set `self.draining`: §3 starts no new send. When `inflight` is empty: emit `keeper restarting: new Factory version`, then `os.execv(sys.executable, [sys.executable, SCRIPT, "keeper", "--state", str(state)])`. The new program runs in the same terminal and pane; `keeper.lock` is released by the exec (its descriptor is close-on-exec) and taken again in step 1 of `run()`. Messages appended during the drain wait as `queued (waiting)` and go out after the exec; nothing is stranded and no command is needed.
+- **Version.** Every 30 s: if `sha1(script on disk)[:12] != VERSION`, set `self.draining` and emit `keeper <v> installed: finishing what is in flight, then restarting`: §3 starts no new send, and no note or ready check starts. When `inflight` is empty, no ready check runs and no result is withheld (`unsettled`): emit `keeper restarting: new Factory version`, then `os.execv(sys.executable, [sys.executable, SCRIPT, "keeper", "--state", str(state)])`. The new program runs in the same terminal and pane; `keeper.lock` is released by the exec (its descriptor is close-on-exec) and taken again in step 1 of `run()`. Messages appended during the drain wait as `queued (waiting)` and go out after the exec; nothing is stranded and no command is needed. A failed exec emits one line and the keeper goes on serving; it looks again 30 s later. A build that cannot be read changes nothing.
 - **Team down.** If `team.json`'s `up` is false, `inflight` is empty, and either no pair is pending for the operator or the operator is not reachable: leave with `team is down`.
 - **Signals.** SIGINT (Ctrl+C in the pane), SIGTERM, SIGHUP: `hc.kill_children()` and leave at once. Verified (LC-1, [hc-checks.md](../../../../docs/qualification/hc-checks.md)): killing `hc connect` (`SIGKILL`) cancels a send held on `draft_wait` (even if the user later submits the draft), and 0 of 20 trials left an unsubmitted paste when killed 18–294 ms after an observed paste; those pairs still become `unconfirmed` on restart. A keeper killed without the chance to run `kill_children()` (SIGKILL, out of memory) leaves its held sends alive: their `hc connect` clients see only EOF, which LC-1 shows does not cancel, so they are typed when the hold ends. The pairs are `unconfirmed` at the next start, and per-recipient order is not guaranteed across such a crash.
 

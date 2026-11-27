@@ -404,6 +404,8 @@ class Config:
         if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", str(self.operator["name"])) or self.operator["name"] in self.members:
             raise SystemExit(f"{self.conf_file}: [operator] name {self.operator['name']!r} must be lowercase letters,"
                              " digits, - or _ (32 at most) and not a member's name")
+        if self.operator["name"] == "factory":
+            raise SystemExit(f"{self.conf_file}: [operator] name 'factory' is reserved for Factory's own notes")
         try:  # whose team this is: the first part of its worktree branches, so two people's never collide
             self.user = str(self.team.get("user") or getpass.getuser())
         except (KeyError, OSError):
@@ -719,6 +721,7 @@ class Box:
         self._only = None                   # for_message: the one id this partial view follows
         self._lineage = None                # the checkpoint lineage this box's view was proven in, by Log.out
         self._damage = None                 # set when an apply failed: the box is unusable until rebuilt
+        self.deliveries = 0                 # delivered outcomes of messages that are not notes (a full box only)
 
     @classmethod
     def for_message(cls, path, ident, recipients, offset):
@@ -785,6 +788,8 @@ class Box:
         if current["o"] not in MOVES[new]:
             return f"illegal outcome {current['o']} -> {new} for @{to} of message {ident}"
         self.outcomes[(ident, to)] = dict(rec)
+        if new == "delivered" and self._only is None and msg.get("kind") != "note":
+            self.deliveries += 1            # quiet's activity count (keeper.md §6): the same on every replay
         if "text" in msg and all(self.outcome(ident, r)["o"] in FINAL for r in msg["to"]):
             msg.pop("text")
         return None
@@ -1770,6 +1775,73 @@ def decide(name, msg, view, box, cfg, now, op_null_since, still_true=True):
     return "send", terminal["address"]
 
 
+def _age(seconds):
+    seconds = max(0, int(seconds))
+    minutes, seconds = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes}m" if hours else f"{minutes}m" if minutes else f"{seconds}s"
+
+
+def _member_terminals(view, cfg):
+    """{address: record} of the live terminals of configured members."""
+    return {t["address"]: t for t in (view.terminal(n) for n in cfg.members) if t is not None}
+
+
+def quiet_now(view, box, cfg, wall_now, monotonic_now, inflight, op_null_since):
+    """keeper.md §6: whether the team is quiet now. Quiet and ready notes are left out of the heads they could hide."""
+    operator = view.operator
+    if operator is None or operator.get("status") is None or operator["status"]["state"] == "working" or inflight:
+        return False
+    for name in cfg.members:
+        t = view.terminal(name)
+        if t is not None and (t.get("status") or {}).get("state") == "working":
+            return False
+        if view.state(name) == "starting" and wall_now - t["created_ms"] / 1000 < LAUNCH_TIMEOUT:
+            return False
+    if any(rec["o"] == "sending" for rec in box.outcomes.values()):
+        return False
+    briefed = box.briefed()
+    for name in dict.fromkeys(name for _, name in box.pending()):
+        terminal = view.terminal(name)
+        ready = name == cfg.operator["name"] or (terminal is not None and terminal["address"] in briefed)
+        pending = [msg for msg, _ in box.pending(name) if not _quiet_or_ready_note(msg)]
+        briefs = [msg for msg in pending if msg["kind"] == "brief"] if not ready else []
+        head = briefs[-1] if briefs else pending[0] if pending else None
+        if head is not None and decide(name, head, view, box, cfg, monotonic_now, op_null_since)[0] == "send":
+            return False
+    return True
+
+
+def rearmed(q, view, box, cfg):
+    """Whether real activity happened after quiet note q: a member working, a new or advanced member terminal, or a
+    delivered message that is not a note."""
+    turns = q["meta"].get("turns") or {}
+    for address, t in _member_terminals(view, cfg).items():
+        if ((t.get("status") or {}).get("state") == "working" or address not in turns
+                or t.get("turn", 0) > turns[address]):
+            return True
+    return box.deliveries > q["meta"].get("deliveries", 0)
+
+
+def quiet_text(view, box, cfg, wall_now, quiet_for):
+    """keeper.md §6's note, from metadata only."""
+    lines = [f"team quiet for {_age(quiet_for)}: nobody is working and nothing is waiting to be delivered."]
+    for name in cfg.members:
+        record = view.terminal(name) or view.finished(name)
+        if record is None:
+            continue
+        state = view.state(name)
+        since = record.get("status_ms") if state not in ("gone",) else None
+        line = f"@{name} {state}" + (f" {_age(wall_now - since / 1000)}" if since else "") + "."
+        got, sent = box.last_to(name), box.last_from(name)
+        line += f" Last received #{got['id']} from @{got['from']}." if got else " Last received none."
+        line += (f" Last sent #{sent['id']} to {', '.join('@' + r for r in sent['to'])}." if sent
+                 else " Last sent none.")
+        lines.append(line)
+    lines.append("A member whose last received message is newer than anything it sent may owe a reply.")
+    return "\n".join(lines)
+
+
 class Keeper:
     """One delivery loop. Only the main thread changes the log and per-recipient claims."""
 
@@ -1789,6 +1861,20 @@ class Keeper:
         self.op_null_since = None
         self._null_terminal = None
         self.damaged = None
+        self.quiet_since = None              # monotonic start of the current quiet interval
+        self.ready_next = None               # monotonic time of the next ready check, while told
+        self.ready_job = None                # the running check's key, or None
+        self._ready_done = None              # its result, applied after the box is refreshed
+        self._cfg_failed = False             # the current factory.toml does not load: no ready check
+        self.draining = None                 # the newer build on disk this keeper drains for, then execs
+        self._version_at = 0                 # monotonic time of the next look at the installed build
+        self._title = None
+        self._told = False                   # the operator has a quiet note for this interval
+        self._quiet_epoch = 0                # bumped by every tick that does not see the team quiet and eligible
+        self._eligible = False
+        self.title_out = sys.stdout          # OSC 2 goes straight to the pane, not through emit
+        self._execv = os.execv
+        self._quiet_sample = None            # member turns and the delivery count at the previous quiet tick
         self._retry_log_at = 0
         self._reported_errors = {}
         self._beat_fd = None
@@ -1845,6 +1931,8 @@ class Keeper:
                 self.emit(f"keeper {VERSION} started")
                 while not self.stop:
                     self.tick()
+                    if self.draining and not self.stop and self._drained():
+                        self._reexec()
                     if not self.stop:
                         try:
                             result = self.results.get(timeout=TICK)
@@ -1879,7 +1967,9 @@ class Keeper:
             if self._cfg_stamp != stamp:
                 self.cfg = Config(root)
                 self._cfg_stamp = stamp
+            self._cfg_failed = False
         except (SystemExit, OSError) as error:
+            self._cfg_failed = True          # the old Config still delivers; it does not run the check
             self._report("config", f"factory.toml: {error}")
 
     def _log_failed(self, error):
@@ -1906,9 +1996,62 @@ class Keeper:
         except (LogDamage, NotStored, OSError) as error:
             self._log_failed(error)
 
+    def _check_version(self, now):
+        """Every 30 s: a newer build on disk starts the drain (phase_6.md §5). A read failure changes nothing."""
+        if now < self._version_at or self.draining:
+            return
+        self._version_at = now + 30
+        try:
+            installed = hashlib.sha1(SCRIPT.read_bytes()).hexdigest()[:12]
+        except OSError:
+            return
+        if installed != VERSION:
+            self.draining = installed
+            self.emit(f"keeper {installed} installed: finishing what is in flight, then restarting")
+
+    def _drained(self):
+        """Nothing in flight, no ready check running and no withheld result: safe to exec."""
+        return not self.inflight and self.ready_job is None and not self.unsettled
+
+    def _reexec(self):
+        argv = [sys.executable, str(SCRIPT), "keeper", "--state", str(self.state)]
+        self.emit("keeper restarting: new Factory version")
+        try:
+            self._execv(sys.executable, argv)   # the lock fd is close-on-exec: the new image takes it again
+        except OSError as error:
+            self.emit(f"keeper could not restart itself ({error}); it goes on serving")
+            self.draining = None
+            self._version_at = self.clock.monotonic() + 30
+
+    def _show_title(self):
+        """OSC 2, only when it changes: pending pairs, else a reported quiet interval, else keeper."""
+        try:
+            pending = len(self.box.pending())
+        except LogDamage:
+            pending = 0
+        if pending:
+            title = f"keeper · {pending} pending"
+        elif self._told and self.quiet_since is not None:
+            title = f"keeper · quiet {int((self.clock.monotonic() - self.quiet_since) // 60)}m"
+        else:
+            title = "keeper"
+        if title != self._title:
+            self._title = title
+            self.title_out.write(f"\x1b]2;{title}\x07")
+            self.title_out.flush()
+
     def tick(self):
+        self._eligible = False
+        try:
+            self._tick()
+        finally:
+            if not self._eligible:           # any interruption ends the interval a ready check belongs to
+                self._quiet_epoch += 1
+
+    def _tick(self):
         if self._beat_fd is not None:
             os.utime(self._beat_fd)
+        self._check_version(self.clock.monotonic())
         previous = set(self.inflight.items())
         self._drain_results()
         if not self._read_team():
@@ -1944,7 +2087,10 @@ class Keeper:
         if self.cfg is None or self.stop:
             return
         try:
-            if self.damaged is None:
+            if self.damaged is None and self.team.get("up") is True and not self.draining:
+                self._member_notes(view)
+                self._quiet(view, now)
+            if self.damaged is None and not self.draining:   # draining: no new claims, only settlements
                 self._deliver(view, now)
             operator = self.cfg.operator["name"]
             if (self.team.get("up") is not True and not self.inflight
@@ -1952,6 +2098,174 @@ class Keeper:
                 self.stop = "team is down"
         except (LogDamage, NotStored, OSError) as error:
             self._log_failed(error)
+        self._show_title()
+
+    def _member_notes(self, view):
+        """keeper.md §5: housekeeping on briefed member terminals, then one note per new episode for the operator."""
+        operator = self.cfg.operator["name"]
+        reachable = view.operator is not None and view.operator.get("status") is not None
+        briefed = self.box.briefed()
+        for name in self.cfg.members:
+            live = view.terminal(name)
+            record = live or view.finished(name)
+            if record is None or record["labels"].get("factory.down") or record["address"] not in briefed:
+                continue
+            address, status = record["address"], (live or {}).get("status")
+            try:
+                if live and live.get("keep"):
+                    self.hc.keep_off(address)
+                if status and status["state"] != record["labels"].get("factory.last"):
+                    self.hc.label(address, {"factory.last": status["state"]})
+            except (HcError, HcDown) as error:
+                self._report(f"member {address}", f"@{name} ({address}): {error}")
+            if not reachable:
+                continue
+            note = self._episode(name, record, status, view)
+            if note is None:
+                continue
+            meta, text = note
+            last = self.box.last_note(address)
+            if last is not None and last.get("what") == meta["what"] and last.get("since") == meta.get("since"):
+                continue                     # the same episode: noted already, maybe before a restart
+            ident = self.log.add("factory", [operator], text, kind="note", meta=meta)[0]
+            self.log.refresh(self.box)
+            stamp = time.strftime("%H:%M:%S", time.localtime(self.clock.time()))
+            self.emit(f"{stamp} #{ident} note: @{name} {meta['what']}")
+
+    def _quiet(self, view, now):
+        """keeper.md §6 steps 1-3: count a quiet interval, and add one quiet note when its grace has passed."""
+        wall = self.clock.time()
+        q = self.box.quiet_note()
+        told = q is not None and not rearmed(q, view, self.box, self.cfg)
+        self._told = told
+        if self._cfg_failed or not quiet_now(view, self.box, self.cfg, wall, now, self.inflight, self.op_null_since):
+            self.quiet_since = self._quiet_sample = self.ready_next = self._ready_done = None
+            self._told = False
+            return
+        sample = ({a: t.get("turn", 0) for a, t in _member_terminals(view, self.cfg).items()}, self.box.deliveries)
+        if self.quiet_since is None or sample != self._quiet_sample:
+            self.quiet_since = now           # activity between two quiet samples starts the grace again
+        self._quiet_sample = sample
+        operator = self.cfg.operator["name"]
+        if view.operator["status"]["state"] == "blocked":
+            return
+        self._eligible = True                # quiet, reachable and unblocked: the interval goes on
+        if told:
+            self._ready(q, view, now)
+            return
+        self.ready_next = None
+        if now - self.quiet_since < self.cfg.quiet_grace:
+            return
+        meta = {"what": "quiet", "turns": sample[0], "deliveries": sample[1]}
+        text = quiet_text(view, self.box, self.cfg, wall, now - self.quiet_since)
+        ident = self.log.add("factory", [operator], text, kind="note", meta=meta)[0]
+        self.log.refresh(self.box)
+        stamp = time.strftime("%H:%M:%S", time.localtime(wall))
+        self.emit(f"{stamp} #{ident} note: team quiet for {_age(now - self.quiet_since)}")
+
+    def _ready_key(self, q):
+        """A check belongs to its quiet note, the config and command it ran with, and the eligibility interval."""
+        return q["id"], self._cfg_stamp, self.cfg.ready_check, self._quiet_epoch
+
+    def _ready(self, q, view, now):
+        """keeper.md §6 step 4 and phase_6.md §4: the owner's ready check, once a period while told."""
+        done, self._ready_done = self._ready_done, None
+        if done is not None and done[1] == self._ready_key(q) and not self._cfg_failed:
+            self._ready_result(q, *done[2])     # stale results (another interval, command or config) are dropped
+        if (not self.cfg.ready_check or self._cfg_failed or self.ready_job is not None
+                or self.box.outcome(q["id"], self.cfg.operator["name"])["o"] not in ("delivered", "unconfirmed")):
+            return
+        if self.ready_next is None:
+            self.ready_next = now + self.cfg.ready_every   # the first check waits a full period
+            return
+        if now < self.ready_next:
+            return
+        self.ready_next = now + self.cfg.ready_every
+        key, command, root = self._ready_key(q), self.cfg.ready_check, self.team["root"]
+        self.ready_job = key
+
+        def job():
+            try:
+                done = subprocess.run(["sh", "-c", command], cwd=root, stdin=subprocess.DEVNULL,
+                                      stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                                      timeout=READY_TIMEOUT, check=False)
+                result = done.returncode, done.stdout
+            except subprocess.TimeoutExpired:
+                result = "timed out", ""
+            except (OSError, UnicodeDecodeError, ValueError) as error:
+                result = f"failed ({type(error).__name__})", ""
+            self.results.put(("ready", key, result))
+        try:
+            self.spawn(job)
+        except RuntimeError:
+            self.ready_job = None
+
+    def _ready_result(self, q, code, output):
+        """Apply a current check's result (keeper.md §6's table)."""
+        work = output.strip() if isinstance(output, str) else ""
+        if code not in (0, 1):
+            self.emit(f"ready check: {'exit ' + str(code) if isinstance(code, int) else code}")
+            return
+        report = self.box.ready_note()
+        clear = self.team.get("ready_clear", 0)
+        last = report["meta"].get("digest") if report and report["id"] > clear else None
+        if code == 1 or not work:
+            if last is not None:                 # only when a report stands: no redundant writes
+                self.team = update_team(self.state, ready_clear=self.box.highest)
+            return
+        digest = hashlib.sha1(work.encode()).hexdigest()
+        if digest == last:
+            return
+        text = "ready work:\n" + "\n".join(work.splitlines()[:20])
+        meta = {"what": "ready", "digest": digest, "quiet_id": q["id"]}
+        ident = self.log.add("factory", [self.cfg.operator["name"]], text[:2000], kind="note", meta=meta)[0]
+        self.log.refresh(self.box)
+        stamp = time.strftime("%H:%M:%S", time.localtime(self.clock.time()))
+        self.emit(f"{stamp} #{ident} note: ready work")
+
+    def _still_true(self, msg, view, now):
+        """For a quiet or ready note about to be handed off: (still true, the fresh view to route it by), from
+        team.json, the team view and the log read again now, not from what this tick saw earlier."""
+        try:
+            team = read_team(self.state)
+            view = team_view(self.hc, self.team["team"])
+            self.log.refresh(self.box)
+        except (Problem, HcDown, HcError, LogDamage, OSError):
+            return False, None
+        return self._true_in(msg, view, team, now), view
+
+    def _true_in(self, msg, view, team, now):
+        operator = view.operator
+        if (team.get("up") is not True or operator is None or operator.get("status") is None
+                or operator["status"]["state"] == "blocked"):
+            return False
+        if not quiet_now(view, self.box, self.cfg, self.clock.time(), now, self.inflight, self.op_null_since):
+            return False
+        q = self.box.quiet_note()
+        if q is None or rearmed(q, view, self.box, self.cfg):
+            return False
+        what = msg["meta"]["what"]
+        return msg["id"] == q["id"] if what == "quiet" else msg["meta"].get("quiet_id") == q["id"]
+
+    def _episode(self, name, record, status, view):
+        """(meta, text) of the note the member's current state calls for, or None."""
+        address = record["address"]
+        if view.state(name) == "gone":
+            cause, word = end_cause(record)
+            text = f"@{name} {cause} " + (f"while {word}." if word else "(state unknown).")
+            last = self.box.last_to(name, sender=self.cfg.operator["name"])
+            if last:
+                text += f" Its last message from you was #{last['id']}."
+            return {"what": "exit", "about": name, "term": address}, text + f" Run: factory.py up {name}"
+        if status is None or status["state"] not in ("blocked", "error"):
+            return None
+        detail = f": {status['msg']}" if status.get("msg") else ""
+        meta = {"about": name, "term": address, "since": record.get("status_ms")}
+        if status["state"] == "blocked":
+            kind = status.get("kind") or ""
+            text = f"@{name} is blocked" + (f" ({kind})" if kind else "") + detail + ". It needs an answer in its pane."
+            return {"what": "blocked:" + kind, **meta}, text
+        return {"what": "error", **meta}, f"@{name} hit an error{detail}."
 
     def _emit_outcome(self, msg, recipient, outcome, why=None):
         stamp = time.strftime("%H:%M:%S", time.localtime(self.clock.time()))
@@ -1982,7 +2296,13 @@ class Keeper:
                 self._record(old, name, "dropped", why="superseded")
             if msg is None:
                 continue
-            action, *detail = decide(name, msg, view, self.box, self.cfg, now, self.op_null_since)
+            route = view
+            if _quiet_or_ready_note(msg):            # judged and routed by the same fresh view (the operator may move)
+                still, fresh = self._still_true(msg, view, now)
+                route = fresh or view
+            else:
+                still = True
+            action, *detail = decide(name, msg, route, self.box, self.cfg, now, self.op_null_since, still)
             if action == "hold":
                 continue
             if action == "latch":
@@ -2000,9 +2320,14 @@ class Keeper:
             if why in ("gone", "not ready", "stopped by down"):
                 for pending, _ in self.box.pending(name):
                     if self.box.outcome(pending["id"], name)["o"] == "queued":
-                        self._record(pending, name, outcome, why=why)
+                        if _quiet_or_ready_note(pending):   # never queued behind another head
+                            self._record(pending, name, "dropped", why="no longer true")
+                        else:
+                            self._record(pending, name, outcome, why=why)
             else:
                 self._record(msg, name, outcome, why=why)
+            if outcome == "dropped" and _quiet_or_ready_note(msg) and msg["meta"]["what"] == "quiet":
+                self.quiet_since = None              # a dropped quiet note: a full grace before the next
 
     def _claim(self, msg, name, term):
         if self.stop or not self._record(msg, name, "sending", term=term) or self.stop:
@@ -2035,7 +2360,11 @@ class Keeper:
                 pending.append(self.results.get_nowait())
             except queue.Empty:
                 break
-        for name, ident, term, result in pending:
+        for item in pending:
+            if len(item) == 3 and item[0] == "ready":   # (tag, job key, result): never a four-field send
+                self.ready_job, self._ready_done = None, item
+                continue
+            name, ident, term, result = item
             if self.inflight.get(name) != ident:
                 continue
             try:
@@ -2073,6 +2402,8 @@ class Keeper:
             self._record(msg, name, "unconfirmed", why=detail, term=term)
         elif _quiet_or_ready_note(msg):
             self._record(msg, name, "dropped", why="operator could not take it", term=term)
+            if msg["meta"]["what"] == "quiet":
+                self.quiet_since = None              # no retry loop on a refusal: a full grace again
         elif name == self.cfg.operator["name"]:
             self._record(msg, name, "queued", why=why)
         else:
@@ -3585,14 +3916,19 @@ def lifecycle_lock(state):
     return fd
 
 
-def interrupted_line(name, record, box):
-    """§8: why a gone member stopped, and the last message it got."""
+def end_cause(record):
+    """Why a gone member's terminal stopped (launch_layout.md §8), and its last observed state or None."""
     reason = record.get("reason")
     cause = ("its harness ended" if record["state"] == "live"
              else f"exited (code {record.get('exit_code')})" if reason == "exited"
              else "was killed" if reason == "killed" else "hc stopped" if reason == "server_stop"
              else f"was lost ({reason})")
-    word = (record.get("labels") or {}).get("factory.last")
+    return cause, (record.get("labels") or {}).get("factory.last")
+
+
+def interrupted_line(name, record, box):
+    """§8: why a gone member stopped, and the last message it got."""
+    cause, word = end_cause(record)
     line = f"@{name} interrupted: {cause} " + (f"while {word}." if word else "(state unknown).")
     msg = box.last_to(name) if box is not None else None
     if msg:
