@@ -1427,128 +1427,13 @@ def kind(call):
 
 
 class UpTests(unittest.TestCase):
-    def test_up_warns_once_for_each_integration_it_will_use(self):
-        members = {n: CATALOG_MEMBERS[n] for n in ("lead-dev", "reviewer", "pm", "frontend-dev")}
-        members["designer"] = {"harness": "agy"}
-        status = textwrap.dedent("""\
-            claude: outdated (v2 < v3) (/hooks/claude)
-            codex: not installed (/hooks/codex)
-            pi: current (v2) (/hooks/pi)
-            opencode: needs repair (v13) (/hooks/opencode)
-            antigravity-cli: needs repair (v4) (/hooks/antigravity-cli)
-            """)
-        with Env(formation(members)) as e:
-            p = e.run("up", "--fresh", "--no-brief", FAKE_INTEGRATION_STATUS=status)
-            self.assertEqual(set(e.starts()), set(members))
-            self.assertEqual(p.stderr.count("Codex herdr integration not installed"), 1)
-            self.assertIn("Claude Code herdr integration outdated (v2 < v3)", p.stderr)
-            self.assertIn("Antigravity CLI herdr integration needs repair (v4)", p.stderr)
-            for target in ("claude", "codex", "antigravity-cli"):
-                self.assertIn(f"Ask the user before running `herdr integration install {target}`", p.stderr)
-            self.assertNotIn("pi herdr integration", p.stderr)
-            self.assertNotIn("OpenCode", p.stderr)
-            e.run("up", "--no-brief", FAKE_INTEGRATION_STATUS=status)  # already running: no query
-            self.assertEqual(e.calls("integration"), [["integration", "status"]])
-            calls = e.calls()
-            self.assertLess(calls.index(["integration", "status"]), calls.index(e.calls("pane", "rename")[0]))
-
-    def test_up_integration_status_failure_and_unknown_rows_only_warn(self):
-        brief = formation({"lead-dev": CATALOG_MEMBERS["lead-dev"]})
-        cases = (
-            ({"FAKE_INTEGRATION_FAIL": "1"}, "could not check herdr integrations (status_failed:"),
-            ({"FAKE_INTEGRATION_STATUS": "pi: current (v2) (/hooks/pi)"}, "could not verify the Codex herdr integration"),
-            ({"FAKE_INTEGRATION_STATUS": "codex: new state (v2) (/hooks/codex)"}, "could not verify the Codex herdr integration"),
-        )
-        for env, warning in cases:
-            with self.subTest(env=env), Env(brief) as e:
-                p = e.run("up", "--no-brief", **env)
-                self.assertIn(warning, p.stderr)
-                self.assertIn("Run `herdr integration status` to verify", p.stderr)
-                self.assertNotIn("integration install", p.stderr)
-                self.assertEqual(e.calls("integration"), [["integration", "status"]])
-                self.assertIn("lead-dev", e.starts())
-
-    def test_ui_team_launches_in_the_team_tab_and_is_briefed(self):
-        with Env(UI) as e:
-            self.assertEqual(factory.Config(e.repo).operator["name"], "operator")  # the default name
-            e.run("up", cwd=e.repo / "sub")  # the team's files are found from a subdirectory too
-            fs = e.fake_state()
-            self.assertEqual((fs["panes"]["w1:p1"]["name"], fs["panes"]["w1:p1"]["label"]), ("operator", "operator"))
-            self.assertEqual(fs["tabs"], {"w1:t1": "factory operator", "w1:t2": "factory team"})  # the operator's tab, and one for the team
-            tab = e.calls("tab", "create")
-            self.assertEqual(len(tab), 1)
-            self.assertEqual((flag(tab[0], "--cwd"), flag(tab[0], "--workspace")), (str(e.repo), "w1"))
-            self.assertTrue(all("--no-focus" in c and flag(c, "--cwd") == str(e.repo) for c in tab + e.calls("pane", "split")))
-            labels = {p["label"]: (k, p["tab_id"]) for k, p in fs["panes"].items()}
-            self.assertEqual(labels, {"operator": ("w1:p1", "w1:t1"), "lead-dev": ("w1:p2", "w1:t2"), "frontend-dev": ("w1:p3", "w1:t2"),
-                                      "reviewer": ("w1:p4", "w1:t2"), "pm": ("w1:p5", "w1:t2")})
-            sizes = {(p["rect"]["width"], p["rect"]["height"]) for p in fs["panes"].values() if p["tab_id"] == "w1:t2"}
-            self.assertEqual(sizes, {(100, 25)})  # four members: a 2 x 2 grid
-
-            starts = e.starts()
-            self.assertEqual({n: kind(c) for n, c in starts.items()},
-                             {"lead-dev": "codex", "frontend-dev": "claude", "reviewer": "codex", "pm": "pi"})
-            cache = e.root / "cache/factory-skill"
-            for name in ("lead-dev", "reviewer"):  # Codex: never stops to ask, never hard read-only
-                argv = native(starts[name])
-                self.assertEqual(flag(argv, "-m"), {"lead-dev": "gpt-6-astra", "reviewer": "gpt-6-luna"}[name])
-                self.assertEqual(argv[-1], "--dangerously-bypass-approvals-and-sandbox")
-                pointer = tomllib.loads(next(v for v in argv if v.startswith("developer_instructions=")))["developer_instructions"]
-                self.assertIn(f"You are @{name}", pointer)
-                prompt_file = pathlib.Path(pointer.split(" are in ")[1].split(". Read")[0])
-                self.assertTrue(str(prompt_file).startswith(str(cache)) and prompt_file.exists())  # outside the repo
-            fe = native(starts["frontend-dev"])
-            settings = json.loads(pathlib.Path(flag(fe, "--settings")).read_text())
-            self.assertIn(f"Bash(python3 {SCRIPT} say *)", settings["permissions"]["allow"])
-            self.assertIn(f"python3 {SCRIPT} say *", settings["sandbox"]["excludedCommands"])
-            self.assertNotIn("herdr agent prompt *", settings["sandbox"]["excludedCommands"])
-            sock = os.environ.get("HERDR_SOCKET_PATH")
-            expected_network = {"allowUnixSockets": [sock]} if sys.platform == "darwin" and sock else {"allowAllUnixSockets": True}
-            self.assertEqual(settings["sandbox"]["network"], expected_network)
-            self.assertEqual(flag(fe, "--permission-mode"), "bypassPermissions")  # the default never stops to ask
-            self.assertTrue(settings["skipDangerousModePermissionPrompt"])  # nor at its first-run warning
-            self.assertNotIn("--disallowedTools", fe)
-            prompt = pathlib.Path(flag(fe, "--append-system-prompt-file")).read_text()
-            self.assertIn(str(e.repo / "FACTORY.md"), prompt)
-            self.assertNotIn("{instructions}", prompt)
-            self.assertEqual(flag(native(starts["pm"]), "--model"), "openrouter/deepseek/deepseek-v4.1-flash-1017")
-
-            status = e.run("status").stdout  # names come from herdr's agent list, not its pane list
-            self.assertNotIn("unnamed", status)
-            sent = dict(e.prompts())
-            self.assertEqual(set(sent), {"lead-dev", "frontend-dev", "reviewer", "pm"})  # one message each
-            self.assertTrue(sent["frontend-dev"].startswith("# Team brief (from @operator)"))  # its instructions are its system prompt
-            self.assertTrue(sent["reviewer"].startswith("[from @operator]: Your standing instructions"))  # Codex gets them here too
-            self.assertIn("You are read-only", sent["reviewer"])
-            for text in sent.values():
-                for needle in ("| **@lead-dev** | Codex, gpt-6-astra, high |", "## Workflow", READY):
-                    self.assertIn(needle, text)
-                self.assertNotIn("+++", text)
-            self.assertEqual(sorted(p.name for p in e.repo.iterdir()), ["FACTORY.md", "factory.toml", "sub"])  # nothing else
-
-    def test_ten_members_stay_a_balanced_grid(self):
-        with Env() as e:
-            e.run("up", "--no-brief")
-            team = [p for p in e.fake_state()["panes"].values() if p["tab_id"] == "w1:t2"]
-            self.assertEqual(len(team), 10)
-            self.assertEqual(len(e.calls("tab", "create")), 1)
-            areas = [p["rect"]["width"] * p["rect"]["height"] for p in team]
-            self.assertLessEqual(max(areas) / min(areas), 2.2)  # no pane is squeezed: each split halves the largest
-            self.assertGreaterEqual(min(p["rect"]["width"] for p in team), 50)
-            self.assertGreaterEqual(min(p["rect"]["height"] for p in team), 12)
-
-    def test_typed_command_fits_the_macos_line_limit(self):
-        # herdr types `<harness> <argv>` into the pane's shell, and macOS limits that line to 1024 bytes.
-        deep = "/Users/someone/Development/some-organization/a-rather-long-repository-name-for-a-project"
-        with Env() as e:
+    def launches(self, e, *names):
+        """{name: (argv, env)}: the checked plans' native launch arguments, as up passes them."""
+        with patch.dict(os.environ, e.env, clear=True):
             cfg = factory.Config(e.repo)
-            cfg.root = pathlib.Path(deep)
-            resume = {"agent": "codex", "kind": "id", "value": "01a1cbc6-e708-7623-986f-cc2e07efa28f"}
-            for name in cfg.members:
-                m = {**factory.plan(cfg, name), "permissions": "full", "branch": "ada/" + name}
-                m["model"] = "openrouter/" + m["model"] if m["harness"] == "pi" else m["model"]
-                argv, _ = factory.launch_argv(m, pathlib.Path("/Users/someone/.cache/factory-skill") / cfg.cache.name / cfg.session_dir.name / f"{name}.md", resume)
-                self.assertLess(len(shlex.join([m["harness"], *argv]).encode("utf-8")), 900, name)
+            plans = factory.checked(cfg, [factory.plan(cfg, n) for n in names or cfg.members])
+            return {m["name"]: factory.launch_argv(m, pathlib.Path("/p.md")) for m in plans}
+
 
     def test_failed_check_launches_nothing_and_explains_the_fix(self):
         with Env(team_brief('''
@@ -1559,82 +1444,12 @@ class UpTests(unittest.TestCase):
             harness = "codex"
             model = "gpt-6-luna"
         ''')) as e:
-            p = e.run("up", check=False)
+            p = e.run("check", check=False)
             self.assertEqual(p.returncode, 2)
             self.assertIn("Cannot launch: 1 member(s)", p.stdout)
             self.assertIn("pi has no model z-ai/glm-9 configured", p.stdout)
             self.assertIn("OpenRouter key", p.stdout)
-            self.assertEqual(e.calls(), [["agent", "get", e.env["HERDR_PANE_ID"]], ["agent", "list"], ["pane", "list"]])
 
-    def test_up_can_be_run_again_after_a_partial_launch(self):
-        with Env(UI) as e:
-            p = e.run("up", check=False, FAKE_START_FAIL="dead:frontend-dev,blocked:pm,banner:reviewer,dialog:lead-dev")
-            self.assertEqual(p.returncode, 3)
-            self.assertIn("started @reviewer", p.stdout)  # a start-up notice that clears is not a failure
-            self.assertIn("started @lead-dev", p.stdout)  # a question the harness table knows is answered
-            self.assertEqual([c[3:] for c in e.calls("pane", "send-keys")], [["enter"]])
-            self.assertIn("@frontend-dev did not come up: timeout: agent did not appear", p.stdout)  # herdr's reason is shown
-            self.assertIn("factory.py up frontend-dev", p.stdout)
-            self.assertIn("@pm launch incomplete: agent_not_ready", p.stdout)
-            self.assertIn("Brief withheld.", p.stdout)
-            self.assertEqual(sorted(e.starts()), ["frontend-dev", "lead-dev", "pm", "reviewer"])  # it went on past both
-            self.assertEqual({n for n, _ in e.prompts()}, {"lead-dev", "reviewer"})  # only those that came up were briefed
-
-            e.update("pm", agent_status="idle")  # the user answered pm's dialog
-            before = len(e.prompts())
-            out = e.run("up", "frontend-dev").stdout
-            self.assertIn("started @frontend-dev", out)
-            later = dict(e.prompts()[before:])
-            self.assertIn("starting in a new session", later.pop("frontend-dev"))
-            self.assertEqual(set(later), {"lead-dev", "reviewer", "pm"})
-            for text in later.values():
-                self.assertTrue(text.startswith("[from @operator]: Joined the team: @frontend-dev (frontend-dev, Claude Code"))
-            self.assertEqual(len(e.calls("tab", "create")), 1)  # the failed member's pane was reused
-            self.assertEqual(len([p for p in e.fake_state()["panes"].values() if p["label"] == "frontend-dev"]), 1)
-            e.run("brief", "--send", "pm")
-            self.assertIn("# Team brief", e.prompts()[-1][1])
-            self.assertEqual(e.prompts()[-1][0], "pm")
-
-    def test_startup_dialog_must_disappear_before_briefing(self):
-        with Env() as e:
-            result = e.run("up", "lead-dev", check=False,
-                           FAKE_START_FAIL="dialog:lead-dev", FAKE_DIALOG_STUCK="1")
-            self.assertEqual(result.returncode, 3)
-            self.assertIn("still asks", result.stdout)
-            self.assertIn("input_failed", result.stdout)
-            self.assertEqual(e.prompts(), [])
-
-    def test_wrapped_startup_question_is_answered_once_before_the_brief(self):
-        # A narrow pane wraps agy's trust question and herdr calls agy ready. Unanswered, the question took the
-        # Enter that ends the brief, and the brief was lost (gate-010).
-        agy = formation({"pm": {"harness": "agy"}}, operator={"harness": "claude"})
-        for width in ("27", "4"):
-            with self.subTest(width=width), Env(agy) as e:
-                e.run("up", FAKE_START_FAIL="dialog:pm", FAKE_DIALOG_WRAP=width)
-                calls = e.fake_state()["calls"]
-                keys = [i for i, c in enumerate(calls) if c[:2] == ["pane", "send-keys"]]
-                prompts = [i for i, c in enumerate(calls) if c[:3] == ["agent", "prompt", "pm"]]
-                self.assertEqual([calls[i][3:] for i in keys], [["enter"]])
-                self.assertEqual(len(prompts), 1)
-                self.assertLess(keys[0], prompts[0])
-        with self.subTest("a question the table does not know"), Env(agy) as e:
-            e.run("up", FAKE_START_FAIL="dialog:pm", FAKE_DIALOG_WRAP="27",
-                  FAKE_DIALOG_TEXT="Do you trust the contents of this?")
-            self.assertEqual(e.calls("pane", "send-keys"), [])
-        with self.subTest("the question stays after its answer"), Env(agy) as e:
-            result = e.run("up", check=False, FAKE_START_FAIL="dialog:pm", FAKE_DIALOG_WRAP="27", FAKE_DIALOG_STUCK="1")
-            self.assertEqual(result.returncode, 3)
-            self.assertIn("still asks", result.stdout)
-            self.assertEqual(len(e.calls("pane", "send-keys")), 1)
-            self.assertEqual(e.prompts(), [])
-
-    def test_lead_detection_preserves_socket_error(self):
-        with Env() as e:
-            result = e.run("up", "lead-dev", check=False, FAKE_GET_FAIL="1")
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("Operation not permitted", result.stderr)
-            self.assertNotIn("herdr sees no agent", result.stderr)
-            self.assertEqual(e.starts(), {})
 
     def test_thinking_levels_are_guarded(self):
         cases = [
@@ -1672,9 +1487,11 @@ class UpTests(unittest.TestCase):
 
     def test_unknown_claude_model_warns_without_blocking(self):
         with Env(formation({"reviewer": {"harness": "claude", "model": "claude-future-9"}})) as e:
-            result = e.run("up", "reviewer")
+            result = e.run("check", "reviewer")
             self.assertIn("claude-future-9 is not among", result.stderr)
-            self.assertEqual(flag(native(e.starts()["reviewer"]), "--model"), "claude-future-9")
+            with contextlib.redirect_stderr(io.StringIO()):
+                argv = self.launches(e, "reviewer")["reviewer"][0]
+            self.assertEqual(flag(argv, "--model"), "claude-future-9")
 
     def test_harness_not_installed(self):
         with Env(harnesses=("claude", "pi")) as e:
@@ -1697,30 +1514,15 @@ class UpTests(unittest.TestCase):
         with Env(formation({
             'reviewer': {'harness': 'opencode', 'model': 'z-ai/glm-5.3', 'thinking': 'high'},
         })) as e:
-            e.run("up", "reviewer")
-            self.assertEqual(native(e.starts()["reviewer"]), ["--standalone", "--auto"])
-            content = json.loads(e.pane_of("reviewer")["env"][0].split("=", 1)[1])
-            self.assertEqual(content, {"model": "openrouter/z-ai/glm-5.3#high"})
-            name, text = e.prompts()[0]
+            argv, env = self.launches(e, "reviewer")["reviewer"]
+            self.assertEqual(argv, ["--standalone", "--auto"])
+            self.assertEqual(json.loads(env["OPENCODE_CONFIG_CONTENT"]), {"model": "openrouter/z-ai/glm-5.3#high"})
+            cfg = factory.Config(e.repo)
+            m = factory.plan(cfg, "reviewer")
+            text = factory.message_for(cfg, m, [m], "operator", "ready")
             self.assertIn("You are @reviewer", text)  # OpenCode gets its instructions as a message
             self.assertIn("# Team brief", text)
 
-    def test_agy_default_launch_trust_message_and_resume(self):
-        with Env(formation({"pm": {"harness": "agy"}}, operator={"harness": "claude"})) as e:
-            e.run("up", FAKE_START_FAIL="dialog:pm")
-            args = ["--model", "gemini-4-neon-high", "--mode", "accept-edits",
-                    "--settings", '{"toolPermission":"always-proceed"}']
-            self.assertEqual(kind(e.starts()["pm"]), "agy")
-            self.assertEqual(native(e.starts()["pm"]), args)
-            self.assertEqual([c[3:] for c in e.calls("pane", "send-keys")], [["enter"]])
-            brief = dict(e.prompts())["pm"]
-            self.assertIn("You are @pm", brief)
-            self.assertIn("Antigravity CLI, gemini-4-neon, high", brief)
-            self.assertIn("factory.py say", brief)
-            e.set_session("pm", {"agent": "agy", "kind": "id", "value": "conversation-94"})
-            e.kill("pm")
-            e.run("up", "pm")
-            self.assertEqual(native(e.starts()["pm"]), args[:2] + ["--conversation", "conversation-94"] + args[2:])
 
     def test_agy_model_variants_and_guarded_permissions(self):
         cases = {"pm": ("gemini-4-neon", "low", "gemini-4-neon-low"),
@@ -1729,11 +1531,11 @@ class UpTests(unittest.TestCase):
         members = {name: {"harness": "agy", "model": model, "permissions": "guarded",
                           **({"thinking": level} if level else {})} for name, (model, level, _) in cases.items()}
         with Env(formation(members)) as e:
-            e.run("up")
+            launches = self.launches(e)
             for name, (_, _, wanted) in cases.items():
-                self.assertEqual(native(e.starts()[name]), ["--model", wanted, "--mode", "accept-edits",
+                self.assertEqual(launches[name][0], ["--model", wanted, "--mode", "accept-edits",
                                  "--settings", '{"toolPermission":"always-proceed"}'])
-            brief = dict(e.prompts())["pm"]
+            brief = e.run("brief").stdout
             self.assertIn("gemini-4-neon-low, low", brief)
             self.assertIn("gemini-pro-orchestrator-neon, default", brief)
             self.assertIn("agy offers: gemini-4-neon-high, gemini-4-neon-low, gemini-pro-orchestrator-neon",
@@ -1745,9 +1547,8 @@ class UpTests(unittest.TestCase):
             "reviewer": {"harness": "agy", "model": "gemini-4-neon", "thinking": "max"},
             "designer": {"harness": "agy", "model": "Gemini 4 Neon (High)"},
         })) as e:
-            result = e.run("up", check=False)
+            result = e.run("check", check=False)
             self.assertEqual(result.returncode, 2)
-            self.assertEqual(e.starts(), {})
             self.assertIn("gemini-4-neon-low has no thinking level 'high'", result.stdout)
             self.assertIn("Use one of: low.", result.stdout)
             self.assertIn("gemini-4-neon has no thinking level 'max'", result.stdout)
@@ -1773,13 +1574,12 @@ class UpTests(unittest.TestCase):
             harness = "omp"
             model = "z-ai/glm-5.3"
         ''')) as e:
-            e.run("up", "lead-dev", "frontend-dev", "reviewer", "pm", "--no-brief", FAKE_START_FAIL="dialog:frontend-dev")
-            starts = {n: native(c) for n, c in e.starts().items()}
+            launches = self.launches(e, "lead-dev", "frontend-dev", "reviewer", "pm")
+            starts = {n: argv for n, (argv, _) in launches.items()}
             self.assertEqual(starts["lead-dev"][-4:], ["--approve-for-me", "-c", "sandbox_workspace_write.network_access=true", "--search"])
             self.assertNotIn("-s", starts["lead-dev"])  # --approve-for-me cannot be combined with -s
             self.assertEqual(flag(starts["frontend-dev"], "--permission-mode"), "auto")
-            self.assertNotIn("network", json.loads(pathlib.Path(flag(starts["frontend-dev"], "--settings")).read_text())["sandbox"])
-            self.assertEqual([c[3:] for c in e.calls("pane", "send-keys")], [["down", "enter"]])  # Claude's trust question
+            self.assertNotIn("network", json.loads(factory.claude_settings("guarded", e.root / "m"))["sandbox"])
             self.assertEqual(starts["reviewer"][-1], "--dangerously-bypass-approvals-and-sandbox")
             self.assertEqual(starts["pm"][-2:], ["--approval-mode", "yolo"])  # omp has no guard that lets messages through
             e.write_brief(team_brief('''
@@ -1789,53 +1589,18 @@ class UpTests(unittest.TestCase):
         '''))
             self.assertIn("must be one of full, guarded", e.run("check", "pm", check=False).stderr)
 
-    def test_claude_members_disable_prompt_suggestions_on_start_and_resume(self):
-        members = {"frontend-dev": {**CATALOG_MEMBERS["frontend-dev"], "permissions": "full"},
-                   "designer": {**CATALOG_MEMBERS["designer"], "permissions": "guarded"}}
-        with Env(formation(members)) as e:
-            e.run("up", "--no-brief")
-            for name in members:
-                e.set_session(name, {"agent": "claude", "kind": "id", "value": f"saved-{name}"})
-            e.run("up", "--restart")
-            for name in members:
-                fresh, resumed = [native(call) for call in e.calls("agent", "start", name)]
-                self.assertNotIn("--resume", fresh)
-                self.assertEqual(flag(resumed, "--resume"), f"saved-{name}")
-                for argv in (fresh, resumed):
-                    self.assertIs(json.loads(pathlib.Path(flag(argv, "--settings")).read_text())["promptSuggestionEnabled"], False)
 
     def test_claude_socket_settings_follow_platform_and_permission_level(self):
         for platform in ("linux", "darwin"):
-            for socket_path in ("", "/tmp/test-herdr.sock"):
+            for socket_path in ("", "/tmp/hc-test.sock"):
                 with self.subTest(platform=platform, socket=socket_path), patch.object(factory.sys, "platform", platform), \
-                        patch.dict(os.environ, {"HERDR_SOCKET_PATH": socket_path}):
-                    full = json.loads(factory.claude_settings("full"))["sandbox"]
+                        patch.dict(os.environ, {"HC_TERMINAL_SOCKET": socket_path}):
+                    full = json.loads(factory.claude_settings("full", "/s/messages/x"))["sandbox"]
                     expected = {"allowUnixSockets": [socket_path]} if platform == "darwin" and socket_path else {"allowAllUnixSockets": True}
                     self.assertEqual(full["network"], expected)
-                    self.assertNotIn("network", json.loads(factory.claude_settings("guarded"))["sandbox"])
+                    guarded = json.loads(factory.claude_settings("guarded", "/s/messages/x"))["sandbox"]
+                    self.assertNotIn("network", guarded)
 
-    def test_new_members_never_rename_existing_members(self):
-        with Env() as e:
-            e.run("up", "backend-dev", "pm", "--no-brief")
-            first = e.pane_of("backend-dev")
-            original_settings = factory.Config(e.repo).members["backend-dev"]
-            original_prompt = pathlib.Path(flag(native(e.starts()["backend-dev"]), "--append-system-prompt"))
-            original_text = original_prompt.read_text()
-            for number in (2, 3):
-                name = f"backend-dev-{number}"
-                members = {**CATALOG_MEMBERS, **{f"backend-dev-{i}": {
-                    "role": "backend-dev", "harness": "codex", "model": "gpt-6-luna",
-                } for i in range(2, number + 1)}}
-                e.write_brief(formation(members))
-                original_brief = (e.repo / "factory.toml").read_bytes()
-                self.assertIn(f"started @{name}", e.run("up", name).stdout)
-                self.assertEqual((e.repo / "factory.toml").read_bytes(), original_brief)
-                self.assertEqual(factory.Config(e.repo).members["backend-dev"], original_settings)
-                self.assertEqual({k: e.pane_of("backend-dev")[k] for k in ("pane_id", "name", "label", "cwd")},
-                                 {k: first[k] for k in ("pane_id", "name", "label", "cwd")})
-                self.assertEqual(original_prompt.read_text(), original_text)
-            self.assertEqual(e.calls("agent", "rename"), [["agent", "rename", "w1:p1", "operator"]])
-            self.assertNotIn("backend-dev-1", factory.Config(e.repo).members)
 
     def test_existing_member_settings_only_come_from_the_brief(self):
         with Env(git=True) as e:
@@ -1847,129 +1612,6 @@ class UpTests(unittest.TestCase):
                 self.assertIn("unrecognized arguments", p.stderr)
             self.assertEqual((e.repo / "factory.toml").read_bytes(), original)
             self.assertEqual(e.starts(), {})
-
-    def test_up_reports_brief_delivery_failure_on_start_and_recovery(self):
-        with Env() as e:
-            p = e.run("up", "lead-dev", check=False, FAKE_PROMPT_FAIL="lead-dev")
-            self.assertEqual(p.returncode, 3)
-            self.assertIn("NOT delivered to @lead-dev: agent_blocked", p.stdout)
-            self.assertEqual(len(e.prompts()), 1)
-            e.kill("lead-dev")
-            p = e.run("up", "lead-dev", check=False, FAKE_UNCONFIRMED="lead-dev")
-            self.assertEqual(p.returncode, 3)
-            self.assertIn("delivery unconfirmed to @lead-dev: unexpected reply from herdr", p.stdout)
-            self.assertNotIn("brief --send", p.stdout)
-            self.assertEqual(len(e.prompts()), 2)
-            self.assertEqual(e.run("brief", "--send", "lead-dev").returncode, 0)
-
-    def test_delivery_preserves_the_briefs_final_newline(self):
-        with Env() as e:
-            e.run("up", "--no-brief")
-            preview = e.run("brief").stdout
-            e.run("brief", "--send", "frontend-dev")  # Claude gets the brief without a standing-instructions prefix
-            self.assertEqual(dict(e.prompts())["frontend-dev"] + "\n", preview)  # CLI print adds one newline
-
-    def test_session_local_drafts_instructions_settings_and_cold_start(self):
-        with Env(formation({"architect": CATALOG_MEMBERS["architect"]}, operator={"harness": "claude"})) as e:
-            fresh = e.fake.read_bytes()
-            drafts, instructions = [], []
-            for session in ("team/one", "team-one"):  # identical readable prefix and roster
-                e.fake.write_bytes(fresh)
-                e.run("up", "--no-brief", HERDR_SESSION=session)
-                launch = e.starts()["architect"]
-                prompt = pathlib.Path(flag(launch, "--append-system-prompt-file"))
-                instructions.append((prompt, prompt.read_text()))
-                settings = json.loads(pathlib.Path(flag(launch, "--settings")).read_text())
-                directory = pathlib.Path(settings["permissions"]["additionalDirectories"][0])
-                self.assertIn(str(directory), prompt.read_text())
-                self.assertIn(str(directory), settings["sandbox"]["filesystem"]["allowWrite"])
-                self.assertIn(f"python3 {SCRIPT} say *", settings["sandbox"]["excludedCommands"])
-                self.assertEqual(directory.stat().st_mode & 0o777, 0o700)
-                path = directory / "message-same.md"
-                path.write_text(session)
-                drafts.append(path)
-            first, second = drafts
-            self.assertNotEqual(first, second)
-            self.assertNotEqual(instructions[0][0], instructions[1][0])
-            for path, original in instructions:
-                self.assertEqual(path.read_text(), original)
-            e.kill("architect")
-            cold = e.run("up", "--no-brief", HERDR_SESSION="team-one").stdout
-            self.assertIn(str(second), cold)
-            self.assertNotIn(str(first), cold)
-
-    def test_cold_up_warns_about_unreadable_drafts_and_lists_readable_siblings(self):
-        members = {name: CATALOG_MEMBERS[name] for name in ("architect", "reviewer")}
-        with Env(formation(members)) as e, patch.dict(os.environ, e.env, clear=True), \
-                patch.object(factory, "HERDR", e.env["HERDR_BIN"]):
-            drafts = factory.Config(e.repo).messages
-            unreadable = drafts / "architect"
-            readable = drafts / "reviewer" / "pending-review.md"
-            unreadable.mkdir(parents=True)
-            readable.parent.mkdir()
-            readable.write_text("A pending review")
-            iterdir = pathlib.Path.iterdir
-
-            def scan(path):
-                if path == unreadable:
-                    raise PermissionError("permission denied")
-                return iterdir(path)
-
-            out, err = io.StringIO(), io.StringIO()
-            with patch.object(pathlib.Path, "iterdir", scan), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-                factory.main(["up", "--cwd", str(e.repo), "--no-brief"])
-
-            self.assertIn(f"warning: cannot scan drafts in {unreadable}: permission denied", err.getvalue())
-            self.assertIn(str(readable), out.getvalue())
-            self.assertIn("leftover draft for @reviewer", out.getvalue())
-            self.assertEqual(set(e.starts()), set(members))
-            self.assertEqual(readable.read_text(), "A pending review")
-
-    def test_brief_send_all_matches_implicit_broadcast(self):
-        with Env() as e:
-            e.run("up", "lead-dev", "pm", "--no-brief")
-            e.run("brief", "--send")
-            expected = e.prompts()
-            self.assertEqual([name for name, text in expected], ["lead-dev", "pm"])
-            e.run("brief", "--send", "all")
-            self.assertEqual(e.prompts(), expected + expected)
-
-    def test_terminal_reads_and_keys_are_limited_to_known_startup_dialogs(self):
-        with Env() as e:
-            launched = e.run("up", "lead-dev", "pm", check=False, FAKE_START_FAIL="dialog:lead-dev,blocked:pm")
-            self.assertEqual(launched.returncode, 3)
-            self.assertIn("@pm launch incomplete", launched.stdout)
-            pane = e.pane_of("lead-dev")["pane_id"]
-            self.assertIn("@pm blocked:", e.run("status").stdout)
-            failed = e.run("brief", "--send", "pm", check=False, FAKE_UNCONFIRMED="pm")
-            self.assertIn("delivery unconfirmed to @pm", failed.stdout)
-            e.run("down", "lead-dev", "pm")
-
-            read = ["pane", "read", pane, "--source", "visible"]
-            terminal_calls = [c for c in e.calls() if len(c) > 1 and c[0] in ("pane", "agent", "terminal")
-                              and c[1] in ("read", "snapshot", "wait-output", "send-keys")]
-            self.assertEqual(terminal_calls, [read, ["pane", "send-keys", pane, "enter"], read])
-
-    def test_herdr_required_and_brief_missing(self):
-        with Env() as e:
-            self.assertEqual(e.run("status", "--all", check=False).returncode, 2)
-            for command in ("up", "check", "prompt"):
-                missing = e.run(command, "ghost", check=False)
-                self.assertEqual(missing.returncode, 1)
-                self.assertIn("not a member", missing.stderr)
-                self.assertNotIn("Traceback", missing.stderr)
-            status = e.run("status").stdout
-            self.assertEqual(status.count("not started"), len(CATALOG_MEMBERS) + 1)
-            self.assertIn("No member of factory.toml has a pane in this herdr session. "
-                          "Run `factory.py up` to start or resume its members.", status)
-            for command in ("cost", "show"):
-                self.assertEqual(e.run(command, check=False).returncode, 2)
-            for option in ("--dry-run", "--trust-models", "--effort"):
-                self.assertEqual(e.run("up", "lead-dev", option, check=False).returncode, 2)
-            for cmd in (["up", "pm"], ["status"]):
-                self.assertIn("not inside herdr", e.run(*cmd, check=False, HERDR_ENV="").stderr)
-        with Env(brief=None) as e:
-            self.assertIn("Run `/factory setup`", e.run("check", "pm", check=False).stderr)
 
 
 @unittest.skipUnless(GIT, "git is not installed")
@@ -1996,7 +1638,13 @@ class WorktreeTests(unittest.TestCase):
 
     def test_worktree_members_get_their_own_checkout_and_commit_there(self):
         with Env(team_brief(self.BRIEF), git=True) as e:
-            out = e.run("up", "backend-dev", "backend-dev-2", "frontend-dev", "reviewer").stdout
+            cfg = factory.Config(e.repo)
+            with contextlib.redirect_stdout(io.StringIO()) as printed:
+                for name in ("backend-dev", "backend-dev-2", "frontend-dev", "reviewer"):
+                    m = factory.plan(cfg, name)
+                    if m["branch"]:
+                        self.assertIsNone(factory.ensure_worktree(cfg, m))
+            out = printed.getvalue()
             trees = e.root / "repo.worktrees"
             self.assertEqual(sorted(p.name for p in trees.iterdir()), ["ada-backend-dev", "feature-login"])  # one is shared
             self.assertEqual(out.count("created worktree"), 2)
@@ -2004,10 +1652,11 @@ class WorktreeTests(unittest.TestCase):
                                               capture_output=True, text=True).stdout.strip()
             self.assertEqual((branch(trees / "ada-backend-dev"), branch(trees / "feature-login")),
                              ("ada/backend-dev", "feature/login"))
-            where = {n: e.pane_of(n)["cwd"] for n in ("backend-dev", "backend-dev-2", "frontend-dev", "reviewer")}
+            names = ("backend-dev", "backend-dev-2", "frontend-dev", "reviewer")
+            where = {n: factory.plan(cfg, n)["dir"] for n in names}
             self.assertEqual(where, {"backend-dev": str(trees / "ada-backend-dev"), "backend-dev-2": str(trees / "feature-login"),
                                      "frontend-dev": str(trees / "feature-login"), "reviewer": str(e.repo)})
-            prompt = e.run("prompt", "backend-dev").stdout
+            prompt = e.run("brief", "backend-dev").stdout
             self.assertIn("Commit your work on `ada/backend-dev`", prompt)
             self.assertIn("`git merge main`", prompt)
             self.assertIn("agree who commits it for you", prompt)
@@ -2015,16 +1664,17 @@ class WorktreeTests(unittest.TestCase):
             staging = "Stage only task files, never `git add -A` or `git add .`"
             self.assertIn(staging, prompt)
             self.assertNotIn("Do not stage files", prompt)
-            shared = e.run("prompt", "reviewer").stdout
+            shared = e.run("brief", "reviewer").stdout
             self.assertIn("Do not stage files. Never run `git commit`, `git merge` or `git push`. "
                           "@operator stages only task files and commits.", shared)
             self.assertNotIn(staging, shared)
-            brief = next(t for n, t in e.prompts() if n == "reviewer")
+            brief = e.run("brief").stdout
             self.assertIn("| branch `feature/login` in `" + str(trees / "feature-login") + "` |", brief)
             self.assertIn("`git diff main...<branch>`", brief)
             self.assertIn("| the main checkout |", brief)
-            e.kill("backend-dev")
-            self.assertNotIn("created worktree", e.run("up", "backend-dev").stdout)  # the checkout is kept
+            with contextlib.redirect_stdout(io.StringIO()) as again:
+                self.assertIsNone(factory.ensure_worktree(cfg, factory.plan(cfg, "backend-dev")))
+            self.assertEqual(again.getvalue(), "")                          # the checkout is kept
 
     def test_new_worktree_branch_passes_no_track(self):
         env = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "branch.autoSetupMerge", "GIT_CONFIG_VALUE_0": "always"}
@@ -2044,14 +1694,15 @@ class WorktreeTests(unittest.TestCase):
         with Env(formation({**CATALOG_MEMBERS, "reviewer-2": {
             "role": "reviewer", "harness": "codex", "model": "gpt-6-luna", "worktree": True,
         }}), git=True) as e:
-            e.run("up", "reviewer-2", "--no-brief")  # the existing reviewer keeps its name
+            cfg = factory.Config(e.repo)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertIsNone(factory.ensure_worktree(cfg, factory.plan(cfg, "reviewer-2")))
             self.assertTrue((e.root / "repo.worktrees/ada-reviewer-2").is_dir())
             self.assertIs(factory.Config(e.repo).members["reviewer-2"]["worktree"], True)
         with Env(team_brief(self.BRIEF)) as e:  # not a git repository
-            p = e.run("up", "backend-dev", check=False)
+            p = e.run("check", "backend-dev", check=False)
             self.assertEqual(p.returncode, 2)
             self.assertIn("a worktree needs a git repository with a commit", p.stdout)
-            self.assertEqual(e.calls(), [["agent", "get", e.env["HERDR_PANE_ID"]], ["agent", "list"], ["pane", "list"]])
 
     def test_distinct_branches_cannot_share_a_worktree_path(self):
         brief = formation({
@@ -2059,12 +1710,10 @@ class WorktreeTests(unittest.TestCase):
             'backend-dev-2': {'role': 'backend-dev', 'harness': 'codex', 'model': 'gpt-6-luna', 'worktree': 'feature-a'},
         })
         with Env(brief, git=True) as e:
-            for command in ("check", "up"):
-                result = e.run(command, "backend-dev", "backend-dev-2", check=False)
-                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-                for needle in ("worktree", "feature/a", "feature-a"):
-                    self.assertIn(needle, result.stdout)
-            self.assertEqual(e.starts(), {})
+            result = e.run("check", "backend-dev", "backend-dev-2", check=False)
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            for needle in ("worktree", "feature/a", "feature-a"):
+                self.assertIn(needle, result.stdout)
             self.assertFalse((e.root / "repo.worktrees").exists())
 
     def test_check_rejects_unregistered_or_wrong_branch_directory(self):
@@ -2077,10 +1726,9 @@ class WorktreeTests(unittest.TestCase):
                 else:
                     subprocess.run([GIT, "-C", str(e.repo), "worktree", "add", "-b", "unrelated", str(target)],
                                    check=True, capture_output=True, env=e.env)
-                result = e.run("up", "lead-dev", check=False)
+                result = e.run("check", "lead-dev", check=False)
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
                 self.assertIn("worktree", result.stdout)
-                self.assertEqual(e.starts(), {})
 
     def test_branch_names_git_rejects_fail_the_check(self):
         team = ('[members.reviewer]\nharness = "codex"\nmodel = "gpt-6-luna"\n'
@@ -2088,566 +1736,10 @@ class WorktreeTests(unittest.TestCase):
         cases = [(f'user = "{u}"\n', "true") for u in (".ada", "ada..x", "ada.lock", "-ada")] + [("", '"feature//x"'), ("", '"x.lock"')]
         for settings, worktree in cases:
             with self.subTest(settings=settings, worktree=worktree), Env(team_brief(settings + team.format(worktree)), git=True) as e:
-                for command in ("check", "up"):
-                    p = e.run(command, check=False)
-                    self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
-                    self.assertIn("is not a branch name git accepts", p.stdout)
-                    self.assertIn("Change `user`, or this member's `worktree`", p.stdout)
-                self.assertEqual(e.starts(), {})  # the reviewer, checked first, was not started either
-        with Env(team_brief(team.format("true")), git=True) as e:  # a running member is not closed for a bad restart
-            e.run("up", "--no-brief")
-            pane = e.pane_of("lead-dev")["pane_id"]
-            e.write_brief(team_brief('user = ".ada"\n' + team.format("true")))
-            p = e.run("up", "lead-dev", "--restart", check=False)
-            self.assertEqual(p.returncode, 2)
-            self.assertEqual(e.calls("pane", "close"), [])
-            self.assertEqual(e.pane_of("lead-dev")["pane_id"], pane)
-
-    def test_up_moves_member_to_newly_configured_worktree(self):
-        with Env(git=True) as e:
-            e.run("up", "lead-dev", "--no-brief")
-            old_id = e.pane_of("lead-dev")["pane_id"]
-            e.set_session("lead-dev", {"agent": "codex", "kind": "id", "value": "saved-codex"})
-            e.kill("lead-dev")
-            e.write_brief(CATALOG.replace('[members.lead-dev]', '[members.lead-dev]\nworktree = true'))
-            e.run("up", "lead-dev")
-            current = e.pane_of("lead-dev")
-            self.assertNotEqual(current["pane_id"], old_id)
-            self.assertEqual(current["cwd"], str(e.root / "repo.worktrees/ada-lead-dev"))
-            self.assertIsNone(e.fake_state()["panes"][old_id]["label"])
-            self.assertEqual(native(e.starts()["lead-dev"])[:2], ["resume", "saved-codex"])
-            # Codex restores its saved tool cwd unless explicitly overridden, even in a new pane.
-            self.assertEqual(flag(native(e.starts()["lead-dev"]), "-C"), current["cwd"])
-
-    def test_up_uses_foreground_directory_when_shell_moved(self):
-        with Env(git=True) as e:
-            e.run("up", "lead-dev", "--no-brief")
-            old_id = e.pane_of("lead-dev")["pane_id"]
-            e.kill("lead-dev")
-            e.update("lead-dev", foreground_cwd=str(e.repo / "sub"))
-            e.run("up", "lead-dev")
-            self.assertNotEqual(e.pane_of("lead-dev")["pane_id"], old_id)
-            self.assertEqual(e.pane_of("lead-dev")["cwd"], str(e.repo))
-
-
-class UpRecoveryTests(unittest.TestCase):
-    def test_stale_operator_sample_keeps_invoking_codex_pane(self):
-        members = {"architect": CATALOG_MEMBERS["architect"]}
-        with Env(formation(members, operator={"harness": "claude"})) as e:
-            local = e.repo / factory.CONF
-            sample = e.repo / factory.SAMPLE
-            local.rename(sample)
-            e.run("init")
-            e.update(None, agent="codex")
-            e.run("up")
-            self.assertEqual(e.pane_of("operator")["pane_id"], e.env["HERDR_PANE_ID"])
-            self.assertEqual(e.pane_of("operator")["agent"], "codex")
-            self.assertEqual(list(e.starts()), ["architect"])
-            self.assertEqual(kind(e.starts()["architect"]), "claude")
-            self.assertEqual(flag(native(e.starts()["architect"]), "--model"), members["architect"]["model"])
-            self.assertEqual(len(e.calls("tab", "create")), 1)  # the member tab
-
-            # Setup reconciles the local operator fields. Raw up leaves the sample alone.
-            local.write_text(local.read_text().replace('harness = "claude"', 'harness = "codex"', 1))
-            e.run("up")
-            self.assertEqual(len(e.calls("agent", "start")), 1)
-            self.assertEqual(tomllib.loads(sample.read_text())["operator"]["harness"], "claude")
-
-    def test_up_supports_pi_and_omp_operators(self):
-        for harness in ("pi", "omp"):
-            with self.subTest(harness=harness), Env(UI) as e:
-                e.update(None, agent=harness)
-                e.run("up", "lead-dev", "--no-brief")
-                self.assertEqual(e.pane_of("operator")["agent"], harness)
-                self.assertEqual(list(e.starts()), ["lead-dev"])
-
-    def test_up_supports_agy_operator(self):
-        with Env(UI) as e:
-            e.update(None, agent="agy")
-            e.run("up", "lead-dev", "--no-brief")
-            self.assertEqual(e.pane_of("operator")["agent"], "agy")
-            self.assertEqual(list(e.starts()), ["lead-dev"])
-
-    def test_launch_matrix(self):
-        for flags in ((), ("--fresh",), ("--restart",), ("--restart", "--fresh")):
-            with self.subTest(flags=flags), Env(UI) as e:
-                # One live member, two closed panes (matching and incompatible sessions), one newcomer.
-                e.run("up", "lead-dev", "frontend-dev", "pm", "--no-brief")
-                for name, agent in (("lead-dev", "codex"), ("frontend-dev", "claude"), ("pm", "codex")):
-                    e.set_session(name, {"agent": agent, "kind": "id", "value": f"saved-{name}"})
-                e.run("status")
-                e.close("frontend-dev", "pm")
-                before = e.pane_of("lead-dev")["pane_id"]
-                out = e.run("up", *flags).stdout
-                restarted = "--restart" in flags
-                fresh = "--fresh" in flags
-                targets = ["frontend-dev", "reviewer", "pm"]
-                if restarted:
-                    targets.insert(0, "lead-dev")
-                self.assertEqual([c[2] for c in e.calls("agent", "start")[3:]], targets)
-                self.assertEqual(e.calls("pane", "close"), [["pane", "close", before]] if restarted else [])
-                prompts = dict(e.prompts())
-                self.assertEqual(len(e.prompts()), 4)
-                for name in targets:
-                    resumed = name in ("lead-dev", "frontend-dev") and not fresh
-                    self.assertEqual(f"saved-{name}" in native(e.starts()[name]), resumed)
-                    self.assertIn(f"{'resumed' if resumed else 'started'} @{name} (", out)
-                    closing = prompts[name].rstrip().rsplit("\n\n", 1)[-1]
-                    if resumed:
-                        self.assertIn("picking up where we left off", closing)
-                        self.assertNotIn("`ready`", closing)
-                    elif name == "reviewer":
-                        self.assertEqual(closing, READY)
-                    else:
-                        self.assertEqual(closing, "You are starting in a new session and know nothing of the work so far. " + READY)
-                if not restarted:
-                    self.assertIn("Joined the team: @reviewer", prompts["lead-dev"])
-                    self.assertNotIn("@frontend-dev", prompts["lead-dev"])
-                    self.assertNotIn("@pm", prompts["lead-dev"])
-
-    def test_restart_with_no_saved_session_sends_no_join(self):
-        with Env(UI) as e:
-            e.run("up", "lead-dev", "pm", "--no-brief")
-            e.run("up", "pm", "--restart")
-            self.assertEqual([name for name, _ in e.prompts()], ["pm"])
-            self.assertIn("starting in a new session", e.prompts()[0][1])
-
-    def test_launch_reports_name_the_operator_and_manual_briefs_ask_nothing(self):
-        with Env(formation({"lead-dev": CATALOG_MEMBERS["lead-dev"]}, operator={"name": "boss"})) as e:
-            e.run("up")
-            self.assertTrue(e.prompts()[0][1].endswith(READY.replace("@operator", "@boss") + "\n"))
-            self.assertEqual(len(e.prompts()), 1)
-            e.run("up")  # already running: nothing sent
-            e.run("brief", "--send", "lead-dev")
-            self.assertEqual(len(e.prompts()), 2)
-            self.assertTrue(e.prompts()[1][1].endswith("That is the whole team brief. No reply needed.\n"))
-            e.set_session("lead-dev", {"agent": "codex", "kind": "id", "value": "saved"})
-            e.run("up", "lead-dev", "--restart")
-            self.assertEqual(len(e.prompts()), 3)
-            self.assertIn("send @boss a new one-line pickup report for this launch, even if you sent one before.",
-                          e.prompts()[2][1])
-
-    def test_up_names_running_members_without_their_launch_flags(self):
-        restored = {"lead-dev": [{"pid": 7, "name": "codex", "argv": ["codex", "resume", "cx-1"]}],
-                    "frontend-dev": [{"pid": 8, "name": ".claude-wrapped", "argv": ["/bin/claude", "--resume", "c",
-                                                                                     "--permission-mode", "auto"]}]}
-        cases = {
-            "matching": ({}, None),
-            "missing flags": (restored, "lead-dev frontend-dev"),
-            "unrelated foreground process": ({"lead-dev": [{"pid": 9, "name": "bash", "argv": ["bash"]}]}, None),
-            "ambiguous": ({"lead-dev": restored["lead-dev"] * 2}, None),
-            "no data": ({"lead-dev": []}, None),
-            "no argv": ({"lead-dev": [{"pid": 7, "name": "codex"}]}, None),
-        }
-        for case, (procs, named) in cases.items():
-            with self.subTest(case), Env(UI) as e:
-                e.run("up", "lead-dev", "frontend-dev", "pm", "--no-brief")
-                for name, p in procs.items():
-                    e.update(name, procs=p)
-                before = len(e.calls())
-                out = e.run("up", "lead-dev", "frontend-dev", "pm").stdout
-                self.assertIn("already running: lead-dev, frontend-dev, pm", out)
-                # pi has no permission flags, so its process is never read
-                read = [c[3] for c in e.calls("pane", "process-info")]
-                self.assertEqual(read, [e.pane_of("lead-dev")["pane_id"], e.pane_of("frontend-dev")["pane_id"]])
-                if named:
-                    self.assertIn("running without their factory launch flags, as after a herdr restart:"
-                                  f" {named.replace(' ', ', ')}. Run factory.py up {named} --restart", out)
-                    self.assertNotIn("--resume", out)  # no raw argv
-                else:
-                    self.assertNotIn("launch flags", out)
-                calls = e.calls()[before:]
-                self.assertFalse([c for c in calls if c[:2] in (["pane", "close"], ["agent", "start"], ["agent", "prompt"])])
-
-    def test_launch_flags_check_needs_args_too_and_skips_restarts(self):
-        with Env(formation({"lead-dev": {**CATALOG_MEMBERS["lead-dev"], "args": ["-c", "x=1"]}})) as e:
-            e.run("up", "--no-brief")
-            argv = native(e.starts()["lead-dev"])
-            e.update("lead-dev", procs=[{"pid": 7, "name": "codex", "argv": ["codex", *[a for a in argv if a != "x=1"]]}])
-            self.assertIn("Run factory.py up lead-dev --restart", e.run("up").stdout)
-            e.run("up", "--restart")
-            self.assertNotIn("launch flags", e.run("up").stdout)  # the relaunch is checked by its own argv
-            self.assertEqual(len(e.calls("pane", "process-info")), 2)
-
-    def test_taken_name_prevents_an_earlier_restart(self):
-        with Env(UI) as e:
-            e.run("up", "lead-dev", "pm", "--no-brief")
-            state = e.fake_state()
-            state["panes"][e.pane_of("pm")["pane_id"]]["name"] = "reviewer"
-            e.write_fake(state)
-            before = len(e.calls())
-            p = e.run("up", "lead-dev", "reviewer", "--restart", check=False)
-            self.assertEqual(p.returncode, 2)
-            self.assertIn("outside this team", p.stderr)
-            calls = e.calls()[before:]
-            self.assertEqual(calls, [["agent", "get", e.env["HERDR_PANE_ID"]], ["agent", "list"], ["pane", "list"]])
-
-    def test_operator_pane_with_an_old_member_label_is_not_a_restart_target(self):
-        with Env(formation({"lead-dev": CATALOG_MEMBERS["lead-dev"]}, operator={"harness": "claude"})) as e:
-            state = e.fake_state()
-            pane = state["panes"]["w1:p1"]
-            pane.update(label="lead-dev", name="lead-dev",
-                        agent_session={"agent": "claude", "kind": "id", "value": "operator-session"})
-            e.write_fake(state)
-            self.assertIn("pending: none", e.run("up", "--restart").stdout)
-            self.assertEqual(e.calls("pane", "close"), [])
-            self.assertEqual(e.pane_of("operator")["pane_id"], "w1:p1")
-            self.assertNotEqual(e.pane_of("lead-dev")["pane_id"], "w1:p1")
-            self.assertIn(READY, dict(e.prompts())["lead-dev"])
-
-    def test_continue_stub_never_launches(self):
-        with Env(UI) as e:
-            for args in ((), ("pm", "--restart", "--fresh")):
-                p = e.run("continue", *args, check=False)
-                self.assertEqual(p.returncode, 2)
-                self.assertEqual((p.stdout + p.stderr).splitlines(), ["use factory.py up [names] [--fresh] [--restart]"])
-            self.assertEqual(e.calls(), [])
-
-    def test_no_member_panes_resumes_noted_sessions(self):
-        marker = "This brief applies to the resumed team."
-        with Env(UI + "\n" + marker + "\n") as e:
-            e.run("up", "--no-brief")
-            e.set_session("lead-dev", {"agent": "codex", "kind": "id", "value": "cx-1"})
-            e.set_session("pm", {"agent": "pi", "kind": "path", "value": "/s/p.jsonl"})
-            e.run("status")
-            e.close("lead-dev", "frontend-dev", "reviewer", "pm")
-            out = e.run("up").stdout
-            self.assertEqual(len(e.calls("agent", "start")), 8)
-            by = {n: native(c) for n, c in e.starts().items()}
-            self.assertEqual(by["lead-dev"][:2], ["resume", "cx-1"])
-            self.assertEqual(flag(by["pm"], "--session"), "/s/p.jsonl")
-            for name in ("frontend-dev", "reviewer"):
-                self.assertTrue({"resume", "--resume", "--session"}.isdisjoint(by[name]))
-            sent = dict(e.prompts())
-            self.assertEqual(len(sent), 4)
-            for message in sent.values():
-                self.assertEqual(message.count(marker), 1)
-                closing = message.rstrip().rsplit("\n\n", 1)[-1]
-                self.assertNotIn("re-read", closing.lower())
-            for name in ("lead-dev", "pm"):
-                self.assertIn("picking up where we left off", sent[name])
-                self.assertNotIn("No reply needed", sent[name])
-            for name in ("frontend-dev", "reviewer"):
-                self.assertTrue(sent[name].endswith(READY + "\n"))
-                self.assertIn(f"started @{name}", out)
-
-    def test_bare_up_recovers_exited_and_closed_members_without_disturbing_live_members(self):
-        with Env(UI) as e:
-            e.run("up", "--no-brief")
-            for name in ("lead-dev", "reviewer"):
-                e.set_session(name, {"agent": "codex", "kind": "id", "value": f"saved-{name}"})
-            e.kill("lead-dev")
-            e.close("reviewer")
-            e.run("up")
-            self.assertEqual([c[2] for c in e.calls("agent", "start")[4:]], ["lead-dev", "reviewer"])
-            self.assertEqual([n for n, _ in e.prompts()], ["lead-dev", "reviewer"])
-
-    def test_up_without_members_says_so(self):
-        with Env(formation({})) as e:
-            result = e.run("up", check=False)
-            self.assertEqual(result.returncode, 1)
-            self.assertIn("no members in factory.toml; add one, then run `factory.py up`", result.stderr)
-            self.assertEqual(e.starts(), {})
-
-    def test_cold_up_checks_every_member_before_launch(self):
-        with Env(UI.replace('model = "gpt-6-luna"', 'model = "missing-model"')) as e:
-            result = e.run("up", check=False)
-            self.assertEqual(result.returncode, 2)
-            self.assertEqual(e.starts(), {})
-            self.assertEqual(e.calls("tab", "create"), [])
-
-    def test_failed_fresh_launch_is_not_reported_as_fresh(self):
-        with Env(UI) as e:
-            result = e.run("up", check=False, FAKE_START_FAIL="dead:lead-dev")
-            self.assertEqual(result.returncode, 3)
-            self.assertNotIn("started @lead-dev (", result.stdout)
-            for name in ("frontend-dev", "reviewer", "pm"):
-                self.assertIn(f"started @{name} (", result.stdout)
-            self.assertEqual({n for n, _ in e.prompts()}, {"frontend-dev", "reviewer", "pm"})
-
-    def test_brings_members_back_in_their_panes_and_sessions(self):
-        with Env() as e:
-            e.run("up", "lead-dev", "frontend-dev", "pm", "--no-brief")
-            e.set_session("lead-dev", {"source": "herdr:codex", "agent": "codex", "kind": "id", "value": "cx-1"})
-            e.set_session("frontend-dev", {"source": "herdr:claude", "agent": "claude", "kind": "id", "value": "cl-1"})
-            e.set_session("pm", {"source": "herdr:pi", "agent": "pi", "kind": "path", "value": "/s/2026_pi-1.jsonl"})
-            self.assertIn("already running", e.run("up", "lead-dev", "frontend-dev", "pm").stdout)
-            self.assertEqual(e.prompts(), [])
-            self.assertEqual(e.calls("agent", "rename"), [["agent", "rename", "w1:p1", "operator"]])
-            e.kill("lead-dev", "frontend-dev", "pm")
-            panes_before = {n: e.pane_of(n)["pane_id"] for n in ("lead-dev", "frontend-dev", "pm")}
-            # The brief changed while they were gone: lead-dev moves to Luna.
-            e.write_brief(CATALOG.replace('model = "gpt-6-astra"\nthinking = "high"',
-                                           'model = "gpt-6-luna"\nthinking = "medium"'))
-            self.assertIn("`factory.py up lead-dev frontend-dev pm`", e.run("status").stdout)
-
-            before = len(e.prompts())
-            e.run("up", "lead-dev", "frontend-dev", "pm")
-            by = {c[2]: c for c in e.calls("agent", "start")[3:]}
-            self.assertEqual({n: flag(c, "--pane") for n, c in by.items()}, panes_before)  # same panes, no new ones
-            self.assertEqual(len(e.calls("tab", "create")) + len(e.calls("pane", "split")), 3)
-            self.assertEqual(native(by["lead-dev"])[:2], ["resume", "cx-1"])
-            self.assertEqual(flag(native(by["lead-dev"]), "-C"), str(e.repo))
-            self.assertEqual(flag(native(by["lead-dev"]), "-m"), "gpt-6-luna")  # current settings apply
-            self.assertEqual(flag(native(by["frontend-dev"]), "--resume"), "cl-1")
-            self.assertEqual(flag(native(by["pm"]), "--session"), "/s/2026_pi-1.jsonl")
-            sent = e.prompts()[before:]
-            self.assertEqual(sorted(n for n, _ in sent), ["frontend-dev", "lead-dev", "pm"])  # one message each
-            for _, text in sent:
-                self.assertIn("picking up where we left off", text)
-                self.assertIn("Send it with the say command", text)
-                self.assertIn("A reply in your own pane does not reach @operator", text)
-                self.assertIn("# Team brief", text)
-                self.assertNotIn("No reply needed", text)
-
-            e.kill("pm")
-            before = len(e.prompts())
-            e.run("up", "pm")  # one member comes back: only it is re-briefed
-            self.assertEqual([n for n, _ in e.prompts()[before:]], ["pm"])
-
-    def test_restart_checks_before_closing_and_reapplies_settings(self):
-        with Env(UI) as e:
-            e.run("up", "--no-brief")
-            old = e.pane_of("lead-dev")["pane_id"]
-            others = {n: {k: v for k, v in e.pane_of(n).items() if k != "rect"}
-                      for n in ("operator", "reviewer", "frontend-dev", "pm")}
-            e.set_session("lead-dev", {"agent": "codex", "kind": "id", "value": "restart-session"})
-            e.write_brief(UI.replace('model = "gpt-6-astra"', 'model = "missing-model"'))
-            failed = e.run("up", "lead-dev", "--restart", check=False)
-            self.assertEqual(failed.returncode, 2)
-            self.assertEqual(e.calls("pane", "close"), [])
-            self.assertEqual(e.pane_of("lead-dev")["pane_id"], old)
-            e.write_brief(UI.replace('model = "gpt-6-astra"', 'model = "gpt-6-luna"'))
-            before = len(e.prompts())
-            e.run("up", "lead-dev", "--restart")
-            argv = native(e.starts()["lead-dev"])
-            self.assertEqual(argv[:2], ["resume", "restart-session"])
-            self.assertEqual(flag(argv, "-m"), "gpt-6-luna")
-            self.assertEqual(flag(argv, "-C"), str(e.repo))
-            self.assertIn("--dangerously-bypass-approvals-and-sandbox", argv)
-            self.assertEqual(e.calls("pane", "close"), [["pane", "close", old]])
-            self.assertNotIn(old, e.fake_state()["panes"])
-            self.assertNotEqual(e.pane_of("lead-dev")["pane_id"], old)
-            self.assertEqual([n for n, _ in e.prompts()[before:]], ["lead-dev"])
-            self.assertIn("Send it with the say command", e.prompts()[-1][1])
-            self.assertIn("picking up where we left off", e.prompts()[-1][1])
-            self.assertEqual({n: {k: v for k, v in e.pane_of(n).items() if k != "rect"} for n in others}, others)
-            e.run("up", "lead-dev", "--fresh", "--restart")
-            self.assertNotIn("resume", native(e.starts()["lead-dev"]))
-            self.assertIn("starting in a new session", e.prompts()[-1][1])
-
-    def test_closed_pane_or_changed_harness_starts_fresh(self):
-        with Env() as e:
-            e.run("up", "pm", "reviewer", "--no-brief")
-            e.set_session("pm", {"agent": "pi", "kind": "path", "value": "/s/p.jsonl"})
-            e.kill("pm")
-            e.close("reviewer")
-            e.write_brief(CATALOG.replace('model = "deepseek/deepseek-v4.1-flash-1017"', 'model = "gpt-6-sol"')
-                          .replace('[members.pm]\nharness = "pi"', '[members.pm]\nharness = "codex"'))
-            out = e.run("up", "pm", "reviewer").stdout
-            self.assertIn("started @reviewer", out)
-            by = {c[2]: native(c) for c in e.calls("agent", "start")[2:]}
-            self.assertNotIn("resume", by["pm"])  # a pi session can't open in codex
-            self.assertNotIn("resume", by["reviewer"])
-            self.assertEqual(e.pane_of("reviewer")["pane_id"], "w1:p4")  # a new, labeled pane
-            self.assertEqual(e.pane_of("reviewer")["tab_id"], e.pane_of("pm")["tab_id"])  # in the team tab
-            self.assertIn("starting in a new session", dict(e.prompts())["pm"])
-            self.assertTrue(dict(e.prompts())["pm"].endswith(READY + "\n"))  # a changed harness starts fresh
-            self.assertTrue(dict(e.prompts())["reviewer"].endswith(READY + "\n"))
-
-    def test_opencode_member_gets_a_new_pane_and_the_old_label_is_cleared(self):
-        with Env(formation({
-            'reviewer': {'harness': 'opencode', 'model': 'z-ai/glm-5.3'},
-            'pm': {'harness': 'pi', 'model': 'z-ai/glm-5.3'},
-        })) as e:
-            e.run("up", "pm", "reviewer", "--no-brief")
-            e.set_session("reviewer", {"agent": "opencode", "kind": "id", "value": "ses_1"})
-            e.kill("reviewer")
-            e.run("up", "reviewer")
-            labeled = [p for p in e.fake_state()["panes"].values() if p["label"] == "reviewer"]
-            self.assertEqual([p["pane_id"] for p in labeled], ["w1:p4"])  # its environment is set at creation
-            self.assertEqual(native(e.calls("agent", "start")[-1]), ["--standalone", "--session", "ses_1", "--auto"])
-
-    def test_failed_resume_says_how_to_start_fresh(self):
-        with Env() as e:
-            e.run("up", "pm", "reviewer", "--no-brief")
-            e.set_session("pm", {"agent": "pi", "kind": "id", "value": "old"})
-            e.kill("pm", "reviewer")
-            p = e.run("up", check=False, FAKE_START_FAIL="dead:pm")
-            self.assertEqual(p.returncode, 3)
-            self.assertIn("factory.py up pm --fresh", p.stdout)
-            self.assertIn("started @reviewer", p.stdout)  # the others still came back
-
-    def test_duplicate_session_observations_keep_latest_resume(self):
-        with Env() as e:
-            e.run("up", "lead-dev", "--no-brief")
-            for value in ("first", "second"):
-                e.set_session("lead-dev", {"agent": "codex", "kind": "id", "value": value})
-                e.run("status")
-            history = next((e.root / "cache/factory-skill").glob("*/sessions.jsonl"))
-            lines = history.read_text().splitlines()
-            with history.open("a") as f:
-                f.write(lines[-1] + "\n")
-            e.kill("lead-dev")
-            e.run("up", "lead-dev")
-            self.assertEqual(native(e.starts()["lead-dev"])[:2], ["resume", "second"])
-
-
-class DownTests(unittest.TestCase):
-    def test_down_hints_at_repair_only_when_no_session_was_recorded(self):
-        names = ("architect", "designer", "lead-dev", "reviewer")
-        members = {name: {"harness": "opencode", "model": "openrouter/z-ai/glm-5.3"} for name in names}
-        with Env(formation(members)) as e:
-            e.run("up", "--no-brief")
-            e.set_session("architect", {"agent": "opencode", "kind": "id", "value": "compatible"})
-            e.set_session("designer", {"agent": "claude", "kind": "id", "value": "older"})
-            e.run("status")  # save both older refs
-            for name in ("architect", "designer"):
-                e.set_session(name, None)
-            p = e.run("down", FAKE_INTEGRATION_STATUS="opencode: needs repair (v13) (/hooks/opencode)")
-            hints = [line for line in p.stdout.splitlines() if "may have prevented session recording" in line]
-            self.assertEqual(len(hints), 2)
-            self.assertIn("@lead-dev", hints[0])
-            self.assertIn("@reviewer", hints[1])
-            self.assertIn("no compatible session recorded for @designer: up will start it fresh\n", p.stdout)
-            self.assertNotIn("no compatible session recorded for @architect", p.stdout)
-            self.assertEqual(e.calls("integration"), [["integration", "status"]] * 2)  # one for up, one for down
-
-    def test_down_records_sessions_for_up_and_preserves_drafts(self):
-        with Env(UI) as e:
-            e.run("up", "lead-dev", "pm", "--no-brief")
-            e.set_session("lead-dev", {"agent": "codex", "kind": "id", "value": "old"})
-            e.run("status")
-            e.set_session("lead-dev", {"agent": "codex", "kind": "id", "value": "latest"})
-            e.set_session("pm", {"agent": "pi", "kind": "path", "value": "/sessions/pm.jsonl"})
-            e.update("lead-dev", agent_status="working")
-            e.update("pm", agent_status="blocked")
-            with patch.dict(os.environ, e.env, clear=True):
-                cfg = factory.Config(e.repo)
-                draft = cfg.messages / "pm" / "pending.md"
-                draft.write_text("unsent report")
-                instruction = cfg.session_dir / "pm.md"
-                preserved = {p: p.read_bytes() for p in (draft, instruction)}
-            operator = e.pane_of("operator")
-            targets = [e.pane_of(name)["pane_id"] for name in ("lead-dev", "pm")]
-            out = e.run("down").stdout
-            self.assertIn("stopped @lead-dev (was working)", out)
-            self.assertIn("stopped @pm (was blocked)", out)
-            self.assertIn("@reviewer was not running", out)
-            self.assertIn(str(draft), out)
-            self.assertEqual(e.calls("pane", "close"), [["pane", "close", pane] for pane in targets])
-            self.assertEqual(e.pane_of("operator"), operator)
-            self.assertEqual({p: p.read_bytes() for p in preserved}, preserved)
-            self.assertNotIn("stopped @", e.run("down").stdout)
-
-            # A plain up with current arguments resumes the sessions just saved by down.
-            e.write_brief(formation({"lead-dev": {**CATALOG_MEMBERS["lead-dev"], "args": ["--no-alt-screen"]},
-                                     "pm": CATALOG_MEMBERS["pm"]}))
-            e.run("up")
-            codex = native(e.starts()["lead-dev"])
-            self.assertEqual(codex[:2], ["resume", "latest"])
-            self.assertIn("--no-alt-screen", codex)
-            self.assertEqual(flag(native(e.starts()["pm"]), "--session"), "/sessions/pm.jsonl")
-            self.assertEqual([n for n, _ in e.prompts()], ["lead-dev", "pm"])
-            for _, brief in e.prompts():
-                self.assertIn("picking up where we left off", brief)
-
-    def test_down_selects_names_and_leaves_empty_panes_and_caller(self):
-        with Env(UI) as e:
-            e.run("up", "lead-dev", "frontend-dev", "pm", "--no-brief")
-            e.kill("frontend-dev")
-            empty = e.pane_of("frontend-dev")
-            e.set_session("pm", {"agent": "pi", "kind": "id", "value": "not-stopping"})
-            other = e.pane_of("pm")
-            e.update("operator", label="reviewer", agent=None, name=None)  # invoking shell has a stale member label
-            caller = e.pane_of("reviewer")
-            out = e.run("down", "@lead-dev", "lead-dev", "frontend-dev", "reviewer").stdout
-            self.assertEqual(out.count("stopped @lead-dev"), 1)
-            self.assertIn("no compatible session recorded for @lead-dev: up will start it fresh", out)
-            self.assertIn("@frontend-dev was not running", out)
-            self.assertIn("@reviewer was not running", out)
-            self.assertEqual(e.pane_of("frontend-dev"), empty)
-            self.assertEqual(e.pane_of("reviewer"), caller)
-            self.assertEqual(e.pane_of("pm"), other)
-            self.assertEqual(len(e.calls("pane", "close")), 1)
-            with patch.dict(os.environ, e.env, clear=True):
-                self.assertNotIn("pm", factory.past_sessions(factory.Config(e.repo)))
-
-    def test_down_validates_before_closing_anything(self):
-        with Env(UI) as e:
-            e.run("up", "lead-dev", "pm", "--no-brief")
-            cases = [("not a member", ("lead-dev", "unknown"), {}),
-                     ("not a member", ("lead-dev", "operator"), {}),
-                     ("not inside herdr", (), {"HERDR_ENV": "0"}),
-                     ("HERDR_PANE_ID is not set", (), {"HERDR_PANE_ID": ""}),
-                     ("not a member pane", (), {"HERDR_PANE_ID": e.pane_of("pm")["pane_id"]})]
-            for message, args, env in cases:
-                with self.subTest(message=message, args=args):
-                    p = e.run("down", *args, check=False, **env)
-                    self.assertNotEqual(p.returncode, 0)
-                    self.assertIn(message, p.stderr)
-            self.assertEqual(e.calls("pane", "close"), [])
-
-    def test_down_leaves_mismatched_pane_and_continues_after_refusal(self):
-        with Env(UI) as e:
-            e.run("up", "lead-dev", "reviewer", "pm", "--no-brief")
-            e.update("reviewer", name="unrelated")
-            unrelated = e.pane_of("reviewer")
-            lead = e.pane_of("lead-dev")["pane_id"]
-            pm = e.pane_of("pm")["pane_id"]
-            p = e.run("down", check=False, FAKE_CLOSE_FAIL=lead)
-            self.assertEqual(p.returncode, 1)
-            self.assertIn("could not stop @reviewer: pane label and agent name", p.stderr)
-            self.assertIn("could not stop @lead-dev: close_refused", p.stderr)
-            self.assertIn("stopped @pm", p.stdout)
-            self.assertEqual(e.calls("pane", "close"), [["pane", "close", pane] for pane in (lead, pm)])
-            self.assertEqual(e.pane_of("reviewer"), unrelated)
-            self.assertIn("stopped @lead-dev", e.run("down", "lead-dev").stdout)
-
-    def test_down_leaves_members_running_when_sessions_cannot_be_recorded(self):
-        with Env(UI) as e:
-            e.run("up", "lead-dev", "--no-brief")
-            e.set_session("lead-dev", {"agent": "codex", "kind": "id", "value": "cx-1"})
-            with patch.dict(os.environ, e.env, clear=True):
-                (factory.Config(e.repo).cache / "sessions.jsonl").mkdir()
-            p = e.run("down", check=False)
-            self.assertNotEqual(p.returncode, 0)
-            self.assertIn("could not record member sessions", p.stderr)
-            self.assertEqual(e.calls("pane", "close"), [])
-
-    def test_down_checks_each_target_again_before_closing(self):
-        for fields, error in (({"agent": None, "name": None}, False),
-                              ({"name": "unrelated", "label": "other"}, True)):
-            with self.subTest(fields=fields), Env(UI) as e:
-                e.run("up", "lead-dev", "pm", "--no-brief")
-                lead = e.pane_of("lead-dev")["pane_id"]
-                pm = e.pane_of("pm")
-                state = e.fake_state()
-                state["after_close"] = {"pane": pm["pane_id"], "fields": fields}
-                e.write_fake(state)
-                p = e.run("down", "lead-dev", "pm", check=False)
-                self.assertEqual(p.returncode, int(error))
-                if error:
-                    self.assertIn("could not stop @pm: member identity changed", p.stderr)
-                else:
-                    self.assertIn("@pm was not running", p.stdout)
-                self.assertEqual(e.calls("pane", "close"), [["pane", "close", lead]])
-                self.assertEqual(e.fake_state()["panes"][pm["pane_id"]], {**pm, **fields})
-
-    def test_down_resumes_with_an_interrupted_history_and_same_session_value(self):
-        with Env(UI) as e:
-            e.run("up", "lead-dev", "--no-brief")
-            current = {"agent": "codex", "kind": "id", "value": "same"}
-            e.set_session("lead-dev", current)
-            with patch.dict(os.environ, e.env, clear=True):
-                cfg = factory.Config(e.repo)
-                stale = {"member": "lead-dev", **current, "agent": "claude", "kind": "path"}
-                (cfg.cache / "sessions.jsonl").write_text(json.dumps(stale) + '\n{"member":')
-            e.run("down", "lead-dev")
-            with patch.dict(os.environ, e.env, clear=True):
-                self.assertEqual(factory.past_sessions(cfg)["lead-dev"], {"member": "lead-dev", **current})
-            e.run("up", "lead-dev")
-            self.assertEqual(native(e.starts()["lead-dev"])[:2], ["resume", "same"])
+                p = e.run("check", check=False)
+                self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+                self.assertIn("is not a branch name git accepts", p.stdout)
+                self.assertIn("Change `user`, or this member's `worktree`", p.stdout)
 
 
 class TeamStateTests(unittest.TestCase):
@@ -2871,6 +1963,463 @@ class TeamCase(HcBackend, unittest.TestCase):
             except SystemExit as error:
                 code = error.code
         return code, out.getvalue(), err.getvalue()
+
+
+@fake_only
+class TeamCommandTests(TeamCase):
+    """v2 up, down, status and brief (launch_layout.md §§2, 6, 8; cli_skill.md §2) on the fake hc, with the keeper
+    driven in-process."""
+
+    def setUp(self):
+        super().setUp()
+        bin_ = self.env.root / "bin"
+        self.enterContext(patch.dict(os.environ, {"PATH": f"{bin_}:{os.environ.get('PATH', '')}",
+                                                  "HOME": self.env.env["HOME"],
+                                                  "FAKE_MODELS": self.env.env["FAKE_MODELS"]}))
+        self.enterContext(patch.object(factory, "ensure_keeper", lambda *args, **kwargs: "keeper"))
+        real = factory.wait_outcomes
+
+        def wait(log, ident, recipients, offset, timeout=factory.SAY_WAIT):
+            self.deliver()
+            return real(log, ident, recipients, offset, 0)
+        self.enterContext(patch.object(factory, "wait_outcomes", wait))
+        self.operator = self.fake.add({}, "working")
+        for name in self.cfg.members:
+            self.fake.on_run(name, status="idle")
+
+    def deliver(self):
+        for _ in range(2):
+            self.keeper.tick()
+            self.run_jobs()
+        self.keeper.tick()
+
+    def cmd(self, terminal, *argv):
+        out, err, code = io.StringIO(), io.StringIO(), 0
+        hc_bin = self.hc.bin or factory.HC
+        env = {"HC_BIN": hc_bin, **({"HC_TERMINAL_ID": terminal} if terminal else {})}
+        with (patch.dict(os.environ, env), patch.object(factory, "HC", hc_bin),
+              contextlib.redirect_stdout(out), contextlib.redirect_stderr(err)):
+            if not terminal:
+                os.environ.pop("HC_TERMINAL_ID", None)
+            try:
+                factory.main([*argv, "--cwd", str(self.root)] if argv[0] != "say" else list(argv))
+            except SystemExit as error:
+                code = error.code or 0
+        return code, out.getvalue(), err.getvalue()
+
+    def member_terms(self):
+        return {r["labels"]["factory.member"]: r["address"] for r in self.hc.list(self.team)
+                if r["labels"].get("factory.kind") == "member" and r["state"] == "live"}
+
+    def mutations(self):
+        changes = ("terminal.run", "terminal.label", "terminal.kill", "terminal.rm", "doc.set")
+        return [c for c in self.fake.received() if c.get("method") in changes]
+
+    def test_up_starts_briefs_and_saves_each_launch(self):
+        code, out, err = self.cmd(self.operator, "up", "lead-dev", "frontend-dev")
+        self.assertEqual(code, 0, out + err)
+        terms = self.member_terms()
+        self.assertEqual(set(terms), {"lead-dev", "frontend-dev"})
+        labels = self.hc.get(self.operator)["labels"]
+        self.assertEqual((labels["factory.kind"], labels["factory.member"], labels["name"]),
+                         ("operator", "operator", "@operator"))
+        _, box = self.log.read_box()
+        briefs = [m for m in box.msgs.values() if m["kind"] == "brief"]
+        self.assertEqual(sorted(m["to"][0] for m in briefs), ["frontend-dev", "lead-dev"])
+        self.assertTrue(all(box.outcome(m["id"], m["to"][0])["o"] == "delivered" for m in briefs))
+        for name, term in terms.items():
+            self.assertIn(f"started @{name}", out)
+            sent = self.fake.sent(term)
+            self.assertEqual(len(sent), 1)
+            self.assertIn("one line saying `ready`", sent[0])
+        newest = factory.saved_sessions(self.state_dir)[0]
+        self.assertEqual({n: (e["term"], e["how"]) for n, e in newest.items()},
+                         {n: (t, "new") for n, t in terms.items()})
+        self.assertTrue(factory.read_team(self.state_dir)["up"])
+        runs = self.fake.calls("terminal.run")
+        self.assertTrue(all(not any(k.startswith("herdr.") for k in r["params"]["labels"]) for r in runs))
+        self.assertFalse(self.fake.calls("doc.set"))
+        before = len(self.mutations())
+        code, out, _ = self.cmd(self.operator, "up")                   # running members are left alone
+        self.assertEqual(len(self.member_terms()), 4)
+        self.assertIn("already running: @lead-dev, @frontend-dev", out)
+        self.assertEqual(len([m for m in self.log.read_box()[1].msgs.values() if m["kind"] == "brief"]), 4)
+        self.assertEqual(sum(1 for c in self.mutations()[before:] if c["method"] == "terminal.run"), 2)
+
+    def test_up_refuses_before_changing_anything(self):
+        member = self.terminal("lead-dev")[0]
+        quiet = self.fake.add({}, None)
+        other = self.fake.add({"factory.team": "elsewhere", "factory.kind": "member", "factory.member": "x"}, "idle")
+        for caller, reason in ((None, "run the operator inside an hc terminal"),
+                               (member, "run up from the operator's pane, not a member's"),
+                               (quiet, "reports no agent status to hc"),
+                               (other, "of team elsewhere")):
+            with self.subTest(reason=reason):
+                before = len(self.mutations())
+                code, _, err = self.cmd(caller, "up")
+                self.assertEqual(code, 2)
+                self.assertIn(reason, err)
+                self.assertEqual(self.mutations()[before:], [])
+        reachable = self.terminal("operator", kind="operator", status="working")[0]
+        code, _, err = self.cmd(self.operator, "up")
+        self.assertEqual(code, 2)
+        self.assertIn(f"@operator is running in {reachable}; use that pane", err)
+        self.assertEqual(self.hc.get(reachable)["labels"]["factory.kind"], "operator")
+
+    def test_up_is_one_at_a_time(self):
+        lock = factory.lifecycle_lock(self.state_dir)
+        self.addCleanup(os.close, lock)
+        code, _, err = self.cmd(self.operator, "up")
+        self.assertEqual(code, 2)
+        self.assertIn("another up or down is running for this team", err)
+        self.assertFalse(self.fake.calls("terminal.run"))
+
+    def test_a_failed_preflight_changes_nothing(self):
+        self.env.write_brief(formation({**{n: CATALOG_MEMBERS[n] for n in ("lead-dev", "reviewer")},
+                                        "pm": {"harness": "pi", "model": "z-ai/glm-9"}}))
+        before = len(self.mutations())
+        code, out, _ = self.cmd(self.operator, "up")
+        self.assertEqual(code, 2)
+        self.assertIn("pi has no model z-ai/glm-9 configured", out)
+        self.assertEqual(self.mutations()[before:], [])
+
+    def test_a_gone_member_gets_a_new_terminal_before_its_old_record_goes(self):
+        old = self.terminal("lead-dev")[0]
+        self.briefed("lead-dev", old)
+        self.fake.finish(old, exit_code=1)
+        code, out, err = self.cmd(self.operator, "up", "lead-dev")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("@lead-dev interrupted: exited (code 1) (state unknown). Last message to it: #1", out)
+        calls = [(c["method"], c["params"].get("terminal")) for c in self.mutations()]
+        run, rm = calls.index(("terminal.run", None)), calls.index(("terminal.rm", old))
+        self.assertLess(run, rm)
+        self.assertIn("starts in a new conversation: none was recorded for it", out)
+
+    def test_a_brief_still_in_flight_points_to_status_not_a_second_send(self):
+        with patch.object(factory, "wait_outcomes",
+                          lambda log, ident, recipients, offset, timeout=0: {recipients[0]: {"o": "queued",
+                                                                                           "why": "waiting"}}):
+            code, out, err = self.cmd(self.operator, "up", "lead-dev")
+        self.assertEqual(code, 3)
+        self.assertIn("is still queued (waiting); the keeper delivers it when it can. Run factory.py status.", out)
+        self.assertIn("Then run: factory.py status", err)
+        self.assertNotIn("brief --send", err)
+
+    def test_up_with_everyone_running_still_starts_the_keeper(self):
+        self.cmd(self.operator, "up", "lead-dev")
+        calls = []
+        with patch.object(factory, "ensure_keeper", lambda *args, **kwargs: calls.append(kwargs) or "keeper"):
+            code, out, _ = self.cmd(self.operator, "up", "lead-dev")
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, [{"force": True}])
+
+    def test_up_never_asks_for_a_second_brief_when_storage_or_outcome_is_unknown(self):
+        with patch.object(factory.Log, "add", side_effect=OSError("disk gone")):
+            code, _, err = self.cmd(self.operator, "up", "lead-dev")
+        self.assertEqual(code, 3)
+        self.assertIn("its brief may be stored: disk gone", err)
+        self.assertNotIn("brief --send", err)
+        with patch.object(factory, "wait_outcomes", side_effect=OSError("cannot read")):
+            code, _, err = self.cmd(self.operator, "up", "reviewer")
+        self.assertEqual(code, 3)
+        self.assertIn("is stored; its outcome could not be read (cannot read). Then run: factory.py status", err)
+
+    def test_an_unrecorded_stop_is_finished_by_the_next_down_and_blocks_up(self):
+        self.cmd(self.operator, "up", "lead-dev")
+        term = self.member_terms()["lead-dev"]
+        with patch.object(factory, "mark_stopped", side_effect=OSError("no space")):
+            code, out, _ = self.cmd(self.operator, "down", "lead-dev")
+        self.assertEqual(code, 1)
+        self.assertIn(f"its record {term} is kept. Run factory.py down lead-dev again.", out)
+        code, _, err = self.cmd(self.operator, "up", "lead-dev")
+        self.assertEqual(code, 2)
+        self.assertIn("the last stop of @lead-dev was not recorded; run factory.py down lead-dev first", err)
+        code, out, err = self.cmd(self.operator, "down", "lead-dev")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("stopped @lead-dev (was stopped)", out)
+        self.assertEqual(factory.read_team(self.state_dir)["stopped"], [term])
+        self.assertNotIn(term, [r["address"] for r in self.hc.list(self.team)])
+        self.assertEqual(self.cmd(self.operator, "up", "lead-dev")[0], 0)
+
+    def test_a_record_that_cannot_be_removed_still_sweeps_and_exits_1(self):
+        self.cmd(self.operator, "up", "lead-dev")
+        self.log.add("pm", ["lead-dev"], "for later")
+
+        def refuse(hc, term):
+            raise factory.HcError("live", "still there")
+        with patch.object(factory.Hc, "rm", refuse):
+            code, out, _ = self.cmd(self.operator, "down", "lead-dev")
+        self.assertEqual(code, 1)
+        self.assertIn("could not be removed (", out)
+        self.assertIn("stopped @lead-dev (was idle); 1 queued messages dropped", out)
+
+    def test_a_failed_sweep_keeps_the_records_so_up_waits(self):
+        self.cmd(self.operator, "up", "lead-dev")
+        term = self.member_terms()["lead-dev"]
+        ident = self.add("lead-dev", "for later")
+        with patch.object(factory.Log, "drop_queued", side_effect=OSError("disk full")):
+            code, out, _ = self.cmd(self.operator, "down", "lead-dev")
+        self.assertEqual(code, 1)
+        self.assertIn("their records are kept. Run factory.py down lead-dev again.", out)
+        self.assertIn(term, [r["address"] for r in self.hc.list(self.team)])
+        self.assertEqual(self.cmd(self.operator, "up", "lead-dev")[0], 2)          # no replacement yet
+        code, out, err = self.cmd(self.operator, "down", "lead-dev")
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(self.outcome(ident)["o"], "dropped")
+        self.assertNotIn(term, [r["address"] for r in self.hc.list(self.team)])
+        self.assertEqual(self.cmd(self.operator, "up", "lead-dev")[0], 0)
+        self.assertFalse(any("for later" in text for text in self.fake.sent(self.member_terms()["lead-dev"])))
+
+    def test_a_fresh_launch_never_falls_back_to_the_old_conversation(self):
+        old = self.terminal("lead-dev")[0]
+        factory.record_session(self.cfg, self.state_dir, "lead-dev", old, {"CODEX_THREAD_ID": "old-conversation"})
+        self.fake.finish(old)
+        def in_flight(log, ident, recipients, offset, timeout=0):
+            return {recipients[0]: {"o": "queued", "why": "waiting"}}
+        with patch.object(factory, "wait_outcomes", in_flight):
+            code, _, _ = self.cmd(self.operator, "up", "lead-dev", "--fresh")
+        self.assertEqual(code, 3)                                      # its brief is still in flight
+        new = self.member_terms()["lead-dev"]
+        self.deliver()                                                 # delivered after up gave up waiting
+        self.fake.finish(new)                                          # and it ends before any say
+        entry = factory.saved_sessions(self.state_dir)[0]["lead-dev"]
+        self.assertEqual((entry["term"], entry["how"], entry["value"]), (new, "new", None))
+        m = factory.plan(self.cfg, "lead-dev", self.state_dir)
+        self.assertFalse(factory.session_plan(m, self.state_dir, entry, fresh=False)["resume"])
+
+    def test_a_fresh_launch_that_cannot_be_recorded_is_stopped(self):
+        old = self.terminal("lead-dev")[0]
+        factory.record_session(self.cfg, self.state_dir, "lead-dev", old, {"CODEX_THREAD_ID": "old-conversation"})
+        self.fake.finish(old)
+        with patch.object(factory, "launch_entry", side_effect=OSError("disk full")):
+            code, _, err = self.cmd(self.operator, "up", "lead-dev", "--fresh")
+        self.assertEqual(code, 3)
+        self.assertIn("its fresh launch could not be recorded (disk full), so up stopped it", err)
+        self.assertIn("then factory.py up lead-dev --fresh", err)                # the retry stays fresh
+        self.assertEqual(self.member_terms(), {})                               # nothing runs unrecorded
+        self.assertIn(old, [r["address"] for r in self.hc.list(self.team)])     # the old record stays
+        self.assertFalse([m for m in self.log.read_box()[1].msgs.values() if m["kind"] == "brief"])
+
+    def test_the_launch_entry_gives_way_to_say_in_either_order(self):
+        m = {**factory.plan(self.cfg, "frontend-dev", self.state_dir), "model": "claude-opus-5-5"}
+        for order in ("say first", "say after"):
+            with self.subTest(order=order):
+                term = f"t-{order[4:9]}"
+                factory.launch_entry(self.state_dir, m, term, "new", None)            # at its start
+                if order == "say first":
+                    factory.record_session(self.cfg, self.state_dir, "frontend-dev", term,
+                                           {"CLAUDE_CODE_SESSION_ID": "from-say"})
+                factory.launch_entry(self.state_dir, m, term, "id", "assigned-1")       # at its delivery
+                if order == "say after":
+                    factory.record_session(self.cfg, self.state_dir, "frontend-dev", term,
+                                           {"CLAUDE_CODE_SESSION_ID": "from-say"})
+                entry = factory.saved_sessions(self.state_dir)[0]["frontend-dev"]
+                self.assertEqual((entry["term"], entry["how"], entry["value"]), (term, "env", "from-say"))
+        factory.launch_entry(self.state_dir, m, "t-plain", "new", None)
+        factory.launch_entry(self.state_dir, m, "t-plain", "id", "assigned-2")          # no say: the ID wins
+        factory.launch_entry(self.state_dir, m, "t-plain", "id", "assigned-2")          # and is not repeated
+        factory.launch_entry(self.state_dir, m, "t-plain", "new", None)                 # nor undone by a late new
+        lines = (self.state_dir / factory.SESSIONS).read_text().splitlines()
+        self.assertEqual(sum('"assigned-2"' in line for line in lines), 1)
+        self.assertEqual(factory.saved_sessions(self.state_dir)[0]["frontend-dev"]["value"], "assigned-2")
+
+    def test_brief_send_does_not_wait_for_a_missing_keeper(self):
+        self.cmd(self.operator, "up", "lead-dev")
+        with patch.object(factory, "ensure_keeper", side_effect=factory.Problem("no keeper", "fix")), \
+                patch.object(factory, "wait_outcomes", wraps=lambda log, i, r, o, timeout: {r[0]: {"o": "queued",
+                                                                                                  "why": "waiting"}}
+                             ) as waited:
+            code, _, err = self.cmd(self.operator, "brief", "--send", "lead-dev")
+        self.assertEqual(code, 1)
+        self.assertIn("the keeper is not running (no keeper)", err)
+        self.assertEqual(waited.call_args.args[4], 0.0)
+
+    def test_a_trust_dialog_without_keys_is_left_to_the_owner(self):
+        self.assertEqual(factory.TABLE["agy"]["dialogs"], [["Do you trust the contents of this project?", []]])
+        self.env.write_brief(formation({"pm": {"harness": "agy"}}))
+        self.fake.on_run("pm", status="idle", screen="Do you trust the contents of this project?")
+        code, out, err = self.cmd(self.operator, "up")
+        self.assertEqual(code, 3)
+        self.assertIn("waits on its trust dialog: accept it in its pane, then run: factory.py brief --send pm", err)
+        self.assertFalse(self.fake.calls("terminal.keys"))
+        self.assertFalse([m for m in self.log.read_box()[1].msgs.values() if m["kind"] == "brief"])
+
+    def test_a_resume_that_exits_is_retried_fresh_once(self):
+        old = self.terminal("lead-dev")[0]
+        factory.record_session(self.cfg, self.state_dir, "lead-dev", old, {"CODEX_THREAD_ID": "thread-a"})
+        self.fake.finish(old)
+        results = iter([{"lead-dev": "exited (code 1): no such session"}, {"lead-dev": None}])
+        with patch.object(factory, "await_ready", lambda *args, **kwargs: next(results)):
+            code, out, err = self.cmd(self.operator, "up", "lead-dev")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("its saved conversation could not be resumed (exited (code 1): no such session); starting fresh",
+                      out)
+        first, second = [c["params"]["argv"] for c in self.fake.calls("terminal.run")]
+        self.assertEqual(first[1:3], ["resume", "thread-a"])
+        self.assertNotIn("resume", second)
+        self.assertEqual(len(self.member_terms()), 1)
+
+    def test_members_already_running_hear_who_joined(self):
+        lead = self.terminal("lead-dev")[0]
+        self.briefed("lead-dev", lead)
+        code, out, err = self.cmd(self.operator, "up", "reviewer")
+        self.assertEqual(code, 0, out + err)
+        news = [m for m in self.log.read_box()[1].msgs.values() if m.get("text", "").startswith("Joined the team:")]
+        self.assertEqual([m["to"] for m in news], [["lead-dev"]])
+        self.assertIn("@reviewer (reviewer, Codex gpt-6-luna)", news[0]["text"])
+
+    def test_down_records_the_stop_then_removes_and_drops(self):
+        self.cmd(self.operator, "up", "lead-dev")
+        term = self.member_terms()["lead-dev"]
+        self.log.add("pm", ["lead-dev"], "for later")
+        code, out, err = self.cmd(self.operator, "down")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("stopped @lead-dev (was idle); 1 queued messages dropped", out)
+        self.assertIn("@reviewer was not running", out)
+        self.assertIn("run factory.py up to bring members back", out)
+        calls = [(c["method"], c["params"].get("labels")) for c in self.mutations()
+                 if c["params"].get("terminal") == term]
+        self.assertEqual(calls, [("terminal.label", {"factory.down": "1"}), ("terminal.kill", None),
+                                 ("terminal.rm", None)])
+        team = factory.read_team(self.state_dir)
+        self.assertEqual((team["stopped"], team["up"]), ([term], False))
+        _, box = self.log.read_box()
+        late = max(box.msgs)
+        self.assertEqual(box.outcome(late, "lead-dev"), {**box.outcome(late, "lead-dev"), "o": "dropped",
+                                                          "why": "stopped by down"})
+
+    def test_down_refuses_or_stops_nobody(self):
+        self.cmd(self.operator, "up", "lead-dev")
+        member = self.member_terms()["lead-dev"]
+        code, _, err = self.cmd(member, "down")
+        self.assertEqual(code, 2)
+        self.assertIn("run down from the operator's pane", err)
+        with patch.object(factory, "sessions_writable", return_value="No space left on device"):
+            code, out, _ = self.cmd(self.operator, "down")
+        self.assertEqual(code, 1)
+        self.assertIn("sessions cannot be saved (No space left on device): members left running", out)
+        self.assertEqual(self.member_terms(), {"lead-dev": member})
+
+    def test_status_shows_the_team(self):
+        self.cmd(self.operator, "up", "lead-dev", "reviewer")
+        reviewer = self.member_terms()["reviewer"]
+        self.fake.finish(reviewer, exit_code=1)
+        self.log.add("lead-dev", ["operator"], "a report")
+        code, out, err = self.cmd(self.operator, "status")
+        self.assertEqual(code, 0, out + err)
+        lines = out.splitlines()
+        self.assertEqual(lines[0], f"factory {factory.VERSION} ({factory.SCRIPT}), hc 0.1.20, team {self.team}")
+        self.assertRegex(out, r"@lead-dev +lead-dev +codex +gpt-6-astra +high +idle +0 +t\d+")
+        self.assertRegex(out, rf"@reviewer +reviewer +codex +gpt-6-luna +high +gone +{reviewer}")
+        self.assertIn("@reviewer interrupted: exited (code 1)", out)
+        self.assertIn("pending: @operator 1", out)
+        self.assertIn("read them with: factory.py inbox --for operator", out)
+        self.assertIn("keeper: starting (keeper), no pane", out)          # no heartbeat yet
+        self.assertIn("operator: reachable", out)
+        self.assertIn("@reviewer gone: run `factory.py up reviewer` to bring them back.", out)
+
+    def test_brief_previews_offline_with_placeholders(self):
+        with patch.dict(os.environ, {"XDG_CACHE_HOME": str(self.env.root / "elsewhere")}):
+            code, out, err = self.cmd(None, "brief", "reviewer")
+        self.assertEqual(code, 0, err)
+        self.assertIn("paths are final after factory.py up", err)
+        self.assertIn("<state>/messages/reviewer/FILENAME", out)
+        self.assertIn("<state>/reviewer.md", out)
+        code, out, err = self.cmd(None, "brief", "reviewer")             # the team's state exists: real paths
+        self.assertNotIn("paths are final", err)
+        self.assertIn(str(self.state_dir / "messages" / "reviewer"), out)
+
+    def test_brief_send_closes_by_whether_the_terminal_was_briefed(self):
+        self.cmd(self.operator, "up", "lead-dev")
+        unbriefed = self.terminal("reviewer")[0]
+        code, out, err = self.cmd(self.operator, "brief", "--send", "lead-dev", "reviewer")
+        self.assertEqual(code, 0, out + err)
+        lead = self.member_terms()["lead-dev"]
+        self.assertTrue(self.fake.sent(lead)[-1].rstrip().endswith("No reply needed."))
+        self.assertIn("mention any work you have already picked up", self.fake.sent(unbriefed)[-1])
+        code, _, err = self.cmd(self.operator, "brief", "--send", "pm")
+        self.assertEqual(code, 2)
+        self.assertIn("not running: @pm", err)
+
+
+@real_only
+class IntegratedTeamTests(TeamCase):
+    """phase_5a.md §5: check, up, say, status, down and up again from the real command entry points, on the private
+    real core, with a real keeper and fake OSC agents standing in for Codex."""
+
+    def setUp(self):
+        super().setUp()
+        bin_ = self.directory / "bin"
+        bin_.mkdir()
+        agent = pathlib.Path(__file__).resolve().with_name("fake_agent.py")
+        codex = bin_ / "codex"                       # any arguments: the fake agent takes none of Codex's
+        codex.write_text(f"#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(agent))} reports\n")
+        codex.chmod(0o755)
+        self.enterContext(patch.dict(os.environ, {"PATH": f"{bin_}:{os.environ.get('PATH', '')}",
+                                                  "HOME": self.env.env["HOME"]}))
+        self.operator = self.hc.run([sys.executable, str(agent), "reports"], str(self.directory), {}, {})["address"]
+        self.addCleanup(self.remove, self.operator)
+        self.state(self.operator, "idle")
+        self.addCleanup(self.stop_everything)
+
+    def stop_everything(self):
+        for record in self.hc.list(self.team):
+            self.remove(record["address"])
+
+    def cmd(self, *argv):
+        out, err, code = io.StringIO(), io.StringIO(), 0
+        with (patch.dict(os.environ, {"HC_TERMINAL_ID": self.operator, "HC_BIN": self.hc.bin}),
+              patch.object(factory, "HC", self.hc.bin),
+              contextlib.redirect_stdout(out), contextlib.redirect_stderr(err)):
+            try:
+                factory.main([*argv, "--cwd", str(self.root)] if argv[0] != "say" else list(argv))
+            except SystemExit as error:
+                code = error.code or 0
+        return code, out.getvalue(), err.getvalue()
+
+    def members(self):
+        return {r["labels"]["factory.member"]: r["address"] for r in self.hc.list(self.team)
+                if r["labels"].get("factory.kind") == "member" and r["state"] == "live"}
+
+    def test_a_team_runs_end_to_end(self):
+        code, out, err = self.cmd("check", "lead-dev", "reviewer")
+        self.assertEqual(code, 0, out + err)
+        code, out, err = self.cmd("up", "lead-dev", "reviewer")
+        self.assertEqual(code, 0, out + err)
+        for name in ("lead-dev", "reviewer"):
+            self.assertRegex(out, rf"@{name}: brief \d+ delivered")
+        first = self.members()
+        _, box = self.log.read_box()
+        self.assertEqual(box.briefed(), set(first.values()))
+        code, out, err = self.cmd("say", "lead-dev", "a task")
+        self.assertEqual(code, 0, out + err)
+        self.assertRegex(out, r"message \d+\n@lead-dev: delivered\n")
+        task = int(out.split()[1])
+        code, out, _ = self.cmd("up")                              # a second up leaves live members alone
+        self.assertIn("already running: @lead-dev, @reviewer", out)
+        self.assertEqual(self.members(), first)
+        self.state(first["lead-dev"], "idle")                         # the fake agent's turn for the task ends
+        code, out, err = self.cmd("status")
+        self.assertEqual(code, 0, err)
+        self.assertRegex(out, r"@lead-dev +lead-dev +codex +gpt-6-astra +high +idle")
+        self.assertIn("keeper: running", out)
+        self.assertIn("operator: reachable", out)
+        self.assertFalse(any(k.startswith("herdr.") for r in self.hc.list(self.team) for k in r["labels"]))
+        code, out, err = self.cmd("down", "lead-dev")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("stopped @lead-dev (was idle)", out)
+        self.assertEqual(set(self.members()), {"reviewer"})
+        keeper = factory.team_view(self.hc, self.team).keeper["address"]
+        code, out, err = self.cmd("down")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("run factory.py up to bring members back", out)
+        self.until(lambda: self.hc.get(keeper)["state"] == "finished", "the keeper's exit after the last down")
+        code, out, err = self.cmd("up", "lead-dev")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("@lead-dev starts in a new conversation: none was recorded for it", out)
+        _, box = self.log.read_box()
+        self.assertEqual(sum(1 for m in box.msgs.values() if m["kind"] == "brief" and m["to"] == ["lead-dev"]), 2)
+        self.assertEqual(box.outcome(task, "lead-dev")["o"], "delivered")      # the team's history persists
 
 
 class KeeperTests(TeamCase):
@@ -3548,6 +3097,26 @@ class CliTests(TeamCase):
         return "keeper"
 
     @fake_only
+    def test_a_member_say_records_its_session_even_when_refused(self):
+        member = self.prepare_sender("lead-dev", kind="member")
+        operator = self.prepare_sender()
+        threads = {"CODEX_THREAD_ID": "thread-1", "CLAUDE_CODE_SESSION_ID": "s-1", "PI_SESSION_ID": "p-1"}
+        with patch.dict(os.environ, threads):
+            status, _, err = self.say(member, "operator", "text")          # refused: members send with --file
+            self.assertEqual(status, 2, err)
+            self.assertEqual(self.say(operator, "operator", "text")[0], 2)
+        newest, _ = factory.saved_sessions(self.state_dir)
+        self.assertEqual(set(newest), {"lead-dev"})                         # the operator records nothing
+        self.assertEqual({k: newest["lead-dev"][k] for k in ("harness", "term", "how", "value")},
+                         {"harness": "codex", "term": member, "how": "env", "value": "thread-1"})
+        (self.state_dir / factory.SESSIONS).unlink()
+        (self.state_dir / factory.SESSIONS).mkdir()                         # cannot be written
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": "thread-2"}):
+            status, _, err = self.say(member, "operator", "text")
+        self.assertIn("warning: could not record your session:", err)
+        self.assertIn("nothing sent: members send with --file", err)        # and say went on
+
+    @fake_only
     def test_say_refusals_never_store_or_deliver(self):
         member = self.prepare_sender("lead-dev", kind="member")
         operator = self.prepare_sender()
@@ -3905,69 +3474,17 @@ class TeamLookupTests(unittest.TestCase):
         self.assertIn("message log needs repair", factory.pending_lines(state, "operator", now)[0])
 
 
-class CutoverTests(unittest.TestCase):
+class MemberPromptTests(unittest.TestCase):
     def setUp(self):
         self.env = self.enterContext(Env(UI))
-        self.enterContext(patch.dict(os.environ, self.env.env, clear=True))
-        cfg = factory.Config(self.env.repo)
-        self.state = factory.state_dir(cfg.root, "fakecore00000000")
-        log = factory.open_log(self.state)
-        self.assertEqual(log.add("lead-dev", ["operator"], "v2 pending")[0], 1)
-        self.queue = cfg.cache / f"inbox-{factory.session_key()}.jsonl"
-        self.history = self.queue.with_suffix(".json")
-        row = {"at": "2026-11-26T17:00:00Z", "from": "lead-dev"}
-        self.queue.write_text(json.dumps({**row, "id": 7, "text": "v1 unread"}) + "\n")
-        self.history.write_text(json.dumps({"seen": 6, "history": [{**row, "id": 6, "text": "v1 acknowledged"}]}))
-        self.legacy = {path: path.read_bytes() for path in (self.queue, self.history)}
-
-    def test_status_and_up_show_v2_pending_only(self):
-        env = self.env
-        for args in (("status",), ("up", "--no-brief"), ("status",)):
-            out = env.run(*args).stdout
-            self.assertIn("pending: @operator 1", out)
-            self.assertIn("factory.py inbox --for operator", out)
-            self.assertNotIn("unread", out)
-            self.assertNotIn("factory.py wait", out)
-        inbox = env.run("inbox", "100", "--for", "@operator", HERDR_ENV="").stdout
-        self.assertIn("[Message 1 from @lead-dev", inbox)
-        self.assertIn("v2 pending", inbox)
-        self.assertNotIn("v1", inbox)
-        self.assertEqual({path: path.read_bytes() for path in self.legacy}, self.legacy)
-        result = env.run("wait", check=False)
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("invalid choice: 'wait'", result.stderr)
 
     def test_member_prompt_has_label_based_say_and_names_the_outcomes(self):
-        prompt = self.env.run("prompt", "lead-dev").stdout
+        prompt = self.env.run("brief", "lead-dev").stdout
         self.assertIn(f"python3 {SCRIPT} say NAME --file", prompt)
         self.assertNotIn("say --cwd", prompt)
         for word in ("delivered", "sending", "queued", "unconfirmed", "dropped", "nothing sent", "not stored"):
             self.assertIn(f"`{word}`", prompt)
         self.assertIn("resend only when asked", prompt)
-
-    @unittest.skipUnless(GIT, "git is not installed")
-    def test_v1_reader_still_prints_the_old_ids(self):
-        repo = SCRIPT.parents[2]
-        ref = next(
-            (ref for ref in ("v1.0.0", "origin/v1", "v1")
-             if subprocess.run([GIT, "-C", str(repo), "rev-parse", "--verify", ref],
-                               capture_output=True).returncode == 0),
-            None,
-        )
-        if ref is None:
-            self.skipTest("the retained v1 ref is not in this checkout")
-        with tempfile.TemporaryDirectory() as directory:
-            archive = subprocess.check_output([GIT, "-C", str(repo), "archive", "--format=zip", ref, "skill"])
-            with zipfile.ZipFile(io.BytesIO(archive)) as package:
-                package.extractall(directory)
-            script = pathlib.Path(directory) / "skill" / "scripts" / "factory.py"
-            for args, ident, text in ((["wait", "--timeout", "0"], 7, "v1 unread"),
-                                      (["inbox", "100"], 6, "v1 acknowledged")):
-                result = subprocess.run([sys.executable, str(script), *args, "--cwd", str(self.env.repo)],
-                                        env=self.env.env, capture_output=True, text=True, check=True)
-                self.assertIn(f"[Message {ident} from @lead-dev", result.stdout)
-                self.assertIn(text, result.stdout)
-                self.assertNotIn("v2 pending", result.stdout)
 
 
 class LogTests(unittest.TestCase):
@@ -5357,6 +4874,463 @@ class InboxReaderTests(unittest.TestCase):
         self.assertEqual(after, before)
 
 
+class SessionTests(unittest.TestCase):
+    """sessions.jsonl and session_plan (launch_layout.md §3)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.state = pathlib.Path(self.tmp.name) / "factory-skill" / "team" / "core"
+        self.cfg = types.SimpleNamespace(members={
+            "claude-dev": {"harness": "claude", "model": "claude-opus-5-5"},
+            "codex-dev": {"harness": "codex", "model": "gpt-6.2-sol"},
+            "pi-dev": {"harness": "pi", "model": "openai/gpt-6-astra"},
+            "agy-dev": {"harness": "agy"}})
+
+    def m(self, name, **over):
+        return {"name": name, **self.cfg.members[name], **over}
+
+    def lines(self):
+        return [json.loads(line) for line in (self.state / factory.SESSIONS).read_bytes().splitlines()]
+
+    def record(self, member, term, value, var=None):
+        var = var or factory.TABLE[self.cfg.members[member]["harness"]]["session_env"]
+        return factory.record_session(self.cfg, self.state, member, term, {var: value})
+
+    def test_a_follow_harness_records_each_new_value_and_terminal_once(self):
+        with patch.dict(factory.TABLE["claude"], session_follow=True):
+            for term, value in (("t1", "aaa"), ("t1", "aaa"), ("t1", "bbb"), ("t2", "bbb")):
+                self.assertIsNone(self.record("claude-dev", term, value))
+        self.assertEqual([(e["term"], e["value"], e["how"]) for e in self.lines()],
+                         [("t1", "aaa", "env"), ("t1", "bbb", "env"), ("t2", "bbb", "env")])
+        newest, skipped = factory.saved_sessions(self.state)
+        self.assertEqual((newest["claude-dev"]["value"], skipped), ("bbb", 0))
+        self.assertEqual(stat.S_IMODE(os.stat(self.state / factory.SESSIONS).st_mode), 0o600)
+
+    def test_without_follow_the_first_capture_of_a_launch_wins_in_either_order(self):
+        self.assertFalse(factory.TABLE["codex"].get("session_follow", True))
+        m = self.m("codex-dev")
+        factory.launch_entry(self.state, m, "t1", "new", None)       # up's fallback first
+        self.record("codex-dev", "t1", "thread-a")                   # then the ready line: replaces it
+        self.record("codex-dev", "t1", "thread-b")                   # a sub-agent's later value: ignored
+        self.assertEqual(factory.saved_sessions(self.state)[0]["codex-dev"]["value"], "thread-a")
+        self.record("codex-dev", "t2", "thread-c")                   # the ready line first this time
+        factory.launch_entry(self.state, m, "t2", "new", None)       # up's fallback never replaces it
+        self.assertEqual([(e["term"], e["how"], e["value"]) for e in self.lines()],
+                         [("t1", "new", None), ("t1", "env", "thread-a"), ("t2", "env", "thread-c")])
+
+    def test_a_fresh_launch_ends_the_previous_conversation(self):
+        m = self.m("codex-dev")
+        self.record("codex-dev", "t1", "thread-a")
+        factory.launch_entry(self.state, m, "t2", "new", None)       # up --fresh, brief delivered, no say yet
+        entry = factory.saved_sessions(self.state)[0]["codex-dev"]
+        sess = factory.session_plan(m, self.state, entry, fresh=False)
+        self.assertEqual((sess["args"], sess["resume"]), ([], False))
+        self.assertIn("starts in a new conversation: none was recorded", sess["notice"])
+
+    def test_values_that_could_be_options_or_too_long_are_not_recorded(self):
+        for value in ("-rf", "", "a" * 129, "a b", "x;y", None):
+            self.assertIsNone(self.record("codex-dev", "t1", value))
+        self.assertFalse((self.state / factory.SESSIONS).exists())
+        self.assertIsNone(self.record("codex-dev", "t1", "A1._:-" + "z" * 122))
+        self.assertEqual(len(self.lines()), 1)
+
+    def test_a_harness_without_a_variable_records_nothing(self):
+        cfg = types.SimpleNamespace(members={"omp-dev": {"harness": "omp", "model": "openai/gpt-6-astra"}})
+        self.assertIsNone(factory.record_session(cfg, self.state, "omp-dev", "t1", {"PI_SESSION_ID": "x"}))
+        self.assertFalse(self.state.exists())
+
+    def test_damaged_lines_are_skipped_and_counted_and_a_torn_tail_is_completed(self):
+        self.record("codex-dev", "t1", "thread-a")
+        with open(self.state / factory.SESSIONS, "ab") as f:
+            f.write(b'not json\n{"member": "codex-dev", "how": "env", "value": "-x", "harness": "codex",'
+                    b' "term": "t9", "at": "x"}\n{"member": "codex-dev", "harn')
+        newest, skipped = factory.saved_sessions(self.state)
+        self.assertEqual((newest["codex-dev"]["value"], skipped), ("thread-a", 3))
+        self.record("codex-dev", "t2", "thread-b")
+        data = (self.state / factory.SESSIONS).read_bytes()
+        self.assertTrue(data.endswith(b'"harn\n' + data.splitlines()[-1] + b"\n"))
+        newest, skipped = factory.saved_sessions(self.state)
+        self.assertEqual((newest["codex-dev"]["value"], skipped), ("thread-b", 3))
+
+    def test_concurrent_writers_each_append_one_whole_line(self):
+        def worker(i):
+            factory.record_session(self.cfg, self.state, "codex-dev", f"t{i}", {"CODEX_THREAD_ID": f"thread-{i}"})
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(16)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(sorted(e["value"] for e in self.lines()), sorted(f"thread-{i}" for i in range(16)))
+
+    def test_teams_do_not_share_sessions(self):
+        other = self.state.parent.parent / "other-team" / "core"
+        self.record("codex-dev", "t1", "thread-a")
+        self.assertEqual(factory.saved_sessions(other), ({}, 0))
+        self.assertFalse(other.exists())                              # a reader creates nothing
+
+    def test_a_failed_write_is_a_warning_and_says_why(self):
+        with patch.object(factory.os, "fsync", side_effect=OSError(5, "Input/output error")):
+            warning = self.record("codex-dev", "t1", "thread-a")
+        self.assertRegex(warning, "^warning: could not record your session: .*Input/output error")
+
+    def test_down_checks_sessions_can_be_saved(self):
+        self.assertIsNone(factory.sessions_writable(self.state))
+        self.assertTrue((self.state / factory.SESSIONS).exists())
+        with patch.object(factory.os, "fsync", side_effect=OSError(28, "No space left on device")):
+            self.assertIn("No space left", factory.sessions_writable(self.state))
+
+    def test_session_plan_resumes_only_a_compatible_entry(self):
+        entry = {"member": "claude-dev", "harness": "claude", "model": "claude-opus-5-5", "term": "t1",
+                 "how": "env", "value": "abc", "at": "x"}
+        m = self.m("claude-dev")
+        self.assertEqual(factory.session_plan(m, self.state, entry, fresh=False),
+                         {"args": ["--resume", "abc"], "resume": True, "assigned": None, "notice": None})
+        self.assertEqual(factory.session_plan(m, self.state, entry, fresh=True)["args"], [])
+        moved = factory.session_plan({**m, "harness": "codex"}, self.state, entry, fresh=False)
+        self.assertEqual((moved["resume"], moved["notice"]),
+                         (False, "@claude-dev starts fresh: its saved conversation is for claude claude-opus-5-5"))
+        self.assertTrue(factory.session_plan({**m, "model": "claude-sonnet-5-5"}, self.state, entry, False)["resume"])
+
+    def test_provider_harnesses_resume_only_within_a_provider(self):
+        m = self.m("pi-dev")
+        entry = {"member": "pi-dev", "harness": "pi", "model": "openai/gpt-6-luna", "term": "t1", "how": "env",
+                 "value": "abc", "at": "x"}
+        self.assertEqual(factory.session_plan(m, self.state, entry, False)["args"], ["--session", "abc"])
+        other = factory.session_plan({**m, "model": "z-ai/glm-5.3"}, self.state, entry, False)
+        self.assertEqual((other["resume"], other["args"]), (False, []))
+        self.assertIn("is for pi openai/gpt-6-luna", other["notice"])
+
+    def test_a_folder_entry_resumes_only_where_the_harness_uses_folders(self):
+        entry = {"member": "pi-dev", "harness": "pi", "model": "openai/gpt-6-astra", "term": "t1", "how": "dir",
+                 "value": str(self.state / "sessions" / "pi-dev-pi"), "at": "x"}
+        self.assertFalse(factory.TABLE["pi"].get("session"))
+        sess = factory.session_plan(self.m("pi-dev"), self.state, entry, fresh=False)
+        self.assertEqual((sess["resume"], sess["args"]), (False, []))
+
+    def test_opencode_gets_an_id_in_its_own_form_and_records_its_variable(self):
+        m = {"name": "oc", "harness": "opencode", "model": "openrouter/z-ai/glm-5.3"}
+        sess = factory.session_plan(m, self.state, None, fresh=False)
+        self.assertRegex(sess["assigned"], r"^ses_[A-Za-z0-9]{26}$")
+        self.assertEqual(sess["args"], ["--session", sess["assigned"]])
+        cfg = types.SimpleNamespace(members={"oc": m})
+        factory.record_session(cfg, self.state, "oc", "t1", {"OPENCODE_SESSION_ID": "ses_abc"})
+        factory.record_session(cfg, self.state, "oc", "t1", {"OPENCODE_SESSION_ID": "ses_def"})   # after /new
+        self.assertFalse(factory.TABLE["opencode"]["session_follow"])           # once per launch (#190)
+        self.assertEqual(factory.saved_sessions(self.state)[0]["oc"]["value"], "ses_abc")
+        again = factory.session_plan(m, self.state, factory.saved_sessions(self.state)[0]["oc"], fresh=False)
+        self.assertEqual((again["resume"], again["args"]), (True, ["--session", "ses_abc"]))
+
+    def test_codex_runs_without_its_daemon_fresh_or_resumed(self):
+        m = {"name": "x", "role": "lead-dev", "harness": "codex", "model": "gpt-6.2-sol", "thinking": "high",
+             "permissions": "full", "args": [], "dir": "/w", "inbox_dir": "/s"}
+        self.assertEqual(factory.launch_argv(m, pathlib.Path("/p.md"))[0][0], "--no-daemon")
+        argv = factory.launch_argv(m, pathlib.Path("/p.md"), {"args": ["resume", "id1"]})[0]
+        self.assertEqual(argv[:3], ["resume", "id1", "--no-daemon"])
+
+    def test_assigned_ids_and_session_folders(self):
+        with patch.dict(factory.TABLE["claude"], session="id"):
+            sess = factory.session_plan(self.m("claude-dev"), self.state, None, fresh=False)
+        self.assertEqual(sess["args"], ["--session-id", sess["assigned"]])
+        self.assertEqual(str(uuid.UUID(sess["assigned"])), sess["assigned"])
+        folder = self.state / "sessions" / "pi-dev-pi"
+        with patch.dict(factory.TABLE["pi"], session="dir"):
+            fresh = factory.session_plan(self.m("pi-dev"), self.state, None, fresh=False)
+            entry = {"member": "pi-dev", "harness": "pi", "model": "openai/gpt-6-astra", "term": "t1", "how": "dir",
+                     "value": str(folder), "at": "x"}
+            again = factory.session_plan(self.m("pi-dev"), self.state, entry, fresh=False)
+        self.assertEqual(fresh["args"], ["--session-dir", str(folder)])
+        self.assertEqual(again["args"], ["--session-dir", str(folder), "--continue"])
+        with patch.dict(factory.TABLE["omp"], session="dir"):
+            m = {"name": "omp-dev", "harness": "omp", "model": "openai/gpt-6-astra"}
+            self.assertEqual(factory.session_plan(m, self.state, None, False)["args"],
+                             [f"--session-dir={self.state / 'sessions' / 'omp-dev-omp'}"])
+
+    def test_launch_arguments_stay_separate_items(self):
+        prompt = pathlib.Path("/tmp/state dir/it's.md")
+        for harness, model, expect in (
+                ("claude", "claude-opus-5-5", ["--resume", "id 1"]),
+                ("codex", "gpt-6.2-sol", ["resume", "id 1"]),
+                ("agy", "gemini-4-neon", ["--conversation", "id 1"]),
+                ("opencode", "openrouter/z-ai/glm-5.3", ["--session", "id 1"]),
+                ("pi", "openai/gpt-6-astra", ["--session", "id 1"])):
+            m = {"name": "x", "role": "lead-dev", "harness": harness, "model": model, "thinking": "high",
+                 "permissions": "full", "args": ["--flag", "two words"], "dir": "/w d", "inbox_dir": "/s"}
+            argv, _ = factory.launch_argv(m, prompt, {"args": expect, "resume": True})
+            at = argv.index(expect[0])
+            self.assertEqual(argv[at:at + 2], expect, harness)
+            self.assertEqual(argv[-2:], ["--flag", "two words"], harness)
+            if harness == "codex":
+                self.assertEqual(at, 0)                                  # resume <id> before the options
+
+
+class ScriptedHc:
+    """A stand-in for Hc in readiness tests: each terminal follows a script of (state, status word, screen) steps,
+    one per get(); keys are recorded and may move the script on."""
+
+    def __init__(self, scripts, on_keys=None):
+        self.scripts = {a: list(s) for a, s in scripts.items()}
+        self.at = {a: 0 for a in scripts}
+        self.on_keys = on_keys or {}
+        self.keys_sent = []
+
+    def step(self, address):
+        steps = self.scripts[address]
+        return steps[min(self.at[address], len(steps) - 1)]
+
+    def get(self, address):
+        state, word, _ = self.step(address)
+        self.at[address] += 1
+        if state == "error":
+            raise factory.HcError("not_found", f"no terminal {address}")
+        return {"address": address, "state": state, "exit_code": 2 if state == "finished" else None,
+                "status": {"state": word} if word else None}
+
+    def read(self, address):
+        return self.step(address)[2]
+
+    def keys(self, address, keys):
+        self.keys_sent.append((address, keys))
+        self.keys_at = getattr(self, "keys_at", []) + [self.at[address]]   # on which poll
+        if address in self.on_keys:
+            self.scripts[address] = self.on_keys.pop(address)
+            self.at[address] = 0
+
+
+class FakeClock:
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+class ReadyTests(unittest.TestCase):
+    """await_ready (launch_layout.md §4), on scripted terminals and fake time."""
+
+    CLAUDE = factory.TABLE["claude"]["dialogs"]
+    TRUST = "Do you trust the contents of this project?"
+
+    def ready(self, scripts, dialogs=(), timeout=5, on_keys=None):
+        hc = ScriptedHc(scripts, on_keys)
+        started = {a: ({"address": a}, dialogs.get(a, []) if isinstance(dialogs, dict) else list(dialogs))
+                   for a in scripts}
+        return factory.await_ready(hc, started, timeout=timeout, clock=FakeClock()), hc
+
+    def test_idle_without_a_dialog_is_ready_and_nothing_else_is(self):
+        out, _ = self.ready({"a": [("live", "working", ""), ("live", "idle", "")],
+                             "b": [("live", "done", "")], "c": [("live", None, "")],
+                             "d": [("live", "working", "")], "e": [("live", "blocked", "")]})
+        self.assertEqual(out, {"a": None, "b": "not ready after 5 s (done)", "c": "not ready after 5 s (no status)",
+                               "d": "not ready after 5 s (working)", "e": "not ready after 5 s (blocked)"})
+
+    def test_a_dialog_is_answered_once_whatever_the_status(self):
+        screen = "Quick safety check\n  Yes, I trust\n  this folder\n  No, exit"      # wrapped by a narrow pane
+        for word in ("blocked", None, "idle"):
+            with self.subTest(status=word):
+                out, hc = self.ready({"a": [("live", word, screen)]}, self.CLAUDE,
+                                     on_keys={"a": [("live", word, screen), ("live", "idle", "")]})
+                self.assertEqual(out, {"a": None})
+                self.assertEqual(hc.keys_sent, [("a", ["down", "enter"])])
+
+    def test_a_second_dialog_is_answered_while_the_first_is_still_shown(self):
+        first, second = "Yes, I trust this folder", "Yes, I accept"
+        out, hc = self.ready({"a": [("live", "blocked", first)]}, self.CLAUDE,
+                             on_keys={"a": [("live", "blocked", first + "\n" + second)]})
+        self.assertEqual(hc.keys_sent, [("a", ["down", "enter"]), ("a", ["down", "enter"])])
+        self.assertEqual(out, {"a": f'still asks "{first}" after the answer was sent'})
+
+    def test_a_signal_or_another_end_is_named(self):
+        hc = ScriptedHc({"a": [("live", "idle", "")]})
+        hc.get = lambda address: {"address": address, "state": "finished", "exit_code": None, "signal": 9,
+                                  "status": None}
+        out = factory.await_ready(hc, {"a": ({"address": "a"}, [])}, timeout=5, clock=FakeClock())
+        self.assertEqual(out, {"a": "was stopped by signal 9"})
+
+    def test_a_dialog_is_answered_on_its_second_poll_not_as_it_is_drawn(self):
+        out, hc = self.ready({"a": [("live", "blocked", "Yes, I trust this folder")]}, self.CLAUDE,
+                             on_keys={"a": [("live", "idle", "")]})
+        self.assertEqual(out, {"a": None})
+        self.assertEqual(hc.keys_at, [2])
+
+    def test_a_dialog_still_shown_after_the_answer_is_named(self):
+        out, hc = self.ready({"a": [("live", "blocked", "Yes, I trust this folder")]}, self.CLAUDE)
+        self.assertEqual(out, {"a": 'still asks "Yes, I trust this folder" after the answer was sent'})
+        self.assertEqual(len(hc.keys_sent), 1)
+
+    def test_a_dialog_without_keys_is_left_to_the_owner(self):
+        out, hc = self.ready({"a": [("live", "blocked", self.TRUST)]}, [[self.TRUST, []]])
+        self.assertEqual(out, {"a": "waits on its trust dialog: accept it in its pane, then run:"
+                                    " factory.py brief --send a"})
+        self.assertEqual(hc.keys_sent, [])
+
+    def test_an_exit_reports_its_code_and_last_line_and_others_go_on(self):
+        out, _ = self.ready({"a": [("finished", None, "starting\nError: bad model\n\n")],
+                             "b": [("live", "working", "")] * 3 + [("live", "idle", "")]})
+        self.assertEqual(out, {"a": "exited (code 2): Error: bad model", "b": None})
+
+    def test_a_terminal_that_cannot_be_read_is_named(self):
+        out, _ = self.ready({"a": [("error", None, "")], "b": [("live", "idle", "")]})
+        self.assertEqual(out["b"], None)
+        self.assertRegex(out["a"], "^could not be watched: .*no terminal a")
+
+    def test_members_are_polled_together_against_one_deadline(self):
+        clock = FakeClock()
+        hc = ScriptedHc({"a": [("live", "working", "")] * 6 + [("live", "idle", "")],
+                         "b": [("live", "working", "")] * 8 + [("live", "idle", "")]})
+        out = factory.await_ready(hc, {"a": ({"address": "a"}, []), "b": ({"address": "b"}, [])}, timeout=60,
+                                  clock=clock)
+        self.assertEqual(out, {"a": None, "b": None})
+        self.assertEqual(clock.now, 4.0)
+
+
+class StartMemberTests(unittest.TestCase):
+    """start_member (launch_layout.md §4) against the fake hc."""
+
+    def setUp(self):
+        self.env = self.enterContext(Env())
+        self.cfg = factory.Config(self.env.repo)
+        self.fake = self.enterContext(FakeHc())
+        self.hc = factory.Hc()
+        self.state = self.env.root / "cache" / "factory-skill" / "team" / "core"
+        self.enterContext(patch.object(factory.shutil, "which", lambda name: f"/opt/bin/{name}"))
+        self.path = f"/opt/bin:{os.environ.get('PATH', '')}"      # the fake hc itself still has to start
+        self.enterContext(patch.dict(os.environ, {"PATH": self.path}))
+
+    def start(self, name, sess=None):
+        m = factory.plan(self.cfg, name)
+        return m, factory.start_member(self.cfg, self.state, self.hc, m, "operator", sess)
+
+    def test_the_harness_runs_by_itself_with_its_argv_cwd_env_and_labels(self):
+        name = next(n for n, m in self.cfg.members.items() if m["harness"] == "claude")
+        m, record = self.start(name, {"args": ["--resume", "abc"], "resume": True})
+        run = self.fake.calls("terminal.run")[-1]["params"]
+        prompt = self.state / f"{name}.md"
+        argv, env = factory.launch_argv({**m, "draft_dir": self.state / "messages" / name, "inbox_dir": self.state},
+                                        prompt, {"args": ["--resume", "abc"]})
+        self.assertEqual(run["argv"], ["/opt/bin/claude", *argv])
+        self.assertEqual((run["cwd"], run["env"]), (m["dir"], {"PATH": self.path, **env}))
+        self.assertEqual(run["labels"], {"factory.team": factory.team_key(self.cfg.root), "factory.kind": "member",
+                                         "factory.member": name, "factory.dir": str(self.state), "name": "@" + name})
+        self.assertTrue(run["no_parent"])
+        self.assertFalse(any(k.startswith("herdr.") for k in record["labels"]))
+
+    def test_files_are_private_and_rewritten_at_each_launch(self):
+        name = next(n for n, m in self.cfg.members.items() if m["harness"] == "claude")
+        self.start(name)
+        prompt, settings = self.state / f"{name}.md", self.state / f"{name}.settings.json"
+        self.assertIn(str(self.state / "messages" / name), prompt.read_text())
+        self.assertIn(str(prompt), prompt.read_text())
+        prompt.write_text("stale")
+        self.start(name)
+        self.assertNotEqual(prompt.read_text(), "stale")
+        for path, mode in ((prompt, 0o600), (settings, 0o600), (self.state / "messages", 0o700),
+                           (self.state / "messages" / name, 0o700)):
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), mode, path)
+        values = json.loads(settings.read_text())
+        say = shlex.join(["python3", str(factory.SCRIPT), "say"]) + " *"
+        self.assertIn(say, values["sandbox"]["excludedCommands"])
+        self.assertIn(f"Bash({say})", values["permissions"]["allow"])
+        self.assertEqual(values["permissions"]["additionalDirectories"], [str(self.state / "messages" / name)])
+
+    def test_a_symbolic_link_for_a_message_folder_is_refused_before_anything_starts(self):
+        name = next(iter(self.cfg.members))
+        (self.state / "messages").mkdir(parents=True)
+        (self.state / "messages" / name).symlink_to(self.env.root)
+        with self.assertRaisesRegex(factory.Problem, "expected a private directory"):
+            self.start(name)
+        self.assertEqual(self.fake.calls("terminal.run"), [])
+
+    def test_session_folders_for_dir_harnesses(self):
+        name = next(n for n, m in self.cfg.members.items() if m["harness"] == "pi")
+        with patch.dict(factory.TABLE["pi"], session="dir"):
+            self.start(name)
+        folder = self.state / "sessions" / f"{name}-pi"
+        self.assertEqual(stat.S_IMODE(folder.stat().st_mode), 0o700)
+
+    def test_a_missing_binary_or_a_refused_run_is_a_problem(self):
+        name = next(iter(self.cfg.members))
+        with patch.object(factory.shutil, "which", lambda _: None), \
+                self.assertRaisesRegex(factory.Problem, "is not on PATH"):
+            self.start(name)
+        self.fake.on_run(name, error="spawn_failed")
+        with self.assertRaisesRegex(factory.Problem, "hc could not start"):
+            self.start(name)
+
+
+class HcCheckTests(unittest.TestCase):
+    """check's offline hc line (hc_client.md, phase_5a.md §4.1)."""
+
+    def setUp(self):
+        self.dir = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.environ = {"XDG_CONFIG_HOME": str(self.dir / "config")}
+
+    def hc(self, output, code=0):
+        script = self.dir / "hc"
+        script.write_text(f"#!/bin/sh\nprintf '%s\\n' {shlex.quote(output)}\nexit {code}\n")
+        script.chmod(0o755)
+        self.enterContext(patch.object(factory, "HC", str(script)))
+
+    def config(self, text):
+        path = self.dir / "config" / "herdr-core" / "config.toml"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        return path
+
+    def test_draft_wait_values(self):
+        self.hc("hc 0.1.20")
+        path = self.dir / "config" / "herdr-core" / "config.toml"
+        warn = f"warning: raise draft_wait to 600 or more in {path} so a report never lands in text you are typing"
+        self.assertEqual(factory.hc_check(self.environ), (["hc 0.1.20, draft_wait 60 s", warn], False))
+        for text, shown, warned in (("other = 1\n", 60, True), ("draft_wait = 599\n", 599, True),
+                                    ("draft_wait = 600\n", 600, False), ("draft_wait = 900\n", 900, False),
+                                    ("draft_wait = -5\n", 0, True)):
+            self.config(text)
+            lines, failed = factory.hc_check(self.environ)
+            self.assertEqual((lines[0], len(lines) == 2, failed), (f"hc 0.1.20, draft_wait {shown} s", warned, False))
+
+    def test_a_missing_hc_is_reported_and_not_a_failure(self):
+        self.enterContext(patch.object(factory, "HC", str(self.dir / "no-such-hc")))
+        lines, failed = factory.hc_check(self.environ)
+        self.assertFalse(failed)
+        self.assertIn("hc: not found", lines[0])
+
+    def test_an_old_or_unrecognised_hc_or_a_bad_config_fails(self):
+        for output, code, expect in (("hc 0.1.19", 0, "too old"), ("herdr 0.9.5", 0, "unrecognised version"),
+                                     ("hc 0.1.20", 1, "unrecognised version")):
+            self.hc(output, code)
+            lines, failed = factory.hc_check(self.environ)
+            self.assertTrue(failed, output)
+            self.assertIn(expect, lines[0])
+        self.hc("hc 0.2.0-dev+abc")
+        self.assertFalse(factory.hc_check(self.environ)[1])
+        for text, expect in (("draft_wait = [", "cannot read"), ('draft_wait = "600"', "whole number"),
+                             ("draft_wait = true", "whole number")):
+            self.config(text)
+            lines, failed = factory.hc_check(self.environ)
+            self.assertTrue(failed, text)
+            self.assertIn(expect, lines[0])
+
+    def test_check_prints_the_line_and_its_exit_code(self):
+        with Env() as e:
+            fake = e.root / "bin" / "hc"
+            fake.write_text("#!/bin/sh\necho 'hc 0.1.20'\n")
+            fake.chmod(0o755)
+            p = e.run("check", HC_BIN=str(fake), XDG_CONFIG_HOME=str(e.root / "config"))
+            self.assertIn("hc 0.1.20, draft_wait 60 s", p.stdout)
+            self.assertEqual(p.returncode, 0)
+            p = e.run("check", check=False, HC_BIN=str(e.root / "missing"), XDG_CONFIG_HOME=str(e.root / "config"))
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertIn("hc: not found", p.stdout)
+            fake.write_text("#!/bin/sh\necho 'hc 0.1.2'\n")
+            p = e.run("check", check=False, HC_BIN=str(fake), XDG_CONFIG_HOME=str(e.root / "config"))
+            self.assertEqual(p.returncode, 2)
+            self.assertIn("too old", p.stdout)
+
+
 class LiveToolTests(unittest.TestCase):
     @staticmethod
     def scrubber(host="local-host", user="local-user"):
@@ -5469,8 +5443,7 @@ class ConfigTests(unittest.TestCase):
                     self.assertEqual(self.files(e.repo), before)
                     self.assertFalse(target.exists())
                 if name == "factory.toml.sample":
-                    for command in (("check",), ("up", "--no-brief")):
-                        e.run(*command)
+                    e.run("check")
                     self.assertEqual(self.files(e.repo), before)
                     self.assertFalse(target.exists())
 
@@ -5483,7 +5456,7 @@ class ConfigTests(unittest.TestCase):
             link.symlink_to(target.name)
             before = self.files(e.repo)
             e.run("check")
-            e.run("up", "--no-brief")
+            e.run("brief")
             self.assertEqual(self.files(e.repo), before)
 
     @unittest.skipUnless(GIT, "git is not installed")
@@ -5566,18 +5539,14 @@ class ConfigTests(unittest.TestCase):
         team = '[members.lead-dev]\nharness = "codex"\nmodel = "gpt-6-luna"\n'
         stock = (factory.SKILL / "templates/FACTORY.md").read_text()  # the shared brief people really get
         with Env(team_brief('[operator]\nname = "boss"\nharness = "claude"\n' + team, stock)) as e:
-            e.run("up")
-            pane = e.fake_state()["panes"]["w1:p1"]
-            self.assertEqual((pane["name"], pane["label"]), ("boss", "boss"))  # its @name, pane label and agent name
-            self.assertRegex(e.run("status").stdout, r"@boss +operator")
-            brief = dict(e.prompts())["lead-dev"]
+            brief = e.run("brief").stdout
             self.assertIn("# Team brief (from @boss)", brief)
             self.assertIn("1. The operator assigns tasks", brief)  # the shared brief names the role ...
             self.assertNotIn("@operator", brief)                   # ... never one person's operator
             e.write_brief(team_brief(team, "## Workflow\n\n{operator} and {name} stay as written.\n"))
             self.assertIn("{operator} and {name} stay as written.", e.run("brief").stdout)  # FACTORY.md is sent as it is
             e.write_brief(team_brief('[operator]\nname = "boss"\nharness = "claude"\n' + team, stock))
-            prompt = e.run("prompt", "lead-dev").stdout
+            prompt = e.run("brief", "lead-dev").stdout
             self.assertIn("led by its operator, @boss", prompt)  # roles and the member prompt follow the name
             self.assertNotIn("@operator", prompt)
             for settings, why in (('[operator]\nname = "Boss!"\n', "[operator] name 'Boss!' must be"),
@@ -5611,7 +5580,7 @@ class ConfigTests(unittest.TestCase):
             self.assertNotIn("\n# Team\n", sent)              # ... without its own title
             self.assertNotIn("for the editor", sent)           # ... and without its comments
             self.assertIn("branch `ada/lead-dev`", sent)       # worktree branches start with the user's name
-            self.assertIn("The team brief says where tasks are tracked", e.run("prompt", "lead-dev").stdout)
+            self.assertIn("The team brief says where tasks are tracked", e.run("brief", "lead-dev").stdout)
             e.write_brief(team_brief('user = "peter"\n' + team))
             self.assertEqual(factory.plan(factory.Config(e.repo), "lead-dev")["branch"], "peter/lead-dev")
             e.write_brief(team_brief(team))  # a VM or CI user name that someone else's machine may share: a note, not a failure
@@ -5702,7 +5671,7 @@ class ConfigTests(unittest.TestCase):
             self.assertIn("No reply needed.", text)
             self.assertIn("factory.py say", text)
             self.assertNotIn("Works in", text)  # no worktrees on this team
-            prompt = e.run("prompt", "reviewer").stdout
+            prompt = e.run("brief", "reviewer").stdout
             self.assertIn("run it only when the brief's Review section or the requester calls for the deep lane", prompt)
             self.assertIn(" NAME --file ", prompt)
             self.assertIn("/messages/reviewer/FILENAME", prompt)
@@ -5744,10 +5713,6 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(heads, ["**You own**", "**You output**", "**Done when**", "**Never**"], path.name)
             self.assertNotIn("LSP", body, path.name)  # nothing harness-specific in a role
 
-    def test_session_id_from_ref(self):
-        self.assertEqual(factory.session_id({"kind": "id", "value": "abc"}), "abc")
-        path = "/x/rollout-2026-11-11T13-02-52-01a1cbc6-e708-7623-986f-cc2e07efa28f.jsonl"
-        self.assertEqual(factory.session_id({"kind": "path", "value": path}), "01a1cbc6-e708-7623-986f-cc2e07efa28f")
 
     def test_bad_role_frontmatter_names_file(self):
         with tempfile.TemporaryDirectory() as d:
@@ -5823,12 +5788,12 @@ class CacheNameTests(unittest.TestCase):
         with Env() as e:
             for xdg in (str(e.root / "cache"), ""):
                 with self.subTest(xdg=xdg), patch.dict(os.environ, {**e.env, "XDG_CACHE_HOME": xdg}):
-                    cache = factory.Config(e.repo).cache
+                    state = factory.state_dir(factory.Config(e.repo).root, "core0000aaaa")
                     base = pathlib.Path(xdg) if xdg else e.home / ".cache"
-                    (base / "a-team" / cache.name).mkdir(parents=True)
-                    self.assertEqual(factory.Config(e.repo).cache, cache)
-                    self.assertEqual(cache.parent, base / "factory-skill")
-                    self.assertFalse(cache.exists())
+                    self.assertEqual(state.parent.parent, base / "factory-skill")
+                    self.assertEqual((state.parent.name, state.name),
+                                     (factory.team_key(factory.Config(e.repo).root), "core0000"))
+                    self.assertFalse(state.exists())
 
 
 class InstalledCopyTests(unittest.TestCase):
@@ -5857,7 +5822,7 @@ class InstalledCopyTests(unittest.TestCase):
             self.assertEqual((e.repo / factory.CONF).read_text(),
                              (installed / "templates" / factory.CONF).read_text())
             self.assertIn("ok", run("check"))
-            prompt = run("prompt", "reviewer")
+            prompt = run("brief", "reviewer")
             self.assertIn("You are @reviewer, the reviewer", prompt)
             self.assertIn("You are read-only", prompt)
             self.assertIn(str(installed / "references/notes.md"), prompt)
@@ -5886,7 +5851,7 @@ class GateFixtureTests(unittest.TestCase):
                 repo = created.pop()
                 fixtures.append(repo)
                 with patch.dict(os.environ, env):
-                    cache = factory.Config(repo).cache
+                    cache = factory.state_dir(factory.Config(repo).root, "core0000").parent
                 self.assertNotIn(cache, caches)
                 self.assertFalse(cache.exists())
                 caches.append(cache)

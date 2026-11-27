@@ -10,7 +10,12 @@
 #   never        levels factory refuses even where the harness accepts them
 #   prompt       how a member gets its standing instructions: `file` (appended to the system prompt),
 #                `pointer` (a system line names the file; the text also goes in the first message), `message`
-#   dialogs      start-up questions `up` answers itself: text on the screen, then the herdr keys that accept it
+#   dialogs      start-up questions `up` answers itself: text on the screen, then the keys that accept it. Empty
+#                keys: never answered; `up` reports it and leaves it to the owner
+#   session      what Factory sets at launch: `id` (an ID it chooses) or `dir` (a session folder per member)
+#   session_env  the variable in which the harness gives its current conversation ID to the commands it runs
+#   session_follow  false: `say` records that variable once per launch, not at every change (LC-12)
+#   resume_model `provider`: resume only while the model's provider prefix is unchanged (default `any`)
 #   [x.permissions]  native flags per permission level. `full` (default) never stops for approval and adds no
 #                sandbox. `guarded` keeps the harness's own guard; only Claude Code and Codex have one.
 
@@ -22,6 +27,8 @@ aliases = ["fable", "opus", "sonnet", "haiku"]
 thinking = ["low", "medium", "high", "xhigh", "max"]
 never = ["max"]
 prompt = "file"
+session_env = "CLAUDE_CODE_SESSION_ID"
+session_follow = false   # LC-3 (an assigned --session-id) and LC-12 not shown yet
 
 # Both questions start on "No, exit". The bypass warning is normally skipped by a setting `up` passes.
 dialogs = [["Yes, I trust this folder", ["down", "enter"]], ["Yes, I accept", ["down", "enter"]]]
@@ -36,6 +43,8 @@ install = "Install the Codex CLI (`npm i -g @openai/codex`) and log in once by r
 models = ["gpt-6.2-astra", "gpt-6.2-sol", "gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna", "gpt-6-sol"]
 never = ["max", "ultra"]
 prompt = "pointer"
+session_env = "CODEX_THREAD_ID"
+session_follow = false   # LC-12 not shown yet
 dialogs = [["Trust and continue", ["enter"]]]   # asked once per new folder, a worktree included
 
 # guarded: the workspace-write sandbox, with automatic review of what leaves it. Network access stays on:
@@ -51,6 +60,8 @@ models = ["openai/gpt-6-astra", "z-ai/glm-5.3", "moonshotai/kimi-k3", "x-ai/grok
 thinking = ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
 never = []
 prompt = "file"
+session_env = "PI_SESSION_ID"   # LC-6's fallback until --session-dir with --continue is shown
+resume_model = "provider"
 
 [pi.permissions]   # pi has no sandbox and no approvals
 full = []
@@ -63,6 +74,7 @@ models = ["openai/gpt-6-astra", "z-ai/glm-5.3", "moonshotai/kimi-k3", "x-ai/grok
 thinking = ["off", "minimal", "low", "medium", "high", "xhigh", "max", "auto"]
 never = []
 prompt = "file"
+resume_model = "provider"   # starts fresh with a notice until LC-6 shows --session-dir with --continue
 
 [omp.permissions]   # omp's stricter modes ask before every command, a message to a teammate included
 full = ["--approval-mode", "yolo"]
@@ -74,6 +86,10 @@ install = "Install OpenCode v2 or later (https://opencode.ai) so `opencode` is o
 models = ["openrouter/openai/gpt-6-astra", "openrouter/z-ai/glm-5.3", "openrouter/z-ai/glm-5.3-flash"]
 never = []
 prompt = "message"
+session = "id"                       # LC-4: --session ses_<26 letters and digits>, new or existing
+session_env = "OPENCODE_SESSION_ID"  # LC-11: equals the assigned ID
+session_follow = false               # following /new is not shown yet (#190): one capture per launch
+resume_model = "provider"
 
 [opencode.permissions]   # --auto approves whatever the user's own rules do not deny
 full = ["--auto"]
@@ -88,7 +104,9 @@ models = ["gemini-4-neon", "gemini-4-argon", "gemini-4-hydrogen", "gemini-3.8-fl
 thinking = ["low", "medium", "high", "xhigh", "max"]
 never = []
 prompt = "message"
-dialogs = [["Do you trust the contents of this project?", ["enter"]]]
+session_env = "ANTIGRAVITY_CONVERSATION_ID"
+session_follow = false   # LC-12 not shown yet
+dialogs = [["Do you trust the contents of this project?", []]]   # the owner's to accept until LC-7 passes
 
 [agy.permissions]   # Factory has no guarded mode for agy. Both levels use the same flags.
 full = ["--mode", "accept-edits", "--settings", '{"toolPermission":"always-proceed"}']

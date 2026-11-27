@@ -111,12 +111,12 @@ Other argv changes from v1: for `guarded` Codex `--add-dir <state>` replaces the
 | codex or agy, fresh | `how: "new"`, `value: null` |
 | any other resumed launch | none: the newest entry already names the conversation |
 
-Inside the lock, `launch_entry` appends only when the newest entry for the member is **not for this terminal**. So:
+Inside the lock, `launch_entry` appends unless the newest entry for the member is for this terminal and is an `env` entry `say` made, the same entry, or anything at all when the new one is `new`. A delivered ID or folder therefore replaces the terminal's own `new`, and nothing replaces what `say` recorded. So:
 
 - a ready line that arrived first has already recorded the real ID for this terminal, and `up`'s later fallback never replaces it;
 - a successful fresh launch always ends with an entry for the new terminal, so the previous launch's conversation is no longer the newest. Codex in conversation A, `up --fresh` gives B, `down` before B has said anything: the newest entry is `new` with no value, and the next `up` starts fresh with the notice. It does not reopen A.
 
-Nothing is saved before the brief is delivered: until then the conversation may not exist, and a saved ID that names nothing would make the next `up` fail on resume.
+A fresh launch saves `new` (no value) for its terminal as soon as it starts, so a brief delivered after `up` stopped waiting can never leave an older conversation as the newest entry. Its ID or folder is saved only once the brief is delivered: until then the conversation may not exist, and a saved ID that names nothing would make the next `up` fail on resume. A later `say` from that terminal replaces either.
 
 `down` cannot read a member's environment and saves no ID. Before it stops anyone it checks that `sessions.jsonl` can be appended to and synced; if not, it stops nobody and prints `sessions cannot be saved (<error>): members left running`, exit 1 (§9.4's "left running"). A switch made inside the harness after the member's last `say` is not seen.
 
@@ -217,12 +217,12 @@ One to three members sit side by side; four to nine fill three columns; the keep
 `down [names]`:
 
 1. The caller's terminal must be `view.operator`: else exit 2, "run down from the operator's pane". Take `up.lock` as above. Check that `sessions.jsonl` can be appended to (§3); if not, stop nobody, exit 1.
-2. For each named member (default all): no record: `@x was not running`. Live: `hc.label(t, {"factory.down": "1"})`, `hc.kill`, `hc.rm`. Finished: `hc.rm`. A terminal that cannot be ended is reported and makes the exit code 1.
-3. One log section: `dropped` for pairs `queued` to the stopped members; print `stopped @x (was <word>); <n> queued messages dropped`.
+2. For each named member (default all): no record: `@x was not running`. `hc.label(t, {"factory.down": "1"})`, then `hc.kill` for a live record. Once the kill succeeded, or for a finished record: `mark_stopped(state, [t], box)` with a full box. A terminal that cannot be ended records no stop and makes the exit code 1; a stop that cannot be recorded keeps the record, so `down` can be run again, and makes the exit code 1. A record with `factory.down` is the gate: while one remains, `up` refuses that member and the next `down` finishes its stop.
+3. One log section: `dropped` for pairs `queued` to the stopped members; print `stopped @x (was <word>); <n> queued messages dropped`. Only then `hc.rm` each stopped record; if the sweep fails every record stays and the exit code is 1.
 4. One `edit_layout(remove_panes)`.
 5. If no member record is left: `team.json` `up: false`; print `run factory.py up to bring members back`. The keeper stops itself ([keeper.md](keeper.md) §8).
 
-`factory.down` is set before the kill so the keeper, which may tick between the kill and the `rm`, sends no exit note and drops rather than requeues a send in flight (§8.4, §8.5).
+`factory.down` is set before the kill, so a finished record with it is not a `gone` member (no exit note) and `up` does not replace that member until `down` has recorded and swept the stop. A send in flight to a stopped terminal is dropped through `team.json`'s `stopped` list, which `mark_stopped` writes and the keeper reads when it settles a definite refusal (§8.4, §8.5).
 
 ## 7. Claude Code settings and sandboxes
 

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""factory: a software team of coding agents in herdr, one team per herdr session. You are the operator (CTO);
-each member runs in its own pane of the team tab, on its own harness, model and thinking level.
+"""factory: a software team of coding agents in herdr-core (hc). You are the operator (CTO); each member runs in its
+own hc terminal, on its own harness, model and thinking level, and a keeper types the team's messages.
 
 A project has two files at its root. FACTORY.md is the brief every member reads: the project and how the team
 works; it is committed and shared. factory.toml is one person's formation: the operator, the members and their
-harnesses and models; it is not committed (factory.toml.sample is, as the project's suggestion). herdr holds the
-rest: a member's pane is labeled with its @name and its agent carries that name. Harnesses are described in
+harnesses and models; it is not committed (factory.toml.sample is, as the project's suggestion). hc holds the
+rest: each team terminal carries labels naming its team, kind and member. Harnesses are described in
 harnesses.toml. `factory.py --help` lists the commands.
 """
 from __future__ import annotations
@@ -14,6 +14,7 @@ import argparse
 import collections
 import contextlib
 import datetime
+import errno
 import fcntl
 import functools
 import getpass
@@ -29,27 +30,25 @@ import secrets
 import shutil
 import signal
 import stat
+import string
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import tomllib
+import uuid
 
 SCRIPT = pathlib.Path(__file__).resolve()
 SKILL = SCRIPT.parent.parent
-HERDR = os.environ.get("HERDR_BIN", "herdr")
-HERDR_TIMEOUT = 90  # seconds for one herdr call, so a herdr that hangs cannot hang a command for ever
 TABLE = tomllib.loads((SKILL / "harnesses.toml").read_text())  # harness -> its data
 HARNESSES = tuple(TABLE)
 LEVELS = ("full", "guarded")
 PROBE_TIMEOUT = 60
-SETTLE = float(os.environ.get("FACTORY_SETTLE", 8))  # seconds a member may take to get past a start-up notice
 BRIEF = "FACTORY.md"              # the brief: shared and committed
 CONF = "factory.toml"             # one person's formation: not committed
 SAMPLE = "factory.toml.sample"    # the project's suggested formation: committed, copied to factory.toml by `init`
 OPERATOR = "operator"  # the operator's @name, unless `[operator] name` in factory.toml says otherwise
-TABS = {"operator": "factory operator", "team": "factory team"}  # herdr tab labels
 HC = os.environ.get("HC_BIN", "hc")
 HC_MIN = (0, 1, 20)
 VERSION = hashlib.sha1(SCRIPT.read_bytes()).hexdigest()[:12]
@@ -349,10 +348,6 @@ def refuse_dangling_links(root):
                              " Repair or remove the link.")
 
 
-def session_key():
-    session = os.environ.get("HERDR_SESSION") or "default"
-    return re.sub(r"[^A-Za-z0-9_.-]", "-", session)[:24] + "-" + hashlib.sha1(session.encode()).hexdigest()[:8]
-
 
 def cache_base():
     return pathlib.Path(os.environ.get("XDG_CACHE_HOME") or pathlib.Path.home() / ".cache")
@@ -436,19 +431,6 @@ class Config:
             if m.get("harness") not in TABLE:
                 raise SystemExit(f"{self.conf_file}: member {name!r} needs `harness`, one of: {', '.join(TABLE)}")
 
-    @property
-    def cache(self):
-        """Per-repo scratch outside the repo: members' prompt files and the sessions `up` resumes from.
-        The path is short on purpose: it is typed into a shell line that macOS limits to 1024 bytes."""
-        return cache_base() / "factory-skill" / team_key(self.root)
-
-    @property
-    def session_dir(self):
-        return self.cache / session_key()
-
-    @property
-    def messages(self):
-        return self.session_dir / "messages"
 
     @property
     def worktree_dir(self):
@@ -465,8 +447,9 @@ class Config:
             return "main"
 
 
-def plan(cfg, name):
-    """A member's settings from factory.toml, before availability checks."""
+def plan(cfg, name, state=None):
+    """A member's settings from factory.toml, before availability checks. state: the team's state directory, when
+    known; without it the paths are None and previews show placeholders."""
     m = cfg.members[name]
     role = m.get("role", name)
     meta, _ = cfg.roles[role]
@@ -482,7 +465,8 @@ def plan(cfg, name):
     return {"name": name, "role": role, "harness": m["harness"], "model": model, "thinking": thinking,
             "readonly": meta["readonly"] == "true", "notes": m.get("notes", ""), "permissions": permissions,
             "args": [str(a) for a in m.get("args", [])], "branch": branch, "dir": str(where),
-            "draft_dir": cfg.messages / name, "inbox_dir": cfg.cache}
+            "state_dir": state, "message_dir": pathlib.Path(state) / "messages" / name if state else None,
+            "instructions": pathlib.Path(state) / f"{name}.md" if state else None}
 
 
 # ================================================================ availability checks
@@ -1734,15 +1718,6 @@ def pending_lines(state, operator, now=None):
     return lines
 
 
-def print_pending(args, operator):
-    """Bridge for the old up/status commands until Phase 5a replaces their launch and pane logic."""
-    try:
-        state = find_team(args)[1]
-    except (Problem, HcError) as error:
-        print(f"pending: unavailable ({error})")
-        return
-    print("\n".join(pending_lines(state, operator)))
-
 
 # ================================================================ keeper delivery
 
@@ -2314,7 +2289,10 @@ def cmd_say(args):
     operator = cfg.operator["name"]
     if kind == "member" and sender not in cfg.members:
         refuse(f"@{sender} is no longer in factory.toml")
-    # Phase 5a: record_session(cfg, state, sender, me["address"]) for a member, before validation.
+    if kind == "member":   # before anything else can refuse: a refused say still saves the session (§3)
+        warning = record_session(cfg, state, sender, me["address"])
+        if warning:
+            print(warning, file=sys.stderr)
     names = list(dict.fromkeys(name.lstrip("@") for name in re.findall(r"[^,\s]+", " ".join(args.to))))
     try:
         view = team_view(hc, labels["factory.team"])
@@ -2408,24 +2386,6 @@ def cmd_inbox(args):
         for line in msg["text"].splitlines():
             print(f"    {line}")
 
-
-def report_leftover_drafts(cfg):
-    if cfg.session_dir.is_symlink() or cfg.messages.is_symlink():
-        return
-    for directory in sorted(cfg.messages.glob("*")):
-        try:
-            if directory.is_symlink() or not directory.is_dir():
-                continue
-            for path in sorted(directory.iterdir()):
-                try:
-                    info = path.lstat()
-                except FileNotFoundError:  # a pending send may have just finished
-                    continue
-                if stat.S_ISREG(info.st_mode):
-                    minutes = max(0, int((time.time() - info.st_mtime) / 60))
-                    print(f"leftover draft for @{directory.name} ({minutes} min old): {path}. Check delivery before resending or discarding.")
-        except OSError as e:
-            print(f"warning: cannot scan drafts in {directory}: {e}", file=sys.stderr)
 
 
 class Checker:
@@ -2555,46 +2515,11 @@ def report_problems(problems):
 
 # ================================================================ harness code: one block per harness
 # model(checker, model, harness) -> (launch-ready model id, its thinking levels or None); raises Problem
-# argv(m, prompt_file, resume)   -> (native arguments, pane environment); resume is a herdr session ref
+# argv(m, prompt_file, sess)     -> (native arguments, environment); sess is session_plan's dict or None
 
-def session_id(ref):
-    """A session id from a herdr session ref, which may hold an id or a file path."""
-    if ref.get("kind") != "path":
-        return ref["value"]
-    name = pathlib.Path(ref["value"]).stem
-    uuids = re.findall(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", name)
-    return uuids[-1] if uuids else name
-
-
-def records(path):
-    with path.open() as f:
-        for line in f:
-            try:
-                yield json.loads(line)
-            except json.JSONDecodeError:
-                continue
 
 
 # ---- claude
-def claude_settings(level, draft_dir=None):
-    """Launch settings for a member. herdr's messaging commands run outside a sandbox the user has turned on,
-    when they are the whole command line. At `full` herdr's socket is also allowed inside it, so a message gets
-    through in any command shape (Linux can only allow every Unix socket; macOS can name herdr's). The last key
-    skips the warning Claude Code shows the first time it starts in bypassPermissions mode."""
-    say = shlex.join(["python3", str(SKILL / "scripts/factory.py"), "say"]) + " *"
-    sandbox = {"excludedCommands": [say, "herdr agent list"]}
-    if level == "full":
-        sock = os.environ.get("HERDR_SOCKET_PATH")
-        sandbox["network"] = {"allowUnixSockets": [sock]} if sys.platform == "darwin" and sock else {"allowAllUnixSockets": True}
-    permissions = {"allow": [f"Bash({cmd})" for cmd in sandbox["excludedCommands"]]}
-    if draft_dir:
-        permissions["additionalDirectories"] = [str(draft_dir)]
-        permissions["allow"].append(f"Write(/{draft_dir}/**)")
-        sandbox["filesystem"] = {"allowWrite": [str(draft_dir)]}
-    return json.dumps({"promptSuggestionEnabled": False, "sandbox": sandbox, "skipDangerousModePermissionPrompt": True,
-                       "permissions": permissions},
-                      separators=(",", ":"))
-
 
 def model_claude(checker, model, harness):
     bare, t = model.removeprefix("anthropic/"), TABLE["claude"]
@@ -2607,10 +2532,10 @@ def model_claude(checker, model, harness):
     return bare, t["thinking"]
 
 
-def argv_claude(m, prompt_file, resume):
+def argv_claude(m, prompt_file, sess):
     argv = ["--model", m["model"], "--effort", m["thinking"], "--append-system-prompt-file", str(prompt_file),
             "--name", m["name"], "--settings", str(prompt_file.with_suffix(".settings.json"))]
-    return argv + (["--resume", session_id(resume)] if resume else []), {}
+    return argv + (sess["args"] if sess else []), {}
 
 
 # ---- codex
@@ -2633,7 +2558,7 @@ def model_codex(checker, model, harness):
     return bare, models[bare]
 
 
-def argv_codex(m, prompt_file, resume):
+def argv_codex(m, prompt_file, sess):
     # Codex has no way to read developer instructions from a file, and the full text would not fit the line
     # macOS lets herdr type into a shell. So the system level carries one line that names the file, and the
     # full text arrives in the member's first message.
@@ -2642,11 +2567,12 @@ def argv_codex(m, prompt_file, resume):
                " compacted or you are unsure of the rules.")
     # -C: a resumed session goes back to the directory it was started in, whatever the pane's is. Naming the
     # member's directory keeps it where factory.toml says, also after its worktree changed.
-    argv = ["-m", m["model"], "-C", m["dir"], "-c", f"model_reasoning_effort={json.dumps(m['thinking'])}",
+    argv = ["--no-daemon", "-m", m["model"], "-C", m["dir"],
+            "-c", f"model_reasoning_effort={json.dumps(m['thinking'])}",
             "-c", f"developer_instructions={json.dumps(pointer)}"]
     if m["permissions"] == "guarded":
-        argv += ["--add-dir", str(m["inbox_dir"])]
-    return (["resume", session_id(resume)] if resume else []) + argv, {}
+        argv += ["--add-dir", str(m["state_dir"])]
+    return (sess["args"] if sess else []) + argv, {}   # resume <id> goes before the options
 
 
 # ---- pi and omp (omp keeps pi's flags and session format)
@@ -2658,11 +2584,11 @@ def model_pi(checker, model, harness):
     return resolve_listed(model, listed, harness), TABLE[harness]["thinking"]
 
 
-def argv_pi(m, prompt_file, resume):
+def argv_pi(m, prompt_file, sess):
     argv = ["--model", m["model"], "--thinking", m["thinking"], "--append-system-prompt", str(prompt_file)]
     if m["harness"] == "pi":
-        return argv + ["--name", m["name"]] + (["--session", resume["value"]] if resume else []), {}
-    return argv + ([f"--resume={resume['value']}"] if resume else []), {}
+        argv += ["--name", m["name"]]
+    return argv + (sess["args"] if sess else []), {}
 
 
 # ---- opencode (v2+)
@@ -2671,11 +2597,11 @@ def model_opencode(checker, model, harness):
     return resolve_listed(model, listed, harness), None  # thinking is a per-model variant; OpenCode reports a bad one at start
 
 
-def argv_opencode(m, prompt_file, resume):
+def argv_opencode(m, prompt_file, sess):
     # The interface herdr can watch has no model flag, so the model comes from inline config in the pane's
     # environment. --standalone: OpenCode's shared background server ignores a client's own config.
     model = m["model"] + (f"#{m['thinking']}" if m["thinking"] != "default" else "")
-    argv = ["--standalone"] + (["--session", session_id(resume)] if resume else [])
+    argv = ["--standalone"] + (sess["args"] if sess else [])
     return argv, {"OPENCODE_CONFIG_CONTENT": json.dumps({"model": model})}
 
 
@@ -2706,11 +2632,11 @@ def model_agy(checker, model, harness):
     return model, levels
 
 
-def argv_agy(m, prompt_file, resume):
+def argv_agy(m, prompt_file, sess):
     model = m["model"]
     if m["thinking"] != "default" and not agy_effort(model):
         model += "-" + m["thinking"]
-    return ["--model", model] + (["--conversation", session_id(resume)] if resume else []), {}
+    return ["--model", model] + (sess["args"] if sess else []), {}
 
 
 Harness = collections.namedtuple("Harness", "model argv")
@@ -2724,11 +2650,344 @@ CODE = {
 }
 
 
-def launch_argv(m, prompt_file, resume=None):
-    """-> (native argv after `--`, pane env): the harness's own arguments, then the member's permission level
-    and any extra `args` from factory.toml."""
-    argv, env = CODE[m["harness"]].argv(m, prompt_file, resume)
+def launch_argv(m, prompt_file, sess=None):
+    """-> (native argv, env): the harness's own arguments with the session plan's, then the member's permission
+    level and any extra `args` from factory.toml."""
+    argv, env = CODE[m["harness"]].argv(m, prompt_file, sess)
     return argv + TABLE[m["harness"]]["permissions"][m["permissions"]] + m["args"], env
+
+
+# ================================================================ sessions (launch_layout.md §3)
+
+SESSIONS = "sessions.jsonl"
+SESSION_VALUE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")   # one argv item, never read as an option
+SESSION_HOWS = ("env", "id", "dir", "new")
+RESUME_ARGS = {"claude": lambda v: ["--resume", v], "codex": lambda v: ["resume", v],
+               "agy": lambda v: ["--conversation", v], "opencode": lambda v: ["--session", v],
+               "pi": lambda v: ["--session", v], "omp": lambda v: [f"--resume={v}"]}
+FRESH_ARGS = {"claude": lambda v: ["--session-id", v], "opencode": lambda v: ["--session", v]}
+
+
+def _session_entry(line):
+    """A sessions.jsonl entry, or None for a damaged line."""
+    try:
+        e = json.loads(line, parse_constant=_reject_constant)
+    except ValueError:
+        return None
+    if not isinstance(e, dict) or e.get("how") not in SESSION_HOWS \
+            or not all(isinstance(e.get(k), str) for k in ("member", "harness", "term", "at")) \
+            or not (e.get("model") is None or isinstance(e.get("model"), str)):
+        return None
+    value = e.get("value")
+    if e["how"] == "new":
+        return e if value is None else None
+    if not isinstance(value, str):
+        return None
+    good = os.path.isabs(value) if e["how"] == "dir" else SESSION_VALUE.fullmatch(value)
+    return e if good else None
+
+
+def _read_sessions(fd):
+    """(newest entry per member, damaged lines skipped, file exists, ends with a newline), relative to fd."""
+    try:
+        f = private_open(SESSIONS, os.O_RDONLY, fix_mode=False, dir_fd=fd)
+    except FileNotFoundError:
+        return {}, 0, False, True
+    with os.fdopen(f, "rb") as handle:
+        data = handle.read()
+    newest, skipped = {}, 0
+    for line in data.split(b"\n"):
+        if line.strip():
+            e = _session_entry(line)
+            if e is None:
+                skipped += 1
+            else:
+                newest[e["member"]] = e
+    return newest, skipped, True, data.endswith(b"\n") or not data
+
+
+def _sessions(state, decide=None):
+    """The one reader and writer of sessions.jsonl, under the team lock: shared to read; exclusive to read, let
+    decide(newest) return an entry or None, and append it in one write followed by fsync. A torn last line (a writer
+    killed mid-write) gets its newline first. -> (newest entry per member, damaged lines skipped)."""
+    with open_log(state).locked(exclusive=decide is not None) as fd:
+        if fd is None:
+            return {}, 0
+        newest, skipped, existed, whole = _read_sessions(fd)
+        entry = decide(newest) if decide else None
+        if entry is None:
+            return newest, skipped
+        line = (b"" if whole else b"\n") + json.dumps(entry, separators=(",", ":")).encode() + b"\n"
+        out = private_open(SESSIONS, os.O_WRONLY | os.O_APPEND | os.O_CREAT, dir_fd=fd)
+        try:
+            if os.write(out, line) != len(line):
+                raise OSError(errno.EIO, f"short write to {pathlib.Path(state) / SESSIONS}")
+            os.fsync(out)
+        finally:
+            os.close(out)
+        if not existed:
+            os.fsync(fd)   # the new file's directory entry
+        return {**newest, entry["member"]: entry}, skipped
+
+
+def saved_sessions(state):
+    """(newest entry per member, how many damaged lines were skipped)."""
+    return _sessions(state)
+
+
+def sessions_writable(state):
+    """down's check before it stops anyone: None, or why sessions.jsonl cannot be appended to and synced."""
+    try:
+        with open_log(state).locked(exclusive=True) as fd:
+            out = private_open(SESSIONS, os.O_WRONLY | os.O_APPEND | os.O_CREAT, dir_fd=fd)
+            try:
+                os.fsync(out)
+            finally:
+                os.close(out)
+    except (OSError, LogDamage, Problem) as error:
+        return str(error)
+    return None
+
+
+def _member_model(m):
+    return agy_choice(m)[0] if m["harness"] == "agy" else m.get("model")
+
+
+def record_session(cfg, state, member, term, environ=os.environ):
+    """Called by say for a member: save the harness's session_env value when it should. -> a warning or None."""
+    m = cfg.members[member]
+    harness, t = m["harness"], TABLE[m["harness"]]
+    value = environ.get(t["session_env"]) if t.get("session_env") else None
+    if not value or not SESSION_VALUE.fullmatch(value):
+        return None
+    follow = t.get("session_follow", True)
+
+    def decide(newest):
+        e = newest.get(member)
+        if e is not None and e["term"] == term:
+            if not follow and e["how"] == "env":
+                return None    # once per launch: later captures from this terminal are ignored
+            if follow and e["harness"] == harness and e["value"] == value:
+                return None
+        return {"member": member, "harness": harness, "model": _member_model(m), "term": term, "how": "env",
+                "value": value, "at": utc_now()}
+    try:
+        _sessions(state, decide)
+    except (OSError, LogDamage, Problem) as error:
+        return f"warning: could not record your session: {error}"
+    return None
+
+
+def launch_entry(state, m, term, how, value):
+    """up's entry for a launch: "new" as soon as a fresh launch starts, so an older conversation is never resumed
+    in its place; the assigned ID or folder once its brief is delivered. Never replaces an entry say made for this
+    terminal, nor repeats one."""
+    def decide(newest):
+        e = newest.get(m["name"])
+        if e is not None and e["term"] == term and (how == "new" or e["how"] == "env"
+                                                     or (e["how"], e["value"]) == (how, value)):
+            return None                              # never "new" after anything for this terminal (@architect-3)
+        return {"member": m["name"], "harness": m["harness"], "model": m.get("model"), "term": term, "how": how,
+                "value": value, "at": utc_now()}
+    _sessions(state, decide)
+
+
+def new_session_id(harness):
+    """An ID for a conversation that does not exist yet, in the form the harness accepts: a UUID for Claude Code;
+    for OpenCode "ses_" and 26 letters and digits (LC-4: a UUID is refused)."""
+    if harness == "opencode":
+        return "ses_" + "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(26))
+    return str(uuid.uuid4())
+
+
+def session_folder(state, m):
+    return pathlib.Path(state) / "sessions" / f"{m['name']}-{m['harness']}"
+
+
+def _provider(model):
+    return model.split("/", 1)[0] if model and "/" in model else None
+
+
+def compatible(entry, m):
+    """Whether m may resume entry's conversation: same harness, a value, and a model resume_model allows (a model
+    with no provider prefix does not tell, and is allowed)."""
+    if entry is None or entry["harness"] != m["harness"] or entry["value"] is None:
+        return False
+    if entry["how"] == "dir" and TABLE[m["harness"]].get("session") != "dir":
+        return False      # --continue outside the member's own session folder would reopen another conversation
+    if TABLE[m["harness"]].get("resume_model", "any") == "provider":
+        a, b = _provider(entry.get("model")), _provider(m.get("model"))
+        return a is None or b is None or a == b
+    return True
+
+
+def session_plan(m, state, entry, fresh):
+    """{"args", "resume", "assigned", "notice"}: the session arguments for m's launch from its newest entry. A member
+    that ran before with no entry at all gets its notice from the caller, which knows its finished record."""
+    harness, t = m["harness"], TABLE[m["harness"]]
+    sess = {"args": [], "resume": False, "assigned": None, "notice": None}
+    if t.get("session") == "dir":
+        folder = session_folder(state, m)
+        sess["args"] = ["--session-dir", str(folder)] if harness == "pi" else [f"--session-dir={folder}"]
+    if not fresh and compatible(entry, m):
+        sess["resume"] = True
+        sess["args"] += ["--continue"] if entry["how"] == "dir" else RESUME_ARGS[harness](entry["value"])
+        return sess
+    if entry is not None and not fresh:
+        unrecorded = entry["value"] is None or entry["harness"] == harness and entry.get("model") == m.get("model")
+        sess["notice"] = (f"@{m['name']} starts in a new conversation: none was recorded for it" if unrecorded
+                          else f"@{m['name']} starts fresh: its saved conversation is for {entry['harness']}"
+                               f" {entry.get('model')}")
+    if t.get("session") == "id":
+        sess["assigned"] = new_session_id(harness)
+        sess["args"] += FRESH_ARGS[harness](sess["assigned"])
+    return sess
+
+
+
+# ================================================================ starting members (launch_layout.md §4)
+
+def private_dir(parent_fd, name, shown):
+    """name below parent_fd, created 0700 when missing, never through a symbolic link: its descriptor."""
+    try:
+        os.mkdir(name, 0o700, dir_fd=parent_fd)
+    except FileExistsError:
+        pass
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+    except OSError as error:
+        raise Problem(f"expected a private directory at {shown}, found a symbolic link or another file ({error})",
+                      f"Remove {shown} and run the command again.") from error
+    if stat.S_IMODE(os.fstat(fd).st_mode) != 0o700:
+        os.fchmod(fd, 0o700)
+    return fd
+
+
+def write_private(dir_fd, name, text):
+    fd = private_open(name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, dir_fd=dir_fd)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+
+
+def claude_settings(level, message_dir):
+    """Claude Code's launch settings for a v2 member (§7): say and inbox run outside a sandbox the owner turned
+    on, and at full the hc socket is reachable inside it. The last key skips the first bypassPermissions warning."""
+    script = ["python3", str(SCRIPT)]
+    commands = [shlex.join([*script, "say"]) + " *", shlex.join([*script, "inbox"]) + " *"]
+    sandbox = {"excludedCommands": commands, "filesystem": {"allowWrite": [str(message_dir)]}}
+    if level == "full":
+        sock = os.environ.get("HC_TERMINAL_SOCKET")
+        sandbox["network"] = ({"allowUnixSockets": [sock]} if sys.platform == "darwin" and sock
+                              else {"allowAllUnixSockets": True})
+    permissions = {"allow": [f"Bash({c})" for c in commands] + [f"Write(/{message_dir}/**)"],
+                   "additionalDirectories": [str(message_dir)]}
+    return json.dumps({"promptSuggestionEnabled": False, "sandbox": sandbox, "skipDangerousModePermissionPrompt": True,
+                       "permissions": permissions}, separators=(",", ":"))
+
+
+def start_member(cfg, state, hc, m, operator, sess):
+    """Start m's harness, by itself, in a new terminal (its worktree exists). -> the terminal record; raises Problem."""
+    name, harness = m["name"], m["harness"]
+    state = pathlib.Path(state)
+    exe = shutil.which(harness)
+    if exe is None:
+        raise Problem(f"{harness} is not on PATH", TABLE[harness]["install"])
+    message_dir = state / "messages" / name
+    try:
+        root = open_log(state).open_dir(create=True)
+    except OSError as error:
+        raise Problem(f"cannot open the state directory {state}: {error}", "Fix its permissions, then run up again.")
+    opened = [root]
+    try:
+        messages = private_dir(root, "messages", state / "messages")
+        opened.append(messages)
+        opened.append(private_dir(messages, name, message_dir))
+        if TABLE[harness].get("session") == "dir":
+            sessions = private_dir(root, "sessions", state / "sessions")
+            opened.append(sessions)
+            folder = session_folder(state, m)
+            opened.append(private_dir(sessions, folder.name, folder))
+        prompt_file = state / f"{name}.md"
+        m = {**m, "state_dir": state, "message_dir": message_dir, "instructions": prompt_file}
+        try:
+            write_private(root, prompt_file.name, member_prompt(m, operator, cfg))   # rewritten at every launch
+            if harness == "claude":
+                write_private(root, f"{name}.settings.json", claude_settings(m["permissions"], message_dir))
+        except OSError as error:
+            raise Problem(f"cannot write {prompt_file}: {error}", "Fix the state directory, then run up again.")
+    finally:
+        for fd in opened:
+            os.close(fd)
+    argv, env = launch_argv(m, prompt_file, sess)
+    labels = {"factory.team": team_key(cfg.root), "factory.kind": "member", "factory.member": name,
+              "factory.dir": str(state), "name": "@" + name}
+    try:
+        return hc.run([exe, *argv], cwd=m["dir"], env={"PATH": os.environ.get("PATH", ""), **env}, labels=labels)
+    except (HcError, HcDown) as error:
+        raise Problem(f"hc could not start @{name}: {error}", "Check that hc runs (hc status), then run up again.")
+
+
+def _last_line(hc, address):
+    try:
+        lines = [line.strip() for line in hc.read(address).splitlines() if line.strip()]
+    except (HcError, HcDown):
+        return ""
+    return lines[-1] if lines else ""
+
+
+def await_ready(hc, started, timeout=LAUNCH_TIMEOUT, clock=time):
+    """started: {member: (its terminal record, its harness's dialogs)}. Polls every member every 0.5 s until each
+    is settled or the deadline passes. -> {member: None when ready, else the reason it is not}."""
+    deadline = clock.monotonic() + timeout
+    outcome, answered, shown, words = {}, {name: set() for name in started}, {}, {}
+    seen = {}                                        # the dialog each member showed at its last poll
+    while True:
+        for name, (record, dialogs) in started.items():
+            if name in outcome:
+                continue
+            address = record["address"]
+            try:
+                t = hc.get(address)
+                if t["state"] == "finished":
+                    last = _last_line(hc, address)
+                    code = t.get("exit_code")
+                    how = (f"exited (code {code})" if code is not None else f"was stopped by signal {t['signal']}"
+                           if t.get("signal") is not None else f"ended ({t.get('reason') or 'unknown'})")
+                    outcome[name] = how + (f": {last}" if last else "")
+                    continue
+                word = words[name] = (t.get("status") or {}).get("state")
+                if word == "working":
+                    seen.pop(name, None)             # two observations of a dialog must be consecutive
+                    continue
+                screen = "".join(hc.read(address).split())
+                matching = [(text, keys) for text, keys in dialogs if "".join(text.split()) in screen]
+                asked = next((d for d in matching if d[0] not in answered[name]), matching[0] if matching else None)
+                shown[name] = asked and asked[0]
+                if asked:
+                    text, keys = asked
+                    if not keys:
+                        outcome[name] = ("waits on its trust dialog: accept it in its pane, then run:"
+                                         f" factory.py brief --send {name}")
+                    elif text not in answered[name] and seen.get(name) == text:
+                        hc.keys(address, keys)       # on its second poll: a harness that just drew it may not read yet
+                        answered[name].add(text)
+                    seen[name] = text
+                    continue
+                seen.pop(name, None)
+                if word == "idle":
+                    outcome[name] = None
+            except (HcError, HcDown) as error:
+                outcome[name] = f"could not be watched: {error}"
+        if len(outcome) == len(started):
+            return outcome
+        if clock.monotonic() >= deadline:
+            for name in started:
+                if name not in outcome:
+                    text = shown.get(name)
+                    outcome[name] = (f'still asks "{text}" after the answer was sent' if text in answered[name]
+                                     else f"not ready after {timeout:g} s ({words.get(name) or 'no status'})")
+            return outcome
+        clock.sleep(0.5)
 
 
 # ================================================================ briefs
@@ -2758,11 +3017,12 @@ def member_prompt(m, operator, cfg):
                      f" tests. Write only scratch files outside the repo, or a document @{operator} asks you for.")
     text = (SKILL / "templates/member-prompt.md").read_text()
     for key, value in {"role_rules": cfg.roles[m["role"]][1], "name": m["name"], "role": m["role"], "operator": f"@{operator}",
-                       "draft_dir": str(m["draft_dir"]),
-                       "draft": shlex.quote(str(m["draft_dir"])) + "/FILENAME",
+                       "draft_dir": str(m["message_dir"] or f"<state>/messages/{m['name']}"),
+                       "draft": (shlex.quote(str(m["message_dir"])) if m["message_dir"]
+                                 else f"<state>/messages/{m['name']}") + "/FILENAME",
                        "say": shlex.join(["python3", str(SCRIPT), "say"]),
                        "brief": str(cfg.brief_file), "where": where, "rules": "\n".join(rules),
-                       "instructions": str(cfg.session_dir / f"{m['name']}.md"),
+                       "instructions": str(m["instructions"] or f"<state>/{m['name']}.md"),
                        "notes": str(SKILL / "references/notes.md")}.items():
         text = text.replace("{" + key + "}", value)
     return text.rstrip() + "\n"
@@ -2811,144 +3071,7 @@ def message_for(cfg, m, members, operator, closing=None):
     return f"{tag(operator)} Your standing instructions, then the team brief.\n\n{member_prompt(m, operator, cfg)}\n{brief}"
 
 
-# ================================================================ herdr: the team is the panes labeled with member names
-
-def herdr(*args, check=True, timeout=HERDR_TIMEOUT):
-    """Run a herdr command -> its result. With check=False a failure returns {"error": reason} instead of exiting."""
-    try:
-        p = subprocess.run([HERDR, *args], capture_output=True, text=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        p = subprocess.CompletedProcess(args, 1, "", f"no answer from herdr in {timeout:g}s")
-    if p.returncode != 0:
-        msg = p.stderr.strip() or p.stdout.strip() or f"exit {p.returncode}"
-        try:  # herdr reports errors as JSON on stderr
-            err = json.loads(msg).get("error")
-            msg = ": ".join(str(err[k]) for k in ("code", "message") if err.get(k)) if isinstance(err, dict) else str(err)
-        except (json.JSONDecodeError, AttributeError):
-            pass
-        if "Operation not permitted" in msg or "PermissionDenied" in msg:
-            msg += ("\nherdr's socket is blocked, probably by a sandbox. In Claude Code add `herdr *` to"
-                    " sandbox.excludedCommands, or run with the sandbox off.")
-        if check:
-            raise SystemExit(f"herdr {' '.join(args[:3])}: {msg}")
-        return {"error": msg}
-    try:
-        return json.loads(p.stdout).get("result") or {}
-    except (json.JSONDecodeError, AttributeError):
-        return {"text": p.stdout}  # Some herdr commands return plain text.
-
-
-def integration_target(harness):
-    return "antigravity-cli" if harness == "agy" else harness
-
-
-def integration_statuses():
-    """Read Herdr's text status. Omitted and unrecognized rows remain unknown."""
-    try:
-        got = herdr("integration", "status", check=False, timeout=5)
-    except OSError as e:
-        return {}, str(e)
-    if error := got.get("error"):
-        return {}, error.splitlines()[0]
-    rows = re.findall(r"^([^:\n]+): (not installed|(?:current|needs repair|outdated) \([^)]+\)) \(.+\)$",
-                      got.get("text", ""), re.MULTILINE)
-    return dict(rows), None
-
-
-def warn_integrations(plans):
-    if not plans:
-        return
-    statuses, error = integration_statuses()
-    verify = "Run `herdr integration status` to verify."
-    if error:
-        print(f"warning: could not check herdr integrations ({error}). {verify}", file=sys.stderr)
-        return
-    for harness in dict.fromkeys(p["harness"] for p in plans):
-        target, label = integration_target(harness), TABLE[harness]["label"]
-        state = statuses.get(target)
-        if not state:
-            print(f"warning: could not verify the {label} herdr integration. {verify}", file=sys.stderr)
-        elif not state.startswith("current "):
-            print(f"warning: {label} herdr integration {state}. Herdr may miss session IDs."
-                  f" Ask the user before running `herdr integration install {target}`."
-                  " It changes files shared with other factories.", file=sys.stderr)
-
-
-def require_herdr():
-    if os.environ.get("HERDR_ENV") != "1":
-        raise SystemExit("not inside herdr (HERDR_ENV != 1). Start herdr and run this from the operator's pane.")
-
-
-class Team:
-    """The running team as herdr sees it: one team per herdr session. A member's pane carries the member's
-    @name as its label, and herdr knows the pane, the agent in it (if any) and its harness session."""
-
-    def __init__(self, cfg, exclude_pane=None, record_sessions=True):
-        self.cfg = cfg
-        # `pane list` has labels and sessions but no agent names; `agent list` has the names.
-        self.agent_panes = {a["name"]: a.get("pane_id") for a in herdr("agent", "list").get("agents", [])
-                            if a.get("name") and (not exclude_pane or a.get("pane_id") != exclude_pane)}
-        self.panes = {}
-        for p in herdr("pane", "list").get("panes", []):
-            if p["pane_id"] == exclude_pane:
-                continue
-            label = p.get("label")
-            if label and (label not in self.panes or p.get("agent")):  # a label can repeat: the live pane wins
-                self.panes[label] = p
-        if record_sessions:
-            remember_sessions(cfg, {n: self.pane(n) for n in [cfg.operator["name"], *cfg.members]})
-
-    def pane(self, name):
-        return self.panes.get(name)
-
-    def live(self, name):
-        """An agent is running in the member's labeled pane."""
-        p = self.panes.get(name)
-        return bool(p and p.get("agent"))
-
-    def members(self):
-        """Member plans for the members that are running, in factory.toml order."""
-        return [plan(self.cfg, n) for n in self.cfg.members if self.live(n)]
-
-    def status(self, name):
-        p = self.panes.get(name)
-        if not p:
-            return "not started"
-        if not p.get("agent"):
-            return "gone"
-        return p.get("agent_status", "?")
-
-
-def caller_agent():
-    pane = os.environ.get("HERDR_PANE_ID")
-    if not pane:
-        raise SystemExit("HERDR_PANE_ID is not set; run this from the operator's herdr pane.")
-    got = herdr("agent", "get", pane, check=False)
-    info = got.get("agent") or {}
-    if "error" in got and "not_found" not in got["error"]:  # herdr itself failed: say that, not "no agent"
-        raise SystemExit(f"herdr agent get {pane}: {got['error']}")
-    if not info or info.get("pane_id") != pane:
-        raise SystemExit(f"herdr sees no agent in this pane ({pane}). Run factory.py from the operator's pane.")
-    return info
-
-
-def ensure_operator(cfg, tab=False, info=None):
-    """Name and label the operator's pane, and its tab when launching. Return the name."""
-    if info is None:
-        info = caller_agent()
-    pane = info["pane_id"]
-    name = cfg.operator["name"]
-    if info.get("name") != name:
-        clash = [a for a in herdr("agent", "list").get("agents", []) if a.get("name") == name]
-        if clash:
-            raise SystemExit(f"another agent is already named @{name} ({clash[0].get('pane_id')}). One team runs per"
-                             f" herdr session: rename that agent, change [operator] name in {CONF}, or use another session.")
-        herdr("agent", "rename", pane, name)
-        print(f"named this pane's agent @{name}")
-    herdr("pane", "rename", pane, name, check=False)
-    if tab and os.environ.get("HERDR_TAB_ID"):
-        herdr("tab", "rename", os.environ["HERDR_TAB_ID"], TABS["operator"], check=False)
-    return name
+# ================================================================ worktrees
 
 
 def ensure_worktree(cfg, m):
@@ -2967,174 +3090,6 @@ def ensure_worktree(cfg, m):
     if p.returncode:
         return f"could not create the worktree {path}: {p.stderr.strip()}"
     print(f"created worktree {path} on branch {m['branch']}")
-
-
-# ================================================================ launching and sending
-
-def place(team, m, env):
-    """A new pane for a member in the team tab. The first member opens the tab. Each later one splits the
-    tab's largest pane along its longer side, so the panes stay a balanced grid however many members join."""
-    flags = ["--cwd", m["dir"], "--no-focus"] + [x for k, v in env.items() for x in ("--env", f"{k}={v}")]
-    anchor = next((p["pane_id"] for n, p in reversed(team.panes.items()) if n in team.cfg.members), None)
-    if not anchor:
-        ws = ["--workspace", os.environ["HERDR_WORKSPACE_ID"]] if os.environ.get("HERDR_WORKSPACE_ID") else []
-        return herdr("tab", "create", "--label", TABS["team"], *ws, *flags)["root_pane"]["pane_id"]
-    direction = "down"
-    panes = (herdr("pane", "layout", "--pane", anchor, check=False).get("layout") or {}).get("panes") or []
-    if panes:
-        big = max(panes, key=lambda p: p["rect"]["width"] * p["rect"]["height"])
-        anchor = big["pane_id"]
-        # a terminal cell is about twice as tall as wide, and an agent needs width more than height
-        direction = "right" if big["rect"]["width"] >= 2.5 * big["rect"]["height"] else "down"
-    return herdr("pane", "split", anchor, "--direction", direction, *flags)["pane"]["pane_id"]
-
-
-def launch(cfg, team, m, operator, timeout, resume=None):
-    """Start one member in its own labeled pane: the one it had if that is free, else a new pane in the team
-    tab. -> None, or why it did not come up."""
-    prompt_file = cfg.session_dir / f"{m['name']}.md"
-    for directory in (cfg.session_dir, cfg.messages, m["draft_dir"]):
-        if directory.is_symlink():
-            return f"expected a private directory at {directory}, found a symbolic link"
-        try:
-            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-        except OSError as e:
-            return f"could not prepare the message directory: {e}"
-    prompt_file.write_text(member_prompt(m, operator, cfg))  # written fresh at each launch
-    if m["harness"] == "claude":
-        # Keep the typed launch command below macOS's 1024-byte line limit.
-        prompt_file.with_suffix(".settings.json").write_text(
-            claude_settings(m["permissions"], m["draft_dir"]))
-    argv, env = launch_argv(m, prompt_file, resume)
-    err = ensure_worktree(cfg, m) if m["branch"] else None
-    if err:
-        return err
-    old = team.pane(m["name"])
-    here = pathlib.Path((old or {}).get("foreground_cwd") or (old or {}).get("cwd") or "/").resolve()
-    if old and not old.get("agent") and not env and here == pathlib.Path(m["dir"]).resolve():
-        pane = old["pane_id"]  # back in the member's own pane, which is still in the member's directory
-    else:
-        pane = place(team, m, env)
-        if old:  # a pane's environment is set when it is created, so this member got a new one
-            herdr("pane", "rename", old["pane_id"], "--clear", check=False)
-        herdr("pane", "rename", pane, m["name"])
-        team.panes[m["name"]] = {"pane_id": pane, "label": m["name"]}
-    started = herdr("agent", "start", m["name"], "--kind", m["harness"], "--pane", pane, "--timeout", str(timeout),
-                    "--", *argv, check=False, timeout=timeout / 1000 + 30)
-    # Answer known startup questions once. Other startup delays settle based on herdr's status.
-    dialogs = TABLE[m["harness"]].get("dialogs", [])
-    answered, waiting = {}, lambda: "agent_not_ready" in started.get("error", "")
-    for _ in range(8):
-        asked = []
-        if dialogs:
-            # A narrow pane wraps a question over several lines, so compare without whitespace.
-            screen = "".join(herdr("pane", "read", pane, "--source", "visible", check=False).get("text", "").split())
-            asked = [d for d in dialogs if "".join(d[0].split()) in screen]
-        for text, keys in asked:
-            if text not in answered:
-                answered[text] = herdr("pane", "send-keys", pane, *keys, check=False).get("error")
-        if waiting() and herdr("agent", "get", pane, check=False).get("agent", {}).get("agent_status") in ("idle", "done"):
-            started = {}
-        if not asked and not waiting():
-            break
-        time.sleep(SETTLE / 8)
-    else:
-        if asked and "error" not in started:
-            why = answered.get(asked[0][0])
-            started = {"error": f"it still asks {asked[0][0]!r} after the answer was sent" + (f" ({why})" if why else "")}
-    if "error" in started:
-        return f"{started['error']} (pane {pane})"
-    team.panes[m["name"]]["agent"] = m["harness"]
-    how = "resumed" if resume else "started"
-    where = f", worktree {m['dir']}" if m["branch"] else ""
-    print(f"{how} @{m['name']} ({m['role']}) on {m['harness']} {m['model']}, thinking {m['thinking']},"
-          f" permissions {m['permissions']} in {pane}{where}")
-
-
-def delivery_refused(reason):
-    return reason.split(":", 1)[0] in ("agent_blocked", "agent_not_found", "agent_not_ready")
-
-
-def prompt_error(name, text):
-    # A trailing newline prevents the harness from completing a last word beginning with @ or $.
-    reply = herdr("agent", "prompt", name, text if text.endswith("\n") else text + "\n", check=False)
-    if reply.get("type") != "agent_prompted":
-        return reply.get("error") or "unexpected reply from herdr"
-    return None
-
-
-def deliver(team, texts, what):
-    """Send {member: text}. herdr refuses a prompt to an agent that is waiting on an approval, so say who
-    did not get it. -> {member: reason}."""
-    failed = {}
-    for name, text in texts.items():
-        error = prompt_error(name, text)
-        if error:
-            failed[name] = error
-    ok = [n for n in texts if n not in failed]
-    if ok:
-        print(f"sent {what} to {', '.join('@' + n for n in ok)}")
-    for name, err in failed.items():
-        status = "NOT delivered" if delivery_refused(err) else "delivery unconfirmed"
-        print(f"{status} to @{name}: {err}")
-    return failed
-
-
-def send_brief(cfg, team, operator, names=None, closing=None):
-    """The team brief to running members (all, or only `names`). Closing is text or {member: text}.
-    -> {member: reason} for failed deliveries."""
-    members = team.members()
-    targets = [m for m in members if names is None or m["name"] in names]
-    if not targets:
-        print("no members running")
-        return {}
-    return deliver(team, {m["name"]: message_for(cfg, m, members, operator,
-                         closing.get(m["name"]) if isinstance(closing, dict) else closing) for m in targets},
-                   "the team brief")
-
-
-def report_failed(failed, team, undelivered=()):
-    """Report failed launches by name. Brief delivery has its own per-recipient output."""
-    for name, err in failed.items():
-        if team.live(name):
-            print(f"@{name} launch incomplete: {err}. Brief withheld.")
-        else:
-            print(f"@{name} did not come up: {err}. Fix the reported cause, then run: factory.py up {name}")
-    if failed or undelivered:
-        sys.exit(3)
-
-
-# ================================================================ sessions seen (for up)
-# herdr drops a pane's session reference when its agent exits. So every command that looks at the team notes
-# each agent's current session in one small file in the cache, and `up` resumes a member's last one.
-# The file is only ever appended to. Without it, a member that exited starts fresh.
-
-def past_sessions(cfg):
-    """{member: its latest noted session ref} from the per-repo cache."""
-    path = cfg.cache / "sessions.jsonl"
-    return {o["member"]: o for o in (records(path) if path.exists() else ()) if o.get("member") and o.get("value")}
-
-
-def remember_sessions(cfg, panes):
-    """Record observed sessions and return the latest saved ref for each agent."""
-    last, new = past_sessions(cfg), []
-    for name, pane in panes.items():
-        ref = (pane or {}).get("agent_session") or {}
-        entry = {"member": name, **{k: ref.get(k) for k in ("agent", "kind", "value")}}
-        if entry["value"] and entry != last.get(name):
-            last[name] = entry
-            new.append(entry)
-    if new:
-        cfg.cache.mkdir(parents=True, exist_ok=True)
-        with (cfg.cache / "sessions.jsonl").open("a+b") as f:
-            prefix = b""
-            if f.tell():
-                f.seek(-1, os.SEEK_END)
-                if f.read(1) != b"\n":
-                    prefix = b"\n"  # an interrupted append can leave a partial line
-            data = "".join(json.dumps(o) + "\n" for o in new).encode()
-            f.write(prefix + data)
-    return last
 
 
 # ================================================================ commands
@@ -3231,251 +3186,634 @@ def cmd_harnesses(args):
             print(f"{'':10}agy offers: {', '.join(sorted(checker.probe('agy-models', agy_models)))}")
 
 
+def hc_check(environ=os.environ):
+    """check's offline lines about hc (hc_client.md): its version, and draft_wait from its config. -> (lines, failed).
+    A missing hc is reported and is not a failure; an hc too old or unreadable, or an unreadable config, is."""
+    try:
+        out = subprocess.run([HC, "--version"], capture_output=True, text=True, timeout=30, check=False)
+    except FileNotFoundError:
+        return [f"hc: not found ({HC}); install hc {'.'.join(map(str, HC_MIN))} or newer before up"], False
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return [f"hc: {HC} --version failed: {error}"], True
+    first = (out.stdout.strip().splitlines() or [""])[0] if out.returncode == 0 else ""
+    found = re.fullmatch(r"hc ([0-9]+(?:\.[0-9]+)+)(?:[-+ ].*)?", first)
+    if not found:
+        return [f"hc: unrecognised version from {HC} --version: {(first or out.stderr.strip())[:200]!r}"], True
+    version = tuple(map(int, found[1].split(".")))
+    if version < HC_MIN:
+        return [f"hc {found[1]} is too old: Factory needs {'.'.join(map(str, HC_MIN))} or newer"], True
+    config = pathlib.Path(environ.get("XDG_CONFIG_HOME") or pathlib.Path.home() / ".config") / "herdr-core/config.toml"
+    try:
+        wait = tomllib.loads(config.read_text()).get("draft_wait", 60)
+    except FileNotFoundError:
+        wait = 60
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        return [f"hc {found[1]}; cannot read {config}: {error}"], True
+    if type(wait) is not int:
+        return [f"hc {found[1]}; draft_wait in {config} must be a whole number of seconds, not {wait!r}"], True
+    wait = max(wait, 0)
+    lines = [f"hc {found[1]}, draft_wait {wait} s"]
+    if wait < 600:
+        lines.append(f"warning: raise draft_wait to 600 or more in {config} so a report never lands in text you"
+                     " are typing")
+    return lines, False
+
+
 def cmd_check(args):
     cfg = cfg_of(args)
     plans = selected(cfg, args.names)
     ready, problems = check_all(cfg, plans)
     ok = {p["name"]: p for p in ready}
     print_plan([ok.get(p["name"], p) for p in plans], ("Check", lambda p: "ok" if p["name"] in ok else "FAILED"))
+    lines, hc_failed = hc_check()
+    for line in lines:
+        print(line)
     if problems:
         report_problems(problems)
+    if problems or hc_failed:
         sys.exit(2)
+
+
+
+# ================================================================ output helpers
+
+# ================================================================ team commands
+# launch_layout.md §§2, 6, 8 and cli_skill.md §2
+
+def stop_with(reason, code=2):
+    print(reason, file=sys.stderr)
+    sys.exit(code)
+
+
+def closings(operator):
+    """The brief's last line: (ready, pickup, new conversation) (functional_spec.md §§6.4, 9.4)."""
+    ready = (f"Send @{operator} one line saying `ready` with the say command in your standing instructions,"
+             " then wait for your task.")
+    pickup = ("We are picking up where we left off. Check the tracker the brief above names, then send"
+              f" @{operator} a new one-line pickup report for this launch, even if you sent one before."
+              " Say what you were doing and what you will do next. Send it with the"
+              f" say command in your standing instructions. A reply in your own pane does not reach @{operator}.")
+    return ready, pickup, "You are starting in a new session and know nothing of the work so far. " + ready
+
+
+def check_operator(cfg, team, me, view):
+    """up's refusals, read-only (launch_layout.md §2): exits 2 with the reason."""
+    labels = me.get("labels") or {}
+    if labels.get("factory.team") and labels["factory.team"] != team:
+        stop_with(f"this pane is @{labels.get('factory.member')} of team {labels['factory.team']}; run up from a pane"
+                  " that is not on a team")
+    if labels.get("factory.team") == team and labels.get("factory.kind") in ("member", "keeper"):
+        stop_with("run up from the operator's pane, not a member's")
+    if me.get("status") is None:
+        stop_with("this pane reports no agent status to hc (OSC 7501); see the harness notes in the docs")
+    other = view.operator
+    if other is not None and other["address"] != me["address"] and other.get("status") is not None:
+        stop_with(f"@{other['labels'].get('factory.member')} is running in {other['address']}; use that pane")
+
+
+def mark_operator(cfg, hc, team, me, view, state):
+    """After preflight: any other live operator terminal of this team becomes operator-lost, then this one is the
+    operator."""
+    name = cfg.operator["name"]
+    for record in hc.list(team):
+        if (record["state"] == "live" and record["address"] != me["address"]
+                and record["labels"].get("factory.kind") in ("operator", "operator-lost")):
+            hc.label(record["address"], {"factory.kind": "operator-lost"})
+    hc.label(me["address"], {"factory.team": team, "factory.kind": "operator", "factory.member": name,
+                             "factory.dir": str(state), "name": "@" + name})
+
+
+def lifecycle_lock(state):
+    """<state>/up.lock, held for a whole up or down (no other team lock is held meanwhile): its descriptor.
+    Exits 2 when another up or down holds it."""
+    try:
+        directory = open_log(state).open_dir(create=True)
+    except (OSError, Problem) as error:
+        stop_with(f"cannot open the state directory {state}: {error}")
+    try:
+        fd = private_open("up.lock", os.O_RDWR | os.O_CREAT, dir_fd=directory)
+    finally:
+        os.close(directory)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        stop_with("another up or down is running for this team")
+    return fd
+
+
+def interrupted_line(name, record, box):
+    """§8: why a gone member stopped, and the last message it got."""
+    reason = record.get("reason")
+    cause = ("its harness ended" if record["state"] == "live"
+             else f"exited (code {record.get('exit_code')})" if reason == "exited"
+             else "was killed" if reason == "killed" else "hc stopped" if reason == "server_stop"
+             else f"was lost ({reason})")
+    word = (record.get("labels") or {}).get("factory.last")
+    line = f"@{name} interrupted: {cause} " + (f"while {word}." if word else "(state unknown).")
+    msg = box.last_to(name) if box is not None else None
+    if msg:
+        line += f" Last message to it: #{msg['id']} from @{msg['from']} at {msg['at']}."
+    return line
+
+
+def _launch_fact(m, state, sess):
+    """(how, value) for launch_entry once m's brief is delivered, or None for a resumed launch."""
+    if sess["assigned"]:
+        return "id", sess["assigned"]
+    if TABLE[m["harness"]].get("session") == "dir":
+        return "dir", str(session_folder(state, m))
+    return None if sess["resume"] else ("new", None)
+
+
+def _brief_lines(name, ident, outcome):
+    """The lines up and brief --send print for one brief, and whether it is confirmed."""
+    o = outcome["o"]
+    if o == "delivered":
+        return [f"@{name}: brief {ident} delivered"], True
+    if o in ("sending", "queued"):
+        why = f" ({outcome['why']})" if o == "queued" else ""
+        return [f"@{name}: brief {ident} is still {o}{why}; the keeper delivers it when it can. Run factory.py"
+                " status."], False
+    return [f"@{name}: brief {ident} {o} ({outcome.get('why')}): check @{name}'s pane, then run"
+            f" factory.py brief --send {name}"], False
+
+
+def _remove_record(hc, record):
+    """A gone member's old record, once its new terminal exists: kill a live shell first, then rm."""
+    for call in ((hc.kill,) if record["state"] == "live" else ()) + (hc.rm,):
+        try:
+            call(record["address"])
+        except HcError as error:
+            if error.kind not in ("not_found", "finished"):
+                print(f"warning: could not remove {record['address']}: {error}", file=sys.stderr)
+        except HcDown as error:
+            print(f"warning: could not remove {record['address']}: {error}", file=sys.stderr)
 
 
 def cmd_up(args):
     cfg = cfg_of(args)
-    plans = selected(cfg, args.names)
-    if not plans:
+    names = selected_names(cfg, args.names)
+    if not names:
         raise SystemExit(f"no members in {CONF}; add one, then run `factory.py up`")
-    require_herdr()
-    info = caller_agent()
-    # The operator pane may still carry a member name or label from an earlier team.
-    team = Team(cfg, exclude_pane=os.environ.get("HERDR_PANE_ID"))
-    cold = not any(team.live(n) for n in cfg.members)
-    if cold:
-        report_leftover_drafts(cfg)
-    running = [m["name"] for m in plans if not args.restart and team.live(m["name"])]
-    ready = checked(cfg, [m for m in plans if m["name"] not in running])
-    for m in ready:
-        name = m["name"]
-        if name in team.agent_panes and (not team.live(name) or team.agent_panes[name] != team.pane(name)["pane_id"]):
-            print(f"an agent outside this team is already named {name}. One team runs per herdr session:"
-                  " rename that agent, or use another session.", file=sys.stderr)
-            sys.exit(2)
-    warn_integrations(ready)
+    if args.timeout <= 0:
+        stop_with("--timeout must be a positive number of seconds")
+    me_id = os.environ.get("HC_TERMINAL_ID")
+    if not me_id:
+        stop_with("run the operator inside an hc terminal (rodeo or the Herdr app)")
+    hc, team, operator = Hc(), team_key(cfg.root), cfg.operator["name"]
+    try:
+        state = state_for(cfg, hc)
+    except HcDown as error:
+        stop_with(f"hc is not reachable: {error}")
+    except Problem as error:
+        stop_with(f"{error.what}. Correct or clear that terminal's factory.dir label, then run factory.py up again.")
+    hc.expect_core = hc.core
+    lock = lifecycle_lock(state)
+    try:
+        _up(cfg, args, hc, team, operator, state, names, me_id)
+    finally:
+        os.close(lock)
+
+
+def _up(cfg, args, hc, team, operator, state, names, me_id):
+    try:
+        me, view = hc.get(me_id), team_view(hc, team)
+    except (HcDown, HcError) as error:
+        stop_with(f"hc is not reachable: {error}")
+    check_operator(cfg, team, me, view)
+    try:
+        current = read_team(state)
+    except Problem:
+        current = None                               # unreadable: rebuilt below, after preflight
+    if current and (current["team"] != team or current["core"] != hc.core or current["root"] != str(cfg.root)):
+        stop_with(f"{state}/team.json belongs to another checkout or hc core; remove it, then run factory.py up")
+    log = open_log(state)
+    try:
+        box = log.read_box()[1]
+    except (LogDamage, OSError) as error:
+        stop_with(f"the message log cannot be read: {error}")
+    unfinished = sorted({r["labels"].get("factory.member") for r in hc.list(team)
+                         if r["labels"].get("factory.down") and r["labels"].get("factory.kind") == "member"}
+                        & set(names))
+    if unfinished:                                   # a stop not recorded yet: a replacement could get its messages
+        stop_with("the last stop of " + ", ".join("@" + n for n in unfinished) + " was not recorded; run"
+                  " factory.py down " + " ".join(unfinished) + " first")
+    targets = [n for n in names if view.state(n) in ("not started", "gone")]
+    running = [n for n in names if n not in targets]
     if running:
-        print(f"already running: {', '.join(running)}")
-        report_launch_drift(team, [m for m in plans if m["name"] in running])
-    operator = ensure_operator(cfg, tab=True, info=info)
-    print_pending(args, operator)
-    if not ready:
+        print("already running: " + ", ".join("@" + n for n in running)
+              + (" (--fresh starts only members that are not running)" if args.fresh else ""))
+    plans = checked(cfg, [plan(cfg, n, state) for n in targets]) if targets else []
+    # Preflight passed: from here on up changes things.
+    mark_operator(cfg, hc, team, me, view, state)
+    facts = {"v": 1, "root": str(cfg.root), "team": team, "core": hc.core, "up": True}
+    update_team(state, reset=current is None, **facts)
+    was_live = [n for n in cfg.members if view.terminal(n) is not None and view.state(n) != "gone"]
+    for m in plans:
+        old = view.terminal(m["name"]) or view.finished(m["name"])
+        if old is not None and view.state(m["name"]) == "gone":
+            print(interrupted_line(m["name"], old, box))
+    if not was_live:
+        print("\n".join(pending_lines(state, operator)))
+    try:
+        ensure_keeper(cfg, state, hc, view, force=True)   # also when every member runs: delivery comes back
+    except (Problem, HcDown, HcError, OSError, LogDamage) as error:
+        stop_with(f"the keeper could not start: {error}. No member was started.", 3)
+    if not plans:
         return
-    pickup_text = ("We are picking up where we left off. Check the tracker the brief above names, then send"
-                   f" @{operator} a new one-line pickup report for this launch, even if you sent one before."
-                   " Say what you were doing and what you will do next. Send it with the"
-                   f" say command in your standing instructions. A reply in your own pane does not reach @{operator}.")
-    ready_text = (f"Send @{operator} one line saying `ready` with the say command in your standing instructions,"
-                  " then wait for your task.")
-    fresh_text = "You are starting in a new session and know nothing of the work so far. " + ready_text
-    past = past_sessions(cfg)
-    closing, joined, failed = {}, [], {}
-    for m in ready:
-        name = m["name"]
-        pane = team.pane(name)
-        ref = (pane or {}).get("agent_session") or past.get(name)
-        resume = ref if ref and ref.get("agent") == m["harness"] and not args.fresh else None
-        was_live = team.live(name)
-        if was_live:  # preflight has passed for every restart
-            herdr("pane", "close", team.panes.pop(name)["pane_id"])
-        err = launch(cfg, team, m, operator, args.timeout, resume=resume)
-        if err:
-            failed[name] = err + (f". If its session cannot be resumed, run: factory.py up {name} --fresh" if resume else "")
+    failed, fixes = {}, {}                           # fixes: a member's fix when it is neither up nor brief --send
+    for m in plans:
+        if m["branch"]:
+            err = ensure_worktree(cfg, m)
+            if err:
+                failed[m["name"]] = err
+    newest, skipped = saved_sessions(state)
+    if skipped:
+        print(f"skipped {skipped} damaged entries in {state / SESSIONS}")
+    starts = {}                                      # name -> (m, sess, record)
+
+    def start(m, sess):
+        try:
+            record = start_member(cfg, state, hc, m, operator, sess)
+        except Problem as error:
+            failed[m["name"]] = f"{error.what} ({error.fix})"
+            return
+        if not sess["resume"]:                       # before its brief: a late one must not leave the old entry newest
+            try:
+                launch_entry(state, m, record["address"], "new", None)
+            except (OSError, LogDamage, Problem) as error:
+                _remove_record(hc, record)           # an unrecorded fresh launch could let an old conversation back
+                failed[m["name"]] = f"its fresh launch could not be recorded ({error}), so up stopped it"
+                again = f"factory.py up {m['name']}" + (" --fresh" if args.fresh else "")
+                fixes[m["name"]] = f"fix {state / SESSIONS}, then {again}"
+                return None
+        starts[m["name"]] = (m, sess, record)
+        how = "resumed" if sess["resume"] else "started"
+        where = f", worktree {m['dir']}" if m["branch"] else ""
+        print(f"{how} @{m['name']} ({m['role']}) on {m['harness']} {m['model']}, thinking {m['thinking']},"
+              f" permissions {m['permissions']} in {record['address']}{where}")
+        return record
+
+    for m in plans:
+        if m["name"] in failed:
             continue
-        if resume:
-            closing[name] = pickup_text
-        elif pane or ref:
-            closing[name] = fresh_text
-        else:
-            closing[name] = ready_text
-        if not was_live and not ref:  # also announce a successful retry of a first launch
-            joined.append(m)
-    team, undelivered = Team(cfg), {}
-    if closing and args.no_brief:
-        print("next: factory.py brief --send")
-    elif closing:
-        undelivered = send_brief(cfg, team, operator, names=closing, closing=closing)
-        if joined:
-            news = "; ".join(f"@{m['name']} ({m['role']}, {TABLE[m['harness']]['label']} {m['model']})" for m in joined)
-            others = [m["name"] for m in team.members() if m["name"] not in closing and m["name"] not in failed]
-            if others:
-                deliver(team, {n: f"{tag(operator)} Joined the team: {news}. No reply needed." for n in others}, "the news")
-    report_failed(failed, team, undelivered)
+        old = view.terminal(m["name"]) or view.finished(m["name"])
+        entry = newest.get(m["name"])
+        sess = session_plan(m, state, entry, args.fresh)
+        if sess["notice"] is None and entry is None and old is not None and not args.fresh:
+            sess["notice"] = f"@{m['name']} starts in a new conversation: none was recorded for it"
+        if sess["notice"]:
+            print(sess["notice"])
+        if start(m, sess) is not None and old is not None:
+            _remove_record(hc, old)                  # the new terminal exists before the old record goes
 
+    def ready_group(names_now):
+        group = {n: (starts[n][2], TABLE[starts[n][0]["harness"]].get("dialogs", [])) for n in names_now}
+        return await_ready(hc, group, timeout=args.timeout) if group else {}
 
-def member_pane_before_close(name, pane_id):
-    """Return (pane, error). A missing pane or an exited agent is already stopped."""
-    # Herdr has no conditional close, so an occupant change between this check and the close goes undetected.
-    got = herdr("pane", "get", pane_id, check=False)
-    if error := got.get("error"):
-        return None, None if error.split(":", 1)[0] == "pane_not_found" else error
-    pane = got.get("pane") or {}
-    if pane.get("pane_id") != pane_id:
-        return None, f"could not verify pane {pane_id}"
-    if not pane.get("agent"):
-        return None, None
-    got = herdr("agent", "get", pane_id, check=False)
-    if error := got.get("error"):
-        return None, None if error.split(":", 1)[0] == "agent_not_found" else error
-    agent = got.get("agent") or {}
-    if pane.get("label") != name or agent.get("name") != name or agent.get("pane_id") != pane_id:
-        return None, f"member identity changed in pane {pane_id}"
-    return pane, None
+    ready = ready_group(list(starts))
+    ended = ("exited", "was stopped", "ended")
+    retry = [n for n, why in ready.items() if why and starts[n][1]["resume"] and why.startswith(ended)]
+    for n in retry:
+        m, _, record = starts.pop(n)
+        print(f"@{n}: its saved conversation could not be resumed ({ready.pop(n)}); starting fresh")
+        if start(m, session_plan(m, state, None, True)) is not None:
+            _remove_record(hc, record)
+    ready.update(ready_group([n for n in retry if n in starts]))
+    for n, why in ready.items():
+        if why:
+            failed[n] = why
+    ready_text, pickup_text, fresh_text = closings(operator)
+    roster = [plan(cfg, n, state) for n in cfg.members]
+    briefs = {}
+    for n in [n for n in starts if ready.get(n) is None]:
+        m, sess, record = starts[n]
+        ran_before = newest.get(n) is not None or view.terminal(n) is not None or view.finished(n) is not None
+        closing = pickup_text if sess["resume"] else fresh_text if ran_before else ready_text
+        try:
+            ident, offset, warning = log.add(operator, [n], message_for(cfg, m, roster, operator, closing),
+                                             kind="brief")
+        except NotStored as error:
+            failed[n] = f"its brief was not stored: {error.detail}"
+            continue
+        except LogDamage as error:
+            failed[n], fixes[n] = f"its brief was not stored: {error}", "repair the log, then factory.py up"
+            continue
+        except OSError as error:                     # the storage outcome is unknown: never a second brief
+            failed[n] = f"its brief may be stored: {error}"
+            fixes[n] = f"factory.py inbox --for {n}, and factory.py status"
+            continue
+        if warning:
+            print(f"warning: brief {ident}: {warning}", file=sys.stderr)
+        briefs[n] = (ident, offset)
+    deadline = time.monotonic() + SAY_WAIT
+    for n, (ident, offset) in briefs.items():
+        m, sess, record = starts[n]
+        try:
+            outcome = wait_outcomes(log, ident, [n], offset, max(0.0, deadline - time.monotonic()))[n]
+        except (LogDamage, OSError) as error:
+            failed[n] = f"brief {ident} is stored; its outcome could not be read ({error})"
+            fixes[n] = "factory.py status"
+            continue
+        lines, confirmed = _brief_lines(n, ident, outcome)
+        print("\n".join(lines))
+        if outcome["o"] in ("sending", "queued"):        # the keeper owns it: never a second brief
+            failed[n], fixes[n] = f"brief {ident} is not delivered yet", "factory.py status"
+        elif confirmed and outcome.get("term") != record["address"]:
+            confirmed = False
+            failed[n] = f"brief {ident} went to another terminal ({outcome.get('term')})"
+        if confirmed:
+            fact = _launch_fact(m, state, sess)
+            if fact:
+                try:
+                    launch_entry(state, m, record["address"], *fact)
+                except (OSError, LogDamage, Problem) as error:
+                    print(f"warning: @{n}'s session was not saved: {error}", file=sys.stderr)
+        elif not confirmed and n not in failed:
+            failed[n] = f"brief {ident} was not confirmed"
+    joined = [starts[n][0] for n in briefs if n not in failed and starts[n][0]["name"] not in newest
+              and view.terminal(n) is None and view.finished(n) is None]
+    others = [n for n in was_live if n not in starts]
+    if joined and others:
+        news = "; ".join(f"@{m['name']} ({m['role']}, {TABLE[m['harness']]['label']} {m['model']})" for m in joined)
+        try:
+            log.add(operator, others, f"Joined the team: {news}. No reply needed.")
+        except (LogDamage, NotStored, OSError) as error:
+            print(f"warning: the news of who joined was not stored: {error}", file=sys.stderr)
+    if failed:
+        ended += ("could not be watched",)
+        for n, why in failed.items():
+            if n in fixes:
+                fix = fixes[n]
+            elif n in starts and not why.startswith(ended):
+                fix = f"factory.py brief --send {n}"              # it runs; it has no confirmed brief
+            else:
+                fix = f"factory.py up {n}"
+            print(f"@{n} is not ready: {why}. Then run: {fix}", file=sys.stderr)
+        sys.exit(3)
 
 
 def cmd_down(args):
-    cfg = cfg_of(args)
-    names = selected_names(cfg, args.names)
-    require_herdr()
-    caller = os.environ.get("HERDR_PANE_ID")
-    if not caller:
-        raise SystemExit("HERDR_PANE_ID is not set; run down from the operator's herdr pane.")
-    got = herdr("agent", "get", caller, check=False)
-    if (error := got.get("error")) and error.split(":", 1)[0] != "agent_not_found":
-        raise SystemExit(f"herdr agent get {caller}: {error}")
-    if (got.get("agent") or {}).get("name") in cfg.members:
-        raise SystemExit("run down from the operator's pane, not a member pane.")
-
-    team = Team(cfg, exclude_pane=caller, record_sessions=False)
-    running = {name for name in cfg.members if team.live(name) or name in team.agent_panes}
-    targets = {name: team.pane(name) for name in names
-               if team.live(name) and team.pane(name)["pane_id"] == team.agent_panes.get(name)}
+    if not os.environ.get("HC_TERMINAL_ID"):
+        stop_with("run down from the operator's pane")
+    hc = Hc()
     try:
-        saved = remember_sessions(cfg, targets) if targets else {}
-    except OSError as e:
-        raise SystemExit(f"could not record member sessions: {e}") from None
+        cfg, state, _ = resolve_team(args, hc)
+    except HcDown as error:
+        stop_with(f"hc is not reachable: {error}")
+    except Problem as error:
+        stop_with(f"{error.what}; {error.fix}")
+    names = selected_names(cfg, args.names)
+    team = team_key(cfg.root)
+    lock = lifecycle_lock(state)
+    try:
+        sys.exit(_down(cfg, hc, team, state, names))
+    finally:
+        os.close(lock)
 
-    stopped, failed = False, False
-    integrations = None
+
+def _stop(hc, log, state, name, record):
+    """factory.down and the kill, then the stop record (launch_layout.md §6). The terminal record stays until the
+    queue sweep has run: while it carries factory.down, up will not replace the member. -> whether it is recorded."""
+    address = record["address"]
+    try:
+        hc.label(address, {"factory.down": "1"})      # before the kill: the keeper drops, not requeues
+        if record["state"] == "live":
+            hc.kill(address)
+    except HcError as error:
+        if error.kind != "finished":
+            print(f"@{name} ({address}) could not be stopped: {error}")
+            return False
+    except HcDown as error:
+        print(f"@{name} ({address}) could not be stopped: {error}")
+        return False
+    try:
+        mark_stopped(state, [address], log.read_box()[1])
+    except (Problem, ValueError, OSError, LogDamage) as error:
+        print(f"@{name} stopped, but the stop could not be recorded ({error}); its record {address} is kept."
+              f" Run factory.py down {name} again.")
+        return False
+    return True
+
+
+def _down(cfg, hc, team, state, names):
+    me_id = os.environ["HC_TERMINAL_ID"]
+    try:
+        records = hc.list(team)
+    except (HcDown, HcError) as error:
+        stop_with(f"hc is not reachable: {error}")
+    view = View(records)
+    if view.operator is None or view.operator["address"] != me_id:
+        stop_with("run down from the operator's pane")
+    problem = sessions_writable(state)
+    if problem:
+        print(f"sessions cannot be saved ({problem}): members left running")
+        return 1
+    log, code, stopped, recorded = open_log(state), 0, {}, []
     for name in names:
-        if name not in running:
+        current = view.terminal(name) or view.finished(name)
+        earlier = [r for r in records if r["state"] == "finished" and r["labels"].get("factory.down")
+                   and r["labels"].get("factory.kind") == "member" and r["labels"].get("factory.member") == name]
+        if current is None and not earlier:
             print(f"@{name} was not running")
             continue
-        target = targets.get(name)
-        pane = None
-        if target is None:
-            error = "pane label and agent name do not point to the same pane"
-        else:
-            pane, error = member_pane_before_close(name, target["pane_id"])
-        if pane:
-            try:
-                if pane.get("agent_session") and pane["agent_session"] != target.get("agent_session"):
-                    saved = remember_sessions(cfg, {name: pane})
-            except OSError as e:
-                error = f"could not record member session: {e}"
+        word = view.state(name) if current is not None else "stopped"
+        for record in [r for r in (current, *earlier) if r is not None]:   # an earlier down's unfinished stop too
+            if _stop(hc, log, state, name, record):
+                stopped[name] = word
+                recorded.append((name, record["address"]))
             else:
-                error = herdr("pane", "close", pane["pane_id"], check=False).get("error")
-        if error:
-            print(f"could not stop @{name}: {error}", file=sys.stderr)
-            failed = True
-            continue
-        running.remove(name)
-        if not pane:
-            print(f"@{name} was not running")
-            continue
-        print(f"stopped @{name} (was {pane.get('agent_status', '?')})")
-        harness, ref = cfg.members[name]["harness"], saved.get(name, {})
-        if ref.get("agent") != harness:
-            hint = ""
-            if not ref and pane.get("agent") == harness:
-                if integrations is None:
-                    integrations, _ = integration_statuses()
-                if integrations.get(integration_target(harness), "").startswith("needs repair "):
-                    hint = ". Its herdr integration needs repair and may have prevented session recording."
-            print(f"no compatible session recorded for @{name}: up will start it fresh{hint}")
-        stopped = True
+                code = 1
     if stopped:
-        if not running:
-            report_leftover_drafts(cfg)
+        try:
+            box = log.read_box()[1]
+            queued = {n: sum(1 for msg, to in box.pending(n) if box.outcome(msg["id"], to)["o"] == "queued")
+                      for n in stopped}
+            log.drop_queued(box, list(stopped), why="stopped by down")
+        except (LogDamage, OSError, NotStored) as error:
+            print(f"queued messages to the stopped members were not dropped ({error}); their records are kept."
+                  f" Run factory.py down {' '.join(stopped)} again.")
+            return 1
+        for name, word in stopped.items():
+            print(f"stopped @{name} (was {word}); {queued[name]} queued messages dropped")
+        for name, address in recorded:               # only now: the swept stop no longer needs its gate
+            try:
+                hc.rm(address)
+            except (HcError, HcDown) as error:
+                if not (isinstance(error, HcError) and error.kind == "not_found"):
+                    print(f"@{name}'s record {address} could not be removed ({error}); run factory.py down"
+                          f" {name} again")
+                    code = 1
+    try:
+        after = team_view(hc, team)
+    except (HcDown, HcError) as error:
+        print(f"could not check whether any member still runs: {error}")
+        return 1
+    if not any(after.terminal(n) or after.finished(n) for n in cfg.members):
+        try:
+            update_team(state, up=False)
+        except (Problem, ValueError, OSError, LogDamage) as error:
+            print(f"the team could not be marked down: {error}")
+            code = 1
         print("run factory.py up to bring members back")
-    if failed:
-        sys.exit(1)
-
-
-def harness_argv(info, harness):
-    """The argv of the one foreground process that is this harness, else None: no data or ambiguous data."""
-    procs = [p.get("argv") for p in (info.get("process_info") or {}).get("foreground_processes") or []
-             if p.get("argv") and harness in (re.sub(r"^\.|-wrapped$", "", p.get("name") or ""),
-                                              os.path.basename(p["argv"][0]))]
-    return procs[0] if len(procs) == 1 else None
-
-
-def report_launch_drift(team, plans):
-    """herdr can restore a member itself, e.g. after its server restarts, without the flags factory launched it
-    with. Name the live members whose harness demonstrably lacks their permission flags or extra args."""
-    drifted = []
-    for m in plans:
-        wanted = [w for w in (TABLE[m["harness"]]["permissions"][m["permissions"]], m["args"]) if w]
-        if not wanted:
-            continue
-        argv = harness_argv(herdr("pane", "process-info", "--pane", team.pane(m["name"])["pane_id"], check=False),
-                            m["harness"])
-        if argv and not all(any(argv[i:i + len(w)] == w for i in range(len(argv) - len(w) + 1)) for w in wanted):
-            drifted.append(m["name"])
-    if drifted:
-        print(f"running without their factory launch flags, as after a herdr restart: {', '.join(drifted)}."
-              f" Run factory.py up {' '.join(drifted)} --restart")
-
+    return code
 
 def cmd_status(args):
-    require_herdr()
-    cfg = cfg_of(args)
-    team = Team(cfg)
-    rows = [("Member", "Role", "Harness", "Model", "Thinking", "Status", "Pane")]
-    operator = cfg.operator["name"]
-    rows.append(("@" + operator, "operator", cfg.operator.get("harness", ""), cfg.operator.get("model", ""), cfg.operator.get("thinking", ""),
-                 team.status(operator), (team.pane(operator) or {}).get("pane_id", "")))
-    for name in cfg.members:
-        p = plan(cfg, name)
-        pane = team.pane(name)
-        rows.append(("@" + name, p["role"], p["harness"], p["model"] or "?", p["thinking"], team.status(name),
-                     (pane or {}).get("pane_id", "")))
+    hc = Hc()
+    try:
+        cfg, state, _ = resolve_team(args, hc)
+        team = team_key(cfg.root)
+        records = hc.list(team)
+    except HcDown as error:
+        stop_with(f"hc is not reachable: {error}")
+    except Problem as error:
+        stop_with(f"{error.what}; {error.fix}")
+    view, operator = View(records), cfg.operator["name"]
+    print(f"factory {VERSION} ({SCRIPT}), hc {'.'.join(map(str, hc.version))}, team {team}")
+    box = None                                       # unreadable: pending_lines prints the diagnosis
+    with contextlib.suppress(LogDamage, OSError, Problem):
+        box = open_log(state).read_box()[1]
+    rows = [("Member", "Role", "Harness", "Model", "Thinking", "State", "Turn", "Terminal")]
+    o = cfg.operator
+    for name, role, harness, model, thinking in (
+            [(operator, "operator", o.get("harness", ""), o.get("model", ""), o.get("thinking", ""))]
+            + [(n, p["role"], p["harness"], p["model"] or "?", p["thinking"])
+               for n, p in ((n, plan(cfg, n, state)) for n in cfg.members)]):
+        live, finished = view.terminal(name), view.finished(name)
+        rows.append(("@" + name, role, harness, model, thinking, view.state(name),
+                     str(live["turn"]) if live else "", (live or finished or {}).get("address", "")))
     print_table(rows)
-    print_pending(args, operator)
-    for state, hint in (("blocked", "blocked: waiting on an approval or a question."),
-                        ("gone", "gone: run `factory.py up {names}` to bring them back.")):
-        hit = [r[0] for r in rows[2:] if state in r[5]]
+    for name in cfg.members:
+        if view.state(name) == "gone":
+            print(interrupted_line(name, view.terminal(name) or view.finished(name), box))
+    print("\n".join(pending_lines(state, operator)))
+    try:
+        keeper = ensure_keeper(cfg, state, hc, view)
+    except (Problem, HcDown, HcError, OSError, LogDamage) as error:
+        print(f"keeper: not running ({error})")
+    else:
+        beat = read_beat(state) if keeper else None
+        if keeper is None:
+            print("keeper: not running")
+        elif beat is None:
+            print(f"keeper: starting ({keeper}), no pane")
+        else:
+            version = "" if beat[1] == VERSION else f", replacing itself (it runs {beat[1]})"
+            print(f"keeper: running, version {beat[1]}, last loop {int(beat[3])} s ago, no pane{version}")
+    reachable = view.operator is not None and view.operator.get("status") is not None
+    print("operator: reachable" if reachable else "operator: not reachable: run factory.py up in the operator's pane")
+    for word, hint in (("blocked", "blocked: waiting on an approval or a question."),
+                       ("gone", "gone: run `factory.py up {names}` to bring them back.")):
+        hit = [n for n in cfg.members if view.state(n) == word]
         if hit:
-            print(f"\n{', '.join(hit)} " + hint.format(names=" ".join(n.lstrip("@") for n in hit)))
-    if not any(team.pane(n) for n in cfg.members):
-        print(f"\nNo member of {CONF} has a pane in this herdr session. Run `factory.py up` to start or resume its members.")
+            print(f"{', '.join('@' + n for n in hit)} " + hint.format(names=" ".join(hit)))
+    for stray in view.strays:
+        print(f"stray: {stray['address']} is another terminal for @{stray['labels'].get('factory.member')};"
+              " Factory does not use it")
+    try:
+        size = (pathlib.Path(state) / Log.LOG).stat().st_size
+    except OSError:
+        size = 0
+    if size > 64 * 1024 * 1024:
+        print(f"warning: the message log is {size // (1024 * 1024)} MiB ({pathlib.Path(state) / Log.LOG})")
 
 
-def cmd_brief(args):
-    cfg = cfg_of(args)
-    names = [n.lstrip("@") for n in args.names]
-    if args.send:
-        require_herdr()
-        operator = ensure_operator(cfg)
-        team = Team(cfg)
-        if names == ["all"]:
-            names = []
-        missing = [n for n in names if n not in cfg.members or not team.live(n)]
-        if missing:
-            raise SystemExit(f"not running: {', '.join(missing)}")
-        if send_brief(cfg, team, operator, names=set(names) or None):
-            sys.exit(1)
-        return
-    print(render_team_brief(cfg, [plan(cfg, n) for n in cfg.members], cfg.operator["name"]))
-
-
-def cmd_prompt(args):
-    cfg = cfg_of(args)
-    p = selected(cfg, [args.name])[0]
+def _brief_preview(cfg, name, state):
+    p = plan(cfg, name, state)
+    if state is None:
+        print("paths are final after factory.py up", file=sys.stderr)
     print(f"# @{p['name']} ({p['role']}) on {p['harness']} {p['model']}, thinking {p['thinking']}\n")
     print(member_prompt(p, cfg.operator["name"], cfg))
 
 
-# ================================================================ output helpers
+def cmd_brief(args):
+    names = [n.lstrip("@") for n in args.names]
+    if args.send:
+        sys.exit(_brief_send(args, names))
+    try:
+        cfg, state, _ = find_team(args)
+    except (Problem, HcError):
+        cfg, state = cfg_of(args), None
+    if names:
+        for name in selected_names(cfg, names):
+            _brief_preview(cfg, name, state)
+        return
+    print(render_team_brief(cfg, [plan(cfg, n, state) for n in cfg.members], cfg.operator["name"]))
+
+
+def _brief_send(args, names):
+    if not os.environ.get("HC_TERMINAL_ID"):
+        stop_with("run brief --send from the operator's pane")
+    hc = Hc()
+    try:
+        cfg, state, me = resolve_team(args, hc)
+        view = team_view(hc, team_key(cfg.root))
+    except HcDown as error:
+        stop_with(f"hc is not reachable: {error}")
+    except Problem as error:
+        stop_with(f"{error.what}; {error.fix}")
+    operator = cfg.operator["name"]
+    if view.operator is None or me is None or view.operator["address"] != me["address"]:
+        stop_with("run brief --send from the operator's pane")
+    every = names in ([], ["all"])
+    names = [n for n in cfg.members if view.terminal(n) is not None] if every else selected_names(cfg, names)
+    missing = [n for n in names if view.terminal(n) is None]
+    if missing or not names:
+        stop_with("not running: " + ", ".join("@" + n for n in missing or cfg.members))
+    log = open_log(state)
+    try:
+        box = log.read_box()[1]
+    except (LogDamage, OSError) as error:
+        stop_with(str(error))
+    briefed, roster = box.briefed(), [plan(cfg, n, state) for n in cfg.members]
+    ready_text = (f"Send @{operator} one line saying `ready` with the say command in your standing instructions,"
+                  " and mention any work you have already picked up, then wait for your task.")
+    code, sent = 0, {}
+    for name in names:
+        record = view.terminal(name)
+        m = plan(cfg, name, state)
+        if record["address"] in briefed:
+            closing = "No reply needed."
+        else:                                        # its first brief: only once it is ready and past its dialogs
+            why = await_ready(hc, {name: (record, TABLE[m["harness"]].get("dialogs", []))}, timeout=5)[name]
+            if why:
+                print(f"@{name} is not ready: {why}")
+                code = 1
+                continue
+            closing = ready_text
+        try:
+            ident, offset, warning = log.add(operator, [name], message_for(cfg, m, roster, operator, closing),
+                                             kind="brief")
+        except (LogDamage, NotStored, OSError) as error:
+            print(f"@{name}: brief not stored: {error}")
+            code = 1
+            continue
+        if warning:
+            print(f"warning: brief {ident}: {warning}", file=sys.stderr)
+        sent[name] = (ident, offset)
+    wait = SAY_WAIT
+    try:
+        if ensure_keeper(cfg, state, hc, view) is None:
+            print("warning: the team is stopped; the briefs are stored and wait for factory.py up.", file=sys.stderr)
+            wait = 0
+    except (Problem, HcDown, HcError, OSError, LogDamage) as error:
+        print(f"warning: the keeper is not running ({error}); the briefs are stored. Run factory.py status.",
+              file=sys.stderr)
+        wait = 0                                     # read each outcome once, without waiting for nobody
+    deadline = time.monotonic() + wait
+    for name, (ident, offset) in sent.items():
+        try:
+            outcome = wait_outcomes(log, ident, [name], offset, max(0.0, deadline - time.monotonic()))[name]
+        except (LogDamage, OSError) as error:
+            print(f"@{name}: brief {ident} is stored; its outcome could not be read: {error}")
+            code = 1
+            continue
+        lines, confirmed = _brief_lines(name, ident, outcome)
+        print("\n".join(lines))
+        code = code or (0 if confirmed else 1)
+    return code
+
 
 def print_table(rows):
     widths = [max(len(str(r[i])) for r in rows) for i in range(len(rows[0]))]
@@ -3487,9 +3825,6 @@ def print_table(rows):
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
-    if argv and argv[0] == "continue":
-        print("use factory.py up [names] [--fresh] [--restart]", file=sys.stderr)
-        sys.exit(2)
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
@@ -3497,7 +3832,8 @@ def main(argv=None):
         sp.add_argument("--cwd", help="where to look for FACTORY.md and factory.toml (default: here, then parent directories)")
 
     def launching(sp):
-        sp.add_argument("--timeout", type=int, default=60000, help="ms to wait for each agent to be ready")
+        sp.add_argument("--timeout", type=float, default=LAUNCH_TIMEOUT,
+                        help=f"seconds to wait for the members to be ready (default {LAUNCH_TIMEOUT})")
         common(sp)
 
     def selection(sp):
@@ -3515,12 +3851,10 @@ def main(argv=None):
     up = sub.add_parser("up", help="check and start or resume members, then send their briefs",
                         epilog="Native harness flags go in the member's `args` in factory.toml.")
     selection(up)
-    up.add_argument("--no-brief", action="store_true", help="do not send the team brief afterwards")
-    up.add_argument("--fresh", action="store_true", help="start new sessions instead of resuming")
-    up.add_argument("--restart", action="store_true", help="also relaunch running members with current settings")
+    up.add_argument("--fresh", action="store_true", help="start new conversations instead of resuming")
     launching(up)
 
-    down = sub.add_parser("down", help="stop members and save their sessions for up")
+    down = sub.add_parser("down", help="stop members; up resumes their conversations")
     selection(down)
     common(down)
 
@@ -3532,8 +3866,8 @@ def main(argv=None):
     ib.add_argument("--for", dest="for_name", help="recipient name (default: this member or the operator)")
     common(ib)
 
-    bf = sub.add_parser("brief", help="print the team brief as members get it, or --send it")
-    bf.add_argument("names", nargs="*", help="with --send: only these members")
+    bf = sub.add_parser("brief", help="print the team brief, a member's standing instructions (NAME), or --send it")
+    bf.add_argument("names", nargs="*", help="a member's name; with --send: all, or these members")
     bf.add_argument("--send", action="store_true")
     common(bf)
 
@@ -3541,10 +3875,6 @@ def main(argv=None):
     sy.add_argument("to", nargs="+", help="recipient names separated by spaces or commas, or all for members only; "
                     "the last argument is the message unless --file")
     sy.add_argument("--file", help="send this file's contents")
-
-    pr = sub.add_parser("prompt", help="the standing instructions a member gets")
-    pr.add_argument("name")
-    common(pr)
 
     keeper = sub.add_parser("keeper", help="run the team's delivery process")
     keeper.add_argument("--state", required=True)
@@ -3554,7 +3884,7 @@ def main(argv=None):
         args.message = args.to.pop() if args.file is None and len(args.to) > 1 else None
     {"init": cmd_init, "harnesses": cmd_harnesses, "check": cmd_check, "up": cmd_up, "down": cmd_down,
      "status": cmd_status, "inbox": cmd_inbox, "brief": cmd_brief, "say": cmd_say,
-     "prompt": cmd_prompt, "keeper": cmd_keeper}[args.cmd](args)
+     "keeper": cmd_keeper}[args.cmd](args)
 
 
 if __name__ == "__main__":
