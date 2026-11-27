@@ -6777,6 +6777,54 @@ class QualifyJudgeTests(unittest.TestCase):
     def trials(self, *seconds, idle=True, outcome="delivered"):
         return [{"idle": idle, "seconds": s, "outcome": outcome} for s in seconds]
 
+    def test_between_turns_judges_refuse_the_old_failure(self):
+        """@architect-2: a report already typed and ignored must not pass as one Factory held (keeper.md §9)."""
+        import live
+        before = {"state": "working", "app": "codex", "outcome": ["queued", "busy"], "marker_on_screen": False}
+        self.assertTrue(live.judge_before_esc(before))
+        for change in ({"outcome": ["delivered", None]}, {"app": "fake"}, {"app": None}, {"marker_on_screen": True},
+                       {"state": "idle"}):
+            self.assertFalse(live.judge_before_esc({**before, **change}), change)
+        trial = {"between_turns": True, "before_esc": before, "holds": True, "held_behind_owner_line": True}
+        self.assertTrue(live._esc_trials_hold({"next-delivery": trial, "owner-line": trial}))
+        for broken in ({"before_esc": {**before, "outcome": ["delivered", None]}}, {"held_behind_owner_line": False},
+                       {"before_esc": {**before, "app": "unmapped"}}):
+            self.assertFalse(live._esc_trials_hold({"next-delivery": trial, "owner-line": {**trial, **broken}}), broken)
+        mid = {"between_turns": True, "app_selects_between_turns": True, "held_while_working": True,
+               "subject": "t1", "turn_at_start": 2,
+               "before_release": {"second_on_screen": False, "third_on_screen": False},
+               "deliveries": {"second": {"o": "delivered", "term": "t1", "turn": 3},
+                              "third": {"o": "delivered", "term": "t1", "turn": 4}},
+               "second_count": 1, "third_count": 1, "committed_order": ["third", "second"],
+               "order": ["finished", "third", "second"]}
+        self.assertTrue(live.judge_between_mid_turn(mid))
+        for broken in ({"deliveries": {**mid["deliveries"], "second": {"o": "delivered", "term": "t1", "turn": 2}}},
+                       {"before_release": {"second_on_screen": True, "third_on_screen": False}},
+                       {"order": ["finished", "second", "third"]}, {"third_count": 2},
+                       {"app_selects_between_turns": False},
+                       {"deliveries": {"second": mid["deliveries"]["second"]}}):
+            self.assertFalse(live.judge_between_mid_turn({**mid, **broken}), broken)
+        up = {"between_turns": True, "operator_seen": {"release": {"app": "codex"}},
+              "histories": {"held": [["sending", None], ["queued", "busy"], ["sending", None], ["delivered", None]]},
+              "deliveries": {"held": {"o": "delivered", "started": True},
+                             "queued": {"o": "delivered", "started": True}},
+              "held_message_count": 1, "new_message_count": 1, "effect_order": ["held", "queued"]}
+        self.assertTrue(live.judge_between_upgrade(up))
+        for broken in ({"deliveries": {**up["deliveries"], "held": {"o": "delivered", "started": False}}},
+                       {"effect_order": ["queued", "held"]}, {"operator_seen": {"release": {"app": "fake"}}},
+                       {"histories": {"held": [["sending", None], ["queued", "waiting"], ["delivered", None]]}}):
+            self.assertFalse(live.judge_between_upgrade({**up, **broken}), broken)
+
+    def test_the_report_shows_an_old_codex_operator_steering_pass_unproved(self):
+        import live
+        self.assertTrue(live._between_needed(4, "mid-turn", "operator", "codex", {}))
+        self.assertFalse(live._between_needed(4, "mid-turn", "operator", "claude", {}))
+        self.assertFalse(live._between_needed(4, "mid-turn", "member", "codex", {}))
+        self.assertTrue(live._between_needed(7, "upgrade", "member", "omp", {"peer": "codex"}))
+        self.assertFalse(live._between_needed(7, "upgrade", "member", "omp", {"peer": "claude"}))
+        old = {"turn_at_start": 1, "order": ["started", "second", "finished"], "second_count": 1}
+        self.assertFalse(live.BETWEEN_TURNS[(4, "mid-turn")](old))
+
     def test_latency(self):
         self.assertEqual(live.judge_latency(self.trials(0.7, 0.9, 1.2))[0], "pass")
         self.assertEqual(live.judge_latency(self.trials(0.7, 0.9, 30))[0], "pass")     # one slow trial, reported

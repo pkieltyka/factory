@@ -2072,8 +2072,17 @@ class FixtureAdapter:
         return f"ACT run {path} {command}"
 
     def act_alone(self, command):
-        """The fake runs it as ACT run does (it has no sandbox); its receipt is thrown away."""
-        return f"ACT run {self.team.dir / 'alone-receipt.txt'} {command}"
+        """The fake runs it as ACT run does (it has no sandbox); its receipt is thrown away, and its output is kept
+        where alone_output finds it (a real harness's is in its own transcript)."""
+        out = self.team.dir / f"alone-{hashlib.sha1(command.encode()).hexdigest()[:12]}.txt"
+        return f"ACT run {self.team.dir / 'alone-receipt.txt'} {command} > {out} 2>&1"
+
+    def act_alone_each(self, commands):
+        return "\n".join(self.act_alone(c) for c in commands)
+
+    def alone_output(self, command):
+        out = self.team.dir / f"alone-{hashlib.sha1(command.encode()).hexdigest()[:12]}.txt"
+        return out.read_text() if out.exists() else None
 
     def blocked_request(self):
         return "FAKE: blocks_once"
@@ -2145,6 +2154,23 @@ class RealAdapter(FixtureAdapter):
         3321bfc)."""
         return (f"Using your shell tool, run exactly this one command, by itself in its own tool call, with nothing"
                 f" added before or after it: {command} Then reply with the single word done.")
+
+    def act_alone_each(self, commands):
+        listed = " ".join(f"({i}) {c}" for i, c in enumerate(commands, 1))
+        return (f"Using your shell tool, run each of these {len(commands)} commands in order, each by itself in its own"
+                f" tool call, exactly as written, with nothing added before or after it: {listed} Then reply with"
+                " the single word done.")
+
+    def alone_output(self, command):
+        """What the command printed, as the harness's own transcript of this run holds it (Claude Code and Codex),
+        else as the operator's screen shows it: the text after the command's last appearance, bounded."""
+        texts = [p.read_text(errors="replace") for p in qa_transcripts([self.team.dir])]
+        texts.append(self.team.qa.rpc("terminal.read", {"terminal": self.team.operator, "lines": 0}).get("text", ""))
+        for text in texts:
+            at = text.rfind(command)
+            if at >= 0:
+                return text[at + len(command):at + len(command) + 4000]
+        return None
 
     def blocked_request(self):
         return ("Before doing anything else, ask me one multiple-choice question with your question tool, and"
@@ -2539,9 +2565,10 @@ class Qualification:
         return 1 if "fail" in statuses else 2 if "not_run" in statuses else 0
 
 
-def _team_for(adapter_class, role, harness, **options):
-    """A two-member-or-less team where the profile's harness has its role (phase_8.md §1)."""
-    peer = _peer(role, harness)
+def _team_for(adapter_class, role, harness, peer=None, **options):
+    """A two-member-or-less team where the profile's harness has its role (phase_8.md §1); peer overrides the
+    default counterpart."""
+    peer = peer or _peer(role, harness)
     operator, member = (harness, peer) if role == "operator" else (peer, harness)
     if adapter_class is FixtureAdapter:
         member = "codex"           # fake agents stand in; the formation needs a harness Factory can check offline
@@ -2619,12 +2646,13 @@ def _trust_entries(run, team, directories=None):
     run.checkpoint()
 
 
-def _member_says(team, text, timeout=300, record=None):
+def _member_says(team, text, timeout=300):
     """Have the member itself run say to the operator through its own tool, with text in a file, by itself in its
     own tool call as its standing instructions say: a sandbox exempts exactly 'python3 <script> say *', which the
-    earlier compound line (redirect, '; echo') did not match (cases 6 and 9 at 14ed74a and 3321bfc). The say is
-    seen in the log. -> "exit 0" once it is there, else None; team.last_say (and record["out"]) get its message ID
-    and the operator's outcome, in say's own form."""
+    earlier compound line (redirect, '; echo') did not match (cases 6 and 9 at 14ed74a and 3321bfc). -> what the log
+    shows of it, never the command's own exit or output: {"id", "from", "to", "outcome", "observed": "log"} for a
+    committed message from @lead-dev to @operator with exactly this text, its outcome read after up to say's own
+    wait; None when none appeared."""
     body = team.dir / f"report-{random.randrange(16 ** 6):06x}.md"
     body.write_text(text)
     log = factory_log(team)
@@ -2633,20 +2661,18 @@ def _member_says(team, text, timeout=300, record=None):
     team.send(team.member("lead-dev"), team.adapter.act_alone(command))
 
     def found():
-        return next((rec["id"] for rec in log.read_box()[0] if rec["t"] == "msg" and rec["id"] > before
-                     and rec.get("from") == "lead-dev" and rec.get("text") == text), None)
-    ident = team.until(found, timeout) and found()
-    team.last_say = None
-    if ident:
-        deadline = time.monotonic() + SAY_WAIT        # what say itself waits for before it reports
-        while time.monotonic() < deadline and log.read_box()[1].outcome(ident, "operator")["o"] == "sending":
-            time.sleep(0.2)
-        outcome = log.read_box()[1].outcome(ident, "operator")
-        word = f"queued ({outcome.get('why')})" if outcome["o"] == "queued" else outcome["o"]
-        team.last_say = f"message {ident}\n@operator: {word}\n"
-    if record is not None:
-        record["out"] = team.last_say
-    return "exit 0\n" if ident else None
+        records, box = log.read_box()
+        return next((rec["id"] for rec in records if rec["t"] == "msg" and rec["id"] > before
+                     and rec["id"] in box.msgs and rec.get("from") == "lead-dev" and rec.get("to") == ["operator"]
+                     and rec.get("text") == text), None)
+    if not team.until(found, timeout):
+        return None
+    ident = found()
+    deadline = time.monotonic() + SAY_WAIT            # what say itself waits for before it reports
+    while time.monotonic() < deadline and _outcome(log, ident, "operator")[0] == "sending":
+        time.sleep(0.2)
+    return {"id": ident, "from": "lead-dev", "to": ["operator"], "outcome": list(_outcome(log, ident, "operator")),
+            "observed": "log"}
 
 
 # Pure judgements, each unit-tested for its false-pass paths (@architect-2's review of the first PR).
@@ -2749,14 +2775,14 @@ def _operator_commands(run, team, harness, peer):
     has it run up, say to a member, status and inbox --for itself through its own tool; no driver up."""
     if not _operator_start(team, run, 2, "operator", harness, ["operator-commands"]):
         return False
-    exits, tok = team.receipt("operator-commands"), token()
-    member_receipt = team.receipt("member")
+    tok, member_receipt = token(), team.receipt("member")
     py = f"python3 {shlex.quote(str(team.script))}"
-    message = shlex.quote(team.adapter.act_append(member_receipt, tok))
-    outs = {name: team.dir / f"out-{name}-{token().lower()}.txt" for name in ("up", "say", "status", "inbox")}
-    commands = {"up": f"{py} up", "say": f"{py} say lead-dev {message}", "status": f"{py} status",
+    message = team.adapter.act_append(member_receipt, tok)
+    # each command alone, one per tool call, as Factory's instructions say: an owner's sandbox exempts only a
+    # standalone say or inbox, and a compound line ran in it first (Claude Code at 709f1a3, @operator)
+    commands = {"up": f"{py} up", "say": f"{py} say lead-dev {shlex.quote(message)}", "status": f"{py} status",
                 "inbox": f"{py} inbox --for operator"}
-    prompt = "\n".join(team.adapter.act_run(exits, f"{commands[name]} > {outs[name]} 2>&1") for name in commands)
+    prompt = team.adapter.act_alone_each(list(commands.values()))
     view = _rodeo(team, ["operator"])
     view.keys("ctrl+b")
     time.sleep(0.2)
@@ -2765,25 +2791,33 @@ def _operator_commands(run, team, harness, peer):
     view.focused_terminal = team.operator
     start = time.monotonic()
     view.paste(prompt)
-    lines = team.until(lambda: exits.exists() and len(exits.read_text().split()) >= 8 and exits.read_text(), 900)
-    codes = [line for line in (lines or "").splitlines() if line.startswith("exit")]
-    reached = bool(codes == ["exit 0"] * 4
-                   and team.until(lambda: member_receipt.exists() and tok in member_receipt.read_text(), 300))
-    full = {name: path.read_text() if path.exists() else None for name, path in outs.items()}
+    log = factory_log(team)
 
+    def said_by_operator():          # the committed say in the log, from the operator to the member, this text
+        records, box = log.read_box()
+        return next((rec["id"] for rec in records if rec["t"] == "msg" and rec.get("from") == "operator"
+                     and rec.get("to") == ["lead-dev"] and rec.get("text") == message and rec["id"] in box.msgs),
+                    None)
+    reached = bool(team.until(lambda: member_receipt.exists() and tok in member_receipt.read_text(), 900))
+    team.until(lambda: team.state(team.operator) in READY, 300)      # its turn over: status and inbox have run
+    time.sleep(3)
     member = team.member("lead-dev")
-    box = factory_log(team).read_box()[1] if member else None
+    box = log.read_box()[1] if member else None
     briefed = bool(box) and member in box.briefed()
+    say_id = said_by_operator()
+    say_outcome = list(_outcome(log, say_id, "lead-dev")) if say_id else None
     to_operator = sorted({ident for (ident, to) in box.outcomes if to == "operator"}) if box else []
-    listed = sorted({int(n) for n in re.findall(r"^\[Message (\d+) ", full["inbox"] or "", re.M)})
+    full = {name: team.adapter.alone_output(commands[name]) for name in ("status", "inbox")}
+    listed = sorted({int(n) for n in re.findall(r"\[Message (\d+) ", full["inbox"] or "")})
     inbox_ok = bool(full["inbox"]) and set(listed) <= set(to_operator) and (
         bool(listed) or "no messages for @operator" in full["inbox"])
     status_ok = "@lead-dev" in (full["status"] or "")
-    proof = {"exits": codes, "member_acted": reached, "member_briefed": briefed, "status_names_member": status_ok,
-             "inbox_ids": listed, "operator_ids_in_log": to_operator,
-             "exits_by_command": dict(zip(commands, codes)), "peer": peer,
+    proof = {"member_acted": reached, "member_briefed": briefed, "say_id": say_id, "say_outcome": say_outcome,
+             "status_names_member": status_ok, "inbox_ids": listed, "operator_ids_in_log": to_operator,
+             "inbox_seen": full["inbox"] is not None, "status_seen": full["status"] is not None, "peer": peer,
+             "observed_in": "Factory's log and the commands' own output (transcript or screen), not shell receipts",
              "prompted_by": "the owner's paste and Enter through rodeo into a fresh operator (prefix+1)"}
-    ok = codes == ["exit 0"] * 4 and reached and briefed and status_ok and inbox_ok
+    ok = reached and briefed and bool(say_id) and (say_outcome or [""])[0] == "delivered" and status_ok and inbox_ok
     run.row(2, "operator-commands", "operator", harness, "pass" if ok else "fail",
             "the owner's first prompt has the operator run up, say, status and inbox --for itself; the brief is"
             " delivered, the member acts on the say, status names it and the inbox lists the operator's messages",
@@ -2813,8 +2847,7 @@ def case_2(run, role, harness, adapter_class):
         acted = team.until(lambda: receipt.exists() and tok in receipt.read_text(), 300)
         acted_at = time.monotonic() - start
         ended = team.until(lambda: team.state(team.operator) in READY and team.get(team.operator)["turn"] > turn, 120)
-        found = _say_id(team.last_say or "")
-        ident = int(found.group(1)) if found else None
+        ident = said["id"] if said else None
         proof = {"member_say": said, "sender_message_id": ident,
                  "operator_turn": [turn, team.get(team.operator)["turn"]], "turn_completed": bool(ended),
                  "action_at_s": round(acted_at, 2), "peer": peer,
@@ -2840,8 +2873,8 @@ def case_9(run, role, harness, adapter_class):
         team.qa.rpc("terminal.kill", {"terminal": old})
         gone = team.until(lambda: team.get(old)["state"] == "finished", 30)
         receipt, tok = team.receipt("operator"), token()
-        said = _member_says(team, team.adapter.act_append(receipt, tok)) and _say_id(team.last_say or "")
-        said = int(said.group(1)) if said else None                    # the say by itself, as members do
+        said = _member_says(team, team.adapter.act_append(receipt, tok))   # the say by itself, as members do
+        said = said["id"] if said else None
         new = team.until(team.keeper, 60)
         acted = team.until(lambda: receipt.exists() and tok in receipt.read_text(), 300)
         proof = {"old_keeper_finished": bool(gone), "new_keeper": bool(new) and new != old, "member_say_id": said,
@@ -3296,8 +3329,9 @@ def _rodeo(team, titles):
 
 def case_5(run, role, harness, adapter_class):
     """blocked (phase_8.md §3.5): nothing typed while blocked, one note, the queued message delivered once after
-    the owner answers through rodeo, with no Factory command between."""
-    team, peer = _team_for(adapter_class, role, harness)
+    the owner answers through rodeo, with no Factory command between. An operator's blocked peer is Claude Code:
+    its question tool blocks it, where a Codex member asked the same never did (Claude Code operator at 709f1a3)."""
+    team, peer = _team_for(adapter_class, role, harness, peer="claude" if role == "operator" else None)
     with team:
         if not _up(team, run, 5, role, harness, ["blocked"]):
             return
@@ -3361,7 +3395,7 @@ def factory_log(team):
 def _outcome(log, ident, name):
     if not ident:
         return None
-    record = log.read_box()[1].outcome(int(ident[1]), name)
+    record = log.read_box()[1].outcome(ident if isinstance(ident, int) else int(ident[1]), name)
     return record["o"], record.get("why")
 
 
@@ -3697,9 +3731,9 @@ def _case_3_draft_cleared(run, team, harness, view, peer):
     view.focused_terminal = team.operator
     view.type(draft)
     time.sleep(1)
-    receipt, tok, said = team.receipt("report-cleared"), token(), {}
-    _member_says(team, team.adapter.act_append(receipt, tok), record=said)
-    found = _say_id(said.get("out") or "")
+    receipt, tok = team.receipt("report-cleared"), token()
+    said = _member_says(team, team.adapter.act_append(receipt, tok)) or {}
+    found = said.get("id")
     log = factory_log(team)
     claimed = team.until(lambda: found and _outcome(log, found, "operator") == ("sending", None), 60) or (
         found and _outcome(log, found, "operator")[0] == "sending")
@@ -3884,7 +3918,7 @@ def _ask_later(team, role, text):
             code, out = team.call("say", "lead-dev", text, timeout=600)
             box.update(out=out, code=code)
         else:
-            box["code"] = _member_says(team, text, timeout=600, record=box)
+            box.update(_member_says(team, text, timeout=600) or {"id": None}, done=True)   # this job's own
     thread = threading.Thread(target=ask, daemon=True)
     thread.start()
     return thread, box
@@ -3937,9 +3971,9 @@ def case_4(run, role, harness, adapter_class):
             started, finished, second = token(), token(), token()
 
             def said(box, log=None):
-                found = _say_id(box.get("out") or "")
-                return (int(found.group(1)) if found else None,
-                        _outcome(log or factory_log(team), found, recipient) if found else None)
+                found = box.get("id") if "id" in box else _say_id(box.get("out") or "")
+                ident = found if isinstance(found, int) or found is None else int(found.group(1))
+                return ident, (_outcome(log or factory_log(team), ident, recipient) if ident else None)
 
             began_at = time.monotonic()
 
@@ -3967,10 +4001,10 @@ def case_4(run, role, harness, adapter_class):
                 if between and trial == "mid-turn":     # two reports in one working turn (keeper.md §9)
                     later3 = _ask_later(team, role, team.adapter.act_append(work, third))
                 if between:                             # Factory keeps it queued while the operator works
-                    delivered = team.until(lambda: later[1].get("out") and said(later[1])[1] == ("queued", "busy"),
+                    delivered = team.until(lambda: later[1].get("done") and said(later[1])[1] == ("queued", "busy"),
                                            60)
                 else:
-                    delivered = team.until(lambda: later[1].get("out") and said(later[1])[1]
+                    delivered = team.until(lambda: (later[1].get("out") or later[1].get("done")) and said(later[1])[1]
                                            and said(later[1])[1][0] == "delivered", 30)
                 time.sleep(5)
                 proof = {"peer": peer, "turn_at_start": turn, "second_id": said(later[1])[0],
@@ -3981,7 +4015,7 @@ def case_4(run, role, harness, adapter_class):
                 if between:
                     proof["app_selects_between_turns"] = _app_selects(app)
                 if later3 is not None:
-                    team.until(lambda: later3[1].get("out"), 60)
+                    team.until(lambda: later3[1].get("done"), 60)
                     proof.update(third_id=said(later3[1])[0], third_outcome_while_working=said(later3[1])[1],
                                  held_while_working=(sorted([said(later[1])[1] or ("",), said(later3[1])[1] or ("",)])
                                                      == [("queued", "busy"), ("queued", "waiting")]
@@ -3999,6 +4033,11 @@ def case_4(run, role, harness, adapter_class):
                         view.focus("@lead-dev")
                     keys = team.adapter.interrupt_keys(harness)
                     pending_at_esc = second not in _lines(work) and team.state(subject) == "working"
+                    if between:                      # the same terminal, just before the key (@architect-2)
+                        snap = team.get(subject)
+                        proof["before_esc"] = {"terminal": subject, "state": (snap.get("status") or {}).get("state"),
+                                               "turn": snap.get("turn"), "app": (snap.get("status") or {}).get("app"),
+                                               "outcome": said(later[1])[1], "marker_on_screen": second in flat()}
                     view.keys(*keys)
                     esc_at = time.monotonic()
                     watch = {}
@@ -4033,8 +4072,8 @@ def case_4(run, role, harness, adapter_class):
                     # between turns: committed and still queued in Factory at Esc, nothing typed to it yet
                     proof["precondition"] = (bool(delivered) and proof["working_when_delivered"]
                                              and proof["pending_before_esc"] and pending_at_esc)
-                    if between:
-                        proof["outcome_at_esc"] = said(later[1])[1]
+                    if between:                      # still Factory's at Esc: queued, nothing of it typed
+                        proof["precondition"] = judge_before_esc(proof["before_esc"]) and pending_at_esc
                 if trial == "next-delivery":                # touch nothing: the keeper's next delivery
                     while time.monotonic() - esc_at < 65:    # past the QA core's draft_wait (60 s) since Esc
                         time.sleep(1)
@@ -4051,6 +4090,11 @@ def case_4(run, role, harness, adapter_class):
                     view.keys("enter")
                     team.until(lambda: owner.exists() and extra in owner.read_text()
                                and second in _lines(work), 300)
+                if between and trial == "mid-turn":      # neither report typed into the original turn
+                    screen = flat()
+                    proof["before_release"] = {"turn": team.get(subject)["turn"], "second_on_screen": second in screen,
+                                               "third_on_screen": third in screen,
+                                               "outcomes": [said(later[1])[1], said(later3[1])[1]]}
                 release.write_text("go\n")
                 team.until(lambda: second in _lines(work), 300)
                 if trial == "mid-turn":
@@ -4078,8 +4122,12 @@ def case_4(run, role, harness, adapter_class):
                     committed = [name for _, name in sorted([(proof["second_id"] or 0, "second"),
                                                              (proof["third_id"] or 0, "third")])]
                     proof["committed_order"] = committed          # the two says can commit in either order
-                    ok = (count == 1 and proof["third_count"] == 1 and order3 == ["finished", *committed]
-                          and proof["held_while_working"] and proof["app_selects_between_turns"])
+                    box = log.read_box()[1]
+                    proof["deliveries"] = {name: {k: box.outcome(i, recipient).get(k) for k in ("o", "term", "turn")}
+                                           for name, i in (("second", proof["second_id"]), ("third", proof["third_id"]))
+                                           if i}
+                    proof["subject"] = subject
+                    ok = judge_between_mid_turn(proof)
                     how = "held by Factory until the turn ended, then both acted on once, in order"
                     proof["classification"] = how if ok else "not held, lost or repeated"
                     run.row(4, "mid-turn", role, harness, "pass" if ok else "fail",
@@ -4108,7 +4156,8 @@ def case_4(run, role, harness, adapter_class):
                     proof.update(owner_exact=seen == extra + "\n", owner_seen=_bounded(seen))
                     # the receipt's exact bytes show the line arrived whole; a screen may fold a paste
                     # ("[Pasted text]"), so the before-Enter screen fact is recorded, not required
-                    proof["holds"] = count == 1 and proof["owner_exact"]
+                    proof["holds"] = count == 1 and proof["owner_exact"] and (
+                        not between or proof.get("held_behind_owner_line") is True)
                     proof["released_by"] = _released_by(proof, count, "the owner's Enter")
                 results[trial] = dict(proof, ran=True)
             finally:
@@ -4142,11 +4191,19 @@ def _upgrade(team, peer):
     view.keys("1")
     time.sleep(0.8)
     view.focused_terminal = team.operator
+    between = between_turns(team.operator_harness, "operator")
+
+    def operator_now():                   # the operator at a moment of the trial (@architect-2)
+        snap = team.get(team.operator)
+        return {"state": (snap.get("status") or {}).get("state"), "turn": snap.get("turn"),
+                "app": (snap.get("status") or {}).get("app")}
+    seen = {"owner_first_key": operator_now()}
     name = f"draft-{random.randrange(16 ** 6):06x}.txt"          # the owner's draft holds the first send
     draft_receipt, literal = team.dir / name, f"owner draft {token()}"
     view.type(team.adapter.draft_request(f"../{name}", literal))
     time.sleep(1)
-    first, tok1 = team.receipt("first"), token()
+    effects, tok1 = team.receipt("upgrade"), token()             # one file: both effects, in the order they ran
+    first = second = effects
     # both sends are driver-run says from the member's terminal, instant: a slow harness's own say (omp, agy) let
     # the owner's 60 s hold lapse before the claim, so nothing was ever held
     team.call("say", "operator", "--file", str(_note(team, team.adapter.act_append(first, tok1))),
@@ -4154,6 +4211,7 @@ def _upgrade(team, peer):
     log = factory_log(team)
     held = team.until(lambda: next((ident for (ident, to), rec in log.read_box()[1].outcomes.items()
                                     if rec["o"] == "sending" and to == "operator"), None), 120)
+    seen["claim"] = operator_now()
     text = team.script.read_text()                               # a second valid copy, comment-only change
     staged = team.script.with_name(".factory.py.new")
     staged.write_text(text + f"\n# qualification other-version {token()}\n")
@@ -4163,14 +4221,15 @@ def _upgrade(team, peer):
     def keeper_screen():
         return "".join(team.qa.rpc("terminal.read", {"terminal": keeper, "lines": 0}).get("text", "").split())
     draining = team.until(lambda: f"keeper{new}installed" in keeper_screen(), 90)
-    still_held = not first.exists()
-    second, tok2 = team.receipt("second"), token()
+    still_held = tok1 not in _lines(effects)
+    tok2 = token()
     # queued during the drain, before release: a driver-run say from the member's terminal, instant, so the owner's
     # hold cannot lapse while a slow harness runs it (agy's own say took long enough for the keeper to finish)
     _, out = team.call("say", "operator", "--file", str(_note(team, team.adapter.act_append(second, tok2))),
                        terminal=team.member("lead-dev"), timeout=60)
     queued = _say_id(out)
-    queued_while_draining = bool(queued) and _outcome(log, queued, "operator")[0] == "queued" and not second.exists()
+    queued_while_draining = (bool(queued) and _outcome(log, queued, "operator")[0] == "queued"
+                             and tok2 not in _lines(effects))
     module = sys.modules["factory_under_test"]
     claimed_under = {}
 
@@ -4184,15 +4243,16 @@ def _upgrade(team, peer):
             time.sleep(0.02)
     watcher = threading.Thread(target=watch_claim, daemon=True)
     watcher.start()
+    seen["release"] = operator_now()
     view.keys("enter")                                           # the owner sends the draft: the send finishes
-    finished = team.until(lambda: first.exists() and tok1 in first.read_text(), 300)
+    finished = team.until(lambda: tok1 in _lines(effects), 300)
 
     def running_new():                                           # observed passively: the keeper's own beat and label
         beat = module.read_beat(log.state)
         return bool(beat) and beat[1] == new and beat[2] == keeper and (
             (team.get(keeper).get("labels") or {}).get("factory.version") == new)
     reexeced = team.until(running_new, 120)
-    acted = team.until(lambda: second.exists() and tok2 in second.read_text(), 300)
+    acted = team.until(lambda: tok2 in _lines(effects), 300)
     time.sleep(10)
     watcher.join(timeout=5)
     screen = keeper_screen()
@@ -4203,6 +4263,17 @@ def _upgrade(team, peer):
                if (r.get("labels") or {}).get("factory.kind") == "keeper"]
     first_outcome = log.read_box()[1].outcome(held, "operator") if held else {}
     beat = module.read_beat(log.state)
+    records, box = log.read_box()
+    queued_id = int(queued.group(1)) if queued else None
+
+    def history(ident):                   # every outcome the log holds for this pair, in order
+        return [[rec["o"], rec.get("why")] for rec in records
+                if rec["t"] == "out" and rec["id"] == ident and rec["to"] == "operator"]
+
+    def delivery(ident):
+        rec = box.outcome(ident, "operator") if ident else {}
+        return {k: rec.get(k) for k in ("o", "term", "turn", "started")}
+    lines = _lines(effects)
     proof = {"old_version": old, "new_version": new, "keeper_before": keeper, "keepers_after": keepers,
              "held_send_id": held, "held_send_outcome": [first_outcome.get("o"), first_outcome.get("why")],
              "draining_seen": bool(draining), "still_held_while_draining": still_held,
@@ -4211,13 +4282,34 @@ def _upgrade(team, peer):
              "new_image_running": bool(reexeced), "queued_claimed_under": claimed_under.get("version"),
              "restart_seen": restart_seen, "exec_failed": exec_failed,
              "queued_final": _outcome(log, queued, "operator") if queued else None,
-             "new_message_count": second.read_text().split().count(tok2) if second.exists() else 0,
+             "new_message_count": lines.count(tok2), "held_message_count": lines.count(tok1),
+             "effect_order": [{tok1: "held", tok2: "queued"}[t] for t in lines if t in (tok1, tok2)],
+             "histories": {"held": history(held), "queued": history(queued_id)},
+             "deliveries": {"held": delivery(held), "queued": delivery(queued_id)},
+             "operator_seen": seen, "between_turns": between,
              "draft_exact": draft_receipt.exists() and draft_receipt.read_text() == literal + "\n", "peer": peer}
     ok = (old != new and keepers == [keeper] and bool(held) and bool(draining) and still_held and bool(finished)
           and first_outcome.get("o") == "delivered" and queued_while_draining and bool(reexeced) and bool(acted)
           and claimed_under.get("version") == new and restart_seen and not exec_failed
-          and proof["new_message_count"] == 1 and (proof["queued_final"] or ("",))[0] == "delivered")
+          and proof["new_message_count"] == 1 and (proof["queued_final"] or ("",))[0] == "delivered"
+          and proof["held_message_count"] == 1 and proof["effect_order"] == ["held", "queued"])
+    if between:                           # neither typed into the owner's turn: each started its own (keeper.md §9)
+        ok = ok and judge_between_upgrade(proof)
     return ok, proof
+
+
+def judge_between_upgrade(p):
+    """case 7 upgrade with a between-turns operator: the live app selected the rule, both messages ended delivered
+    each starting a turn of its own (none typed into the owner's turn), each acted on once, held first; a held
+    message the guard refused shows the requeue (sending, then queued busy) in its history."""
+    seen, histories, deliveries = p.get("operator_seen") or {}, p.get("histories") or {}, p.get("deliveries") or {}
+    held = histories.get("held") or []
+    requeue_ok = all(held[i + 1] == ["queued", "busy"] for i, h in enumerate(held[:-1])
+                     if h[0] == "sending" and held[i + 1][0] == "queued")
+    return bool(p.get("between_turns") and any(_app_selects(s.get("app")) for s in seen.values())
+                and all(d.get("o") == "delivered" and d.get("started") is True for d in deliveries.values())
+                and len(deliveries) == 2 and requeue_ok and p.get("held_message_count") == 1
+                and p.get("new_message_count") == 1 and p.get("effect_order") == ["held", "queued"])
 
 
 def cross_other_version(run, fixture):
@@ -4670,15 +4762,41 @@ def _cycled(proof):
 
 # A stored pass is judged again by today's rule where its proof holds the facts (@reviewer): an older proof with
 # switched but no successful replacement stays unproved.
+def judge_before_esc(before):
+    """A between-turns owner-interrupt precondition, from the snapshot taken just before Esc: the operator is
+    working, its live app selects the rule, the report is still queued in Factory, and none of it is on screen."""
+    return (isinstance(before, dict) and before.get("state") == "working" and _app_selects(before.get("app"))
+            and (before.get("outcome") or ("",))[0] == "queued" and before.get("marker_on_screen") is False)
+
+
+def judge_between_mid_turn(p):
+    """case 4 mid-turn for a between-turns operator (keeper.md §9): both reports held while it worked and neither on
+    screen before the release, both delivered to the subject in a later turn than the original one, each acted on
+    once, in committed order, after the original task finished, and the live app selected the rule."""
+    deliveries, before = p.get("deliveries") or {}, p.get("before_release") or {}
+    later = all(isinstance(d.get("turn"), int) and isinstance(p.get("turn_at_start"), int)
+                and d["turn"] > p["turn_at_start"] and d.get("o") == "delivered" and d.get("term") == p.get("subject")
+                for d in deliveries.values()) and len(deliveries) == 2
+    return bool(p.get("between_turns") and p.get("app_selects_between_turns") and p.get("held_while_working")
+                and before.get("second_on_screen") is False and before.get("third_on_screen") is False and later
+                and p.get("second_count") == 1 and p.get("third_count") == 1
+                and p.get("order") == ["finished", *(p.get("committed_order") or ["?"])])
+
+
 def _esc_trials_hold(proof):
     """case 4 owner-interrupt by today's rule: both Esc trials delivered M1 while the subject worked, found it still
     pending with the subject working at the moment of Esc, and held. The imported Claude Code trials (their own
     runner, checked by @architect-2) carry "trials" instead."""
     if "trials" in proof:
         return True
-    return all(isinstance(proof.get(t), dict) and proof[t].get("working_when_delivered") is True
-               and proof[t].get("pending_and_working_at_esc") is True and proof[t].get("holds") is True
-               for t in ("next-delivery", "owner-line"))
+    trials = [proof.get(t) for t in ("next-delivery", "owner-line")]
+    if not all(isinstance(t, dict) for t in trials):
+        return False
+    if any(t.get("between_turns") for t in trials):  # the report was Factory's at Esc, then acted on once
+        return all(t.get("between_turns") and judge_before_esc(t.get("before_esc")) and t.get("holds") is True
+                   for t in trials) and trials[1].get("held_behind_owner_line") is True
+    return all(t.get("working_when_delivered") is True and t.get("pending_and_working_at_esc") is True
+               and t.get("holds") is True for t in trials)
 
 
 REJUDGE = {(6, "resume"): _cycled, (6, "member-switch"): lambda p: p.get("switched") is True and _cycled(p),
@@ -4692,6 +4810,24 @@ REJUDGE = {(6, "resume"): _cycled, (6, "member-switch"): lambda p: p.get("switch
            # say returned at its wait, not at once, required since 7038415
            (10, "held-sender-exit"): lambda p: isinstance(p.get("say_seconds"), (int, float))
            and p["say_seconds"] >= SAY_WAIT - 1}
+
+# A Codex operator takes Factory's messages between turns from 539acb1 (keeper.md §9): its case 4 rows, and any
+# upgrade with it as operator, count only with the between-turns facts (@architect-2). Older steering passes stay
+# in the report as history, shown unproved.
+BETWEEN_TURNS = {(4, "mid-turn"): judge_between_mid_turn,
+                 (4, "owner-interrupt"): lambda p: _esc_trials_hold(p) and all(
+                     isinstance(p.get(t), dict) and p[t].get("between_turns") for t in ("next-delivery", "owner-line")),
+                 (7, "upgrade"): judge_between_upgrade}
+
+
+def _between_needed(case, subcase, role, harness, proof):
+    if (case, subcase) not in BETWEEN_TURNS:
+        return False
+    if case == 4:
+        return between_turns(harness, role)
+    operator = harness if role == "operator" else proof.get("peer")
+    return between_turns(operator, "operator")
+
 
 REPORT_BEGIN, REPORT_END = "<!-- qualify report: generated, do not edit -->", "<!-- end of generated report -->"
 
@@ -4772,6 +4908,9 @@ def report(paths, out):
                     status = "unproved (an older driver's weaker check)"
                 elif status == "pass" and (case, subcase) in REJUDGE and not REJUDGE[(case, subcase)](proof):
                     status = "unproved (its proof does not meet today's check)"
+                elif status == "pass" and _between_needed(case, subcase, role, harness, proof) \
+                        and not BETWEEN_TURNS[(case, subcase)](proof):
+                    status = "unproved (not yet proved between turns, keeper.md §9)"
                 text = str(row.get("observed") or row.get("reason") or "")
                 false = [k for k, v in proof.items() if v is False]
                 if row.get("reason") == "see proof" and false:   # name what the proof found false
