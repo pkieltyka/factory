@@ -94,7 +94,7 @@ Verified facts about `hc` and `rodeo`, collected on isolated private cores (neve
 
 @lead-dev-3 ran these at `325223a` with the owner's own logins, on private cores, Linux 7.3.5. Each was run as its own command except where noted.
 
-- **LC-3, Claude Code 2.1.332: pass** on the standalone rerun. A fresh start with the assigned `--session-id` reached idle, and the environment's ID matched the assigned one. The ID was stored; a resume reached idle and recalled the word; the ID still matched after the resume.
+- **LC-3, Claude Code 2.1.332: pass** on the standalone rerun. A fresh start with the assigned `--session-id` reached idle, and the environment's ID matched the assigned one. The ID was stored; a resume reached idle and recalled the word; the ID still matched after the resume. It passed again at 7a90602 on the real HOME (@lead-dev-3, lc3-7a90602.json), with the same observations.
   - The first attempt, inside `check login`, timed out on a trust-dialog race ("Enter to confirm · Esc to cancel").
 - **LC-4 and LC-11, OpenCode v2.4.1: pass.**
   - A UUID4 session ID is rejected (`finished (code 1): at ["sessionID"]`).

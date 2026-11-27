@@ -89,6 +89,7 @@ Claude Code and Codex may record per-directory trust for each QA scratch project
 | claude | `~/.claude.json` | `/tmp/factory-qa-ec_u6smw/work` |
 | claude | `~/.claude.json` | `/tmp/factory-qa-eo0o8od7/work` |
 | claude | `~/.claude.json` | `/tmp/factory-qa-hmorlr71/work` |
+| claude | `~/.claude.json` | `/tmp/factory-qa-i82lw014/work` |
 | claude | `~/.claude.json` | `/tmp/factory-qa-q69bqbx7/work` |
 | claude | `~/.claude.json` | `/tmp/factory-qa-u0sldmtb/work` |
 | claude | `~/.claude.json` | `/tmp/factory-qa-v1smguw_/work` |
@@ -185,6 +186,8 @@ Claude Code and Codex may record per-directory trust for each QA scratch project
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-z9xj_6lf/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-z_13dk5z/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-zg88hg09/work` |
+| codex | `~/.codex/config.toml` | `/tmp/factory-qa-1w5n44a5/work` |
+| codex | `~/.codex/config.toml` | `/tmp/factory-qa-3h7u9bsk/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-3ir867ml/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-42xr_j5d/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-56xq749n/work` |
@@ -206,6 +209,8 @@ Claude Code and Codex may record per-directory trust for each QA scratch project
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-esww8t_5/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-fcschd99/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-hmorlr71/work` |
+| codex | `~/.codex/config.toml` | `/tmp/factory-qa-i5lz01ut/work` |
+| codex | `~/.codex/config.toml` | `/tmp/factory-qa-i82lw014/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-ingp3yd4/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-k830c332/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-k85qr4ty/work` |
@@ -299,6 +304,7 @@ Claude Code and Codex may record per-directory trust for each QA scratch project
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-q2v1qk5s/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-q69bqbx7/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-qinamxo2/work` |
+| codex | `~/.codex/config.toml` | `/tmp/factory-qa-t8hi9xbo/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-u0sldmtb/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-umijxmve/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-v1smguw_/work` |
