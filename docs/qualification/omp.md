@@ -2,7 +2,7 @@
 
 **Status: not qualified yet.** omp is covered as **member only** this phase.
 
-- **Tested:** omp/19.2.1, model openai-codex/gpt-6-astra (FACTORY_QA_MODEL_OMP), on hc 0.1.20 and rodeo 0.2.1, Linux, 2026-11-27. The operator is Codex. Runs were in a bwrap HOME overlay (@lead-dev-3).
+- **Tested:** omp/19.2.1, model openai-codex/gpt-6-astra (FACTORY_QA_MODEL_OMP), on hc 0.1.20 and rodeo 0.2.1, Linux, 2026-11-27. The operator is Codex. Runs were in a bwrap HOME overlay (@lead-dev-3). Later runs use the real HOME (@operator's decision): a sign-in token refreshed inside a discarded overlay would be lost and could leave the owner's real login revoked. Claude Code and Codex trust entries are listed, and agy is trusted only through its session-only --settings, with its settings files checked before and after (size and mtime only).
 - **Model:** the table default, openai/gpt-6-astra, resolves to openrouter/openai/gpt-6-astra, and this machine has no openrouter key ("No API key found for openrouter"). That also explains LC-6's stored=false for omp. openai-codex was rate-limited at times (turn_rate_limit_exceeded).
 - **Batch at f4e5ea1 (@lead-dev-3):** cases 3, 4, 5, 7 (suffix, multiline), 8 (dead-member) and 10 (latency) pass. The gaps:
   - case 1 states not_run: the team did not come up.

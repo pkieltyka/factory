@@ -2,7 +2,7 @@
 
 **Status: not qualified yet.** OpenCode is covered as **member only** this phase.
 
-- **Tested:** opencode v2.4.1+6f05140, model openrouter/openai/gpt-6-astra, on hc 0.1.20 and rodeo 0.2.1, Linux, 2026-11-27. The operator is Codex. Runs were in a bwrap HOME overlay (@lead-dev-3).
+- **Tested:** opencode v2.4.1+6f05140, model openrouter/openai/gpt-6-astra, on hc 0.1.20 and rodeo 0.2.1, Linux, 2026-11-27. The operator is Codex. Runs were in a bwrap HOME overlay (@lead-dev-3). Later runs use the real HOME (@operator's decision): a sign-in token refreshed inside a discarded overlay would be lost and could leave the owner's real login revoked. Claude Code and Codex trust entries are listed, and agy is trusted only through its session-only --settings, with its settings files checked before and after (size and mtime only).
 - **Session strategy:** LC-4 and LC-11 passed at 325223a. `ses_`-prefixed session IDs are accepted (a UUID4 is rejected), and `OPENCODE_SESSION_ID` carries the ID.
 - **Mid-turn:** a message to a working OpenCode is queued for its next turn (case 4).
 - **Batch at 5dad3f7 (@lead-dev-3):**

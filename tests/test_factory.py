@@ -6742,8 +6742,16 @@ class QualifyReportTests(unittest.TestCase):
                                   "status": "fail", "reason": "late row", "proof": {}})
             (tmp / "early.json").write_text(json.dumps(early))
             (tmp / "final.json").write_text(json.dumps(final))
-            live.report([str(tmp / "early.json"), str(tmp / "final.json")], out)
-            self.assertIn("| 3 | draft | fail | late row", (out / "codex.md").read_text())
+            for order in (["early.json", "final.json"], ["final.json", "early.json"]):   # either import order
+                live.report([str(tmp / name) for name in order], out)
+                self.assertIn("| 3 | draft | fail | late row", (out / "codex.md").read_text())
+            repeated = json.loads(json.dumps(final))                     # a later --case repeat in one run
+            repeated["rows"] += [dict(final["rows"][-1], status="pass", reason=None)]
+            repeated["utc"] = "2026-11-27T03:20:00Z"
+            (tmp / "repeated.json").write_text(json.dumps(repeated))
+            for order in (["final.json", "repeated.json"], ["repeated.json", "final.json"]):
+                live.report([str(tmp / name) for name in order], out)
+                self.assertIn("| 3 | draft | pass |", (out / "codex.md").read_text())
 
 
 class QualifyFrameworkTests(unittest.TestCase):
@@ -6787,6 +6795,41 @@ class QualifyFrameworkTests(unittest.TestCase):
         self.assertEqual([(r["subcase"], r["status"]) for r in evidence["rows"]],
                          [("resume", "fail"), ("member-switch", "not_run")])
         self.assertEqual(code, 1)
+
+    def test_a_changed_settings_file_withholds_the_case_passes(self):
+        run = live.Qualification("real")
+        run.row(1, "states", "member", "agy", "pass", "x")
+        run.row(1, "startup-dialog", "member", "agy", "fail", "x", reason="r")
+        with patch.dict(live.EVIDENCE, {"teams": [], "settings_changed": ["~/.gemini/antigravity-cli/settings.json"]}):
+            live._file_evidence(run, 0)
+        rows = {r["subcase"]: r for r in run.data["rows"]}
+        self.assertEqual(rows["states"]["status"], "not_run")
+        self.assertIn("settings.json", rows["states"]["reason"])
+        self.assertEqual(rows["startup-dialog"]["status"], "fail")      # a failure stays a failure
+        self.assertEqual(rows["startup-dialog"]["settings_changed"], ["~/.gemini/antigravity-cli/settings.json"])
+
+    def test_a_failing_case_7_trial_does_not_stop_the_others(self):
+        ran = []
+
+        def trial(name):
+            def run_it(run, role, harness, adapter_class):
+                ran.append(name)
+                run.row(7, name, role, harness, "pass", "x")
+            return run_it
+
+        def boom(run, role, harness, adapter_class):
+            ran.append("two-senders")
+            raise subprocess.TimeoutExpired("say", 120)
+        run = live.Qualification("fixture")
+        with patch.multiple(live, _case_7_main=lambda *a: ran.append("main"), _case_7_two_senders=boom,
+                            _case_7_pending_restart=trial("pending-restart"), _case_7_upgrade=trial("upgrade"),
+                            _case_7_held_quiet=trial("held-quiet")):
+            live.case_7(run, "member", "codex", live.FixtureAdapter)
+        self.assertEqual(ran, ["main", "two-senders", "pending-restart", "upgrade", "held-quiet"])
+        rows = {r["subcase"]: (r["status"], r.get("reason") or "") for r in run.data["rows"]}
+        self.assertEqual(rows["two-senders"][0], "not_run")
+        self.assertIn("TimeoutExpired", rows["two-senders"][1])
+        self.assertEqual({rows[n][0] for n in ("pending-restart", "upgrade", "held-quiet")}, {"pass"})
 
     def test_rows_need_reasons_and_stay_bounded(self):
         run = live.Qualification("real")

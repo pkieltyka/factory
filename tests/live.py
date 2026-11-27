@@ -2019,11 +2019,16 @@ class RealAdapter(FixtureAdapter):
             qa.rpc("terminal.send", {"terminal": terminal, "text": {"claude": "/exit"}.get(self.team.operator_harness,
                                                                                          "/quit")}, timeout=60)
 
-    def quit_keys_only(self, qa, terminal):
-        """Quit with the owner's keys alone, Ctrl+C twice: no typed /exit, which a held send could merge with."""
+    def quit_keys_only(self, qa, terminal, stop=lambda: False):
+        """Quit with the owner's keys alone, Ctrl+C twice: no typed /exit, which a held send could merge with. The
+        second press is skipped once stop() is true (the harness has gone), so it cannot reach the sink."""
         for _ in range(2):
+            if stop():
+                return
             qa.rpc("terminal.keys", {"terminal": terminal, "keys": ["ctrl+c"]})
-            time.sleep(1)
+            deadline = time.monotonic() + 1
+            while time.monotonic() < deadline and not stop():
+                time.sleep(0.05)
 
     def restart(self, qa, terminal):
         """Type the same command at the shell prompt in that pane."""
@@ -2041,6 +2046,10 @@ class QATeam:
                  startup_dialog=None, quiet_grace=None, setup=None, operator_model=None, operator_sink=False):
         self.operator_harness, self.members, self.permissions = operator, members, permissions
         self.startup_dialog = startup_dialog    # fixture only: the harness whose fake shows its declared dialog
+        # agy on the real HOME (@operator): its settings files' size and mtime before and after, never contents
+        self.agy_roots = ([os.path.expanduser(p) for p in AGY_SETTINGS]
+                          if adapter_class is RealAdapter and "agy" in {operator, *members.values()} else [])
+        self.agy_before = stamps(self.agy_roots) if self.agy_roots else {}
         self.real = adapter_class is RealAdapter
         home = os.path.expanduser("~")
         extra = {"HOME": home} if self.real else None   # a real harness needs the owner's login (testing.md §6)
@@ -2157,6 +2166,11 @@ class QATeam:
         return self.dir / f"receipt-{name}-{random.randrange(16 ** 6):06x}.txt"
 
     def close(self):
+        if self.agy_roots:
+            home = os.path.expanduser("~")
+            touched = [p for p in changed(self.agy_before, stamps(self.agy_roots))
+                       if pathlib.Path(p).name == "settings.json" or "trust" in pathlib.Path(p).name.lower()]
+            EVIDENCE.setdefault("settings_changed", []).extend(p.replace(home, "~", 1) for p in touched)
         try:
             EVIDENCE["teams"].append(self.diagnostics())
         except (OSError, HcError, HcDown, RuntimeError, ValueError) as error:
@@ -2707,7 +2721,27 @@ def case_1(run, role, harness, adapter_class):
 
 
 def case_7(run, role, harness, adapter_class):
-    """suffix and multiline in one team; two-senders, pending-restart, upgrade and held-quiet in their own (§3.7)."""
+    """suffix and multiline in one team; two-senders, pending-restart, upgrade and held-quiet in their own (§3.7).
+    Each runs whatever happened to the ones before it."""
+    for names, trial in ((("suffix", "multiline"), _case_7_main), (("two-senders",), _case_7_two_senders),
+                         (("pending-restart",), _case_7_pending_restart), (("upgrade",), _case_7_upgrade),
+                         (("held-quiet",), _case_7_held_quiet)):
+        first_row = len(run.data["rows"])
+        try:
+            trial(run, role, harness, adapter_class)
+        except NotRun as why:
+            reason = str(why)
+        except (RuntimeError, HcError, HcDown, OSError, subprocess.SubprocessError) as error:
+            reason = f"the driver stopped: {type(error).__name__}: {error}"
+        else:
+            continue
+        for name in names:                               # only the rows this trial did not record
+            if not any(r["case"] == 7 and r["subcase"] == name and r["role"] == role and r["harness"] == harness
+                       for r in run.data["rows"][first_row:]):
+                run.row(7, name, role, harness, "not_run", f"case 7 {name}", reason=reason)
+
+
+def _case_7_main(run, role, harness, adapter_class):
     team, peer = _team_for(adapter_class, role, harness)
     with team:
         if not _up(team, run, 7, role, harness, ["suffix", "multiline"]):
@@ -2749,13 +2783,6 @@ def case_7(run, role, harness, adapter_class):
                 "a long multi-line message: the markers at its beginning, middle and end acted on in order",
                 proof={"bytes": len(text.encode()), "order": [marks.index(m) for m in order]},
                 reason=None if ok else "a marker was missing or out of order")
-    for name, trial in (("two-senders", _case_7_two_senders), ("pending-restart", _case_7_pending_restart),
-                        ("upgrade", _case_7_upgrade), ("held-quiet", _case_7_held_quiet)):
-        try:                                             # each in its own team: one that cannot run stops only itself
-            trial(run, role, harness, adapter_class)
-        except NotRun as why:
-            run.row(7, name, role, harness, "not_run", f"case 7 {name}", reason=str(why))
-
 
 def _case_7_two_senders(run, role, harness, adapter_class):
     """two-senders (phase_8.md §3.7): two senders say to one recipient at the same moment; both IDs are acted on
@@ -3291,7 +3318,7 @@ def _case_8_quit_during_hold(run, role, harness, adapter_class):
         claimed = team.until(lambda: found and _outcome(log, found, "operator") == ("sending", None), 60)
         start = time.monotonic()
         if team.sink is not None:                        # a real harness: its exit starts cat into a fresh file
-            team.adapter.quit_keys_only(team.qa, team.operator)
+            team.adapter.quit_keys_only(team.qa, team.operator, stop=team.sink.exists)
             exited = team.until(lambda: team.sink.exists(), 60)
         else:                                            # the fake's loop reads a line and runs nothing
             team.adapter.quit(team.qa, team.operator)
@@ -3307,10 +3334,12 @@ def _case_8_quit_during_hold(run, role, harness, adapter_class):
         at_exit = sink().count(tok)                      # what was already there when the harness had gone
         time.sleep(75)                                   # past draft_wait: the hold has ended either way
         after = sink().count(tok)
+        recorder_alive = team.sink is None or team.get(team.operator)["state"] == "live"   # cat still reading
         final = _outcome(log, found, "operator") if found else None
         missing = ("the send was not claimed and held" if not claimed else "the harness was not seen to exit"
                    if not exited else "the send was no longer held when the harness had exited"
-                   if (held_at_exit or ("",))[0] != "sending" else None)
+                   if (held_at_exit or ("",))[0] != "sending" else "the sink stopped reading before the hold ended"
+                   if not recorder_alive else None)
         reached = after > at_exit
         observed = None if missing else (
             f"the harness exited after {quit_s} s with the send held; afterwards the token"
@@ -3319,6 +3348,7 @@ def _case_8_quit_during_hold(run, role, harness, adapter_class):
                 "what reaches the pane after a quit during a held send", observed=observed,
                 proof={"id": int(found.group(1)) if found else None, "claimed": bool(claimed), "quit_s": quit_s,
                        "held_at_exit": held_at_exit, "token_count_at_exit": at_exit, "token_count_after": after,
+                       "recorder_alive": recorder_alive,
                        "reached_after_exit": reached if not missing else None, "final": final,
                        "peer": peer}, reason=missing)
 
@@ -3824,14 +3854,14 @@ def _upgrade(team, peer):
     module = sys.modules["factory_under_test"]
     claimed_under = {}
 
-    def watch_claim():                                           # which image claimed the queued message
+    def watch_claim():                    # the image whose beat stands when the queued claim is first seen
         deadline = time.monotonic() + 300
         while time.monotonic() < deadline and "version" not in claimed_under and queued:
             outcome = _outcome(log, queued, "operator")[0]
             if outcome != "queued":
                 beat = module.read_beat(log.state)
                 claimed_under.update(version=beat[1] if beat else None, seen_as=outcome)
-            time.sleep(0.05)
+            time.sleep(0.02)
     watcher = threading.Thread(target=watch_claim, daemon=True)
     watcher.start()
     view.keys("enter")                                           # the owner sends the draft: the send finishes
@@ -3845,6 +3875,10 @@ def _upgrade(team, peer):
     acted = team.until(lambda: second.exists() and tok2 in second.read_text(), 300)
     time.sleep(10)
     watcher.join(timeout=5)
+    screen = keeper_screen()
+    # a failed exec says so and keeps serving with the old image: its later claim must not count as the new one
+    exec_failed = "keepercouldnotrestartitself" in screen
+    restart_seen = "keeperrestarting:newFactoryversion" in screen
     keepers = [r["address"] for r in team.qa.rpc("terminal.list", {"all": False})["terminals"]
                if (r.get("labels") or {}).get("factory.kind") == "keeper"]
     first_outcome = log.read_box()[1].outcome(held, "operator") if held else {}
@@ -3855,12 +3889,13 @@ def _upgrade(team, peer):
              "old_send_finished": bool(finished), "queued_id": int(queued.group(1)) if queued else None,
              "queued_while_draining": queued_while_draining, "beat_version": beat[1] if beat else None,
              "new_image_running": bool(reexeced), "queued_claimed_under": claimed_under.get("version"),
+             "restart_seen": restart_seen, "exec_failed": exec_failed,
              "queued_final": _outcome(log, queued, "operator") if queued else None,
              "new_message_count": second.read_text().split().count(tok2) if second.exists() else 0,
              "draft_exact": draft_receipt.exists() and draft_receipt.read_text() == literal + "\n", "peer": peer}
     ok = (old != new and keepers == [keeper] and bool(held) and bool(draining) and still_held and bool(finished)
           and first_outcome.get("o") == "delivered" and queued_while_draining and bool(reexeced) and bool(acted)
-          and claimed_under.get("version") == new
+          and claimed_under.get("version") == new and restart_seen and not exec_failed
           and proof["new_message_count"] == 1 and (proof["queued_final"] or ("",))[0] == "delivered")
     return ok, proof
 
@@ -4181,9 +4216,15 @@ CASE_FUNCTIONS = {1: case_1, 2: case_2, 3: case_3, 4: case_4, 5: case_5, 6: case
 
 
 def _file_evidence(run, first_row):
-    """Attach the case's team diagnostics to each of its rows (bounded; for a team per trial, in order)."""
+    """Attach the case's team diagnostics to each of its rows (bounded; for a team per trial, in order). A settings
+    file agy changed during the case withholds its passes: the stamp cannot tell which process wrote it."""
+    touched = sorted(set(EVIDENCE.get("settings_changed") or []))
     for row in run.data["rows"][first_row:]:
         row["diagnostics"] = EVIDENCE["teams"]
+        if touched and row["status"] == "pass":
+            row.update(status="not_run", reason=_bounded(f"a settings file changed during the case: {touched}"))
+        if touched:
+            row["settings_changed"] = touched
 
 
 def _tool_version(executable):
@@ -4225,7 +4266,7 @@ def qualify(target, role=None, cases=None, json_path=None, fixture=False):
     EVIDENCE["rodeo_tabs"] = None                       # probed once, by the first case that uses rodeo
     if target == "cross":
         for name in CROSS_CASES:
-            EVIDENCE.update(teams=[], tokens=[])
+            EVIDENCE.update(teams=[], tokens=[], settings_changed=[])
             first_row = len(run.data["rows"])
             function = CROSS_FUNCTIONS.get(name)
             try:
@@ -4260,7 +4301,7 @@ def qualify(target, role=None, cases=None, json_path=None, fixture=False):
             for name, measured in subcases(case, role_):
                 run.row(case, name, role_, harness, "not_run", f"case {case} {name}", reason="not built yet")
         else:
-            EVIDENCE.update(teams=[], tokens=[])
+            EVIDENCE.update(teams=[], tokens=[], settings_changed=[])
             first_row = len(run.data["rows"])
             try:
                 function(run, role_, harness, adapter_class)
@@ -4340,20 +4381,27 @@ def report(paths, out):
     trust entries already listed stay listed (a partial import must not drop one the owner still has to remove)."""
     runs, chosen, trust, older = [], {}, set(), {}
     paths = [*paths, *sorted(str(p) for p in (ROOT / "docs" / "qualification" / "imported").glob("*.json"))]
+    loaded, snapshots = [], {}
     for path in dict.fromkeys(paths):
         data = json.loads(pathlib.Path(path).read_text())
         if not isinstance(data, dict) or data.get("mode") != "real" or "rows" not in data:
             continue                                  # a check's results, or a fixture run
-        if not data.get("run_id") or data["run_id"] not in {r.get("run_id") for r in runs}:
-            runs.append(data)                         # checkpoints of one run count once; their rows merge (§1)
-        rank = (data.get("utc") or "", _commit_rank(data.get("source_head")))   # newest attempt by UTC (§1)
-        for entry in data.get("trust_entries", []):
+        for entry in data.get("trust_entries", []):  # every snapshot's cleanup entries count
             trust.add((entry["harness"], entry["file"], entry["directory"]))
+        if not data.get("run_id"):
+            loaded.append(data)
+            continue
+        best = snapshots.get(data["run_id"])          # checkpoints are cumulative: keep the most complete one
+        if best is None or (len(data["rows"]), data.get("utc") or "") > (len(best["rows"]), best.get("utc") or ""):
+            snapshots[data["run_id"]] = data
+    for data in [*loaded, *snapshots.values()]:
+        runs.append(data)
+        rank = (data.get("utc") or "", _commit_rank(data.get("source_head")))   # newest attempt by UTC (§1)
         for row in data["rows"]:
             key = (row["role"], row["harness"], row["case"], row["subcase"])
-            same_run = key in chosen and data.get("run_id") and chosen[key][2].get("run_id") == data.get("run_id")
+            same_run = key in chosen and chosen[key][2] is data     # a repeated --case: its last row stands
             if key not in chosen or rank >= chosen[key][0]:
-                if key in chosen and not same_run:          # an earlier checkpoint of this run is not superseded
+                if key in chosen and not same_run:
                     older.setdefault(key, []).append(chosen[key])
                 chosen[key] = (rank, row, data)
             elif not same_run:

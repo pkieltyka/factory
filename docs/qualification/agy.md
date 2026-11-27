@@ -2,7 +2,7 @@
 
 **Status: not qualified yet.** agy is covered as **member only** this phase.
 
-- **Tested:** agy 1.5.18, model gemini-4-neon, on hc 0.1.20 and rodeo 0.2.1, Linux, 2026-11-27. The operator is Codex. Runs were in a bwrap HOME overlay (@lead-dev-3).
+- **Tested:** agy 1.5.18, model gemini-4-neon, on hc 0.1.20 and rodeo 0.2.1, Linux, 2026-11-27. The operator is Codex. Runs were in a bwrap HOME overlay (@lead-dev-3). Later runs use the real HOME (@operator's decision): a sign-in token refreshed inside a discarded overlay would be lost and could leave the owner's real login revoked. Claude Code and Codex trust entries are listed, and agy is trusted only through its session-only --settings, with its settings files checked before and after (size and mtime only).
 - **Trust dialog:** never accepted by hand (@operator).
   - At f4e5ea1, Factory left the dialog to the owner, so case 1's dialog row passes and cases 2–10 are not_run: up cannot finish past it.
   - The isolated LC-7 then showed that `trustedWorkspaces` in agy's session-only `--settings` avoids the dialog and writes no trust list (hc-checks.md).
