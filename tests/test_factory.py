@@ -7045,6 +7045,14 @@ class QualifyJudgeTests(unittest.TestCase):
         self.assertEqual(live.tool_calls("\n".join(json.dumps(x) for x in omp[:2])), [(status, None)])   # not yet
         other = {**omp[2], "content": omp[2]["content"].replace(status, "python3 /qa/other.py")}
         self.assertEqual(live.tool_calls("\n".join(json.dumps(x) for x in [*omp[:2], other])), [(status, None)])
+        waited = {"type": "message", "message": {"role": "toolResult", "toolCallId": "w1", "toolName": "wait",
+                  "isError": False, "content": [{"type": "text", "text": (
+                      "## Completed (1)\n\n### bg_1 [bash] — completed\nIntent: Reading operator inbox\n"
+                      f"Label: {status}\nDelivery: handed over by this snapshot\n```\n@lead-dev idle\n\n```")}]}}
+        self.assertEqual(live.tool_calls("\n".join(json.dumps(x) for x in [*omp[:2], waited])),
+                         [(status, "@lead-dev idle\n\n")])                    # omp's wait tool hands it over
+        wrong = {**waited, "message": {**waited["message"], "toolName": "read"}}
+        self.assertEqual(live.tool_calls("\n".join(json.dumps(x) for x in [*omp[:2], wrong])), [(status, None)])
         quote = {"type": "message", "message": {"role": "assistant", "content": [{"type": "text", "text":
                  omp[2]["content"]}]}}                     # the model quoting the notice is not the notice
         self.assertEqual(live.tool_calls("\n".join(json.dumps(x) for x in [*omp[:2], quote])), [(status, None)])

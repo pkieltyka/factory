@@ -242,6 +242,8 @@ def installed_needles(installed):
     return sorted("".join(n.split()) for n in needles)
 
 
+OMP_WAIT_DONE = re.compile(r"### (bg_\d+) \[bash\] \S+ completed\n(?:Intent: [^\n]*\n)?Label: ([^\n]*)\n"
+                           r"(?:[^\n]*\n)*?```\n(.*?)```", re.S)
 OMP_BACKGROUNDED = re.compile(r"Backgrounded as job (bg_\d+)")
 OMP_JOB_DONE = re.compile(r"(bg_\d+) \((.*?)\) has completed\.\nResume your work using the result below\.\n(.*)", re.S)
 CODE_EXEC = re.compile(r'exec_command\(\{\s*cmd\s*:\s*("(?:[^"\\]|\\.)*")')
@@ -300,6 +302,12 @@ def tool_calls(text, pairing=False):
             if node.get("role") == "toolResult" and node.get("toolCallId"):
                 text = "".join(c.get("text", "") for c in node.get("content") or [] if isinstance(c, dict))
                 results[node["toolCallId"]] = None if node.get("isError") is True else text
+                if node.get("toolName") == "wait" and node.get("isError") is not True:
+                    # omp's own wait tool hands over finished jobs: "### bg_N [bash] — completed", the job's
+                    # command as Label, then its output in a fence
+                    for job, command, output in OMP_WAIT_DONE.findall(text):
+                        if job in jobs and calls.get(jobs[job]) == command:
+                            results[jobs.pop(job)] = output
                 job = OMP_BACKGROUNDED.search(text)
                 if job:                          # omp ran it as a job: its own result comes later, by job name
                     jobs[job.group(1)] = node["toolCallId"]
