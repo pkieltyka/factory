@@ -74,9 +74,9 @@ state  = <cache base>/factory-skill/<team>/<core.id[:8]>/   # mode 0700; cache b
 | (the state directory) | The team lock: `flock` on its no-follow descriptor for `log.jsonl`, `log.check`, `team.json` and `sessions.jsonl`; no lock file (message_log.md §Locking). It must be on a local filesystem; a failed lock names the path and the original error and suggests a local `XDG_CACHE_HOME` | — |
 | `log.jsonl` | Messages, commit records and outcomes | `say`, `up`, `brief`, `down`, keeper |
 | `log.check` | Checkpoint proving the log unchanged since the last validated append | every log writer |
-| `up.lock` | `flock` held by `up` and `down` for their whole run | — |
+| `up.lock` | `flock` held across `up`, `down` and `brief --send` | — |
 | `keeper.start` | `flock` serializing keeper starts | — |
-| `sessions.jsonl` | Saved native sessions, append-only, one entry per line, under the team lock | `say` (members), `up` |
+| `sessions.jsonl` | Saved native sessions, append-only, one entry per line, under the team lock | `say` (members), `up`, `down`, `brief --send` |
 | `keeper.lock` | `flock` held for the keeper's lifetime | keeper |
 | `keeper.beat` | One line `<pid> <version> <terminal>`; its mtime is the heartbeat | keeper |
 | `<member>.md`, `<member>.settings.json` | Standing instructions and Claude Code settings, rewritten at every launch | `up` |
@@ -95,9 +95,12 @@ All files are created with v1's `private_open` (`O_NOFOLLOW`, mode 0600, regular
 | `factory.dir` | every team terminal | absolute state directory |
 | `factory.last` | members | last state word the keeper observed (`working`, `idle`, …); shown by `status` and exit notes, nothing depends on it |
 | `factory.down` | members | `1`, set by `down` just before it ends the terminal |
+| `factory.launch` | members | JSON launch fact with `how`, `value`, `fresh`, `harness`, and `model`; cleared once its session entries are saved |
 | `factory.version` | keeper | the keeper's `VERSION` |
 | `name` | members, keeper, operator | `@<member>` or `keeper` (rodeo's sidebar name) |
-| `herdr.space`, `herdr.tab`, `herdr.seen` | members, keeper | layout ids and `herdr.seen=0`, written once, only after the pane is in the layout doc; `herdr.seen` is never written again |
+| `herdr.space`, `herdr.tab` | members, keeper | the space and tab that hold the pane, written after placement |
+
+Rodeo owns `herdr.seen`.
 
 Factory never sets an `hc` terminal name (§6.1) and always addresses a terminal by its ID after reading its labels. Whether a member is ready, and what the operator has been told about it, are not labels: they are read from the log ([message_log.md](components/message_log.md), "Derived facts").
 
@@ -107,11 +110,13 @@ Factory never sets an `hc` terminal name (§6.1) and always addresses a terminal
 {"v": 1, "root": "/abs/checkout", "team": "factory-ab12cd34", "core": "2b0e89bc…",
  "up": true,
  "stopped": ["t4"],
- "layout": {"space": "sp…", "tab": "tb…", "made_space": false},
+ "layout": {"space": "sp…", "tab": "tb…", "made_space": false, "keeper": "t7"},
  "ready_clear": 0}
 ```
 
 `up` is true from the first `up` that passes preflight until `down` stops the last member. `down` records intentionally stopped terminals in `stopped` before removing their records or dropping queued messages. The keeper checks that list under the same lock it uses to settle a definite refusal. A missing or unreadable file withholds settlement until metadata is available again. `ready_clear` is the highest message id at the last ready check that found no work. `up` can rebuild missing or unreadable metadata from the checkout and its terminals.
+
+`layout.keeper` names the terminal in the keeper pane. If the keeper is replaced headless, `up` reuses the recorded block and the last `down` removes it.
 
 ### 3.4 Member and operator state
 

@@ -311,6 +311,9 @@ class View:
     def terminal(self, name: str) -> dict | None:
         return self._live.get(name)
 
+    def member_terminals(self) -> list[dict]:
+        return [record for record in self._live.values() if record["labels"].get("factory.kind") == "member"]
+
     def finished(self, name: str) -> dict | None:
         return None if name in self._live else self._finished.get(name)
 
@@ -2199,6 +2202,283 @@ def ensure_keeper(cfg, state, hc, view, force=False):
         return _wait_for_beat(log.state, hc, terminal)
 
 
+# ================================================================ layout (launch_layout.md §5)
+
+def new_id(prefix):
+    return prefix + uuid.uuid4().hex
+
+
+def _layout_tabs(doc):
+    spaces = doc["spaces"]
+    if not isinstance(spaces, list):
+        raise TypeError("layout spaces must be a list")
+    for space in spaces:
+        if not isinstance(space["id"], str) or not isinstance(space["tabs"], list):
+            raise TypeError("invalid layout space")
+        for tab in space["tabs"]:
+            if not isinstance(tab["id"], str) or tab["root"]["type"] == "block":
+                raise TypeError("invalid layout tab")
+            yield space, tab
+
+
+def _pane_blocks(node):
+    if not isinstance(node["id"], str) or not isinstance(node["type"], str):
+        raise TypeError("invalid layout node")
+    if node["type"] == "block":
+        content = node["content"]
+        if not isinstance(content, dict) or ("terminal" in content and not isinstance(content["terminal"], str)):
+            raise TypeError("invalid pane content")
+        yield node
+        return
+    children = node["children"]
+    if not isinstance(children, list):
+        raise TypeError("layout children must be a list")
+    for child in children:
+        yield from _pane_blocks(child)
+
+
+def blocks(doc):
+    """Map terminal IDs to their blocks anywhere in the layout."""
+    return {terminal: block for _, tab in _layout_tabs(doc) for block in _pane_blocks(tab["root"])
+            if (terminal := block["content"].get("terminal"))}
+
+
+def where(doc, terminal):
+    """The actual space and tab containing terminal, or None."""
+    if terminal is None:
+        return None
+    for space, tab in _layout_tabs(doc):
+        if any(block["content"].get("terminal") == terminal for block in _pane_blocks(tab["root"])):
+            return space["id"], tab["id"]
+    return None
+
+
+def _tab_terminals(tab):
+    return {term for block in _pane_blocks(tab["root"]) if (term := block["content"].get("terminal"))}
+
+
+def resolve_tab(doc, layout, view, me):
+    """Find the existing team tab before proposing a new one in the operator's space."""
+    me_labels = me["labels"]
+    operator_tab = me_labels.get("herdr.tab")
+    members = view.member_terminals()
+    if view.keeper:
+        members.append(view.keeper)
+    chosen, most = None, 0
+    for space, tab in _layout_tabs(doc):
+        ident = tab["id"]
+        if ident == layout.get("tab"):
+            chosen = space, tab
+            break
+        present = _tab_terminals(tab)
+        if ident == operator_tab or me["address"] in present:
+            continue
+        count = sum(record["address"] in present or record["labels"].get("herdr.tab") == ident for record in members)
+        if count > most:
+            chosen, most = (space, tab), count
+    if chosen:
+        space, tab = chosen
+        made = space["id"] == layout.get("space") and layout.get("made_space", False)
+        return space["id"], tab["id"], made
+    spaces = {space["id"]: space for space in doc["spaces"]}
+    for ident in (me_labels.get("herdr.space"), layout.get("space")):
+        if ident in spaces:
+            return ident, new_id("tb"), ident == layout.get("space") and layout.get("made_space", False)
+    return new_id("sp"), new_id("tb"), True
+
+
+def add_panes(doc, space, tab, panes, keeper=None, *, folder=None):
+    have = blocks(doc)
+    area = next((area for area in doc["spaces"] if area["id"] == space), None)
+    target = next((node for node in area["tabs"] if node["id"] == tab), None) if area else None
+    for terminal, title in panes:
+        if terminal in have:
+            continue
+        block = {"id": new_id("p"), "type": "block", "title": title, "content": {"terminal": terminal}}
+        if target is None:
+            if area is None:
+                if folder is None:
+                    raise KeyError(f"no layout space {space}")
+                area = {"id": space, "name": "", "folder": str(folder), "tabs": []}
+                doc["spaces"].append(area)
+            target = {"id": tab, "name": "team", "root": {"id": new_id("s"), "type": "row", "children": []}}
+            area["tabs"].append(target)
+        root = target["root"]
+        if root["type"] != "row":
+            root = target["root"] = {"id": new_id("s"), "type": "row", "children": [root]}
+        children = root["children"]
+        columns = [i for i, child in enumerate(children)
+                   if keeper is None or child["type"] != "block" or child["content"].get("terminal") != keeper]
+        if terminal == keeper:
+            block["size"] = {"weight": 0.4}
+            children.append(block)
+        elif len(columns) < 3:
+            children.insert(columns[-1] + 1 if columns else 0, block)
+        else:
+            index = min(columns, key=lambda i: sum(1 for _ in _pane_blocks(children[i])))
+            child = children[index]
+            if child["type"] == "column":
+                child["children"].append(block)
+            else:
+                children[index] = {"id": new_id("s"), "type": "column", "children": [child, block]}
+        have[terminal] = block
+
+
+def _remove_blocks(node, terminals, *, root=False):
+    """Return the remaining node and whether a block was removed below it."""
+    if node["type"] == "block":
+        return (None, True) if node["content"].get("terminal") in terminals else (node, False)
+    children, changed = [], False
+    for child in node["children"]:
+        kept, removed = _remove_blocks(child, terminals)
+        if kept is not None:
+            children.append(kept)
+        changed |= removed
+    if changed:
+        if not root and len(children) < 2:
+            return (children[0] if children else None), True
+        node["children"] = children
+    return node, changed
+
+
+def remove_panes(doc, layout, terminals):
+    terminals = {term for term in terminals if term is not None}
+    for space, tab in list(_layout_tabs(doc)):
+        root, _ = _remove_blocks(tab["root"], terminals, root=True)
+        if tab["id"] != layout.get("tab") or any(_pane_blocks(root)):
+            continue
+        space["tabs"].remove(tab)
+        if space["id"] == layout.get("space") and layout.get("made_space") and not space["tabs"]:
+            doc["spaces"].remove(space)
+
+
+def swap_terminal(doc, old, new):
+    have = blocks(doc)
+    if old not in have or new in have:
+        return False
+    have[old]["content"]["terminal"] = new
+    return True
+
+
+def edit_layout(hc, change):
+    """Apply a layout edit by compare-and-set, recomputing it after each conflict."""
+    for attempt in range(1, CAS_TRIES + 1):
+        try:
+            value, version = hc.doc_get()
+            doc = {"spaces": []} if value is None else value
+            blocks(doc)  # validate the document before the callback can edit it
+            if not change(doc):
+                return None
+        except (KeyError, TypeError, AttributeError):
+            return "the herdr-app doc has an unexpected shape"
+        except (HcDown, HcError) as error:
+            return str(error)
+        try:
+            hc.doc_set(doc, version)
+            return None
+        except HcDown as error:
+            return str(error)
+        except HcError as error:
+            if error.kind != "conflict":
+                return str(error)
+        if attempt < CAS_TRIES:
+            time.sleep(0.05 * attempt)
+    return "another client kept changing it"
+
+
+def _place_team(cfg, state, hc, team, me, keeper, replacements):
+    """Place headless team terminals and reuse blocks for replacements, after a successful CAS."""
+    try:
+        view = team_view(hc, team)
+        layout = read_team(state).get("layout", {})
+    except (Problem, HcDown, HcError) as error:
+        print(f"layout not updated ({error}): run factory.py up again to place the team", file=sys.stderr)
+        return
+    panes = {record["address"]: f"@{name}" for name in cfg.members if (record := view.terminal(name))}
+    if keeper:
+        panes[keeper] = "keeper"
+    if not isinstance(layout, dict):
+        layout = {}
+    saved_layout, placed = None, {}
+
+    def change(doc):
+        nonlocal saved_layout, placed
+        saved_layout, placed = None, {}
+        swaps = dict(replacements)
+        if layout.get("keeper") and keeper:
+            swaps[layout["keeper"]] = keeper
+        changed = [new for old, new in swaps.items() if new in panes and swap_terminal(doc, old, new)]
+        space, tab, made = resolve_tab(doc, layout, view, me)
+        have = blocks(doc)
+        adds = [(terminal, title) for terminal, title in panes.items() if terminal not in have]
+        if adds:
+            add_panes(doc, space, tab, adds, keeper, folder=cfg.root)
+            changed.extend(terminal for terminal, _ in adds)
+        if any(area["id"] == space and target["id"] == tab for area, target in _layout_tabs(doc)):
+            saved_layout = {"space": space, "tab": tab, "made_space": made}
+            if keeper and where(doc, keeper):
+                saved_layout["keeper"] = keeper
+        placed = {terminal: where(doc, terminal) for terminal in changed}
+        return bool(changed)
+
+    reason = edit_layout(hc, change)
+    if reason is not None:
+        print(f"layout not updated ({reason}): run factory.py up again to place the team", file=sys.stderr)
+        return
+    if saved_layout is not None and saved_layout != layout:
+        try:
+            update_team(state, layout=saved_layout)
+        except (Problem, OSError, LogDamage, ValueError) as error:
+            print(f"layout placed, but team.json was not updated: {error}", file=sys.stderr)
+    for terminal, (space, tab) in placed.items():
+        try:
+            hc.label(terminal, {"herdr.space": space, "herdr.tab": tab})
+        except (HcDown, HcError) as error:
+            print(f"warning: could not label the placed terminal {terminal}: {error}", file=sys.stderr)
+
+
+def _unplace_team(state, hc, recorded, last, keeper):
+    names = ", ".join(f"@{name}" for name in dict(recorded))
+    close = f"close the panes of {names} in your client" if names else "close the keeper pane in your client"
+    try:
+        layout = read_team(state).get("layout", {})
+    except (Problem, LogDamage, OSError) as error:
+        print(f"layout not updated ({error}): {close}", file=sys.stderr)
+        return
+    if not isinstance(layout, dict):
+        layout = {}
+    terminals = {term for _, term in recorded}
+    if last:
+        terminals.update((keeper, layout.get("keeper")))
+    saved_layout = layout
+
+    def change(doc):
+        nonlocal saved_layout
+        before = blocks(doc)
+        tabs = list(_layout_tabs(doc))
+        remove_panes(doc, layout, terminals)
+        saved_layout = dict(layout)
+        if saved_layout.get("keeper") not in blocks(doc):
+            saved_layout.pop("keeper", None)
+        after = list(_layout_tabs(doc))
+        if not any(tab["id"] == layout.get("tab") for _, tab in after):
+            saved_layout.pop("tab", None)
+        if not any(space["id"] == layout.get("space") for space in doc["spaces"]):
+            if "space" in saved_layout:
+                saved_layout.pop("space")
+                saved_layout["made_space"] = False
+        return bool(terminals.intersection(before) or len(after) != len(tabs))
+
+    reason = edit_layout(hc, change)
+    if reason is not None:
+        print(f"layout not updated ({reason}): {close}", file=sys.stderr)
+    elif saved_layout != layout:
+        try:
+            update_team(state, layout=saved_layout)
+        except (Problem, OSError, LogDamage, ValueError) as error:
+            print(f"layout updated, but team.json was not updated: {error}", file=sys.stderr)
+
+
 def wait_outcomes(log, ident, recipients, offset, timeout=SAY_WAIT):
     """Follow only this message from its commit, without rereading the log prefix."""
     box = Box.for_message(log.path, ident, recipients, offset)
@@ -2919,8 +3199,15 @@ def start_member(cfg, state, hc, m, operator, sess):
         for fd in opened:
             os.close(fd)
     argv, env = launch_argv(m, prompt_file, sess)
+    sess = sess or {"resume": False}
     labels = {"factory.team": team_key(cfg.root), "factory.kind": "member", "factory.member": name,
               "factory.dir": str(state), "name": "@" + name}
+    fact = _launch_fact(m, state, sess)
+    if fact is not None:
+        how, value = fact
+        labels["factory.launch"] = json.dumps({"how": how, "value": value, "fresh": not sess["resume"],
+                                               "harness": harness, "model": m.get("model")},
+                                              separators=(",", ":"))
     try:
         return hc.run([exe, *argv], cwd=m["dir"], env={"PATH": os.environ.get("PATH", ""), **env}, labels=labels)
     except (HcError, HcDown) as error:
@@ -3284,8 +3571,7 @@ def mark_operator(cfg, hc, team, me, view, state):
 
 
 def lifecycle_lock(state):
-    """<state>/up.lock, held for a whole up or down (no other team lock is held meanwhile): its descriptor.
-    Exits 2 when another up or down holds it."""
+    """Hold <state>/up.lock across up, down or a manual brief, including launch fact settlement. Returns its fd."""
     try:
         directory = open_log(state).open_dir(create=True)
     except (OSError, Problem) as error:
@@ -3298,7 +3584,7 @@ def lifecycle_lock(state):
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         os.close(fd)
-        stop_with("another up or down is running for this team")
+        stop_with("another up, down or brief --send is running for this team")
     return fd
 
 
@@ -3318,12 +3604,80 @@ def interrupted_line(name, record, box):
 
 
 def _launch_fact(m, state, sess):
-    """(how, value) for launch_entry once m's brief is delivered, or None for a resumed launch."""
-    if sess["assigned"]:
+    """The fact to settle for this launch, or None when it resumed by ID."""
+    if sess.get("assigned"):
         return "id", sess["assigned"]
     if TABLE[m["harness"]].get("session") == "dir":
         return "dir", str(session_folder(state, m))
     return None if sess["resume"] else ("new", None)
+
+
+def _valid_launch_fact(fact):
+    if not isinstance(fact, dict) or "model" not in fact or "value" not in fact \
+            or type(fact.get("fresh")) is not bool \
+            or not isinstance(fact.get("harness"), str) \
+            or not (fact.get("model") is None or isinstance(fact["model"], str)):
+        return False
+    how, value = fact.get("how"), fact.get("value")
+    if how == "new":
+        return value is None and fact["fresh"]
+    if not isinstance(value, str):
+        return False
+    if how == "dir":
+        return os.path.isabs(value)
+    return how == "id" and bool(SESSION_VALUE.fullmatch(value))
+
+
+def settle_launches(cfg, state, hc, view, box):
+    """Save the launch facts owed by live or finished members. Return unsaved members and warning lines."""
+    failed, warnings = {}, []
+    briefed = box.briefed()
+    for name in cfg.members:
+        record = view.terminal(name) or view.finished(name)
+        raw = record["labels"].get("factory.launch") if record else None
+        if not raw:
+            continue
+        try:
+            fact = json.loads(raw, parse_constant=_reject_constant)
+        except (TypeError, ValueError):
+            fact = None
+        if not _valid_launch_fact(fact):
+            warnings.append(f"@{name}: malformed factory.launch label on {record['address']}; left in place")
+            continue
+        member = {"name": name, "harness": fact["harness"], "model": fact["model"]}
+        address, how = record["address"], fact["how"]
+        try:
+            if fact["fresh"]:
+                launch_entry(state, member, address, "new", None)
+            if how != "new":
+                if address not in briefed:
+                    continue
+                launch_entry(state, member, address, how, fact["value"])
+        except (OSError, LogDamage, Problem) as error:
+            failed[name] = str(error)
+            continue
+        try:
+            hc.label(address, {"factory.launch": ""})
+        except (HcDown, HcError) as error:
+            warnings.append(f"@{name}: its conversation was saved, but the launch label could not be cleared: {error}")
+    return failed, warnings
+
+
+def _settle_current_launches(cfg, state, hc, team, log):
+    try:
+        view, box = team_view(hc, team), log.read_box()[1]
+    except (HcDown, HcError, LogDamage, OSError) as error:
+        print(f"warning: could not check for unsaved conversations: {error}", file=sys.stderr)
+        return {}
+    failed, warnings = settle_launches(cfg, state, hc, view, box)
+    for warning in warnings:
+        print(f"warning: {warning}", file=sys.stderr)
+    return failed
+
+
+def _warn_unsaved_launches(failed):
+    for name, why in failed.items():
+        print(f"warning: @{name}: its conversation could not be saved yet: {why}", file=sys.stderr)
 
 
 def _brief_lines(name, ident, outcome):
@@ -3337,6 +3691,13 @@ def _brief_lines(name, ident, outcome):
                 " status."], False
     return [f"@{name}: brief {ident} {o} ({outcome.get('why')}): check @{name}'s pane, then run"
             f" factory.py brief --send {name}"], False
+
+
+def _pending_brief_line(box, name):
+    for msg, _ in reversed(box.pending(name)):
+        if msg["kind"] == "brief":
+            return f"@{name}: first brief {msg['id']} is still {outcome_word(box.outcome(msg['id'], name))}"
+    return None
 
 
 def _remove_record(hc, record):
@@ -3409,6 +3770,13 @@ def _up(cfg, args, hc, team, operator, state, names, me_id):
     mark_operator(cfg, hc, team, me, view, state)
     facts = {"v": 1, "root": str(cfg.root), "team": team, "core": hc.core, "up": True}
     update_team(state, reset=current is None, **facts)
+    unsaved = _settle_current_launches(cfg, state, hc, team, log)
+    failed, fixes = {}, {}                           # per-member launch failures and their recovery commands
+    for name, why in unsaved.items():
+        if name in targets:
+            failed[name] = f"its conversation could not be saved ({why}); not restarted"
+        else:
+            _warn_unsaved_launches({name: why})
     was_live = [n for n in cfg.members if view.terminal(n) is not None and view.state(n) != "gone"]
     for m in plans:
         old = view.terminal(m["name"]) or view.finished(m["name"])
@@ -3416,15 +3784,25 @@ def _up(cfg, args, hc, team, operator, state, names, me_id):
             print(interrupted_line(m["name"], old, box))
     if not was_live:
         print("\n".join(pending_lines(state, operator)))
+        try:
+            rows, warnings = log.leftovers()
+        except (LogDamage, OSError) as error:
+            print(f"warning: leftover message files could not be checked: {error}", file=sys.stderr)
+        else:
+            for line in format_leftovers(rows):
+                print(line)
+            for warning in warnings:
+                print(f"warning: {warning}", file=sys.stderr)
     try:
-        ensure_keeper(cfg, state, hc, view, force=True)   # also when every member runs: delivery comes back
+        keeper = ensure_keeper(cfg, state, hc, view, force=True)   # also when every member runs: delivery comes back
     except (Problem, HcDown, HcError, OSError, LogDamage) as error:
         stop_with(f"the keeper could not start: {error}. No member was started.", 3)
     if not plans:
+        _place_team(cfg, state, hc, team, me, keeper, {})
         return
-    failed, fixes = {}, {}                           # fixes: a member's fix when it is neither up nor brief --send
+    replacements = {}
     for m in plans:
-        if m["branch"]:
+        if m["branch"] and m["name"] not in failed:
             err = ensure_worktree(cfg, m)
             if err:
                 failed[m["name"]] = err
@@ -3465,8 +3843,12 @@ def _up(cfg, args, hc, team, operator, state, names, me_id):
             sess["notice"] = f"@{m['name']} starts in a new conversation: none was recorded for it"
         if sess["notice"]:
             print(sess["notice"])
-        if start(m, sess) is not None and old is not None:
+        record = start(m, sess)
+        if record is not None and old is not None:
+            replacements[old["address"]] = record["address"]
             _remove_record(hc, old)                  # the new terminal exists before the old record goes
+
+    _place_team(cfg, state, hc, team, me, keeper, replacements)
 
     def ready_group(names_now):
         group = {n: (starts[n][2], TABLE[starts[n][0]["harness"]].get("dialogs", [])) for n in names_now}
@@ -3475,11 +3857,16 @@ def _up(cfg, args, hc, team, operator, state, names, me_id):
     ready = ready_group(list(starts))
     ended = ("exited", "was stopped", "ended")
     retry = [n for n, why in ready.items() if why and starts[n][1]["resume"] and why.startswith(ended)]
+    replacements = {}
     for n in retry:
         m, _, record = starts.pop(n)
         print(f"@{n}: its saved conversation could not be resumed ({ready.pop(n)}); starting fresh")
-        if start(m, session_plan(m, state, None, True)) is not None:
+        fresh = start(m, session_plan(m, state, None, True))
+        if fresh is not None:
+            replacements[record["address"]] = fresh["address"]
             _remove_record(hc, record)
+    if replacements:
+        _place_team(cfg, state, hc, team, me, keeper, replacements)
     ready.update(ready_group([n for n in retry if n in starts]))
     for n, why in ready.items():
         if why:
@@ -3488,7 +3875,7 @@ def _up(cfg, args, hc, team, operator, state, names, me_id):
     roster = [plan(cfg, n, state) for n in cfg.members]
     briefs = {}
     for n in [n for n in starts if ready.get(n) is None]:
-        m, sess, record = starts[n]
+        m, sess, _ = starts[n]
         ran_before = newest.get(n) is not None or view.terminal(n) is not None or view.finished(n) is not None
         closing = pickup_text if sess["resume"] else fresh_text if ran_before else ready_text
         try:
@@ -3509,7 +3896,7 @@ def _up(cfg, args, hc, team, operator, state, names, me_id):
         briefs[n] = (ident, offset)
     deadline = time.monotonic() + SAY_WAIT
     for n, (ident, offset) in briefs.items():
-        m, sess, record = starts[n]
+        _, _, record = starts[n]
         try:
             outcome = wait_outcomes(log, ident, [n], offset, max(0.0, deadline - time.monotonic()))[n]
         except (LogDamage, OSError) as error:
@@ -3523,15 +3910,9 @@ def _up(cfg, args, hc, team, operator, state, names, me_id):
         elif confirmed and outcome.get("term") != record["address"]:
             confirmed = False
             failed[n] = f"brief {ident} went to another terminal ({outcome.get('term')})"
-        if confirmed:
-            fact = _launch_fact(m, state, sess)
-            if fact:
-                try:
-                    launch_entry(state, m, record["address"], *fact)
-                except (OSError, LogDamage, Problem) as error:
-                    print(f"warning: @{n}'s session was not saved: {error}", file=sys.stderr)
-        elif not confirmed and n not in failed:
+        if not confirmed and n not in failed:
             failed[n] = f"brief {ident} was not confirmed"
+    _warn_unsaved_launches(_settle_current_launches(cfg, state, hc, team, log))
     joined = [starts[n][0] for n in briefs if n not in failed and starts[n][0]["name"] not in newest
               and view.terminal(n) is None and view.finished(n) is None]
     others = [n for n in was_live if n not in starts]
@@ -3611,7 +3992,20 @@ def _down(cfg, hc, team, state, names):
         print(f"sessions cannot be saved ({problem}): members left running")
         return 1
     log, code, stopped, recorded = open_log(state), 0, {}, []
+    try:
+        box = log.read_box()[1]
+    except (LogDamage, OSError) as error:
+        print(f"sessions cannot be saved ({error}): members left running")
+        return 1
+    unsaved, warnings = settle_launches(cfg, state, hc, view, box)
+    for warning in warnings:
+        print(f"warning: {warning}", file=sys.stderr)
     for name in names:
+        if name in unsaved:
+            kept = f"@{name} left running" if view.terminal(name) else f"@{name}'s record kept"
+            print(f"sessions cannot be saved ({unsaved[name]}): {kept}")
+            code = 1
+            continue
         current = view.terminal(name) or view.finished(name)
         earlier = [r for r in records if r["state"] == "finished" and r["labels"].get("factory.down")
                    and r["labels"].get("factory.kind") == "member" and r["labels"].get("factory.member") == name]
@@ -3646,11 +4040,15 @@ def _down(cfg, hc, team, state, names):
                           f" {name} again")
                     code = 1
     try:
-        after = team_view(hc, team)
+        after = hc.list(team)
     except (HcDown, HcError) as error:
         print(f"could not check whether any member still runs: {error}")
         return 1
-    if not any(after.terminal(n) or after.finished(n) for n in cfg.members):
+    last = not any(r["labels"].get("factory.kind") == "member" for r in after)
+    if recorded or last:
+        keeper = View(after).keeper if last else None
+        _unplace_team(state, hc, recorded, last, keeper["address"] if keeper else None)
+    if last:
         try:
             update_team(state, up=False)
         except (Problem, ValueError, OSError, LogDamage) as error:
@@ -3658,6 +4056,7 @@ def _down(cfg, hc, team, state, names):
             code = 1
         print("run factory.py up to bring members back")
     return code
+
 
 def cmd_status(args):
     hc = Hc()
@@ -3688,19 +4087,38 @@ def cmd_status(args):
         if view.state(name) == "gone":
             print(interrupted_line(name, view.terminal(name) or view.finished(name), box))
     print("\n".join(pending_lines(state, operator)))
+    keeper, keeper_error = None, None
     try:
         keeper = ensure_keeper(cfg, state, hc, view)
     except (Problem, HcDown, HcError, OSError, LogDamage) as error:
-        print(f"keeper: not running ({error})")
+        keeper_error = error
+    panes = None
+    with contextlib.suppress(HcDown, HcError, KeyError, TypeError, AttributeError):
+        doc, _ = hc.doc_get()
+        panes = {} if doc is None else blocks(doc)
+    if keeper_error is not None:
+        print(f"keeper: not running ({keeper_error})")
+    elif keeper is None:
+        print("keeper: not running")
     else:
-        beat = read_beat(state) if keeper else None
-        if keeper is None:
-            print("keeper: not running")
-        elif beat is None:
-            print(f"keeper: starting ({keeper}), no pane")
+        beat = read_beat(state)
+        pane_hint = ", no pane (run factory.py up)" if panes is not None and keeper not in panes else ""
+        if beat is None or beat[2] != keeper:
+            print(f"keeper: starting ({keeper}){pane_hint}")
         else:
             version = "" if beat[1] == VERSION else f", replacing itself (it runs {beat[1]})"
-            print(f"keeper: running, version {beat[1]}, last loop {int(beat[3])} s ago, no pane{version}")
+            print(f"keeper: running, version {beat[1]}, last loop {int(beat[3])} s ago{version}{pane_hint}")
+    live_members = {name: record["address"] for name in cfg.members if (record := view.terminal(name))}
+    if panes is not None:
+        headless = [f"@{name}" for name, term in live_members.items() if term not in panes]
+        if headless:
+            print(f"no pane: {', '.join(headless)} (run factory.py up)")
+    if box is not None:
+        briefed = box.briefed()
+        for name, term in live_members.items():
+            if term not in briefed and view.state(name) != "starting":
+                pending = _pending_brief_line(box, name)
+                print(pending or f"@{name} has no confirmed brief: run factory.py brief --send {name}")
     reachable = view.operator is not None and view.operator.get("status") is not None
     print("operator: reachable" if reachable else "operator: not reachable: run factory.py up in the operator's pane")
     for word, hint in (("blocked", "blocked: waiting on an approval or a question."),
@@ -3748,13 +4166,27 @@ def _brief_send(args, names):
     hc = Hc()
     try:
         cfg, state, me = resolve_team(args, hc)
-        view = team_view(hc, team_key(cfg.root))
     except HcDown as error:
         stop_with(f"hc is not reachable: {error}")
     except Problem as error:
         stop_with(f"{error.what}; {error.fix}")
+    if me is None or me["labels"].get("factory.kind") != "operator":
+        stop_with("run brief --send from the operator's pane")
+    lock = lifecycle_lock(state)
+    try:
+        return _brief_send_locked(cfg, state, hc, me, names)
+    finally:
+        os.close(lock)
+
+
+def _brief_send_locked(cfg, state, hc, me, names):
+    team = team_key(cfg.root)
+    try:
+        view = team_view(hc, team)
+    except (HcDown, HcError) as error:
+        stop_with(f"hc is not reachable: {error}")
     operator = cfg.operator["name"]
-    if view.operator is None or me is None or view.operator["address"] != me["address"]:
+    if view.operator is None or view.operator["address"] != me["address"]:
         stop_with("run brief --send from the operator's pane")
     every = names in ([], ["all"])
     names = [n for n in cfg.members if view.terminal(n) is not None] if every else selected_names(cfg, names)
@@ -3776,6 +4208,11 @@ def _brief_send(args, names):
         if record["address"] in briefed:
             closing = "No reply needed."
         else:                                        # its first brief: only once it is ready and past its dialogs
+            pending = _pending_brief_line(box, name)
+            if pending:
+                print(f"{pending}; run factory.py status")
+                code = 1
+                continue
             why = await_ready(hc, {name: (record, TABLE[m["harness"]].get("dialogs", []))}, timeout=5)[name]
             if why:
                 print(f"@{name} is not ready: {why}")
@@ -3812,6 +4249,7 @@ def _brief_send(args, names):
         lines, confirmed = _brief_lines(name, ident, outcome)
         print("\n".join(lines))
         code = code or (0 if confirmed else 1)
+    _warn_unsaved_launches(_settle_current_launches(cfg, state, hc, team, log))
     return code
 
 

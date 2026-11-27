@@ -4,6 +4,7 @@ Two test classes touch real tools and skip when they cannot: HerdrContract reads
 schema, and LiveFlags (FACTORY_LIVE=1, outside any sandbox) greps each installed harness's --help for the
 flags factory.py passes."""
 import importlib.util
+import concurrent.futures
 import contextlib
 from concurrent.futures import ThreadPoolExecutor
 import datetime
@@ -14,6 +15,7 @@ import io
 import json
 import os
 import pathlib
+import random
 import re
 import shlex
 import shutil
@@ -24,11 +26,9 @@ import tempfile
 import textwrap
 import threading
 import time
-import tomllib
 import types
 import unittest
 import uuid
-import zipfile
 from urllib.parse import unquote, urlsplit
 from unittest.mock import call, patch
 
@@ -1590,16 +1590,12 @@ class UpTests(unittest.TestCase):
             self.assertIn("must be one of full, guarded", e.run("check", "pm", check=False).stderr)
 
 
-    def test_claude_socket_settings_follow_platform_and_permission_level(self):
-        for platform in ("linux", "darwin"):
-            for socket_path in ("", "/tmp/hc-test.sock"):
-                with self.subTest(platform=platform, socket=socket_path), patch.object(factory.sys, "platform", platform), \
-                        patch.dict(os.environ, {"HC_TERMINAL_SOCKET": socket_path}):
-                    full = json.loads(factory.claude_settings("full", "/s/messages/x"))["sandbox"]
-                    expected = {"allowUnixSockets": [socket_path]} if platform == "darwin" and socket_path else {"allowAllUnixSockets": True}
-                    self.assertEqual(full["network"], expected)
-                    guarded = json.loads(factory.claude_settings("guarded", "/s/messages/x"))["sandbox"]
-                    self.assertNotIn("network", guarded)
+    def test_claude_socket_settings_in_the_qualified_environment(self):
+        with patch.object(factory.sys, "platform", "linux"):
+            full = json.loads(factory.claude_settings("full", "/s/messages/x"))["sandbox"]
+            self.assertEqual(full["network"], {"allowAllUnixSockets": True})
+            guarded = json.loads(factory.claude_settings("guarded", "/s/messages/x"))["sandbox"]
+            self.assertNotIn("network", guarded)
 
 
     def test_existing_member_settings_only_come_from_the_brief(self):
@@ -2038,13 +2034,146 @@ class TeamCommandTests(TeamCase):
         self.assertTrue(factory.read_team(self.state_dir)["up"])
         runs = self.fake.calls("terminal.run")
         self.assertTrue(all(not any(k.startswith("herdr.") for k in r["params"]["labels"]) for r in runs))
-        self.assertFalse(self.fake.calls("doc.set"))
+        self.assertTrue(self.fake.calls("doc.set"))
         before = len(self.mutations())
         code, out, _ = self.cmd(self.operator, "up")                   # running members are left alone
         self.assertEqual(len(self.member_terms()), 4)
         self.assertIn("already running: @lead-dev, @frontend-dev", out)
         self.assertEqual(len([m for m in self.log.read_box()[1].msgs.values() if m["kind"] == "brief"]), 4)
         self.assertEqual(sum(1 for c in self.mutations()[before:] if c["method"] == "terminal.run"), 2)
+
+    def test_up_labels_are_written_after_doc_set(self):
+        term = self.terminal("lead-dev")[0]
+        self.hc.label(term, {"herdr.seen": "9"})
+        code, out, err = self.cmd(self.operator, "up", "lead-dev")
+        self.assertEqual(code, 0, out + err)
+        doc, version = self.hc.doc_get()
+        space, tab = factory.where(doc, term)
+        calls = self.mutations()
+        write = next(i for i, req in enumerate(calls) if req["method"] == "doc.set")
+        label = next(i for i, req in enumerate(calls) if req["method"] == "terminal.label"
+                     and "herdr.space" in req["params"]["labels"])
+        self.assertGreater(label, write)
+        self.assertEqual(calls[label]["params"]["labels"], {"herdr.space": space, "herdr.tab": tab})
+        self.assertEqual(self.hc.get(term)["labels"]["herdr.seen"], "9")
+        self.assertIsNone(factory.where(doc, self.operator))
+        self.assertEqual(factory.read_team(self.state_dir)["layout"],
+                         {"space": space, "tab": tab, "keeper": "keeper", "made_space": True})
+        self.assertEqual(self.cmd(self.operator, "up", "lead-dev")[0], 0)
+        self.assertEqual(self.hc.doc_get(), (doc, version))
+
+    def test_up_recovers_existing_ids_without_a_write_and_keeps_newly_proposed_ids_out(self):
+        self.assertEqual(self.cmd(self.operator, "up", "lead-dev")[0], 0)
+        layout = factory.read_team(self.state_dir)["layout"]
+        _, version = self.hc.doc_get()
+        factory.update_team(self.state_dir, layout={})
+        self.assertEqual(self.cmd(self.operator, "up", "lead-dev")[0], 0)
+        self.assertEqual(self.hc.doc_get()[1], version)
+        self.assertEqual(factory.read_team(self.state_dir)["layout"]["tab"], layout["tab"])
+        doc, version = self.hc.doc_get()
+        tab = doc["spaces"][0]["tabs"][0]
+        tab["id"] = "owner-tab"
+        tab["root"]["children"].append(LayoutTests.pane(self.operator))
+        self.hc.doc_set(doc, version)
+        factory.update_team(self.state_dir, layout={})
+        before = self.hc.doc_get()
+        self.assertEqual(self.cmd(self.operator, "up", "lead-dev")[0], 0)
+        self.assertEqual(factory.read_team(self.state_dir)["layout"], {})
+        self.assertEqual(self.hc.doc_get(), before)
+
+    def test_up_swaps_a_restarted_member_in_its_moved_pane_without_creating_a_space(self):
+        self.assertEqual(self.cmd(self.operator, "up", "lead-dev")[0], 0)
+        old = self.member_terms()["lead-dev"]
+        doc, version = self.hc.doc_get()
+        moved, keeper = factory.blocks(doc)[old], factory.blocks(doc)["keeper"]
+        moved["size"] = {"weight": 2}
+        owner_tab = LayoutTests.tab("owner-tab", moved, keeper, LayoutTests.pane(self.operator))
+        doc = {"spaces": [LayoutTests.space("owner-space", owner_tab)]}
+        self.hc.doc_set(doc, version)
+        factory.update_team(self.state_dir, layout={})
+        self.fake.finish(old)
+        code, out, err = self.cmd(self.operator, "up", "lead-dev")
+        self.assertEqual(code, 0, out + err)
+        new = self.member_terms()["lead-dev"]
+        self.assertNotEqual(new, old)
+        doc, _ = self.hc.doc_get()
+        self.assertEqual([space["id"] for space in doc["spaces"]], ["owner-space"])
+        self.assertEqual(factory.blocks(doc)[new], {**moved, "content": {"terminal": new}})
+        self.assertEqual(factory.where(doc, new), ("owner-space", "owner-tab"))
+        labels = self.hc.get(new)["labels"]
+        self.assertEqual((labels["herdr.space"], labels["herdr.tab"]), ("owner-space", "owner-tab"))
+        self.assertNotIn("herdr.seen", labels)
+        self.assertEqual(factory.read_team(self.state_dir)["layout"], {})
+
+    def test_replaced_keeper_gets_its_old_pane(self):
+        self.assertEqual(self.cmd(self.operator, "up", "lead-dev")[0], 0)
+        doc, _ = self.hc.doc_get()
+        old = factory.blocks(doc)["keeper"]
+        replacement = self.terminal("keeper", kind="keeper")[0]
+        with patch.object(factory, "ensure_keeper", return_value=replacement):
+            self.assertEqual(self.cmd(self.operator, "up", "lead-dev")[0], 0)
+        doc, _ = self.hc.doc_get()
+        self.assertEqual(factory.blocks(doc)[replacement], {**old, "content": {"terminal": replacement}})
+        self.assertEqual(factory.read_team(self.state_dir)["layout"]["keeper"], replacement)
+
+    def test_layout_failure_does_not_change_up_exit_code_or_write_placement_labels(self):
+        self.fake.doc_conflicts(factory.CAS_TRIES)
+        code, out, err = self.cmd(self.operator, "up", "lead-dev")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("layout not updated (another client kept changing it)", err)
+        self.assertFalse(any("herdr.space" in r["params"]["labels"] for r in self.fake.calls("terminal.label")))
+        self.assertNotIn("layout", factory.read_team(self.state_dir))
+
+    def test_layout_metadata_write_failure_is_only_a_warning(self):
+        real = factory.update_team
+
+        def update(state, **changes):
+            if "layout" in changes:
+                raise OSError("test metadata failure")
+            return real(state, **changes)
+
+        with patch.object(factory, "update_team", update):
+            code, out, err = self.cmd(self.operator, "up", "lead-dev")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("layout placed, but team.json was not updated: test metadata failure", err)
+        term = self.member_terms()["lead-dev"]
+        self.assertIn(term, factory.blocks(self.hc.doc_get()[0]))
+        self.assertNotIn("layout", factory.read_team(self.state_dir))
+        self.assertEqual(self.cmd(self.operator, "up", "lead-dev")[0], 0)
+        old = factory.read_team(self.state_dir)["layout"]
+        with patch.object(factory, "update_team", update):
+            code, out, err = self.cmd(self.operator, "down")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("layout updated, but team.json was not updated: test metadata failure", err)
+        self.assertNotIn(term, factory.blocks(self.hc.doc_get()[0]))
+        self.assertEqual(factory.read_team(self.state_dir)["layout"], old)
+
+    def test_conflict_recomputes_the_winning_tab_and_keeps_an_owner_moved_pane(self):
+        lead = self.terminal("lead-dev")[0]
+        space = LayoutTests.space("a", LayoutTests.tab("first", LayoutTests.pane(lead)))
+        self.hc.doc_set({"spaces": [space]}, 0)
+        real_set = factory.Hc.doc_set
+        changed = False
+
+        def conflict(hc, doc, version):
+            nonlocal changed
+            if not changed:
+                changed = True
+                owner = LayoutTests.tab("moved-to", LayoutTests.pane(lead))
+                real_set(hc, {"spaces": [LayoutTests.space("b", owner)]}, version)
+            return real_set(hc, doc, version)
+
+        with patch.object(factory.Hc, "doc_set", conflict):
+            code, out, err = self.cmd(self.operator, "up", "reviewer")
+        self.assertEqual(code, 0, out + err)
+        doc, _ = self.hc.doc_get()
+        reviewer = self.member_terms()["reviewer"]
+        self.assertEqual(factory.where(doc, lead), ("b", "moved-to"))
+        self.assertEqual(factory.where(doc, reviewer), ("b", "moved-to"))
+        labels = self.hc.get(reviewer)["labels"]
+        self.assertEqual((labels["herdr.space"], labels["herdr.tab"]), ("b", "moved-to"))
+        self.assertEqual(factory.read_team(self.state_dir)["layout"]["space"], "b")
+        self.assertNotIn("herdr.tab", self.hc.get(lead)["labels"])  # an existing pane was left alone
 
     def test_up_refuses_before_changing_anything(self):
         member = self.terminal("lead-dev")[0]
@@ -2071,7 +2200,7 @@ class TeamCommandTests(TeamCase):
         self.addCleanup(os.close, lock)
         code, _, err = self.cmd(self.operator, "up")
         self.assertEqual(code, 2)
-        self.assertIn("another up or down is running for this team", err)
+        self.assertIn("another up, down or brief --send is running for this team", err)
         self.assertFalse(self.fake.calls("terminal.run"))
 
     def test_a_failed_preflight_changes_nothing(self):
@@ -2258,6 +2387,11 @@ class TeamCommandTests(TeamCase):
         self.assertEqual(first[1:3], ["resume", "thread-a"])
         self.assertNotIn("resume", second)
         self.assertEqual(len(self.member_terms()), 1)
+        edits = [c["params"]["value"] for c in self.fake.calls("doc.set")]
+        original, fresh = (next(p for p in factory.blocks(doc).values() if p["title"] == "@lead-dev")
+                           for doc in edits)
+        self.assertEqual(fresh["id"], original["id"])
+        self.assertNotEqual(fresh["content"]["terminal"], original["content"]["terminal"])
 
     def test_members_already_running_hear_who_joined(self):
         lead = self.terminal("lead-dev")[0]
@@ -2268,16 +2402,162 @@ class TeamCommandTests(TeamCase):
         self.assertEqual([m["to"] for m in news], [["lead-dev"]])
         self.assertIn("@reviewer (reviewer, Codex gpt-6-luna)", news[0]["text"])
 
+    def launch_fact(self, terminal, how, value, *, fresh=True, harness="claude", model=None):
+        raw = json.dumps({"how": how, "value": value, "fresh": fresh, "harness": harness, "model": model})
+        self.hc.label(terminal, {"factory.launch": raw})
+
+    def test_late_briefed_member_that_exited_keeps_its_conversation(self):
+        folder = factory.session_folder(self.state_dir, {"name": "pm", "harness": "pi"})
+        with patch.dict(factory.TABLE["pi"], session="dir"):
+            with patch.object(factory, "wait_outcomes", return_value={"pm": {"o": "queued", "why": "waiting"}}):
+                self.assertEqual(self.cmd(self.operator, "up", "pm")[0], 3)
+            old = self.member_terms()["pm"]
+            self.assertEqual(factory.saved_sessions(self.state_dir)[0]["pm"]["how"], "new")
+            self.deliver()
+            self.fake.finish(old)
+            code, out, err = self.cmd(self.operator, "up", "pm")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("resumed @pm", out)
+        self.assertIn("--continue", self.fake.calls("terminal.run")[-1]["params"]["argv"])
+        new = self.member_terms()["pm"]
+        entry = factory.saved_sessions(self.state_dir)[0]["pm"]
+        self.assertEqual((entry["term"], entry["how"], entry["value"]), (new, "dir", str(folder)))
+        self.assertFalse(self.hc.get(new)["labels"].get("factory.launch"))
+
+    def test_a_fresh_launch_without_a_journal_entry_blocks_an_older_resume(self):
+        lead = self.terminal("lead-dev")[0]
+        factory.record_session(self.cfg, self.state_dir, "lead-dev", "previous", {"CODEX_THREAD_ID": "old-id"})
+        self.launch_fact(lead, "new", None, harness="codex")
+        self.fake.finish(lead)
+        code, out, err = self.cmd(self.operator, "up", "lead-dev")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("none was recorded for it", out)
+        self.assertNotIn("resume", self.fake.calls("terminal.run")[-1]["params"]["argv"])
+
+    def test_up_does_not_restart_a_member_whose_launch_cannot_be_saved(self):
+        term = self.terminal("lead-dev")[0]
+        self.launch_fact(term, "id", "old-id", harness="codex")
+        self.briefed("lead-dev", term)
+        self.fake.finish(term)
+        with patch.object(factory, "launch_entry", side_effect=OSError("no space")):
+            code, out, err = self.cmd(self.operator, "up", "lead-dev")
+        self.assertEqual(code, 3, out + err)
+        self.assertIn("conversation could not be saved (no space); not restarted", err)
+        self.assertFalse(self.fake.calls("terminal.run"))
+        self.assertTrue(self.hc.get(term)["labels"]["factory.launch"])
+        code, out, err = self.cmd(self.operator, "up", "lead-dev")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("resumed @lead-dev", out)
+        self.assertEqual(self.fake.calls("terminal.run")[-1]["params"]["argv"][1:3], ["resume", "old-id"])
+
+    def test_rebrief_saves_the_original_model_and_preserves_a_ready_line_session(self):
+        self.assertEqual(self.cmd(self.operator, "up", "lead-dev")[0], 0)
+        term = self.terminal("frontend-dev")[0]
+        for from_say in (False, True):
+            with self.subTest(from_say=from_say):
+                self.launch_fact(term, "id", "from-launch", harness="claude", model=None)
+                if from_say:
+                    factory.record_session(self.cfg, self.state_dir, "frontend-dev", term,
+                                           {"CLAUDE_CODE_SESSION_ID": "from-say"})
+                code, out, err = self.cmd(self.operator, "brief", "--send", "frontend-dev")
+                self.assertEqual(code, 0, out + err)
+                entry = factory.saved_sessions(self.state_dir)[0]["frontend-dev"]
+                self.assertEqual(entry["value"], "from-say" if from_say else "from-launch")
+                if not from_say:
+                    self.assertIsNone(entry["model"])
+                    self.assertEqual(entry["harness"], "claude")
+                self.assertFalse(self.hc.get(term)["labels"].get("factory.launch"))
+
+    def test_launch_fact_does_not_follow_a_formation_change(self):
+        lead = self.terminal("lead-dev")[0]
+        self.launch_fact(lead, "id", "claude-id", model="claude-opus-5-5")
+        self.briefed("lead-dev", lead)
+        code, out, err = self.cmd(self.operator, "up", "lead-dev")  # no launches needed
+        self.assertEqual(code, 0, out + err)
+        entry = factory.saved_sessions(self.state_dir)[0]["lead-dev"]
+        m = factory.plan(self.cfg, "lead-dev", self.state_dir)
+        self.assertIn("saved conversation is for claude claude-opus-5-5",
+                      factory.session_plan(m, self.state_dir, entry, False)["notice"])
+        self.launch_fact(lead, "dir", str(self.root), harness="pi", model="openai/gpt-6-astra")
+        self.assertEqual(self.cmd(self.operator, "up", "lead-dev")[0], 0)
+        entry = factory.saved_sessions(self.state_dir)[0]["lead-dev"]
+        with patch.dict(factory.TABLE["pi"], session="dir", resume_model="provider"):
+            m = {**m, "harness": "pi", "model": "deepseek/some-model"}
+            self.assertIn("saved conversation is for pi openai/gpt-6-astra",
+                          factory.session_plan(m, self.state_dir, entry, False)["notice"])
+
+    def test_down_preserves_live_or_finished_members_whose_launch_cannot_be_saved(self):
+        for finished in (False, True):
+            with self.subTest(finished=finished):
+                self.assertEqual(self.cmd(self.operator, "up", "lead-dev", "reviewer")[0], 0)
+                term = self.member_terms()["lead-dev"]
+                self.launch_fact(term, "id", "assigned", harness="codex")
+                if finished:
+                    self.fake.finish(term)
+                with patch.object(factory, "launch_entry", side_effect=OSError("no space")):
+                    code, out, err = self.cmd(self.operator, "down")
+                self.assertEqual(code, 1, out + err)
+                self.assertIn("@lead-dev's record kept" if finished else "@lead-dev left running", out)
+                self.assertIn("stopped @reviewer", out)
+                self.assertTrue(self.hc.get(term)["labels"]["factory.launch"])
+                self.assertEqual(self.cmd(self.operator, "down")[0], 0)
+                self.assertEqual(factory.saved_sessions(self.state_dir)[0]["lead-dev"]["value"], "assigned")
+
+    def test_malformed_or_unclearable_launch_label_is_only_a_warning(self):
+        lead = self.terminal("lead-dev")[0]
+        self.hc.label(lead, {"factory.launch": '{"how":"new","fresh":true,"harness":"codex","value":null}'})
+        code, out, err = self.cmd(self.operator, "up", "lead-dev")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("malformed factory.launch label", err)
+        self.launch_fact(lead, "new", None, harness="codex")
+        label = factory.Hc.label
+
+        def refuse_clear(hc, address, labels):
+            if labels == {"factory.launch": ""}:
+                raise factory.HcDown("terminal.label", "test")
+            return label(hc, address, labels)
+
+        with patch.object(factory.Hc, "label", refuse_clear):
+            code, out, err = self.cmd(self.operator, "up", "lead-dev")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("launch label could not be cleared", err)
+        data = (self.state_dir / factory.SESSIONS).read_bytes()
+        self.assertEqual(self.cmd(self.operator, "up", "lead-dev")[0], 0)
+        self.assertEqual((self.state_dir / factory.SESSIONS).read_bytes(), data)
+        self.assertFalse(self.hc.get(lead)["labels"].get("factory.launch"))
+
+    def test_cold_up_lists_undelivered_files_and_warm_up_leaves_them_alone(self):
+        folder = self.state_dir / "messages" / "pm"
+        folder.mkdir(parents=True)
+        delivered, pending = folder / "lead-dev-done-1.md", folder / "lead-dev-later-2.md"
+        delivered.write_text("done")
+        pending.write_text("later")
+        ident = self.add("lead-dev", "done", file=str(delivered))
+        box = self.log.read_box()[1]
+        self.log.out(box, ident, "lead-dev", "sending", term="old")
+        self.log.out(box, ident, "lead-dev", "delivered", term="old", started=True, turn=1)
+        self.add("lead-dev", "later", file=str(pending))
+        code, out, err = self.cmd(self.operator, "up", "reviewer")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn(str(pending), out)
+        self.assertNotIn(str(delivered), out)
+        self.assertTrue(pending.exists())
+        self.assertFalse(delivered.exists())
+        code, out, err = self.cmd(self.operator, "up", "reviewer")
+        self.assertEqual(code, 0, out + err)
+        self.assertNotIn("leftover message file", out)
+
     def test_down_records_the_stop_then_removes_and_drops(self):
         self.cmd(self.operator, "up", "lead-dev")
         term = self.member_terms()["lead-dev"]
         self.log.add("pm", ["lead-dev"], "for later")
+        before = len(self.mutations())
         code, out, err = self.cmd(self.operator, "down")
         self.assertEqual(code, 0, out + err)
         self.assertIn("stopped @lead-dev (was idle); 1 queued messages dropped", out)
         self.assertIn("@reviewer was not running", out)
         self.assertIn("run factory.py up to bring members back", out)
-        calls = [(c["method"], c["params"].get("labels")) for c in self.mutations()
+        calls = [(c["method"], c["params"].get("labels")) for c in self.mutations()[before:]
                  if c["params"].get("terminal") == term]
         self.assertEqual(calls, [("terminal.label", {"factory.down": "1"}), ("terminal.kill", None),
                                  ("terminal.rm", None)])
@@ -2300,6 +2580,40 @@ class TeamCommandTests(TeamCase):
         self.assertIn("sessions cannot be saved (No space left on device): members left running", out)
         self.assertEqual(self.member_terms(), {"lead-dev": member})
 
+    def test_down_keeps_the_keeper_pane_until_the_last_member(self):
+        self.assertEqual(self.cmd(self.operator, "up", "lead-dev", "reviewer")[0], 0)
+        terms = self.member_terms()
+        self.assertEqual(self.cmd(self.operator, "down", "lead-dev")[0], 0)
+        doc, _ = self.hc.doc_get()
+        self.assertEqual(set(factory.blocks(doc)), {"keeper", terms["reviewer"]})
+        self.assertTrue(factory.read_team(self.state_dir)["up"])
+        self.assertEqual(self.cmd(self.operator, "down", "reviewer")[0], 0)
+        self.assertEqual(self.hc.doc_get()[0], {"spaces": []})
+        self.assertEqual(factory.read_team(self.state_dir)["layout"], {"made_space": False})
+
+    def test_last_down_removes_the_saved_keeper_pane_after_a_headless_replacement(self):
+        owner = LayoutTests.space("owner", LayoutTests.tab("home", LayoutTests.pane(self.operator)))
+        self.hc.doc_set({"spaces": [owner]}, 0)
+        self.hc.label(self.operator, {"herdr.space": "owner", "herdr.tab": "home", "herdr.seen": "7"})
+        self.assertEqual(self.cmd(self.operator, "up", "lead-dev")[0], 0)
+        replacement = self.terminal("keeper", kind="keeper")[0]
+        self.assertNotIn(replacement, factory.blocks(self.hc.doc_get()[0]))
+        code, out, err = self.cmd(self.operator, "down")
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(self.hc.doc_get()[0], {"spaces": [owner]})
+        self.assertEqual(factory.read_team(self.state_dir)["layout"], {"space": "owner", "made_space": False})
+        self.assertEqual(self.hc.get(self.operator)["labels"]["herdr.seen"], "7")
+
+    def test_layout_failure_does_not_change_down_exit_code(self):
+        self.assertEqual(self.cmd(self.operator, "up", "lead-dev")[0], 0)
+        original = self.hc.doc_get()
+        self.fake.doc_conflicts(factory.CAS_TRIES)
+        code, out, err = self.cmd(self.operator, "down")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("close the panes of @lead-dev in your client", err)
+        self.assertEqual(self.hc.doc_get()[0], original[0])
+        self.assertFalse(factory.read_team(self.state_dir)["up"])
+
     def test_status_shows_the_team(self):
         self.cmd(self.operator, "up", "lead-dev", "reviewer")
         reviewer = self.member_terms()["reviewer"]
@@ -2314,7 +2628,7 @@ class TeamCommandTests(TeamCase):
         self.assertIn("@reviewer interrupted: exited (code 1)", out)
         self.assertIn("pending: @operator 1", out)
         self.assertIn("read them with: factory.py inbox --for operator", out)
-        self.assertIn("keeper: starting (keeper), no pane", out)          # no heartbeat yet
+        self.assertIn("keeper: starting (keeper)\n", out)                  # placed, no heartbeat yet
         self.assertIn("operator: reachable", out)
         self.assertIn("@reviewer gone: run `factory.py up reviewer` to bring them back.", out)
 
@@ -2329,6 +2643,35 @@ class TeamCommandTests(TeamCase):
         self.assertNotIn("paths are final", err)
         self.assertIn(str(self.state_dir / "messages" / "reviewer"), out)
 
+    def test_status_reports_unplaced_terminals_and_an_unconfirmed_brief(self):
+        self.assertEqual(self.cmd(self.operator, "up", "lead-dev")[0], 0)
+        reviewer = self.terminal("reviewer")[0]
+        starting = self.terminal("frontend-dev", status=None)[0]
+        code, out, err = self.cmd(self.operator, "status")
+        self.assertEqual(code, 0, err)
+        self.assertIn("no pane: @frontend-dev, @reviewer (run factory.py up)", out)
+        self.assertIn("@reviewer has no confirmed brief: run factory.py brief --send reviewer", out)
+        self.assertNotIn("@frontend-dev has no confirmed brief", out)
+        self.assertNotIn("@lead-dev has no confirmed brief", out)
+        self.assertIsNone(factory.where(self.hc.doc_get()[0], reviewer))
+        self.assertIsNone(factory.where(self.hc.doc_get()[0], starting))
+        with patch.object(factory, "ensure_keeper", return_value="replacement"):
+            code, out, err = self.cmd(self.operator, "status")
+        self.assertEqual(code, 0, err)
+        self.assertIn("keeper: starting (replacement), no pane (run factory.py up)", out)
+
+    def test_status_survives_a_malformed_doc_and_a_damaged_log(self):
+        self.assertEqual(self.cmd(self.operator, "up", "lead-dev")[0], 0)
+        self.terminal("reviewer")
+        self.hc.doc_set({"unexpected": []}, self.hc.doc_get()[1])
+        with self.log.path.open("ab") as f:
+            f.write(b"invalid\n")
+        code, out, err = self.cmd(self.operator, "status")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("message log needs repair:", out)
+        self.assertNotIn("no pane", out)
+        self.assertNotIn("has no confirmed brief", out)
+
     def test_brief_send_closes_by_whether_the_terminal_was_briefed(self):
         self.cmd(self.operator, "up", "lead-dev")
         unbriefed = self.terminal("reviewer")[0]
@@ -2340,6 +2683,64 @@ class TeamCommandTests(TeamCase):
         code, _, err = self.cmd(self.operator, "brief", "--send", "pm")
         self.assertEqual(code, 2)
         self.assertIn("not running: @pm", err)
+
+    def test_status_and_brief_send_keep_a_pending_first_brief(self):
+        self.assertEqual(self.cmd(self.operator, "up", "lead-dev")[0], 0)
+        term = self.terminal("reviewer")[0]
+        first, _, _ = self.log.add("operator", ["reviewer"], "original startup brief", kind="brief")
+        for pending in ("queued (waiting)", "sending"):
+            with self.subTest(pending=pending):
+                if pending == "sending":
+                    self.keeper.tick()                         # the original worker has not typed anything yet
+                    self.assertEqual(len(self.jobs), 1)
+                before = self.log.path.read_bytes()
+                code, out, err = self.cmd(self.operator, "status")
+                self.assertEqual(code, 0, out + err)
+                self.assertIn(f"@reviewer: first brief {first} is still {pending}", out)
+                self.assertNotIn("run factory.py brief --send reviewer", out)
+                code, out, err = self.cmd(self.operator, "brief", "--send", "reviewer")
+                self.assertEqual(code, 1, out + err)
+                self.assertIn(f"@reviewer: first brief {first} is still {pending}", out)
+                self.assertEqual(self.log.path.read_bytes(), before)
+                self.assertFalse(self.fake.sent(term))
+        self.deliver()
+        self.assertEqual(self.outcome(first, "reviewer")["o"], "delivered")
+        self.assertEqual(len(self.fake.sent(term)), 1)
+        self.assertIn("original startup brief", self.fake.sent(term)[0])
+        code, out, err = self.cmd(self.operator, "brief", "--send", "reviewer")
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(len(self.fake.sent(term)), 2)
+        self.assertTrue(self.fake.sent(term)[1].rstrip().endswith("No reply needed."))
+
+    def test_brief_settlement_cannot_overlap_a_fresh_replacement(self):
+        self.assertEqual(self.cmd(self.operator, "up", "lead-dev")[0], 0)
+        old = self.terminal("frontend-dev")[0]
+        self.launch_fact(old, "id", "old-session", model="claude-opus-5-5")
+        real = factory.settle_launches
+        fresh = ("up", "frontend-dev", "--fresh")
+
+        def interleave(cfg, state, hc, view, box):
+            self.assertEqual(view.terminal("frontend-dev")["address"], old)
+            self.assertIn(old, box.briefed())
+            self.fake.finish(old)
+            code, out, err = self.cmd(self.operator, *fresh)
+            self.assertEqual(code, 2, out + err)
+            self.assertIn("another up, down or brief --send is running for this team", err)
+            self.assertFalse(self.fake.calls("terminal.rm"))
+            return real(cfg, state, hc, view, box)
+
+        with patch.dict(factory.TABLE["claude"], session="id"):
+            with patch.object(factory, "settle_launches", interleave):
+                code, out, err = self.cmd(self.operator, "brief", "--send", "frontend-dev")
+            self.assertEqual(code, 0, out + err)
+            self.assertEqual(factory.saved_sessions(self.state_dir)[0]["frontend-dev"]["value"], "old-session")
+            code, out, err = self.cmd(self.operator, *fresh)
+        self.assertEqual(code, 0, out + err)
+        entry = factory.saved_sessions(self.state_dir)[0]["frontend-dev"]
+        self.assertEqual(entry["term"], self.member_terms()["frontend-dev"])
+        self.assertNotEqual(entry["term"], old)
+        self.assertEqual(entry["how"], "id")
+        self.assertNotEqual(entry["value"], "old-session")
 
 
 @real_only
@@ -2361,6 +2762,8 @@ class IntegratedTeamTests(TeamCase):
         self.addCleanup(self.remove, self.operator)
         self.state(self.operator, "idle")
         self.addCleanup(self.stop_everything)
+        previous, _ = self.hc.doc_get()
+        self.addCleanup(lambda: self.hc.doc_set(previous, self.hc.doc_get()[1]))
 
     def stop_everything(self):
         for record in self.hc.list(self.team):
@@ -2380,6 +2783,67 @@ class IntegratedTeamTests(TeamCase):
     def members(self):
         return {r["labels"]["factory.member"]: r["address"] for r in self.hc.list(self.team)
                 if r["labels"].get("factory.kind") == "member" and r["state"] == "live"}
+
+    def new_operator(self, name):
+        term, log = self.launch("reports", name=name)
+        self.hc.label(term, {"factory.team": "", "factory.kind": "", "factory.member": ""})
+        return term, log
+
+    def test_new_operator_adopts_team_tab_and_queue(self):
+        code, out, err = self.cmd("up", "lead-dev", "reviewer")
+        self.assertEqual(code, 0, out + err)
+        members = self.members()
+        saved = factory.read_team(self.state_dir)["layout"]
+        doc, version = self.hc.doc_get()
+        term, log = self.new_operator("replacement-operator")
+        op_space = LayoutTests.space("another-space", LayoutTests.tab("operator-home", LayoutTests.pane(term)))
+        doc["spaces"].append(op_space)
+        self.hc.doc_set(doc, version)
+        self.hc.label(term, {"herdr.space": "another-space", "herdr.tab": "operator-home"})
+        self.hc.kill(self.operator)
+        self.until(lambda: self.hc.get(self.operator)["state"] == "finished", "old operator to finish")
+        first = self.add("operator", "first queued report")
+        second = self.add("operator", "second queued report")
+        self.until(lambda: self.outcome(first, "operator").get("why") == "gone", "old operator's queued message")
+        self.assertEqual([m["id"] for m, _ in self.log.read_box()[1].pending("operator")], [first, second])
+        before = self.hc.doc_get()
+        self.operator = term
+        code, out, err = self.cmd("up", "lead-dev", "reviewer")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("already running: @lead-dev, @reviewer", out)
+        self.assertEqual(self.members(), members)
+        self.assertEqual(self.hc.doc_get(), before)
+        self.assertEqual(factory.read_team(self.state_dir)["layout"], saved)
+        self.until(lambda: self.outcome(second, "operator")["o"] == "delivered", "second report to reach new operator")
+        self.assertEqual(self.outcome(second, "operator")["term"], term)
+        self.assertEqual(self.outcome(first, "operator")["term"], term)
+        self.assertEqual([text.splitlines()[-1] for text in self.inputs(term, log)],
+                         ["first queued report", "second queued report"])
+
+    def test_two_teams_have_separate_tabs_and_stops(self):
+        code, out, err = self.cmd("up", "lead-dev")
+        self.assertEqual(code, 0, out + err)
+        home = self.members()["lead-dev"]
+        first_doc, _ = self.hc.doc_get()
+        other_root = self.directory / "another-checkout"
+        other_root.mkdir()
+        for name in ("factory.toml", "FACTORY.md"):
+            (other_root / name).write_bytes((self.root / name).read_bytes())
+        term, _ = self.new_operator("other-team-operator")
+        with patch.object(self, "root", other_root), patch.object(self, "operator", term):
+            other_team = factory.team_key(other_root)
+            self.addCleanup(lambda: [self.remove(r["address"]) for r in self.hc.list(other_team)])
+            code, out, err = self.cmd("up", "lead-dev")
+            self.assertEqual(code, 0, out + err)
+            other_members = factory.team_view(self.hc, other_team)
+            other = other_members.terminal("lead-dev")["address"]
+            both, _ = self.hc.doc_get()
+            self.assertEqual(factory.where(both, home), factory.where(first_doc, home))
+            self.assertNotEqual(factory.where(both, home), factory.where(both, other))
+            code, out, err = self.cmd("down", "lead-dev")
+            self.assertEqual(code, 0, out + err)
+            self.assertEqual(self.hc.doc_get()[0], first_doc)
+        self.assertEqual(self.hc.get(home)["state"], "live")
 
     def test_a_team_runs_end_to_end(self):
         code, out, err = self.cmd("check", "lead-dev", "reviewer")
@@ -2404,15 +2868,21 @@ class IntegratedTeamTests(TeamCase):
         self.assertRegex(out, r"@lead-dev +lead-dev +codex +gpt-6-astra +high +idle")
         self.assertIn("keeper: running", out)
         self.assertIn("operator: reachable", out)
-        self.assertFalse(any(k.startswith("herdr.") for r in self.hc.list(self.team) for k in r["labels"]))
+        doc, _ = self.hc.doc_get()
+        for terminal in first.values():
+            record = self.hc.get(terminal)
+            self.assertEqual(factory.where(doc, terminal), (record["labels"]["herdr.space"], record["labels"]["herdr.tab"]))
+            self.assertNotIn("herdr.seen", record["labels"])
         code, out, err = self.cmd("down", "lead-dev")
         self.assertEqual(code, 0, out + err)
         self.assertIn("stopped @lead-dev (was idle)", out)
         self.assertEqual(set(self.members()), {"reviewer"})
         keeper = factory.team_view(self.hc, self.team).keeper["address"]
+        self.assertEqual(set(factory.blocks(self.hc.doc_get()[0])), {first["reviewer"], keeper})
         code, out, err = self.cmd("down")
         self.assertEqual(code, 0, out + err)
         self.assertIn("run factory.py up to bring members back", out)
+        self.assertFalse(factory.blocks(self.hc.doc_get()[0]))
         self.until(lambda: self.hc.get(keeper)["state"] == "finished", "the keeper's exit after the last down")
         code, out, err = self.cmd("up", "lead-dev")
         self.assertEqual(code, 0, out + err)
@@ -3320,6 +3790,266 @@ class CliTests(TeamCase):
         self.until(lambda: self.inputs(member, log) == ["[from @operator]\nreal keeper\n"], "keeper delivery")
         factory.update_team(self.state_dir, up=False)
         self.until(lambda: self.hc.get(terminal)["state"] == "finished", "keeper shutdown")
+
+
+class LayoutTests(unittest.TestCase):
+    @staticmethod
+    def pane(terminal, **extra):
+        return {"id": f"pane-{terminal}", "type": "block", "content": {"terminal": terminal}, **extra}
+
+    @staticmethod
+    def split(ident, *children, kind="row"):
+        return {"id": ident, "type": kind, "children": list(children)}
+
+    @classmethod
+    def tab(cls, ident, *children):
+        return {"id": ident, "name": ident, "root": cls.split(f"root-{ident}", *children)}
+
+    @staticmethod
+    def space(ident, *tabs):
+        return {"id": ident, "tabs": list(tabs)}
+
+    @staticmethod
+    def member(address, **labels):
+        return {"address": address, "state": "live", "created_ms": 0,
+                "labels": {"factory.kind": "member", "factory.member": address, **labels}}
+
+    def setup_layout(self, count=0, *, keeper=None):
+        doc = {"spaces": [self.space("space")]}
+        panes = [(f"t{i}", f"@member-{i}") for i in range(count)]
+        if keeper:
+            panes.append((keeper, "keeper"))
+        factory.add_panes(doc, "space", "team", panes, keeper)
+        return doc
+
+    @staticmethod
+    def children(doc):
+        return doc["spaces"][0]["tabs"][0]["root"]["children"]
+
+    def test_new_tab_root_is_a_row(self):
+        doc = self.setup_layout(1)
+        tab = doc["spaces"][0]["tabs"][0]
+        self.assertEqual((tab["id"], tab["name"], tab["root"]["type"]), ("team", "team", "row"))
+        self.assertEqual([(node["title"], node["content"]) for node in self.children(doc)],
+                         [("@member-0", {"terminal": "t0"})])
+        self.assertEqual(factory.where(doc, "t0"), ("space", "team"))
+        self.assertIsNone(factory.where(doc, "absent"))
+
+    def test_three_members_three_columns(self):
+        doc = self.setup_layout(3)
+        self.assertEqual([p["content"]["terminal"] for p in self.children(doc)], ["t0", "t1", "t2"])
+
+    def test_fourth_member_stacks_in_first_column(self):
+        doc = self.setup_layout(4)
+        first, *other = self.children(doc)
+        self.assertEqual(first["type"], "column")
+        self.assertEqual([p["content"]["terminal"] for p in first["children"]], ["t0", "t3"])
+        self.assertEqual([p["content"]["terminal"] for p in other], ["t1", "t2"])
+
+    def test_nine_members_three_by_three(self):
+        doc = self.setup_layout(9)
+        self.assertEqual([[p["content"]["terminal"] for p in column["children"]] for column in self.children(doc)],
+                         [["t0", "t3", "t6"], ["t1", "t4", "t7"], ["t2", "t5", "t8"]])
+
+    def test_keeper_pane_last_and_narrow_across_edits(self):
+        doc = self.setup_layout(0, keeper="keeper")
+        factory.add_panes(doc, "space", "team", [("t1", "@one"), ("t2", "@two")], keeper="keeper")
+        self.assertEqual([p["content"]["terminal"] for p in self.children(doc)], ["t1", "t2", "keeper"])
+        last = self.children(doc)[-1]
+        self.assertEqual((last["title"], last["size"]), ("keeper", {"weight": 0.4}))
+        factory.add_panes(doc, "space", "team", [("t3", "@three"), ("t4", "@four")], keeper="keeper")
+        self.assertIs(self.children(doc)[-1], last)
+
+    def test_owner_restructured_root_is_wrapped_not_changed(self):
+        old = self.split("owner-root", self.pane("owner"), kind="column")
+        doc = {"spaces": [self.space("space", {"id": "team", "root": old})]}
+        factory.add_panes(doc, "space", "team", [("t1", "@one")])
+        self.assertIs(self.children(doc)[0], old)
+        self.assertEqual(old["children"], [self.pane("owner")])
+
+    def test_fourth_pane_wraps_an_owner_made_row(self):
+        owner_row = self.split("nested", self.pane("owner"))
+        other_columns = [self.split(key, self.pane(key + "-1"), self.pane(key + "-2"), kind="column")
+                         for key in ("second", "third")]
+        doc = {"spaces": [self.space("space", self.tab("team", owner_row, *other_columns))]}
+        factory.add_panes(doc, "space", "team", [("new", "@new")])
+        column = self.children(doc)[0]
+        self.assertEqual(column["type"], "column")
+        self.assertIs(column["children"][0], owner_row)
+        self.assertEqual(owner_row["children"], [self.pane("owner")])
+        self.assertEqual(column["children"][1]["content"], {"terminal": "new"})
+
+    def test_remove_prunes_empty_and_collapses_only_changed_nonroot_containers(self):
+        one = self.split("one", self.pane("t0"), self.pane("owner"), kind="column")
+        empty = self.split("empty", self.split("nested", self.pane("t1"), kind="column"))
+        untouched = self.split("untouched", self.pane("other"), kind="column")
+        tab = self.tab("team", one, empty, untouched)
+        root = tab["root"]
+        doc = {"spaces": [self.space("space", tab)]}
+        factory.remove_panes(doc, {"tab": "team"}, ["t0", "t1"])
+        self.assertEqual(root["children"], [self.pane("owner"), untouched])
+        self.assertIs(tab["root"], root)
+
+    def test_last_member_removes_only_the_tracked_tab_and_its_own_empty_space(self):
+        for made in (False, True):
+            with self.subTest(made=made):
+                other = self.space("other-space", self.tab("other"))
+                team = self.space("space", self.tab("team", self.pane("t1")))
+                doc = {"spaces": [team, other]}
+                factory.remove_panes(doc, {"space": "space", "tab": "team", "made_space": made}, ["t1"])
+                self.assertEqual(doc["spaces"], [other] if made else [team, other])
+                self.assertEqual(team["tabs"], [])
+
+    def test_owner_added_block_keeps_team_tab_when_members_stop(self):
+        owner = {"id": "tool", "type": "block", "content": {"tool": "files"}}
+        tab = self.tab("team", owner)
+        doc = {"spaces": [self.space("space", tab)]}
+        factory.add_panes(doc, "space", "team", [("t1", "@one")])
+        factory.remove_panes(doc, {"space": "space", "tab": "team", "made_space": True}, ["t1", None])
+        self.assertEqual(self.children(doc), [owner])
+
+    def test_remove_panes_only_empties_the_team_tab(self):
+        owner_tab = self.tab("owner-tab", self.pane("moved"))
+        team = self.tab("team", self.pane("t1"))
+        doc = {"spaces": [self.space("space", team, owner_tab)]}
+        factory.remove_panes(doc, {"space": "space", "tab": "team", "made_space": True}, ["t1", "moved"])
+        self.assertEqual(doc["spaces"][0]["tabs"], [owner_tab])
+        self.assertEqual(owner_tab["root"]["children"], [])
+
+    def test_missing_block_is_not_an_error_and_existing_blocks_are_not_duplicated(self):
+        doc = self.setup_layout(1)
+        original = json.dumps(doc)
+        factory.remove_panes(doc, {"tab": "team"}, ["t999"])
+        factory.add_panes(doc, "space", "another-tab", [("t0", "@duplicate")])
+        self.assertEqual(json.dumps(doc), original)
+        self.assertFalse(factory.swap_terminal(doc, "t999", "t0"))
+
+    def test_swap_terminal_keeps_position_and_uses_actual_tab(self):
+        block = self.pane("old", title="@owner-moved", size={"weight": 2})
+        target = self.tab("owner-tab", self.split("stack", block, kind="column"))
+        doc = {"spaces": [self.space("team-space", self.tab("team", self.pane("other"))),
+                          self.space("owner-space", target)]}
+        self.assertFalse(factory.swap_terminal(doc, "old", "other"))
+        self.assertTrue(factory.swap_terminal(doc, "old", "new"))
+        self.assertIs(factory.blocks(doc)["new"], block)
+        self.assertEqual(block, {**self.pane("old"), "content": {"terminal": "new"},
+                                 "title": "@owner-moved", "size": {"weight": 2}})
+        self.assertEqual(factory.where(doc, "new"), ("owner-space", "owner-tab"))
+
+    def test_root_stays_container_across_adds_and_removals(self):
+        doc = self.setup_layout()
+        rng = random.Random(170)
+        live = set()
+        for _ in range(60):
+            term = f"t{rng.randrange(12)}"
+            if term in live:
+                factory.remove_panes(doc, {"tab": "team"}, [term])
+                live.remove(term)
+            else:
+                factory.add_panes(doc, "space", "team", [(term, term)])
+                live.add(term)
+            self.assertEqual(set(factory.blocks(doc)), live)
+            if live:
+                self.assertEqual(doc["spaces"][0]["tabs"][0]["root"]["type"], "row")
+
+    def test_resolve_tab_prefers_saved_tab_in_the_space_that_holds_it(self):
+        doc = {"spaces": [self.space("team-space", self.tab("team")),
+                          self.space("op-space", self.tab("op-tab", self.pane("operator")))]}
+        me = {"address": "operator", "labels": {"herdr.space": "op-space", "herdr.tab": "op-tab"}}
+        actual = factory.resolve_tab(doc, {"space": "team-space", "tab": "team", "made_space": True},
+                                     factory.View([]), me)
+        self.assertEqual(actual, ("team-space", "team", True))
+
+    def test_resolve_tab_counts_distinct_terminals_and_excludes_operator_tabs(self):
+        doc = {"spaces": [self.space("space", self.tab("operator-actual", self.pane("operator"), self.pane("t1")),
+                                     self.tab("operator-labelled", self.pane("t2"), self.pane("t3")),
+                                     self.tab("one", self.pane("t4")), self.tab("team", self.pane("t5"), self.pane("t6")))]}
+        me = {"address": "operator", "labels": {"herdr.tab": "operator-labelled", "herdr.space": "space"}}
+        view = factory.View([self.member(f"t{i}", **({"herdr.tab": "one"} if i == 4 else {})) for i in range(1, 7)])
+        self.assertEqual(factory.resolve_tab(doc, {}, view, me), ("space", "team", False))
+        self.assertEqual(factory.resolve_tab(doc, {"tab": "one"}, view, me),
+                         ("space", "one", False))
+        self.assertEqual(factory.resolve_tab(doc, {"tab": "operator-actual"}, view, me),
+                         ("space", "operator-actual", False))
+
+    def test_resolve_tab_can_recover_from_labels_and_propose_without_adding_tab(self):
+        doc = {"spaces": [self.space("space", self.tab("existing"))]}
+        me = {"address": "operator", "labels": {"herdr.space": "space"}}
+        view = factory.View([self.member("t1", **{"herdr.tab": "existing"})])
+        self.assertEqual(factory.resolve_tab(doc, {}, view, me), ("space", "existing", False))
+        space, tab, made = factory.resolve_tab(doc, {}, factory.View([]), me)
+        self.assertEqual((space, made), ("space", False))
+        self.assertTrue(tab.startswith("tb"))
+        self.assertEqual([t["id"] for t in doc["spaces"][0]["tabs"]], ["existing"])
+        fresh = {"spaces": []}
+        space, tab, made = factory.resolve_tab(fresh, {}, view, me)
+        self.assertTrue(made)
+        self.assertEqual(fresh, {"spaces": []})
+        factory.add_panes(fresh, space, tab, [("t1", "@one")], folder="/src")
+        self.assertEqual(fresh["spaces"][0]["folder"], "/src")
+
+    @fake_only
+    def test_edit_layout_retries_with_a_new_document_after_conflict(self):
+        clock = unittest.mock.Mock(wraps=time)
+        with FakeHc() as fake, patch.object(factory, "time", clock):
+            hc = factory.Hc()
+            initial = {"spaces": [self.space("space", self.tab("team", self.pane("old")))]}
+            hc.doc_set(initial, 0)
+            wrote = []
+
+            def change(doc):
+                wrote.append(factory.where(doc, "old"))
+                if len(wrote) == 1:
+                    moved = {"spaces": [self.space("elsewhere", self.tab("moved", self.pane("old"), self.pane("owner")))]}
+                    hc.doc_set(moved, 1)
+                return factory.swap_terminal(doc, "old", "new")
+
+            self.assertIsNone(factory.edit_layout(hc, change))
+            current, version = hc.doc_get()
+            self.assertEqual(wrote, [("space", "team"), ("elsewhere", "moved")])
+            self.assertEqual(factory.where(current, "new"), ("elsewhere", "moved"))
+            self.assertIn("owner", factory.blocks(current))
+            self.assertEqual(version, 3)
+            self.assertEqual(len(fake.calls("doc.set")), 4)
+            clock.sleep.assert_called_once_with(0.05)
+
+    @fake_only
+    def test_edit_layout_gives_up_after_its_last_conflict(self):
+        clock = unittest.mock.Mock(wraps=time)
+        clock.sleep.return_value = None
+        with FakeHc() as fake, patch.object(factory, "time", clock):
+            hc = factory.Hc()
+            fake.doc_conflicts(factory.CAS_TRIES)
+            self.assertEqual(factory.edit_layout(hc, lambda doc: True), "another client kept changing it")
+            self.assertEqual(len(fake.calls("doc.set")), factory.CAS_TRIES)
+            self.assertEqual(clock.sleep.call_count, factory.CAS_TRIES - 1)
+
+    @fake_only
+    def test_edit_layout_refuses_an_unexpected_doc(self):
+        bad_layouts = ([], {}, {"spaces": [self.space("s", {"id": "t", "root": {"id": "r", "type": "row"}})]})
+        with FakeHc() as fake:
+            hc = factory.Hc()
+            for malformed in bad_layouts:
+                with self.subTest(malformed=malformed):
+                    _, version = hc.doc_get()
+                    hc.doc_set(malformed, version)
+                    count = len(fake.calls("doc.set"))
+                    edit = unittest.mock.Mock(return_value=True)
+                    self.assertEqual(factory.edit_layout(hc, edit), "the herdr-app doc has an unexpected shape")
+                    edit.assert_not_called()
+                    self.assertEqual(len(fake.calls("doc.set")), count)
+
+    @fake_only
+    def test_edit_layout_skips_write_for_noop_and_reports_transport_errors(self):
+        with FakeHc() as fake:
+            hc = factory.Hc()
+            self.assertIsNone(factory.edit_layout(hc, lambda doc: False))
+            self.assertFalse(fake.calls("doc.set"))
+        for method, error in (("doc_get", factory.HcDown(False, "core unavailable")),
+                              ("doc_set", factory.HcError("invalid_params", "cannot edit"))):
+            with self.subTest(method=method), patch.object(hc, "doc_get", return_value=(None, 0)):
+                with patch.object(hc, method, side_effect=error):
+                    self.assertEqual(factory.edit_layout(hc, lambda doc: True), str(error))
 
 
 class TeamLookupTests(unittest.TestCase):
@@ -4928,6 +5658,28 @@ class SessionTests(unittest.TestCase):
         self.assertEqual((sess["args"], sess["resume"]), ([], False))
         self.assertIn("starts in a new conversation: none was recorded", sess["notice"])
 
+    def test_launch_entry_never_replaces_a_current_session_with_new(self):
+        m = self.m("pi-dev")
+        for i, (how, value) in enumerate((("id", "abc"), ("dir", "/private/folder"), ("env", "xyz"))):
+            with self.subTest(how=how):
+                term = f"t{i}"
+                factory.launch_entry(self.state, m, term, how, value)
+                before = self.lines()
+                factory.launch_entry(self.state, m, term, "new", None)
+                self.assertEqual(self.lines(), before)
+        m = self.m("codex-dev")
+        start = threading.Barrier(2)
+
+        def write(how, value):
+            start.wait(timeout=5)
+            factory.launch_entry(self.state, m, "race", how, value)
+
+        with concurrent.futures.ThreadPoolExecutor(2) as workers:
+            calls = [workers.submit(write, how, value) for how, value in (("new", None), ("id", "latest"))]
+            for call in calls:
+                call.result(timeout=5)
+        self.assertEqual(factory.saved_sessions(self.state)[0]["codex-dev"]["value"], "latest")
+
     def test_values_that_could_be_options_or_too_long_are_not_recorded(self):
         for value in ("-rf", "", "a" * 129, "a b", "x;y", None):
             self.assertIsNone(self.record("codex-dev", "t1", value))
@@ -5250,6 +6002,32 @@ class StartMemberTests(unittest.TestCase):
             self.start(name)
         folder = self.state / "sessions" / f"{name}-pi"
         self.assertEqual(stat.S_IMODE(folder.stat().st_mode), 0o700)
+
+    def test_start_member_labels_the_session_plan_it_runs(self):
+        for name, member in self.cfg.members.items():
+            harness = member["harness"]
+            for fallback in (False, True):
+                for resume in (False, True):
+                    with self.subTest(harness=harness, fallback=fallback, resume=resume):
+                        table = factory.TABLE[harness]
+                        mode = "env" if fallback else table.get("session")
+                        with patch.dict(table, session=mode):
+                            m = factory.plan(self.cfg, name)
+                            entry = {"harness": harness, "model": m["model"],
+                                     "how": "dir" if mode == "dir" else "id",
+                                     "value": str(factory.session_folder(self.state, m)) if mode == "dir" else "saved"}
+                            sess = factory.session_plan(m, self.state, entry if resume else None, False)
+                            _, record = self.start(name, sess)
+                        raw = record["labels"].get("factory.launch")
+                        self.assertEqual(self.fake.calls("terminal.run")[-1]["params"]["labels"].get("factory.launch"),
+                                         raw)
+                        if resume and mode != "dir":
+                            self.assertIsNone(raw)
+                            continue
+                        how = "dir" if mode == "dir" else "id" if mode == "id" else "new"
+                        value = entry["value"] if how == "dir" else sess["assigned"]
+                        self.assertEqual(json.loads(raw), {"how": how, "value": value, "fresh": not resume,
+                                                           "harness": harness, "model": m["model"]})
 
     def test_a_missing_binary_or_a_refused_run_is_a_problem(self):
         name = next(iter(self.cfg.members))

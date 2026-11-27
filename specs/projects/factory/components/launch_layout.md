@@ -61,7 +61,7 @@ def saved_sessions(state) -> tuple[dict[str, dict], int]       # newest entry pe
 def record_session(cfg: Config, state, member: str, term: str, environ=os.environ) -> str | None
     # called by say: saves the harness's session_env value when it should; returns a warning or None
 def launch_entry(state, m: dict, term: str, how: str, value: str | None) -> None
-    # called by up after the brief is delivered; never replaces an entry say already made for this terminal
+    # writes a new marker at launch or a session fact after the brief; respects say captures
 def session_plan(m: dict, state, entry: dict | None, fresh: bool) -> dict
     # {"args": [...], "resume": bool, "assigned": str | None, "notice": str | None}
 ```
@@ -100,25 +100,15 @@ A member that has run before (it has a finished record or a saved entry) and has
 
 Other argv changes from v1: for `guarded` Codex `--add-dir <state>` replaces the inbox directory; v1's `session_id(ref)` helper is removed. The adapters' `argv(m, prompt_file, resume)` signature stays; `resume` is the plan dict.
 
-### What `up` and `down` save
+### Saving and recovering a launch
 
-`up`, once the member's brief is `delivered`, calls `launch_entry(state, m, term, how, value)`:
+A fresh launch writes a `new` entry before its first brief. The label `factory.launch` carries the launch's `harness`, `model` (string or null), `fresh`, `how` and `value`. Assigned IDs use `how: "id"`. Folder harnesses record `how: "dir"` and the folder actually used, including on a resume. Other fresh launches record `how: "new"` and a null value. A resume by ID needs no launch label.
 
-| Launch | Entry |
-|---|---|
-| claude or opencode, fresh | `how: "id"`, the assigned ID |
-| pi or omp, fresh or resumed | `how: "dir"`, the session directory |
-| codex or agy, fresh | `how: "new"`, `value: null` |
-| any other resumed launch | none: the newest entry already names the conversation |
+`settle_launches` reads the live record for each member, or its newest finished record. It restores a missing `new` entry for a fresh terminal, then saves the ID or folder once the log confirms delivery of its first brief. A settled record's launch label is cleared. A corrupt label or a failed label clear is reported as a warning. `launch_entry` decides under the journal lock: it never replaces an `env` entry from the same terminal, repeats an identical entry, or appends `new` after another entry for that terminal.
 
-Inside the lock, `launch_entry` appends unless the newest entry for the member is for this terminal and is an `env` entry `say` made, the same entry, or anything at all when the new one is `new`. A delivered ID or folder therefore replaces the terminal's own `new`, and nothing replaces what `say` recorded. So:
+`up` settles late briefs before reading sessions for a restart, and checks again with a fresh view and log after waiting for briefs. `brief --send` holds the lifecycle lock through its wait and check, so `up` cannot replace a terminal between the snapshot and the journal write. A failed save leaves the label in place. `up` skips restarting a member whose old fact could not be saved, exits 3 and names the member. `down` first checks that the journal can be appended to and synced. Then it settles launch facts before stopping members, leaving a member running or keeping its finished record when its entry cannot be saved, with exit 1.
 
-- a ready line that arrived first has already recorded the real ID for this terminal, and `up`'s later fallback never replaces it;
-- a successful fresh launch always ends with an entry for the new terminal, so the previous launch's conversation is no longer the newest. Codex in conversation A, `up --fresh` gives B, `down` before B has said anything: the newest entry is `new` with no value, and the next `up` starts fresh with the notice. It does not reopen A.
-
-A fresh launch saves `new` (no value) for its terminal as soon as it starts, so a brief delivered after `up` stopped waiting can never leave an older conversation as the newest entry. Its ID or folder is saved only once the brief is delivered: until then the conversation may not exist, and a saved ID that names nothing would make the next `up` fail on resume. A later `say` from that terminal replaces either.
-
-`down` cannot read a member's environment and saves no ID. Before it stops anyone it checks that `sessions.jsonl` can be appended to and synced; if not, it stops nobody and prints `sessions cannot be saved (<error>): members left running`, exit 1 (§9.4's "left running"). A switch made inside the harness after the member's last `say` is not seen.
+A switch inside a harness after its last `say` is outside this recovery path.
 
 **When a resume fails.** If a member started with `resume` exits before it is ready, `up` prints `@x: its saved conversation could not be resumed (<reason>); starting fresh`, removes the record, and starts it once more with a fresh plan. A second failure is reported like any failed start.
 
@@ -139,7 +129,7 @@ def await_ready(hc, started: dict[str, dict], timeout: float = LAUNCH_TIMEOUT, c
 1. Make `<state>`, `messages/<member>` and, for `dir` harnesses, the session directory: mode 0700, refuse a symbolic link (v1's check and message).
 2. Write `<state>/<member>.md` from `member_prompt` and, for Claude Code, `<member>.settings.json` (§7). Both are rewritten at every launch (§9.4).
 3. `argv, env = launch_argv(m, prompt_file, sess)`; `exe = shutil.which(m["harness"])`.
-4. `hc.run([exe, *argv], cwd=m["dir"], env={"PATH": os.environ.get("PATH", ""), **env}, labels={"factory.team": team, "factory.kind": "member", "factory.member": name, "factory.dir": str(state), "name": "@" + name})`.
+4. Run the harness with its own argv and working directory. Set the Factory identity labels and, when owed, the `factory.launch` fact from §3.
 
 No `herdr.*` label is set here. A terminal that carries `herdr.space` and is not yet in the layout doc is adopted by a client after about two seconds, and adoption turns `keep` on, which §9.2 forbids. The layout labels are written only after the pane is in the doc (§5).
 
@@ -161,37 +151,28 @@ The screen is read whenever the member is not `working`, so a dialog is caught w
 ## 5. Layout doc
 
 ```python
-def new_id(prefix: str) -> str                                   # prefix + uuid.uuid4().hex; prefixes "sp", "tb", "p", "s"
-def edit_layout(hc: Hc, change: Callable[[dict], bool]) -> bool  # False when the write kept conflicting
-def blocks(doc: dict) -> dict[str, dict]                         # terminal ID -> its block, over the whole doc
-def resolve_tab(doc: dict, team_json: dict, view: View, me: dict, root: pathlib.Path) -> tuple[str, str]   # (space id, tab id)
-def add_panes(doc, space: str, tab: str, panes: list[tuple[str, str]], keeper: str | None = None) -> None   # panes: (terminal, title)
-def remove_panes(doc, terminals: list[str], keeper: str | None) -> None
-def swap_terminal(doc, old: str, new: str) -> bool
+def new_id(prefix: str) -> str
+def edit_layout(hc: Hc, change: Callable[[dict], bool]) -> str | None
+def blocks(doc: dict) -> dict[str, dict]                # terminal ID -> its block
+def where(doc: dict, terminal: str) -> tuple[str, str] | None
+def resolve_tab(doc, layout, view, me) -> tuple[str, str, bool]    # space, tab, made_space
+def add_panes(doc, space, tab, panes, keeper=None, *, folder=None) -> None
+def remove_panes(doc, layout, terminals) -> None
+def swap_terminal(doc, old, new) -> bool
 ```
 
-`edit_layout`: up to `CAS_TRIES` times: `value, version = hc.doc_get()`; `doc = value or {"spaces": []}`; `if not change(doc): return True`; `hc.doc_set(doc, version)` and return True; on `HcError` kind `conflict` sleep `0.05 * attempt` s and repeat. After the last attempt return False. A client's concurrent edit is never overwritten (§7.1).
+`edit_layout` reads `herdr-app` and validates its shape. Unwritten docs start as `{"spaces": []}`. Each of up to `CAS_TRIES` attempts recomputes from the current document, then writes with its version. A no-op and a successful write return None. Conflicts retry after `0.05 * attempt` seconds. Invalid shape, other errors or exhausted retries return a reason and leave the layout alone.
 
-Doc shape (hc-capabilities §1.4): `{"spaces": [{"id", "name", "folder", "tabs": [{"id", "name", "root": node}]}]}`; a node is a block `{"id", "type": "block", "title", "content": {"terminal"}}` or a container `{"id", "type": "row" | "column", "children": [...]}`, each optionally with `size`. **A tab's `root` is always a container**: rodeo requires it when it removes a pane, and a bare block there crashes it.
+A doc's spaces contain tabs with split-tree roots. Each root is a container, even for one pane. Rodeo writes a row root for its own initial single-pane tab. A block contains its title and terminal, with an optional size.
 
-`resolve_tab`:
-- Space: `me`'s `herdr.space` label when that space is in the doc; else `team_json["layout"]["space"]` when in the doc; else append `{"id": new_id("sp"), "name": "", "folder": str(root), "tabs": []}` and set `layout.made_space`.
-- Tab: `team_json["layout"]["tab"]` when it is in that space; else the `herdr.tab` label of a terminal of kind `member` or `keeper` when that tab is in the doc; else a new id. The operator's own tab is never evidence: on a first `up` the team gets a new tab.
+`resolve_tab` selects the saved team tab anywhere in the doc. Without it, the tab with the most team terminals by block or label wins, excluding the operator's own tab. For a new tab it uses the operator's space if present, then the saved space if present, then proposes a new space. It leaves the document untouched. `add_panes` creates a missing space and tab when it places the first block.
 
-`add_panes`, for each pane in order, with `block = {"id": new_id("p"), "type": "block", "title": title, "content": {"terminal": terminal}}`:
+- Members fill up to three columns. Each additional member goes in the column with the fewest blocks, first on a tie. A column gets another block. Any other node is wrapped whole in a column with the new block.
+- The keeper's new block is last at weight 0.4. New member columns are inserted before it. An owner-arranged root is wrapped in a row if needed. Existing nodes retain their position and size within the tree.
+- A replacement takes the old block's position when it still exists. `where` finds its actual space and tab, including panes moved by the owner.
+- `remove_panes` deletes the requested blocks and prunes changed non-root containers from the bottom up: empty containers go away, single-child containers collapse into that child. Only an empty tracked team tab is removed, along with its empty space if Factory made it. An already missing block is fine.
 
-1. Tab missing: append `{"id": tab, "name": "team", "root": {"id": new_id("s"), "type": "row", "children": []}}` to the space.
-2. `root` is not a `row` (the owner rearranged it): `root = {"id": new_id("s"), "type": "row", "children": [old_root]}`.
-3. Let `cols` be `root`'s children other than the keeper's block.
-   - The pane is the keeper's: append the block as the last child with `"size": {"weight": 0.4}` (LC-8).
-   - Fewer than 3 `cols`: insert the block after the last of `cols`, so before the keeper's block.
-   - Otherwise take the child of `cols` with the fewest blocks (first on a tie): a block becomes `{"id": new_id("s"), "type": "column", "children": [it, block]}`; a `column` gets the block appended.
-
-One to three members sit side by side; four to nine fill three columns; the keeper is the narrow last pane whatever the order of the calls. Existing nodes are never moved or resized beyond the wraps in steps 2 and 3, so panes the owner moved or added stay where they are.
-
-`remove_panes`: for each terminal, delete its block; a container other than the tab's root that is left with one child is replaced by that child; the root is never replaced. A tab whose remaining blocks are none, or only the keeper's, is removed; a space Factory made (`layout.made_space`) that has no tabs left is removed. A block that is already gone (a client removed it when the terminal ended) is not an error.
-
-**Labels follow placement.** After an `edit_layout` that returned True, each terminal it placed gets `hc.label(term, {"herdr.space": space, "herdr.tab": tab, "herdr.seen": "0"})`. If `edit_layout` returns False, no label is written and `up` prints `layout not updated: <names> run without a pane; run factory.py up again to place them`. They are fully working team members; the next `up` places every live team terminal that has no block.
+After a successful edit, `up` labels added or swapped terminals with their actual `herdr.space` and `herdr.tab`. Rodeo owns `herdr.seen`. The saved layout changes only when the resolved team tab exists in the resulting document. A layout failure is a warning; a later `up` places the live terminals without blocks.
 
 ## 6. `up` and `down` sequences
 
@@ -199,18 +180,18 @@ One to three members sit side by side; four to nine fill three columns; the keep
 
 1. `Config`; the selected plans.
 2. `hc` answers and is new enough; `HC_TERMINAL_ID` is set.
-3. The state directory: an existing team terminal's `factory.dir`, else the computed path; create it private if missing. Take `<state>/up.lock` with `LOCK_EX | LOCK_NB`; if held: exit 2, `another up or down is running for this team`. Names are reserved by this lock, not by labels.
+3. The state directory: an existing team terminal's `factory.dir`, else the computed path; create it private if missing. Take `<state>/up.lock` with `LOCK_EX | LOCK_NB`; if held: exit 2, `another up, down or brief --send is running for this team`. Names are reserved by this lock, not by labels.
 4. **Under the lock:** `me = hc.get(HC_TERMINAL_ID)`; `view = team_view`; `check_operator`. Both are read now, not before the lock, so a caller that waited behind another `up` sees the operator that `up` just marked and is refused instead of demoting it.
 5. To start: selected members whose state is `not started` or `gone`. Preflight `checked()` on those: exit 2.
-6. `mark_operator`; write `team.json` (`root`, `team`, `core`, `up: true`).
+6. `mark_operator`; write `team.json` (`root`, `team`, `core`, `up: true`). Settle launch facts before reading saved sessions, including on a running team.
 7. Print the interrupted line for each `gone` member (§8). If no member was live: list leftover message files and the count of pending pairs for the operator.
 8. `ensure_worktree` for every member to start (v1). A failure fails that member only.
 9. `keeper = ensure_keeper(…, force=True)`.
 10. For each member: `session_plan`; `start_member`; then, for a `gone` member, remove its old record (`hc.kill` first when it is a live terminal that stopped reporting, then `hc.rm`). The new terminal exists before the old record is removed, so the keeper never sees the member with no record.
-11. One `edit_layout`: `resolve_tab`; `swap_terminal(old, new)` for a restarted member whose old block is still there; `add_panes` for every other started member and for every live team terminal with no block, the keeper included. Save the ids in `team.json`; write the layout labels (§5).
+11. Run the placement edit in §5, also when no member needed starting. Swap reusable member and keeper blocks first. Place each remaining headless team terminal in the selected tab. Save only IDs in the winning document and label the panes it placed.
 12. `await_ready` on all started members together. For a resumed member that exited: the fresh retry of §3 (steps 10–12 once more for it).
 13. For each ready member `log.add(operator, [name], message_for(...), kind="brief")` with v1's closing text (ready line, pickup line, or "new session" line); wait as `say` does until each brief is final or `SAY_WAIT` passes.
-14. For each member whose brief is `delivered`: `launch_entry` (§3).
+14. Settle launch facts with a fresh view and box, including briefs delivered during the wait (§3).
 15. News to members that were already running: one `log.add(operator, others, "Joined the team: … No reply needed.")` (v1).
 16. Print one line per member; exit 3 if any member did not start, is not ready, or its brief is not `delivered`, naming each with the command that fixes it (`factory.py up NAME`, or `factory.py brief --send NAME` when it runs but has no confirmed brief).
 
@@ -219,7 +200,7 @@ One to three members sit side by side; four to nine fill three columns; the keep
 1. The caller's terminal must be `view.operator`: else exit 2, "run down from the operator's pane". Take `up.lock` as above. Check that `sessions.jsonl` can be appended to (§3); if not, stop nobody, exit 1.
 2. For each named member (default all): no record: `@x was not running`. `hc.label(t, {"factory.down": "1"})`, then `hc.kill` for a live record. Once the kill succeeded, or for a finished record: `mark_stopped(state, [t], box)` with a full box. A terminal that cannot be ended records no stop and makes the exit code 1; a stop that cannot be recorded keeps the record, so `down` can be run again, and makes the exit code 1. A record with `factory.down` is the gate: while one remains, `up` refuses that member and the next `down` finishes its stop.
 3. One log section: `dropped` for pairs `queued` to the stopped members; print `stopped @x (was <word>); <n> queued messages dropped`. Only then `hc.rm` each stopped record; if the sweep fails every record stays and the exit code is 1.
-4. One `edit_layout(remove_panes)`.
+4. One layout edit removes stopped members’ panes. On the last stop, remove both the current keeper block and any block for the recorded keeper. Clear removed layout IDs from `team.json`. A write failure is a warning.
 5. If no member record is left: `team.json` `up: false`; print `run factory.py up to bring members back`. The keeper stops itself ([keeper.md](keeper.md) §8).
 
 `factory.down` is set before the kill, so a finished record with it is not a `gone` member (no exit note) and `up` does not replace that member until `down` has recorded and swept the stop. A send in flight to a stopped terminal is dropped through `team.json`'s `stopped` list, which `mark_stopped` writes and the keeper reads when it settles a definite refusal (§8.4, §8.5).
