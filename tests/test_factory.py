@@ -3,6 +3,7 @@ import importlib.util
 import concurrent.futures
 import contextlib
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 import datetime
 import errno
 import fcntl
@@ -7229,6 +7230,145 @@ class E2EFixtureTests(unittest.TestCase):
             (root / "tests/test_calc.py").unlink()
             self.assertEqual(e2e.test_run(root), 0)
             self.assertEqual(e2e.test_run(root, ci=True), 0)
+
+
+class E2EJudgeTests(unittest.TestCase):
+    revision = "a" * 40
+
+    def message(self, ident, sender, recipient, text, committed, **fields):
+        return e2e.Message(ident, sender, recipient, text, committed,
+                           **{"delivered": committed + 1, "outcome": "delivered", **fields})
+
+    def normal(self, github=False):
+        names = ("#31", "#32", "#33") if github else ("(1)", "(2)", "(3)")
+        first, second, _ = names
+        messages = [
+            self.message(1, "operator", "lead-dev", f"Assign {first}", 10, terminal="t2", turn=3),
+            self.message(2, "factory", "operator", "team quiet", 15, kind="note", meta={"what": "quiet"}),
+            self.message(3, "operator", "lead-dev", f"What remains on {first}?", 17),
+            self.message(4, "operator", "lead-dev", f"Assign {second}", 50, terminal="t2", turn=5),
+            self.message(5, "factory", "operator", "@lead-dev was killed", 55,
+                         kind="note", meta={"what": "exit", "term": "t2"}),
+            self.message(6, "operator", "lead-dev", "Pick up your work", 60, kind="brief", terminal="t4"),
+        ]
+        tickets = []
+        main_code = set()
+        for n, item in enumerate(names):
+            revision = chr(ord("a") + n) * 40
+            offset = n * 50
+            introduced = frozenset({revision, f"earlier-{n}"})
+            main_code.update(introduced)
+            tickets.append(e2e.Ticket(item, planned=2 + offset, changed=7 + offset, revision=revision,
+                                      checked_revision=revision, test_count=2, timely_check=True,
+                                      integrated=42 + offset, branch_proof=True, introduced=introduced,
+                                      accepted=True, closed=43 + offset, state="Done"))
+            messages.append(self.message(7 + n, "reviewer", "operator",
+                                         f"status: approve; item {item}; commit {revision}", 40 + offset))
+        return e2e.Evidence(tuple(tickets), tuple(messages), frozenset(main_code), ci_count=2, loaded=True, prompts=1,
+                            within_budget=True, interrupt=e2e.Fault(first, "t2", 3, 11, 13, 1080),
+                            kill=e2e.Fault(second, "t2", 5, 51, 53, 3700), recovered={"t4": 57},
+                            github=github, scoped=True)
+
+    def status(self, evidence, name, item=None):
+        return next(r["status"] for r in e2e.judge(evidence) if r["name"] == name and r.get("item") == item)
+
+    def test_all_normal_rows_pass_with_multi_commit_reviewed_branch(self):
+        for github in (False, True):
+            with self.subTest(github=github):
+                self.assertTrue(all(r["status"] == "pass" for r in e2e.judge(self.normal(github))))
+
+    def test_each_ticket_needs_plan_approval_check_integration_and_closure(self):
+        sample = self.normal()
+        for label, changes in (
+            ("planned", {"planned": 8}), ("checked", {"test_count": 0}),
+            ("checked", {"checked_revision": "b" * 40}), ("integrated", {"branch_proof": False}),
+            ("integrated", {"accepted": False}), ("closed", {"closed": 35}),
+            ("closed", {"state": "In progress"}),
+        ):
+            with self.subTest(label=label, changes=changes):
+                tickets = (replace(sample.tickets[0], **changes), *sample.tickets[1:])
+                self.assertEqual(self.status(replace(sample, tickets=tickets), label, "(1)"), "fail")
+        original = sample.messages[6]
+        for changes in ({"text": original.text.replace("approve", "changes required")},
+                        {"text": original.text.replace("(1)", "(2)")},
+                        {"text": original.text.replace(self.revision, "d" * 40)}, {"delivered": 43}):
+            with self.subTest(changes=changes):
+                messages = (*sample.messages[:6], replace(original, **changes), *sample.messages[7:])
+                self.assertEqual(self.status(replace(sample, messages=messages), "reviewed", "(1)"), "fail")
+
+    def test_run_rows_reject_direct_code_missing_ci_extra_input_and_wrong_build(self):
+        sample = self.normal()
+        for name, changes in (
+            ("no-direct-code", {"main_code": sample.main_code | {"direct"}}), ("ci-green", {"ci_count": 0}),
+            ("one-prompt", {"prompts": 2}), ("one-prompt", {"factory_commands": 1}),
+            ("loaded-version", {"loaded": False}), ("within-budget", {"within_budget": False}),
+            ("no-unconfirmed", {"messages": (replace(sample.messages[0], outcome="unconfirmed"), *sample.messages[1:])}),
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(self.status(replace(sample, **changes), name), "fail")
+        github = self.normal(github=True)
+        self.assertEqual(self.status(replace(github, scoped=False), "scoped-writes"), "fail")
+        tickets = (replace(github.tickets[0], timely_check=False), *github.tickets[1:])
+        self.assertEqual(self.status(replace(github, tickets=tickets), "checked", "#31"), "fail")
+
+    def test_interrupt_needs_silent_turn_and_item_specific_chase_after_note(self):
+        sample = self.normal()
+        chase = sample.messages[2]
+        for messages in ((sample.messages[:2] + sample.messages[3:]),
+                         (sample.messages[:2] + (replace(chase, text="Please review (2)"),) + sample.messages[3:]),
+                         (sample.messages[:2] + (replace(chase, delivered=14),) + sample.messages[3:])):
+            self.assertEqual(self.status(replace(sample, messages=messages), "quiet-then-chase"), "fail")
+        for committed in (12, 14):
+            report = self.message(12, "lead-dev", "operator", "I sent my progress on (1)", committed, delivered=None)
+            self.assertEqual(self.status(replace(sample, messages=(*sample.messages, report)), "quiet-then-chase"),
+                             "not_run")
+        self.assertEqual(self.status(replace(sample, interrupt=None), "quiet-then-chase"), "not_run")
+
+    def test_exit_note_and_replacement_must_match_the_kill(self):
+        sample = self.normal()
+        for changes in ({"recovered": {}}, {"recovered": {"t4": 50}},
+                        {"messages": (*sample.messages[:4], replace(sample.messages[4], meta={"what": "exit", "term": "x"}),
+                                      *sample.messages[5:])},
+                        {"messages": (*sample.messages[:5], replace(sample.messages[5], terminal="t2"), *sample.messages[6:])}):
+            self.assertEqual(self.status(replace(sample, **changes), "exit-then-up"), "fail")
+
+    def test_empty_board_requires_silence_and_pickup_of_the_moved_item(self):
+        sample = e2e.Evidence((e2e.Ticket("(1)", state="In progress"),), (
+            self.message(1, "factory", "operator", "team quiet", 2, kind="note", meta={"what": "quiet"}),
+            self.message(2, "factory", "operator", "ready work", 12, kind="note", meta={"what": "ready"}),
+            self.message(3, "operator", "lead-dev", "Assign (1)", 14),
+        ), loaded=True, prompts=1, within_budget=True, empty=True, moved=10, quiet_seconds=900, ready_seconds=63)
+        self.assertTrue(all(r["status"] == "pass" for r in e2e.judge(sample)))
+        for what, name in (("quiet", "one-quiet-note"), ("error", "silence")):
+            other = self.message(4, "factory", "operator", what, 5, kind="note", meta={"what": what}, delivered=None)
+            self.assertEqual(self.status(replace(sample, messages=(*sample.messages, other)), name), "fail")
+        self.assertEqual(self.status(replace(sample, quiet_seconds=899), "silence"), "fail")
+        self.assertEqual(self.status(replace(sample, ready_seconds=121), "ready-note"), "fail")
+        other = replace(sample.messages[2], text="Assign (2)")
+        self.assertEqual(self.status(replace(sample, messages=(*sample.messages[:2], other)), "item-taken", "(1)"), "fail")
+        waiting = replace(sample.tickets[0], state="Ready")
+        self.assertEqual(self.status(replace(sample, tickets=(waiting,)), "item-taken", "(1)"), "fail")
+
+    def test_triggers_correlate_receipt_to_the_observed_working_turn(self):
+        sample = self.normal()
+        first, second, _ = sample.tickets
+        term = {"address": "t2", "state": "live", "turn": 3, "status": {"state": "working"}}
+        receipt = sample.messages[0]
+        self.assertTrue(e2e.should_interrupt(receipt, first, term, 2))
+        self.assertTrue(e2e.should_interrupt(replace(receipt, turn=2), first, term, 2))
+        for msg, terminal, turn, options in (
+            (receipt, term, 3, {}), (receipt, {**term, "turn": 6}, 2, {}),
+            (replace(receipt, terminal="t3"), term, 2, {}), (replace(receipt, kind="brief"), term, 2, {}),
+            (replace(receipt, text="@reviewer joined"), term, 2, {}),
+            (receipt, term, 2, {"fired": True}), (receipt, term, 2, {"reported": True}),
+        ):
+            self.assertFalse(e2e.should_interrupt(msg, first, terminal, turn, **options))
+        term["turn"] = 5
+        receipt = sample.messages[3]
+        self.assertTrue(e2e.should_kill(receipt, second, term, 4, first.integrated))
+        for options in ({"fired": True}, {"pending": True}):
+            self.assertFalse(e2e.should_kill(receipt, second, term, 4, first.integrated, **options))
+        self.assertFalse(e2e.should_kill(receipt, second, term, 4, receipt.delivered))
 
 
 class SkillTextTests(unittest.TestCase):

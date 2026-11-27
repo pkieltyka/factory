@@ -1,6 +1,6 @@
 """Scratch repositories and evidence checks for the live autonomy runs."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
 import pathlib
 import re
@@ -109,3 +109,207 @@ def test_run(root, *, ci=False):
 def accepts(root, item):
     return subprocess.run([sys.executable, "-c", ACCEPTANCE[item - 1]], cwd=root, capture_output=True,
                           timeout=30).returncode == 0
+
+
+@dataclass(frozen=True)
+class Message:
+    """A committed pair and, if delivered, its receipt and observation order."""
+
+    ident: int
+    sender: str
+    recipient: str
+    text: str
+    committed: int
+    kind: str = "say"
+    meta: dict = field(default_factory=dict)
+    delivered: int | None = None
+    terminal: str | None = None
+    turn: int | None = None
+    outcome: str = "queued"
+
+
+@dataclass(frozen=True)
+class Fault:
+    item: str
+    terminal: str
+    turn: int
+    assignment: int
+    order: int
+    offset: int
+
+
+@dataclass(frozen=True)
+class Ticket:
+    item: str
+    planned: int | None = None
+    changed: int | None = None
+    revision: str = ""
+    checked_revision: str = ""
+    test_count: int = 0
+    timely_check: bool = False
+    integrated: int | None = None
+    branch_proof: bool = False
+    introduced: frozenset = frozenset()
+    accepted: bool = False
+    closed: int | None = None
+    state: str = "Ready"
+
+
+@dataclass
+class Evidence:
+    tickets: tuple
+    messages: tuple = ()
+    main_code: frozenset = frozenset()
+    ci_count: int = 0
+    loaded: bool = False
+    prompts: int = 0
+    factory_commands: int = 0
+    within_budget: bool = False
+    interrupt: Fault | None = None
+    kill: Fault | None = None
+    recovered: dict = field(default_factory=dict)  # live replacement addresses -> observation order of their creation
+    github: bool = False
+    scoped: bool = False
+    empty: bool = False
+    moved: int | None = None
+    quiet_seconds: float = 0
+    ready_seconds: float = float("inf")
+    rehearsal: bool = False
+
+
+def ordered(*events):
+    return all(event is not None for event in events) and all(a < b for a, b in zip(events, events[1:]))
+
+
+def names_item(message, item):
+    return message.kind == "say" and re.search(rf"(?<![\w#]){re.escape(item)}(?!\w)", message.text) is not None
+
+
+def assignment(message, item):
+    return (message.sender == "operator" and message.recipient == "lead-dev"
+            and message.delivered is not None and names_item(message, item))
+
+
+def working_assignment(message, item, terminal, before_claim):
+    """The receipt can be written after the reported working turn began."""
+    if not assignment(message, item) or message.terminal != terminal["address"] or before_claim is None:
+        return False
+    turn = terminal.get("turn")
+    return (terminal.get("state") == "live" and (terminal.get("status") or {}).get("state") == "working"
+            and type(turn) is int and type(message.turn) is int and turn == before_claim + 1
+            and message.turn in (before_claim, turn))
+
+
+def should_interrupt(message, ticket, terminal, before_claim, *, fired=False, reported=False):
+    return not fired and not reported and working_assignment(message, ticket.item, terminal, before_claim)
+
+
+def should_kill(message, ticket, terminal, before_claim, first_integration, *, fired=False, pending=False):
+    return (not fired and not pending and ordered(first_integration, message.delivered)
+            and working_assignment(message, ticket.item, terminal, before_claim))
+
+
+def row(name, passed, *, item=None, detail=None):
+    result = {"name": name, "status": ("pass" if passed else "fail") if isinstance(passed, bool) else passed}
+    if item is not None:
+        result["item"] = item
+    if detail is not None:
+        result["detail"] = detail
+    return result
+
+
+def approval(ticket, messages):
+    if not re.fullmatch(r"[a-f0-9]{40}", ticket.revision):
+        return None
+    exact = rf"(?m)^status: approve; item {re.escape(ticket.item)}; commit {ticket.revision}(?:\s|$)"
+    return next((msg for msg in messages if msg.sender == "reviewer" and msg.recipient == "operator"
+                 and msg.kind == "say" and ordered(msg.delivered, ticket.integrated)
+                 and re.search(exact, msg.text)), None)
+
+
+def is_note(message, what):
+    return message.sender == "factory" and message.kind == "note" and message.meta.get("what") == what
+
+
+def interrupt_row(evidence, first):
+    fault = evidence.interrupt
+    if fault is None:
+        return row("quiet-then-chase", "not_run", detail="interrupt trigger did not fire")
+    note = next((msg for msg in evidence.messages if is_note(msg, "quiet") and msg.recipient == "operator"
+                 and ordered(fault.order, msg.committed, msg.delivered)), None)
+    report = next((msg for msg in evidence.messages if msg.sender == "lead-dev" and names_item(msg, fault.item)
+                   and ordered(fault.assignment, msg.committed)
+                   and (note is None or ordered(msg.committed, note.delivered))), None)
+    if report is not None:
+        return row("quiet-then-chase", "not_run", detail=f"developer reported in #{report.ident}")
+    if note and fault.item == first.item and any(assignment(msg, fault.item)
+                                                and ordered(note.delivered, msg.delivered, first.integrated)
+                                                for msg in evidence.messages):
+        return row("quiet-then-chase", True, detail=f"quiet note #{note.ident}")
+    return row("quiet-then-chase", False, detail="no delivered quiet note and subsequent chase for the interrupted item")
+
+
+def kill_row(evidence, second):
+    fault = evidence.kill
+    if fault is None:
+        return row("exit-then-up", "not_run", detail="kill trigger did not fire")
+    notes = [msg for msg in evidence.messages if is_note(msg, "exit") and msg.recipient == "operator"
+             and msg.meta.get("term") == fault.terminal and ordered(fault.order, msg.delivered)]
+    for note in notes:
+        if fault.item == second.item and any(
+            msg.kind == "brief" and msg.sender == "operator" and msg.recipient == "lead-dev"
+            and msg.terminal != fault.terminal and ordered(fault.order, evidence.recovered.get(msg.terminal))
+            and ordered(note.delivered, msg.delivered, second.integrated) for msg in evidence.messages
+        ):
+            return row("exit-then-up", True, detail=f"exit note #{note.ident}")
+    return row("exit-then-up", False, detail="no matching exit note and subsequent replacement brief")
+
+
+def empty_rows(evidence):
+    item = evidence.tickets[0]
+    quiet = [msg for msg in evidence.messages if is_note(msg, "quiet") and msg.recipient == "operator"
+             and ordered(msg.committed, evidence.moved)]
+    ready = [msg for msg in evidence.messages if is_note(msg, "ready") and msg.recipient == "operator"
+             and ordered(evidence.moved, msg.committed, msg.delivered)]
+    one_quiet = len(quiet) == 1 and ordered(quiet[0].committed, quiet[0].delivered, evidence.moved)
+    silence = one_quiet and evidence.quiet_seconds >= 15 * 60 and not any(
+        msg.sender == "factory" and ordered(quiet[0].delivered, msg.committed, evidence.moved)
+        for msg in evidence.messages)
+    ready_note = len(ready) == 1 and evidence.ready_seconds <= 120
+    taken = ready_note and item.state in {"In progress", "In Progress", "Done"} and any(
+        assignment(msg, item.item) and ordered(ready[0].delivered, msg.delivered) for msg in evidence.messages)
+    return [row("one-quiet-note", one_quiet), row("silence", silence), row("ready-note", ready_note),
+            row("item-taken", taken, item=item.item)]
+
+
+def judge(evidence):
+    """Decide using records collected before teardown. This function performs no I/O."""
+    rows = [row("no-unconfirmed", not any(msg.outcome == "unconfirmed" for msg in evidence.messages)),
+            row("one-prompt", "measured" if evidence.rehearsal else
+                evidence.prompts == 1 and evidence.factory_commands == 0),
+            row("loaded-version", evidence.loaded)]
+    if evidence.github:
+        rows.append(row("scoped-writes", evidence.scoped))
+    if evidence.empty:
+        rows.extend(empty_rows(evidence))
+    else:
+        allowed = set()
+        for ticket in evidence.tickets:
+            verdict = approval(ticket, evidence.messages)
+            reviewed = verdict is not None
+            integrated = reviewed and ticket.branch_proof and ticket.accepted
+            if reviewed and ticket.branch_proof:
+                allowed.update(ticket.introduced)
+            rows.extend((
+                row("planned", ordered(ticket.planned, ticket.changed), item=ticket.item),
+                row("reviewed", reviewed, item=ticket.item, detail=f"message #{verdict.ident}" if verdict else None),
+                row("checked", ticket.test_count > 0 and bool(ticket.revision)
+                    and ticket.checked_revision == ticket.revision and (not evidence.github or ticket.timely_check),
+                    item=ticket.item, detail=f"{ticket.test_count} tests"),
+                row("integrated", integrated, item=ticket.item, detail=ticket.revision or None),
+                row("closed", ticket.state == "Done" and ordered(ticket.integrated, ticket.closed), item=ticket.item),
+            ))
+        rows.extend((row("no-direct-code", evidence.main_code <= allowed), row("ci-green", evidence.ci_count > 0),
+                     interrupt_row(evidence, evidence.tickets[0]), kill_row(evidence, evidence.tickets[1])))
+    rows.append(row("within-budget", evidence.within_budget and all(r["status"] in {"pass", "measured"} for r in rows)))
+    return rows
