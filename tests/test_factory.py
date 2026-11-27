@@ -6853,6 +6853,15 @@ class QualifyJudgeTests(unittest.TestCase):
                                                          "content": "@lead-dev idle"}]}}])
         self.assertIn("@lead-dev idle", adapter.alone_output(status, [inbox, up], prompt))
         self.assertIsNone(adapter.alone_output(status, [inbox, up], "another conversation's prompt"))
+        grep = {"type": "tool_use", "id": "g1", "name": "Grep", "input": {"pattern": status}}   # a search, not a run
+        write([{"type": "assistant", "message": {"content": [grep]}},
+               {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "g1",
+                                                         "content": f"README: run {status} to see @lead-dev"}]}}])
+        self.assertIsNone(adapter.alone_output(status, [inbox, up], prompt))
+        write([{"type": "assistant", "message": {"content": [alone]}},
+               {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "c2", "is_error": True,
+                                                         "content": "Read-only file system @lead-dev"}]}}])
+        self.assertIsNone(adapter.alone_output(status, [inbox, up], prompt))     # an unsuccessful result
         codex = [{"type": "response_item", "payload": {"type": "function_call", "call_id": "x1", "name": "shell",
                                                        "arguments": json.dumps({"cmd": inbox})}},
                  {"type": "response_item", "payload": {"type": "function_call_output", "call_id": "x1",
@@ -6897,6 +6906,22 @@ class QualifyJudgeTests(unittest.TestCase):
         row = run.data["rows"][0]
         self.assertEqual((row["subcase"], row["status"]), ("operator-commands", "fail"))
         self.assertIn("up did not run or did not finish", row["reason"])
+
+    def test_the_upgrade_row_fails_a_same_turn_delivery_before_calling_it_not_run(self):
+        """@architect-2: an observed delivery into the owner's turn is a fail, never a missed overlap."""
+        import live
+        later = {"o": "delivered", "started": True, "term": "t1", "turn": 4}
+        proof = {"between_turns": True, "operator": "t1", "operator_seen": {"release": {"app": "codex", "turn": 3}},
+                 "histories": {"held": [["sending", None], ["delivered", None]]},
+                 "deliveries": {"held": {**later, "turn": 3, "started": False}, "queued": later},
+                 "held_message_count": 1, "new_message_count": 1, "effect_order": ["held", "queued"]}
+        self.assertEqual(live.upgrade_row_status(True, proof)[0], "fail")              # typed into the owner's turn
+        proof["deliveries"] = {"held": later, "queued": {**later, "turn": 5}}
+        self.assertEqual(live.upgrade_row_status(True, proof)[0], "not_run")           # both later, no overlap seen
+        proof["histories"] = {"held": [["sending", None], ["queued", "busy"], ["sending", None], ["delivered", None]]}
+        self.assertEqual(live.upgrade_row_status(True, proof), ("pass", None))
+        self.assertEqual(live.upgrade_row_status(False, proof)[0], "fail")
+        self.assertEqual(live.upgrade_row_status(True, {"between_turns": False}), ("pass", None))   # cross control
 
     def test_the_report_shows_an_old_codex_operator_steering_pass_unproved(self):
         import live

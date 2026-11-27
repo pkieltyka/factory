@@ -235,23 +235,56 @@ def installed_needles(installed):
     return sorted("".join(n.split()) for n in needles)
 
 
+CODE_EXEC = re.compile(r'exec_command\(\{\s*cmd\s*:\s*("(?:[^"\\]|\\.)*")')
+
+
 def tool_calls(text):
-    """[(call text, its result text or None)] for every tool call in a Claude Code or Codex transcript (JSONL),
-    paired by the call's own ID: Claude Code's tool_use / tool_result, Codex's function_call or custom_tool_call /
-    its _output."""
+    """[(command, result text or None)] for every shell execution in a Claude Code or Codex transcript (JSONL),
+    paired by the call's own ID, with its actual command argument: Claude Code's Bash tool_use (input.command),
+    Codex's shell or exec_command function_call (arguments' cmd or command), and a Codex code-mode call that runs
+    exactly one exec_command. Searches, file reads and other tools are not executions and are left out; a result
+    that reports failure (is_error, a non-zero exit) is None (@architect-2)."""
     calls, results = {}, {}
+
+    def command_of(node, kind):
+        if kind == "tool_use":
+            return (node.get("input") or {}).get("command") if node.get("name") == "Bash" else None
+        if kind == "function_call" and node.get("name") in ("shell", "exec_command", "local_shell"):
+            try:
+                args = json.loads(node.get("arguments") or "{}")
+            except ValueError:
+                return None
+            cmd = args.get("cmd", args.get("command"))
+            return " ".join(cmd) if isinstance(cmd, list) else cmd
+        if kind == "custom_tool_call":
+            found = CODE_EXEC.findall(node.get("input") or "")
+            if len(found) == 1 and (node.get("input") or "").count("exec_command(") == 1:
+                try:
+                    return json.loads(found[0])
+                except ValueError:
+                    return None
+        return None
+
+    def failed(node, kind, output):
+        if kind == "tool_result":
+            return node.get("is_error") is True
+        match = re.search(r"(?:Exit code|exit_code)\D{0,4}(-?\d+)", output or "")
+        return bool(match) and match.group(1) != "0"
 
     def walk(node):
         if isinstance(node, dict):
             kind = node.get("type")
-            if kind == "tool_use" and node.get("id"):
-                calls[node["id"]] = json.dumps(node.get("input"))
-            elif kind in ("function_call", "custom_tool_call", "local_shell_call") and node.get("call_id"):
-                calls[node["call_id"]] = json.dumps(node.get("arguments") or node.get("input") or node.get("action"))
-            elif kind == "tool_result" and node.get("tool_use_id"):
-                results[node["tool_use_id"]] = json.dumps(node.get("content"))
-            elif kind in ("function_call_output", "custom_tool_call_output") and node.get("call_id"):
-                results[node["call_id"]] = json.dumps(node.get("output"))
+            ident = node.get("id") if kind == "tool_use" else node.get("call_id")
+            if kind in ("tool_use", "function_call", "custom_tool_call") and ident:
+                command = command_of(node, kind)
+                if isinstance(command, str):
+                    calls[ident] = command
+            elif kind in ("tool_result", "function_call_output", "custom_tool_call_output"):
+                key = node.get("tool_use_id") if kind == "tool_result" else node.get("call_id")
+                output = node.get("content") if kind == "tool_result" else node.get("output")
+                output = output if isinstance(output, str) else json.dumps(output)
+                if key:
+                    results[key] = None if failed(node, kind, output) else output
             for value in node.values():
                 walk(value)
         elif isinstance(node, list):
@@ -262,8 +295,7 @@ def tool_calls(text):
             walk(json.loads(line))
         except ValueError:
             continue
-    return [(json.loads(call) if isinstance(json.loads(call), str) else call, results.get(ident))
-            for ident, call in calls.items()]
+    return [(command, results.get(ident)) for ident, command in calls.items()]
 
 
 def qa_transcripts(roots, labelled=False):
@@ -2204,8 +2236,8 @@ class RealAdapter(FixtureAdapter):
             if prompt and prompt not in text and json.dumps(prompt)[1:-1] not in text:
                 continue                                  # another conversation (a member's)
             for call, output in tool_calls(text):
-                if command in call and not any(o in call for o in others) and output is not None:
-                    found = output
+                if " ".join(call.split()) == " ".join(command.split()) and output is not None:
+                    found = output                        # this command, executed, and its own successful result
         return found
 
     def blocked_request(self):
@@ -4340,6 +4372,26 @@ def _upgrade(team, peer):
     return ok, proof
 
 
+def upgrade_row_status(ok, proof):
+    """case 7 upgrade's row: the general verdict, and for a between-turns operator (keeper.md §9) the overlap
+    (@architect-2): a message typed into the owner's turn fails first; with both in later turns of their own but no
+    busy requeue the overlap never came (not_run); otherwise the between-turns judge decides."""
+    if not ok:
+        return "fail", "see proof"
+    if not proof.get("between_turns") or judge_between_upgrade(proof):
+        return "pass", None
+    release = ((proof.get("operator_seen") or {}).get("release") or {}).get("turn")
+    deliveries = (proof.get("deliveries") or {}).values()
+    if any(d.get("started") is not True or not isinstance(d.get("turn"), int) or not isinstance(release, int)
+           or d["turn"] <= release or d.get("term") != proof.get("operator") for d in deliveries):
+        return "fail", "see proof: a message was not delivered between turns (in the owner's turn or elsewhere)"
+    held = (proof.get("histories") or {}).get("held") or []
+    if not any(a == ["sending", None] and b == ["queued", "busy"] for a, b in zip(held, held[1:])):
+        return "not_run", ("the owner's turn never overlapped the held send (no busy requeue): between-turns"
+                           " delivery was not exercised")
+    return "fail", "see proof"
+
+
 def judge_between_upgrade(p):
     """case 7 upgrade with a between-turns operator: the live app selected the rule, both messages ended delivered
     each starting a turn of its own (none typed into the owner's turn), each acted on once, held first; a held
@@ -4433,14 +4485,7 @@ def _case_7_upgrade(run, role, harness, adapter_class):
         if not _up(team, run, 7, role, harness, ["upgrade"]):
             return
         ok, proof = _upgrade(team, peer)
-        status, reason = ("pass", None) if ok else ("fail", "see proof")
-        if ok and proof.get("between_turns") and not judge_between_upgrade(proof):
-            # a between-turns operator (keeper.md §9) must show the overlap; one that never came is not run
-            held = (proof.get("histories") or {}).get("held") or []
-            requeued = any(a == ["sending", None] and b == ["queued", "busy"] for a, b in zip(held, held[1:]))
-            status, reason = (("fail", "see proof: a message reached the owner's turn") if requeued else
-                              ("not_run", "the owner's turn never overlapped the held send (no busy requeue):"
-                                          " between-turns delivery was not exercised"))
+        status, reason = upgrade_row_status(ok, proof)
         run.row(7, "upgrade", role, harness, status,
                 "a new Factory version under a live keeper while this profile works: the held send finishes, the"
                 " keeper restarts in its pane, and the next message is delivered once by the new image",
