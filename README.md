@@ -70,7 +70,7 @@ Pluggable project context (notes, specs and knowledge per project), and cost and
 
 - [skill/](skill/) — what you install: instructions, roles, templates, recipes and `scripts/factory.py`.
 - [docs/](docs/README.md) — the team, command map and getting-started guide.
-- [tests/](tests/) — fake harness and fake `hc` tests, a private real `hc` core, real Git checks and the Gate 1 fixture. Run `python3 tests/test_factory.py`, or set `FACTORY_TEST_HC=real` for the private core suite. Run `python3 tests/live.py smoke` to exercise the rodeo workflow.
+- [tests/](tests/) — fake harness and fake `hc` tests, a private real `hc` core, real Git checks and the Gate 1 fixture. Run `python3 tests/test_factory.py`, or set `FACTORY_TEST_HC=real` for the private core suite. Run `python3 tests/live.py smoke` to exercise the rodeo workflow. `FACTORY_LIVE=1 python3 tests/test_factory.py LiveFlags` checks installed harness flags.
 
 To add a harness, add its table in `skill/harnesses.toml`, its code block and a test fake.
 
