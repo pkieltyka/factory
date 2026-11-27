@@ -39,7 +39,7 @@ def check_operator(cfg: Config, team: str, me: dict, view: View) -> None     # r
 def mark_operator(cfg: Config, hc: Hc, team: str, me: dict, view: View, state: pathlib.Path) -> None
 ```
 
-`me` is `hc.get(os.environ["HC_TERMINAL_ID"])`; with the variable unset `up` exits 2, "run the operator inside an hc terminal (rodeo or the Herdr app)".
+`me` is `hc.get(os.environ["HC_TERMINAL_ID"])`; with the variable unset `up` exits 2, "run the operator inside an hc terminal, such as a rodeo pane".
 
 `check_operator` changes nothing. It refuses when:
 

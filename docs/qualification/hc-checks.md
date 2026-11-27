@@ -76,7 +76,7 @@ Verified facts about `hc` and `rodeo`, collected on isolated private cores (neve
 - **Command:** `python3 tests/live.py check lc8` (`hc 0.1.20`, `rodeo 0.2.1`, Linux, 26 November 2026, branch `peter/169-launch`).
 - **Setup:** Two private cores, as in LC-13. The QA core holds three OSC 7501 probes placed in a `herdr-app` doc written before rodeo starts: tab `team`, a `row` root with `@alice`, `@bob` and a `keeper` block with `"size": {"weight": 0.4}`, each terminal labelled `herdr.space`/`herdr.tab`/`herdr.seen`. A fourth probe carries no `herdr.*` label. rodeo runs at 160×48 on the driver core; the check waits 5 s past a client's adoption delay.
 - **Observed:** each member title appears once; on the title row the panes measure 56, 56 and 20 columns, so the keeper is last and narrowest (0.36 of a member's width for weight 0.4 against 1); `doc.get` returns the doc unchanged, weight included; the unlabelled terminal is not added to the doc; `keep` is `false` on all four terminals.
-- **Verdict:** **Pass** for rodeo. The Herdr desktop app is **not run**: it is checked only when pointed at a private session by hand.
+- **Verdict:** **Pass** with rodeo.
 - **Consequence:** `launch_layout.md` §5 keeps the keeper's `size.weight`; no fallback is applied.
 
 ---

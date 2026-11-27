@@ -4,7 +4,7 @@
 
 ## What's new in v2
 
-v2 rebuilds Factory on **herdr-core** (`hc`): a server that owns persistent terminals, with clients on top of it, such as the [Herdr desktop app](https://github.com/herdrdev/herdr-core) (`herdr-app`) and [rodeo](https://github.com/lukeed/rodeo), a keyboard-first terminal UI. Factory talks to `hc` directly, so it doesn't care which client you use, and your team appears in all of them at once.
+v2 rebuilds Factory on **herdr-core** (`hc`): a server that owns persistent terminals, with clients on top of it, such as [rodeo](https://github.com/lukeed/rodeo), a keyboard-first terminal UI. Factory talks to `hc` directly and writes its team into the layout `hc` clients share.
 
 - **Agents report their own state.** Claude Code, Codex, pi, omp, OpenCode and agy emit **OSC 7501**, and `hc` tracks each one as idle, working, done, blocked or error, with a turn counter. Factory reads that instead of watching screens, so herdr integrations and per-harness plugins are gone.
 - **Simpler, more reliable messaging.** Most of v1's trouble was getting a report to wake the operator and the right member at the right moment. On `hc`, delivery uses `hc send` (which waits for an unsent draft and refuses blocked agents) and `hc wait`, on top of a durable inbox.

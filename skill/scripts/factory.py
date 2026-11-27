@@ -3360,7 +3360,7 @@ def cmd_up(args):
         stop_with("--timeout must be a positive number of seconds")
     me_id = os.environ.get("HC_TERMINAL_ID")
     if not me_id:
-        stop_with("run the operator inside an hc terminal (rodeo or the Herdr app)")
+        stop_with("run the operator inside an hc terminal, such as a rodeo pane")
     hc, team, operator = Hc(), team_key(cfg.root), cfg.operator["name"]
     try:
         state = state_for(cfg, hc)

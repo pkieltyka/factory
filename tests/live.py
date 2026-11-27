@@ -1267,7 +1267,6 @@ def lc8():
         return result
     result["rodeo_version"] = subprocess.run([RODEO, "--version"], capture_output=True, text=True,
                                              check=False).stdout.strip()
-    result["desktop_app"] = "not run: checked only when pointed at a private session by hand"
     with Core("lc8qa") as qa, Core("lc8drv") as drv:
         alice, bob, keeper = Probe(qa, "alpha"), Probe(qa, "beta"), Probe(qa, "kp")
         stray = Probe(qa, "stray")   # no herdr labels: a client must leave it alone

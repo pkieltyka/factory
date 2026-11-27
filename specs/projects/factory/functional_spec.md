@@ -13,7 +13,7 @@ Goals:
 - No agent, operator or member, ever starts, arms, re-arms or keeps a wait, watcher or background task for Factory, and nothing depends on a harness's background or foreground tool modes. Agents only run Factory commands that return within seconds; the keeper is Factory's own process in `hc` (§8.5).
 - Agent state comes only from OSC 7501 as `hc` reports it. No screen reading except the startup-dialog check (§6.3).
 - The team runs autonomously and continuously through ready work, and is never silent for long without the operator being told (§8a).
-- The team shows up in any `hc` client (rodeo, the Herdr desktop app) because Factory writes its panes into the `herdr-app` layout doc.
+- The team shows up in `hc`'s clients, rodeo for one, because Factory writes its panes into the `herdr-app` layout doc.
 - Fewer commands, fewer files and less script than v1, keeping v1's tested guarantees where they still apply.
 - v1's `FACTORY.md` and `factory.toml` work unchanged.
 
@@ -40,7 +40,7 @@ A harness counts as supported only when its OSC 7501 reports pass §10.1. One kn
 ## 2. Concepts
 
 - **Owner:** the person. Talks to the operator and may type into any pane.
-- **Operator:** the agent the owner talks to, `@operator` by default, running in an `hc` terminal the owner opened in a client (a rodeo or Herdr app pane). It assigns work, reviews and integrates.
+- **Operator:** the agent the owner talks to, `@operator` by default, running in an `hc` terminal the owner opened in a client (a rodeo pane). It assigns work, reviews and integrates.
 - **Member:** an agent Factory launches, with a stable name (`@lead-dev`, `@reviewer-2`), a role, a harness, a model and a checkout.
 - **Team:** one operator and its members for one repository checkout. Several teams may share one `hc` session (§7.3).
 - **Formation** (`factory.toml`, local) and **brief** (`FACTORY.md`, committed): v1's formats.
@@ -51,7 +51,7 @@ A harness counts as supported only when its OSC 7501 reports pass §10.1. One kn
 ## 3. Requirements on the environment
 
 - `hc` 0.1.20 or newer. Factory checks the version and fails with a clear message when `hc` is older or missing.
-- The operator runs inside an `hc` terminal: any rodeo or Herdr app pane is one. Outside one, `up` refuses with "run the operator inside an hc terminal (rodeo or the Herdr app)". Offline commands (§5.1) work anywhere.
+- The operator runs inside an `hc` terminal: any rodeo pane is one. Outside one, `up` refuses with "run the operator inside an hc terminal, such as a rodeo pane". Offline commands (§5.1) work anywhere.
 - Python 3.11+ standard library only; Git for worktrees; the harnesses the formation names.
 - No herdr integrations, hooks or plugins. Factory never installs or rewrites any harness's global settings.
 

@@ -180,7 +180,7 @@ CAS_TRIES = 8                        # layout doc compare-and-set attempts
 | Failure | Where | Result |
 |---|---|---|
 | `hc` missing, older than 0.1.20, another core than the team's, or `hc connect` cannot reach a core | any team command | Exit 2 with the reason; decided from `hello`, before any request is written. Offline commands never call `hc`. |
-| `HC_TERMINAL_ID` unset | `up` | Exit 2: "run the operator inside an hc terminal (rodeo or the Herdr app)" |
+| `HC_TERMINAL_ID` unset | `up` | Exit 2: "run the operator inside an hc terminal, such as a rodeo pane" |
 | Caller's terminal has no team labels | `say` | Exit 2: "run up first" |
 | The operator check or preflight fails, or another `up`/`down` holds the team lock | `up` | Exit 2; no label, terminal, layout, `team.json` or log change was made |
 | A member does not start or gets no brief | `up` | Exit 3 naming it; other members proceed |
@@ -254,7 +254,6 @@ Each step is mergeable alone and ends with its tests green ([testing.md](compone
 | LC-7 | agy: does `--settings '{"trustedWorkspaces": ["<dir>"]}'` suppress the trust dialog for that session without writing the global list? | launch | The dialog is left to the owner (§6.3) |
 | LC-11 | OpenCode: is there a variable like the others in its tool environment? | sessions | Its launch flag only (`--session`) |
 | LC-12 | Claude Code, Codex, agy: does a `say` run by a sub-agent or sub-thread carry the parent conversation's ID in the variable? | sessions | `session_follow = false` for that harness: record once per launch, from the ready line |
-| LC-8 (Herdr app) | The same questions as LC-8 for rodeo (below), for the Herdr desktop app pointed at a private session | layout | Drop the keeper's `size`; the keeper already turns `keep` off |
 
 ### Resolved (Phase 1 and Phase 5a, 26 November 2026, [docs/qualification/hc-checks.md](../../../docs/qualification/hc-checks.md))
 
