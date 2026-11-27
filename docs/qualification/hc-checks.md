@@ -81,6 +81,15 @@ Verified facts about `hc` and `rodeo`, collected on isolated private cores (neve
 
 ---
 
+## rodeo_tabs: selecting a tab by its place (Phase 8)
+
+- **Command:** `python3 tests/live.py check rodeo_tabs` (`hc 0.1.20`, `rodeo 0.2.1`, Linux, 27 November 2026, branch `peter/173-qualification`).
+- **Setup:** two private cores. On the QA core a `herdr-app` doc with two tabs, `operator` (one OSC 7501 probe) and `team` (two probes), with each terminal's `herdr.*` labels written; rodeo on the driver core.
+- **Observed:** `ctrl+b` then `2` put the next marker only in the team tab's focused probe; `ctrl+b` then `1`, only in the operator tab's; `ctrl+b` then `2` again, only in the team tab's.
+- **Verdict:** **Pass.** The qualification driver selects a tab with `prefix+N` by the tab's place in the layout doc (phase_8.md §2).
+
+---
+
 ## Fixtures (`tests/hc_fixtures.json`)
 
 - **Command:** `python3 tests/live.py fixtures --out tests/hc_fixtures.json`

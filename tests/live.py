@@ -1426,6 +1426,58 @@ def lc8():
     return result
 
 
+def rodeo_tabs():
+    """check rodeo_tabs (phase_8.md §2): prefix+1..9 selects a tab by its place in the layout doc, so a marker
+    typed after it reaches only that tab's focused pane."""
+    result = {"check": "rodeo_tabs", "rodeo": RODEO}
+    if not RODEO or not os.path.exists(RODEO):
+        result["result"] = "not run: rodeo not found (set RODEO_BIN)"
+        return result
+    result["rodeo_version"] = subprocess.run([RODEO, "--version"], capture_output=True, text=True,
+                                             check=False).stdout.strip()
+    with Core("tabsqa") as qa, Core("tabsdrv") as drv:
+        op, lead, rev = Probe(qa, "op"), Probe(qa, "lead"), Probe(qa, "rev")
+        space = "sp" + "7" * 32
+
+        def block(n, probe, title):
+            return {"id": "p" + str(n) * 32, "type": "block", "title": title, "content": {"terminal": probe.address}}
+        doc = {"spaces": [{"id": space, "name": "tabs", "folder": str(qa.dir), "tabs": [
+            {"id": "tb" + "1" * 32, "name": "operator", "root": {"id": "s" + "1" * 32, "type": "row",
+                                                                "children": [block(1, op, "@operator")]}},
+            {"id": "tb" + "2" * 32, "name": "team", "root": {"id": "s" + "2" * 32, "type": "row",
+                                                            "children": [block(2, lead, "@lead"),
+                                                                         block(3, rev, "@rev")]}}]}]}
+        qa.rpc("doc.set", {"name": "herdr-app", "value": doc, "version": 0})
+        for probe, tab, name in ((op, "1", "@operator"), (lead, "2", "@lead"), (rev, "2", "@rev")):
+            qa.rpc("terminal.label", {"terminal": probe.address, "labels": {
+                "herdr.space": space, "herdr.tab": "tb" + tab * 32, "herdr.seen": "0", "name": name}})
+        rodeo = Rodeo(qa, drv, "unset_env")
+        try:
+            if rodeo.wait_for(["operator", "team"]) is None:
+                result["result"] = "fail: rodeo did not render both tabs"
+                return result
+            time.sleep(2)
+            seen = {}
+            for tab, marker in (("2", "x"), ("1", "y"), ("2", "z")):
+                before = {name: len(p.text()) for name, p in (("op", op), ("lead", lead), ("rev", rev))}
+                rodeo.keys("ctrl+b")
+                time.sleep(0.2)
+                rodeo.keys(tab)
+                time.sleep(0.6)
+                rodeo.keys(marker)
+                time.sleep(0.8)
+                got = [name for name, p in (("op", op), ("lead", lead), ("rev", rev))
+                       if marker in p.text()[before[name]:]]
+                seen[f"prefix+{tab} then {marker}"] = got
+            result["landed"] = seen
+            ok = (seen["prefix+2 then x"] == ["lead"] and seen["prefix+1 then y"] == ["op"]
+                  and seen["prefix+2 then z"] == ["lead"])
+            result["result"] = "pass" if ok else "fail"
+        finally:
+            rodeo.close()
+    return result
+
+
 def smoke():
     """Exercise the real Factory commands and keeper through rodeo on two private cores."""
     if not RODEO:
@@ -1767,7 +1819,7 @@ def fixtures(out):
     return {"check": "fixtures", "out": str(out), "hc": version, "replies": sorted(replies), "errors": sorted(errors)}
 
 
-CHECKS = {"lc1": lc1, "lc10": lc10, "lc13": lc13, "lc8": lc8, "rodeo_focus": rodeo_focus}
+CHECKS = {"lc1": lc1, "lc10": lc10, "lc13": lc13, "lc8": lc8, "rodeo_tabs": rodeo_tabs, "rodeo_focus": rodeo_focus}
 LOGIN_CHECKS = {"lc2": lc2, "lc3": lc3, "lc4": lc4, "lc6": lc6, "lc7": lc7, "lc12": lc12}   # start real harnesses
 
 
