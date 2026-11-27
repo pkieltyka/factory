@@ -3594,9 +3594,10 @@ def _last_line(hc, address):
     return lines[-1] if lines else ""
 
 
-def await_ready(hc, started, timeout=LAUNCH_TIMEOUT, clock=time):
+def await_ready(hc, started, timeout=LAUNCH_TIMEOUT, clock=time, ready=("idle",)):
     """started: {member: (its terminal record, its harness's dialogs)}. Polls every member every 0.5 s until each
-    is settled or the deadline passes. -> {member: None when ready, else the reason it is not}."""
+    is settled or the deadline passes. -> {member: None when ready, else the reason it is not}. A launch waits for
+    idle; brief --send also takes done, the state a real harness rests in after any turn."""
     deadline = clock.monotonic() + timeout
     outcome, answered, shown, words = {}, {name: set() for name in started}, {}, {}
     seen = {}                                        # the dialog each member showed at its last poll
@@ -3633,7 +3634,7 @@ def await_ready(hc, started, timeout=LAUNCH_TIMEOUT, clock=time):
                     seen[name] = text
                     continue
                 seen.pop(name, None)
-                if word == "idle":
+                if word in ready:
                     outcome[name] = None
             except (HcError, HcDown) as error:
                 outcome[name] = f"could not be watched: {error}"
@@ -4597,7 +4598,10 @@ def _brief_send_locked(cfg, state, hc, me, names):
                 print(f"{pending}; run factory.py status")
                 code = 1
                 continue
-            why = await_ready(hc, {name: (record, TABLE[m["harness"]].get("dialogs", []))}, timeout=5)[name]
+            # done as well as idle: a replacement that already answered its unconfirmed brief rests in done
+            # (Claude Code member case 8 at 97afeec), and a dialog on screen still stops it, as at launch
+            why = await_ready(hc, {name: (record, TABLE[m["harness"]].get("dialogs", []))}, timeout=5,
+                              ready=("idle", "done"))[name]
             if why:
                 print(f"@{name} is not ready: {why}")
                 code = 1

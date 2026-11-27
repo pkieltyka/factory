@@ -2528,6 +2528,32 @@ class TeamCommandTests(TeamCase):
         self.assertIn("@reviewer gone: run `factory.py up reviewer`", out)
         self.assertNotIn("factory.py brief --send reviewer", out)
 
+    def test_brief_send_reaches_a_replacement_resting_in_done(self):
+        """Claude Code member case 8 at 97afeec: the replacement answered its unconfirmed brief and rested in done,
+        and brief --send refused it because only idle counted as ready. A dialog still stops it, and up's own
+        launch still waits for idle."""
+        self.cmd(self.operator, "up", "lead-dev")
+        term = self.terminal("reviewer")[0]
+        self.fake.set_status(term, "working")
+        self.fake.set_status(term, "done")                    # it took a turn, and the owner has not looked
+        code, out, err = self.cmd(self.operator, "brief", "--send", "reviewer")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("mention any work you have already picked up", self.fake.sent(term)[-1])
+        record = {"address": term}
+        clock = types.SimpleNamespace(t=0.0)
+        clock.monotonic = lambda: clock.t
+        clock.sleep = lambda s: setattr(clock, "t", clock.t + s)
+        hc = types.SimpleNamespace(get=lambda a: {"state": "live", "status": {"state": "done"}},
+                                   read=lambda a: "", keys=lambda a, k: None)
+        self.assertEqual(factory.await_ready(hc, {"x": (record, [])}, timeout=1, clock=clock),
+                         {"x": "not ready after 1 s (done)"})
+        self.assertEqual(factory.await_ready(hc, {"x": (record, [])}, timeout=1, clock=clock, ready=("idle", "done")),
+                         {"x": None})
+        hc.read = lambda a: "Do you trust the contents of this project?"
+        dialog = [["Do you trust the contents of this project?", []]]
+        self.assertIn("trust dialog", factory.await_ready(hc, {"x": (record, dialog)}, timeout=1, clock=clock,
+                                                          ready=("idle", "done"))["x"])
+
     def test_brief_send_closes_by_whether_the_terminal_was_briefed(self):
         self.cmd(self.operator, "up", "lead-dev")
         unbriefed = self.terminal("reviewer")[0]
@@ -6800,6 +6826,105 @@ class QualifyReportTests(unittest.TestCase):
 
 class QualifyFrameworkTests(unittest.TestCase):
     """phase_8.md §1 and §5.1: selection, rows, the case rule, exit precedence and checkpoints, with no login."""
+
+    def test_qa_environment_drops_every_herdr_variable(self):
+        """A runner started from the owner's herdr pane passes nothing of that session on (@architect, #173)."""
+        import live
+        caller = {"HERDR_ENV": "1", "HERDR_SOCKET_PATH": "/s", "HERDR_SESSION": "x", "HERDR_PANE_ID": "p",
+                  "HERDR_CONFIG_PATH": "/c", "HC_SOCKET": "/h", "RODEO_X": "r", "PATH": "/bin", "HOME": "/home/o"}
+        self.assertEqual(live.qa_environ(caller), {"PATH": "/bin", "HOME": "/home/o"})
+
+    @real_only
+    def test_a_qa_team_cannot_reach_herdr_or_another_factory(self):
+        """Every QA terminal sees a failing herdr first on PATH and no HERDR_* variable, and the scratch brief
+        names the candidate script as the team's only Factory command."""
+        import live
+        with patch.dict(os.environ, {"HERDR_ENV": "1", "HERDR_SOCKET_PATH": "/owner.sock", "HERDR_PANE_ID": "w1:p1"}):
+            team = live.QATeam(live.FixtureAdapter, "codex", {"lead-dev": "codex"})
+        with team:
+            self.assertFalse([k for k in team.qa.env if k.startswith("HERDR")])
+            self.assertFalse([k for k in team.env if k.startswith("HERDR")])
+            stub = shutil.which("herdr", path=team.env["PATH"])
+            self.assertEqual(stub, str(team.bin / "herdr"))
+            run = subprocess.run([stub, "status"], capture_output=True, text=True)
+            self.assertEqual(run.returncode, 1)
+            self.assertIn("not available", run.stderr)
+            brief = (team.work / "FACTORY.md").read_text()
+            self.assertIn(f"Factory's only command for this team is python3 {team.script}.", brief)
+
+    def test_installed_factory_skills_are_found_by_a_scan(self):
+        """Every skills/factory under a dot-directory, by path and resolved folder; a symlinked install resolves to
+        its target, and repositories, caches and other skills are left alone."""
+        import live
+        home = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
+        store = home / ".nix-config" / "extras" / "skills" / "factory"
+        (store / "scripts").mkdir(parents=True)
+        (store / "SKILL.md").write_text("x")
+        for parent in (".claude/skills", ".gemini/config/skills"):
+            (home / parent).mkdir(parents=True)
+            (home / parent / "factory").symlink_to(store)
+        copy = home / ".codex" / "skills" / "factory" / "scripts"
+        copy.mkdir(parents=True)
+        (copy / "factory.py").write_text("x")
+        for other in (".pi/agent/skills/review", ".cache/x/skills/factory", "Dev/skills/factory"):
+            (home / other).mkdir(parents=True)
+            (home / other / "SKILL.md").write_text("x")
+        (home / ".agents" / "skills" / "factory").mkdir(parents=True)      # empty: not a skill
+        found = dict(live.installed_factory_skills(home))
+        self.assertEqual(found, {str(store): str(store), str(home / ".claude/skills/factory"): str(store),
+                                 str(home / ".gemini/config/skills/factory"): str(store),
+                                 str(home / ".codex/skills/factory"): str(home / ".codex/skills/factory")})
+        self.assertEqual(dict(live.installed_factory_skills(home, exclude=(store,))),
+                         {str(home / ".codex/skills/factory"): str(home / ".codex/skills/factory")})
+
+    def test_a_hiding_core_starts_its_server_inside_bwrap(self):
+        import live
+        seen = []
+
+        def run(argv, **kwargs):
+            seen.append(argv)
+            raise RuntimeError("stop here")
+        scratch = self.enterContext(tempfile.TemporaryDirectory())
+        with patch.object(live.subprocess, "run", run), patch.object(live.shutil, "which", return_value="/bin/bwrap"), \
+                patch.object(live.tempfile, "gettempdir", return_value=scratch), \
+                contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(RuntimeError):
+                live.Core("hide", hide=[("/qa/tripwire", "/store/factory"), ("/qa/tripwire", "/copy/factory")])
+        self.assertEqual(seen[0][:10], ["/bin/bwrap", "--dev-bind", "/", "/", "--ro-bind", "/qa/tripwire",
+                                        "/store/factory", "--ro-bind", "/qa/tripwire", "/copy/factory"])
+        self.assertEqual(seen[0][10:], ["--", live.HC, "server", "start", "--json"])
+
+    def test_the_tripwire_records_a_run_and_refuses(self):
+        import live
+        work = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
+        team = types.SimpleNamespace(dir=work, tripwire_log=work / "runs.jsonl")
+        folder = live.QATeam._tripwire(team)
+        self.assertTrue((folder / live.TRIPWIRE_MARK).exists())
+        self.assertIn("name: factory", (folder / "SKILL.md").read_text())
+        run = subprocess.run([sys.executable, str(folder / "scripts/factory.py"), "say", "operator", "hi"],
+                             capture_output=True, text=True, cwd=work)
+        self.assertEqual(run.returncode, 3)
+        self.assertIn("not available", run.stderr)
+        self.assertEqual(json.loads(team.tripwire_log.read_text())["argv"], ["say", "operator", "hi"])
+
+    def test_a_run_of_an_installed_factory_fails_the_case(self):
+        import live
+        run = live.Qualification("real")
+        run.row(2, "idle-report", "member", "omp", "pass", "x")
+        with patch.dict(live.EVIDENCE, {"teams": [], "installed_factory_runs": ['{"argv": ["wait"]}']}):
+            live._file_evidence(run, 0)
+        self.assertEqual(run.data["rows"][0]["status"], "fail")
+        self.assertIn("installed Factory skill", run.data["rows"][0]["reason"])
+
+    def test_a_real_team_does_not_start_when_the_installed_skill_cannot_be_hidden(self):
+        import live
+        found = [("/home/o/.codex/skills/factory", "/store/factory")]
+        which = lambda name, *a, **k: None if name == "bwrap" else shutil.which(name, *a, **k)   # noqa: E731
+        with patch.object(live, "installed_factory_skills", return_value=found), \
+                patch.object(live.shutil, "which", which), patch.object(live, "Core") as core:
+            with self.assertRaises(live.NotRun):
+                live.QATeam(live.RealAdapter, "codex", {"lead-dev": "codex"})
+        core.assert_not_called()
 
     def test_restart_waits_for_the_shell_prompt(self):
         """claude-op-8 at 7a90602: a harness clears its status before it has exited, and a restart typed then is

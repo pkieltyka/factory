@@ -163,10 +163,58 @@ class Conn:
             self.p.stdout.close()
 
 
+def qa_environ(environ):
+    """The caller's environment without any hc, rodeo or herdr variable: a runner started from the owner's herdr
+    pane must not hand its session and pane IDs to the QA terminals, where a harness that finds the owner's
+    installed v1 skill could act in that session (@architect, #173)."""
+    return {k: v for k, v in environ.items() if not k.startswith(("HC_", "RODEO_", "HERDR"))}
+
+
+HERDR_STUB = "#!/bin/sh\necho 'herdr is not available in a Factory qualification run' >&2\nexit 1\n"
+TRIPWIRE_MARK = ".factory-qa-tripwire"
+TRIPWIRE_SKILL = ("---\nname: factory\ndescription: Not available in this qualification session. Use only the command"
+                  " FACTORY.md names.\n---\n\nNot available here: use only the command FACTORY.md names.\n")
+TRIPWIRE_SCRIPT = '''#!/usr/bin/env python3
+"""An installed Factory skill, hidden in a qualification run: a run of it is recorded and refused."""
+import json, os, sys, time
+with open({log!r}, "a") as out:
+    out.write(json.dumps({{"argv": sys.argv[1:4], "cwd": os.getcwd(), "at": time.time()}}) + "\\n")
+sys.stderr.write("The installed Factory skill is not available in a qualification run.\\n")
+sys.exit(3)
+'''
+
+
+def installed_factory_skills(home, exclude=(), depth=4):
+    """[(path, resolved folder)] of every Factory skill installed under home's dot-directories: a folder named
+    factory in a skills folder, holding SKILL.md or scripts/factory.py, found by a scan at run start so a later
+    install is caught (the owner's rule: no QA run may use an installed copy). Folders under exclude are skipped."""
+    home, found, seen = pathlib.Path(home), [], set()
+    excluded = [pathlib.Path(e).resolve() for e in exclude]
+    try:
+        tops = [t for t in home.iterdir() if t.name.startswith(".") and t.is_dir() and not t.is_symlink()
+                and t.name not in (".cache", ".npm")]
+    except OSError:
+        return found
+    for top in tops:
+        for dirpath, dirnames, _ in os.walk(top, onerror=lambda error: None):
+            here = pathlib.Path(dirpath)
+            if here.name == "skills" and "factory" in dirnames:
+                path = here / "factory"
+                resolved = path.resolve()
+                if ((resolved / "SKILL.md").is_file() or (resolved / "scripts" / "factory.py").is_file()) \
+                        and not any(resolved == e or e in resolved.parents for e in excluded) and path not in seen:
+                    seen.add(path)
+                    found.append((str(path), str(resolved)))
+            if len(here.relative_to(top).parts) >= depth - 1:
+                dirnames[:] = []
+    return found
+
+
 class Core:
     """A private hc core in its own temporary directory."""
 
-    def __init__(self, tag, config="", extra_env=None):
+    def __init__(self, tag, config="", extra_env=None, hide=()):
+        self.hide = list(hide)      # [(folder, over)]: bound read-only over each path for this core's terminals only
         self.dir = pathlib.Path(tempfile.mkdtemp(prefix=f"hc-{tag}-", dir=tempfile.gettempdir()))
         d = self.dir
         for sub in ("run", "state", "config/herdr-core", "home"):
@@ -174,8 +222,7 @@ class Core:
         os.chmod(d / "run", 0o700)
         if config:
             (d / "config/herdr-core/config.toml").write_text(config)
-        env = {k: v for k, v in os.environ.items()
-               if not k.startswith(("HC_", "RODEO_")) and k != "HERDR_CONFIG_PATH"}
+        env = qa_environ(os.environ)
         env.update(HC_SESSION=f"factory-{tag}-{os.getpid()}", HC_SOCKET=str(d / "hc.sock"),
                    XDG_RUNTIME_DIR=str(d / "run"), XDG_STATE_HOME=str(d / "state"),
                    XDG_CONFIG_HOME=str(d / "config"), HOME=str(d / "home"))
@@ -195,8 +242,11 @@ class Core:
             raise
 
     def start(self):
-        out = subprocess.run([HC, "server", "start", "--json"], env=self.start_env,
-                             capture_output=True, text=True, timeout=30)
+        argv = [HC, "server", "start", "--json"]
+        if self.hide:   # the server, and so every terminal it starts, in a mount namespace with these bound over
+            argv = [shutil.which("bwrap") or "bwrap", "--dev-bind", "/", "/",
+                    *(arg for folder, over in self.hide for arg in ("--ro-bind", folder, over)), "--", *argv]
+        out = subprocess.run(argv, env=self.start_env, capture_output=True, text=True, timeout=30)
         if out.returncode:
             raise RuntimeError(f"hc server start failed: {out.stderr.strip() or out.stdout.strip()}")
         started = json.loads(out.stdout)["core"]["id"]
@@ -2060,11 +2110,28 @@ class QATeam:
         self.real = adapter_class is RealAdapter
         home = os.path.expanduser("~")
         extra = {"HOME": home} if self.real else None   # a real harness needs the owner's login (testing.md §6)
-        self.qa = Core("qualify", config=f"draft_wait = {draft_wait}\n" if draft_wait is not None else "",
-                       extra_env=extra)
         self.dir = pathlib.Path(tempfile.mkdtemp(prefix=QA_PREFIX, dir=tempfile.gettempdir()))
+        self.tripwire_log, hide, installed = self.dir / "installed-factory-runs.jsonl", [], []
+        if self.real:      # the owner's rule: no QA terminal may find or run an installed Factory skill
+            installed = installed_factory_skills(home, exclude=(ROOT, self.dir))
+            if installed and not shutil.which("bwrap"):
+                shutil.rmtree(self.dir, ignore_errors=True)
+                raise NotRun("bwrap is needed to hide the installed Factory skill from the QA terminals")
+            if installed:
+                hide = [(str(self._tripwire()), over) for over in sorted({r for _, r in installed})]
+        try:
+            self.qa = Core("qualify", config=f"draft_wait = {draft_wait}\n" if draft_wait is not None else "",
+                           extra_env=extra, hide=hide)
+            if installed:
+                self._check_hidden([p for p, _ in installed])
+        except BaseException:
+            shutil.rmtree(self.dir, ignore_errors=True)
+            raise
         self.bin, self.home = self.dir / "bin", (pathlib.Path(home) if self.real else self.dir / "home")
         self.bin.mkdir()
+        stub = self.bin / "herdr"          # first on every QA PATH: no QA agent reaches the owner's herdr
+        stub.write_text(HERDR_STUB)
+        stub.chmod(0o755)
         self.skill = self.dir / "skill"
         shutil.copytree(ROOT / "skill", self.skill, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
         self.script = self.skill / "scripts" / "factory.py"
@@ -2109,7 +2176,10 @@ class QATeam:
         work = self.dir / "work"
         work.mkdir()
         subprocess.run(["git", "init", "-q", "-b", "main", str(work)], check=True)
-        (work / "FACTORY.md").write_text("Qualification team: answer every request exactly as asked.\n")
+        (work / "FACTORY.md").write_text(
+            "Qualification team: answer every request exactly as asked.\n"
+            f"Factory's only command for this team is python3 {self.script}. Never run another copy of Factory"
+            " (an installed skill's script) or herdr.\n")
         lines = [f'[operator]\nharness = "{self.operator_harness}"\n']
         if quiet_grace:
             lines.insert(0, f"quiet_grace = {quiet_grace}\n")
@@ -2172,7 +2242,38 @@ class QATeam:
     def receipt(self, name):
         return self.dir / f"receipt-{name}-{random.randrange(16 ** 6):06x}.txt"
 
+    def _tripwire(self):
+        """What a QA terminal finds in place of an installed Factory skill: a skill that says to use FACTORY.md's
+        command, and a scripts/factory.py that records its own run and refuses."""
+        folder = self.dir / "installed-skill"
+        (folder / "scripts").mkdir(parents=True)
+        (folder / "SKILL.md").write_text(TRIPWIRE_SKILL)
+        (folder / TRIPWIRE_MARK).write_text("")
+        script = folder / "scripts" / "factory.py"
+        script.write_text(TRIPWIRE_SCRIPT.format(log=str(self.tripwire_log)))
+        script.chmod(0o755)
+        return folder
+
+    def _check_hidden(self, paths):
+        """Prove inside the QA core, before anything starts, that each installed path shows the tripwire; else the
+        run does not start (no fallback: the owner's rule is that a QA run may never reach an installed copy)."""
+        ok = self.dir / "tripwire-checked"
+        test = " && ".join(f"test -e {shlex.quote(str(pathlib.Path(p) / TRIPWIRE_MARK))}" for p in paths)
+        self.qa.rpc("terminal.run", {"argv": ["sh", "-c", f"{test} && : > {shlex.quote(str(ok))}"],
+                                     "cwd": str(self.dir), "env": {"PATH": os.environ.get("PATH", "")},
+                                     "no_parent": True, "no_notify": True})
+        deadline = time.monotonic() + 15
+        while not ok.exists() and time.monotonic() < deadline:
+            time.sleep(0.2)
+        if not ok.exists():
+            self.qa.stop()
+            raise NotRun("an installed Factory skill is still visible inside the QA core: "
+                         + ", ".join(p.replace(os.path.expanduser("~"), "~", 1) for p in paths))
+
     def close(self):
+        if self.tripwire_log.exists() and self.tripwire_log.read_text().strip():
+            EVIDENCE.setdefault("installed_factory_runs", []).extend(
+                _bounded(line) for line in self.tripwire_log.read_text().splitlines()[:5])
         if self.agy_roots:
             home = os.path.expanduser("~")
             touched = [p for p in changed(self.agy_before, stamps(self.agy_roots))
@@ -3298,7 +3399,7 @@ def _case_8_unconfirmed_brief(run, role, harness, adapter_class):
         held = _outcome(log, ordinary, "lead-dev")
         time.sleep(10)
         early = tok in _lines(receipt)
-        send_code, _ = team.call("brief", "--send", "lead-dev", timeout=240)
+        send_code, send_out = team.call("brief", "--send", "lead-dev", timeout=240)
         team.until(lambda: tok in _lines(receipt), 300)
         time.sleep(10)
         count = _lines(receipt).count(tok)
@@ -3314,7 +3415,8 @@ def _case_8_unconfirmed_brief(run, role, harness, adapter_class):
                 "an interrupted first brief is unconfirmed; an ordinary message waits not ready and is delivered once,"
                 " after a new brief --send", proof={
                     "brief_id": hit["id"], "brief_outcome": [brief.get("o"), brief.get("why")], "held": held,
-                    "acted_before_new_brief": early, "brief_send_exit": send_code, "new_brief_id": new_brief,
+                    "acted_before_new_brief": early, "brief_send_exit": send_code,
+                    "brief_send_output": _bounded(send_out.strip()), "new_brief_id": new_brief,
                     "delivery_order": order, "action_count": count, "peer": peer},
                 reason=None if ok else "see proof")
 
@@ -4259,8 +4361,12 @@ def _file_evidence(run, first_row):
     """Attach the case's team diagnostics to each of its rows (bounded; for a team per trial, in order). A settings
     file agy changed during the case withholds its passes: the stamp cannot tell which process wrote it."""
     touched = sorted(set(EVIDENCE.get("settings_changed") or []))
+    installed = EVIDENCE.get("installed_factory_runs") or []
     for row in run.data["rows"][first_row:]:
         row["diagnostics"] = EVIDENCE["teams"]
+        if installed:          # the owner's rule was broken: the case fails whatever it observed
+            row.update(status="fail", reason=_bounded(f"a QA terminal ran an installed Factory skill: {installed}"))
+            row["installed_factory_runs"] = installed
         if touched and row["status"] == "pass":
             row.update(status="not_run", reason=_bounded(f"a settings file changed during the case: {touched}"))
         if touched:
@@ -4306,7 +4412,7 @@ def qualify(target, role=None, cases=None, json_path=None, fixture=False):
     EVIDENCE["rodeo_tabs"] = None                       # probed once, by the first case that uses rodeo
     if target == "cross":
         for name in CROSS_CASES:
-            EVIDENCE.update(teams=[], tokens=[], settings_changed=[])
+            EVIDENCE.update(teams=[], tokens=[], settings_changed=[], installed_factory_runs=[])
             first_row = len(run.data["rows"])
             function = CROSS_FUNCTIONS.get(name)
             try:
@@ -4341,7 +4447,7 @@ def qualify(target, role=None, cases=None, json_path=None, fixture=False):
             for name, measured in subcases(case, role_):
                 run.row(case, name, role_, harness, "not_run", f"case {case} {name}", reason="not built yet")
         else:
-            EVIDENCE.update(teams=[], tokens=[], settings_changed=[])
+            EVIDENCE.update(teams=[], tokens=[], settings_changed=[], installed_factory_runs=[])
             first_row = len(run.data["rows"])
             try:
                 function(run, role_, harness, adapter_class)
