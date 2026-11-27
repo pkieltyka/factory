@@ -1935,8 +1935,9 @@ class FixtureAdapter:
         return "ACT switch"
 
     def quit(self, qa, terminal):
-        """The fake operator quits to its loop: it reports state=clear, as a harness returning to its shell."""
-        qa.rpc("terminal.send", {"terminal": terminal, "text": "FAKE: quits"}, timeout=60)
+        """The fake operator quits to its loop on Ctrl+D, a key like a real harness's quit (no send, so a held
+        draft does not delay it), reporting state=clear as a harness returning to its shell."""
+        qa.rpc("terminal.keys", {"terminal": terminal, "keys": ["ctrl+d"]})
 
     def restart(self, qa, terminal):
         """Start the fake operator again in its open pane (its loop waits for Enter)."""
@@ -3053,17 +3054,18 @@ def _say_id(out):
 
 
 def case_8(run, role, harness, adapter_class):
-    """dead-member, operator-gone and same-pane in one team, unconfirmed-brief in its own; quit-during-hold is not
-    built yet (phase_8.md §3.8)."""
+    """dead-member, operator-gone and same-pane in one team; unconfirmed-brief and quit-during-hold each in their
+    own (phase_8.md §3.8)."""
     _case_8_main(run, role, harness, adapter_class)
     if role == "member":
         _case_8_unconfirmed_brief(run, role, harness, adapter_class)
+    _case_8_quit_during_hold(run, role, harness, adapter_class)
 
 
 def _case_8_main(run, role, harness, adapter_class):
     team, peer = _team_for(adapter_class, role, harness, operator_shell=role == "operator")
     with team:
-        names = [n for n, _ in subcases(8, role) if n != "unconfirmed-brief"]
+        names = [n for n, _ in subcases(8, role) if n not in ("unconfirmed-brief", "quit-during-hold")]
         if not _up(team, run, 8, role, harness, names):
             return
         log = factory_log(team)
@@ -3075,7 +3077,6 @@ def _case_8_main(run, role, harness, adapter_class):
             if not ended:
                 run.row(8, "dead-member", role, harness, "not_run", "case 8 dead-member",
                         reason=f"the member's terminal is {team.get(member)['state']} after terminal.kill")
-                _not_built(run, 8, role, harness, ["quit-during-hold"])
                 return
             receipt, tok = team.receipt("dead"), token()
             code, out = team.call("say", "lead-dev", team.adapter.act_append(receipt, tok), timeout=60)
@@ -3094,7 +3095,6 @@ def _case_8_main(run, role, harness, adapter_class):
             run.row(8, "dead-member", role, harness, "pass" if ok else "fail",
                     "a member whose harness ended gets nothing typed; up brings a new terminal that gets the message",
                     proof=proof, reason=None if ok else "see proof")
-            _not_built(run, 8, role, harness, ["quit-during-hold"])
             return
         operator = team.operator
         # operator-gone: the harness stops reporting in an open pane; messages queue until up.
@@ -3136,7 +3136,6 @@ def _case_8_main(run, role, harness, adapter_class):
                 "an operator restarted in the same pane with nothing pending: the next say is delivered without up",
                 proof={"same_terminal": same, "say": out.strip().splitlines()[-1:], "acted": bool(acted2)},
                 reason=None if ok2 else "see proof")
-        _not_built(run, 8, role, harness, ["quit-during-hold"])
 
 
 def _case_8_unconfirmed_brief(run, role, harness, adapter_class):
@@ -3207,6 +3206,48 @@ def _case_8_unconfirmed_brief(run, role, harness, adapter_class):
                     "acted_before_new_brief": early, "brief_send_exit": send_code, "new_brief_id": new_brief,
                     "delivery_order": order, "action_count": count, "peer": peer},
                 reason=None if ok else "see proof")
+
+
+def _case_8_quit_during_hold(run, role, harness, adapter_class):
+    """quit-during-hold (phase_8.md §3.8), measurement only: the operator quits while hc holds a claimed send for the
+    owner's draft; what reached its pane's sink after the hold ended is recorded. An inert token, no action."""
+    if role == "member":
+        run.row(8, "quit-during-hold", role, harness, "not_run", "case 8 quit-during-hold",
+                reason="a member's pane closes when its harness ends: there is no sink to read")
+        return
+    team, peer = _team_for(adapter_class, role, harness, operator_shell=True, draft_wait=60)
+    with team:
+        _operator_tab(team)
+        if not _up(team, run, 8, role, harness, ["quit-during-hold"]):
+            return
+        log = factory_log(team)
+        view = _rodeo(team, ["operator", "team"])
+        view.keys("ctrl+b")
+        time.sleep(0.2)
+        view.keys("1")
+        time.sleep(0.8)
+        view.focused_terminal = team.operator
+        view.type(f"owner draft {token()}")
+        time.sleep(1)
+        tok = token()                                    # inert: a bare word, nothing to act on
+        code, out = team.call("say", "operator", "--file", str(_note(team, tok)), terminal=team.member("lead-dev"),
+                              timeout=60)
+        found = _say_id(out)
+        claimed = team.until(lambda: found and _outcome(log, found, "operator") == ("sending", None), 60)
+        start = time.monotonic()
+        team.adapter.quit(team.qa, team.operator)
+        quit_s = round(time.monotonic() - start, 1) if team.until(lambda: team.state(team.operator) is None, 60) \
+            else None
+        time.sleep(75)                                   # past draft_wait: the hold has ended either way
+        sink = "".join(team.qa.rpc("terminal.read", {"terminal": team.operator, "lines": 0}).get("text", "").split())
+        observed = (f"after the quit ({quit_s} s), the held token {'reached' if tok in sink else 'did not reach'} the"
+                    f" pane's shell; the send ended {(_outcome(log, found, 'operator') or ('?',))[0]}")
+        status = "measured" if claimed else "not_run"
+        run.row(8, "quit-during-hold", role, harness, status, "what reaches the pane after a quit during a held send",
+                observed=observed if claimed else None,
+                proof={"id": int(found.group(1)) if found else None, "claimed": bool(claimed), "quit_s": quit_s,
+                       "token_in_sink": tok in sink, "final": _outcome(log, found, "operator") if found else None,
+                       "peer": peer}, reason=None if claimed else "the send was not claimed and held")
 
 
 def _operator_tab(team):

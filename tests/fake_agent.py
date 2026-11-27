@@ -65,6 +65,9 @@ def submitted_lines():
     paste = False
     echo = bool(os.environ.get("FAKE_ECHO"))
     while chunk := read_input():
+        if chunk == b"\x04":                    # Ctrl+D: handled at once, like a harness's quit key
+            yield "\x04"
+            continue
         incoming += chunk
         if echo:   # show the unsubmitted input, as a harness's composer would
             os.write(1, b"\r\x1b[K> " + bytes(pending) + CONTROL.sub(b" ", incoming))
@@ -154,6 +157,9 @@ def main():
 
     waiting = False
     for text in submitted_lines():
+        if text == "\x04":                      # Ctrl+D on its own line: quit to the shell, as "quits" does
+            report("clear")
+            return 0
         if log:
             with pathlib.Path(log).open("a") as stream:
                 stream.write(json.dumps({"at": time.time(), "text": text}) + "\n")
