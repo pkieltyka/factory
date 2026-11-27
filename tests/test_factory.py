@@ -7316,9 +7316,7 @@ class E2EFixtureTests(unittest.TestCase):
             self.assertEqual(github.manifest["branches"][0]["name"], github.base)
             brief = (github.root / "FACTORY.md").read_text()
             self.assertIn("--repo pkieltyka/factory-test --project pkieltyka/42", brief)
-            self.assertIn("records them in comments on the related seeded issues", brief)
-            self.assertIn("Use only the three seeded issues and their existing project cards", brief)
-            self.assertNotIn("who records them in Backlog", brief)
+            self.assertIn("who records them in Backlog", brief)
             for placeholder in ("OWNER/REPO", "BOARD_OWNER/BOARD_NUMBER", "READY_COLUMN", "ACTIVE_COLUMN",
                                 "BACKLOG_COLUMN", "BASE_BRANCH", "CI_DESCRIPTION"):
                 self.assertNotIn(placeholder, brief)
@@ -7619,6 +7617,54 @@ class E2EObserverTests(unittest.TestCase):
 
 
 class E2EGitHubEvidenceTests(unittest.TestCase):
+    def test_scope_accepts_discoveries_and_rejects_missing_or_foreign_cards(self):
+        seeded = {1, 2, 3}
+        observation = {"truncated": False, "hidden_items": 0,
+                       "project": {"title": "factory-qa-fixture", "owner": "pkieltyka", "number": 42}}
+        for name, numbers, foreign_url, hidden, scoped in (
+                ("discovery", {1, 2, 3, 4}, None, 0, True),
+                ("missing seed", {1, 2, 4}, None, 0, False),
+                ("foreign card", {1, 2, 3, 4}, "https://github.com/pkieltyka/factory/issues/4", 0, False),
+                ("hidden card", seeded, None, 1, False)):
+            with self.subTest(name=name):
+                repo = e2e.GitHubFixture.__new__(e2e.GitHubFixture)
+                repo.name, repo.project = "factory-qa-fixture", "pkieltyka/42"
+                repo.prefix, repo.base = "qa/fixture/", "qa/fixture/main"
+                repo.master, repo.initial = "master-sha", "seed-sha"
+                repo.other_refs = {"master": repo.master}
+                repo.manifest = {"issues": [{"number": number} for number in sorted(seeded)]}
+                cards = [{"number": number, "url": foreign_url if number == 4 and foreign_url else
+                          f"{e2e.QA_URL}/issues/{number}"} for number in sorted(numbers)]
+                repo.todos = unittest.mock.Mock(return_value={**observation, "hidden_items": hidden,
+                    "columns": [{"status": "Todo", "cards": cards}]})
+                repo.branch_head = lambda _: repo.master
+                repo.refs = lambda: {**repo.other_refs, repo.base: repo.initial}
+                repo.save_manifest = unittest.mock.Mock()
+                issue_url = f"{e2e.QA_URL}/issues/4"
+                replies = {f"repos/{e2e.QA_REPO}/issues/4": {"node_id": "new-issue", "html_url": issue_url}}
+
+                def read(path):
+                    return replies[path] if path in replies else []
+
+                repo.api = unittest.mock.Mock(side_effect=read)
+                evidence = e2e.Evidence(tuple(e2e.Ticket(f"#{number}", planned=1) for number in sorted(seeded)),
+                                        github=True, scoped=True)
+                collector = e2e.GitHubEvidence.__new__(e2e.GitHubEvidence)
+                collector.repo, collector.head = repo, repo.initial
+                collector.observer = types.SimpleNamespace(evidence=evidence, stamp=lambda: 2)
+                if scoped:
+                    collector.refresh_forge()
+                    collector.refresh_forge()
+                    self.assertEqual(repo.manifest["discoveries"],
+                                     [{"number": 4, "id": "new-issue", "url": issue_url}])
+                    self.assertEqual(repo.api.call_args_list.count(call(f"repos/{e2e.QA_REPO}/issues/4")), 1)
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "the run's project"):
+                        collector.refresh_forge()
+                    repo.api.assert_not_called()
+                verdict = next(row for row in e2e.judge(evidence) if row["name"] == "scoped-writes")
+                self.assertEqual(verdict["status"], "pass" if scoped else "fail")
+
     def test_open_ticket_branch_does_not_inherit_earlier_implementation_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = e2e.make_local(pathlib.Path(directory), factory.SKILL)

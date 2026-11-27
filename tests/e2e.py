@@ -730,10 +730,27 @@ class GitHubFixture:
         if (board.get("truncated") is not False or project.get("title") != self.name
                 or f"{project.get('owner')}/{project.get('number')}" != self.project):
             raise RuntimeError("the GitHub project snapshot is incomplete or belongs to another project")
-        cards = [(card["number"], column["status"]) for column in board["columns"] for card in column["cards"]]
-        if len(dict(cards)) != len(cards):
-            raise RuntimeError("GitHub project returned duplicate issue numbers")
-        return dict(cards)
+        if board.get("hidden_items") != 0:
+            raise RuntimeError("the run's project has cards outside the visible scratch issues")
+        cards = {}
+        for column in board["columns"]:
+            for card in column["cards"]:
+                number = card["number"]
+                if card.get("url") != f"{QA_URL}/issues/{number}":
+                    raise RuntimeError("the run's project has a card outside factory-test")
+                if number in cards:
+                    raise RuntimeError("GitHub project returned duplicate issue numbers")
+                cards[number] = column["status"]
+        return cards
+
+    def record_discoveries(self, numbers):
+        """Retain every additional issue observed on the run's project."""
+        discoveries = self.manifest.setdefault("discoveries", [])
+        for number in sorted(numbers - {issue["number"] for issue in discoveries}):
+            issue = self.api(f"repos/{QA_REPO}/issues/{number}")
+            if issue.get("html_url") != f"{QA_URL}/issues/{number}" or not issue.get("node_id"):
+                raise RuntimeError("the run's project has a card outside factory-test")
+            discoveries.append({"number": number, "id": issue["node_id"], "url": issue["html_url"]})
 
     def wait_for_board(self, expected, timeout=20):
         """Read back recent GitHub writes until this exact set of cards and states is visible."""
@@ -779,9 +796,7 @@ class GitHubFixture:
         tasks = (skill / "recipes/tasks-todos.md").read_text().split("```markdown\n", 1)[1].split("```", 1)[0]
         tasks = (tasks.replace("OWNER/REPO", QA_REPO).replace("BOARD_OWNER/BOARD_NUMBER", self.project)
                  .replace("READY_COLUMN", "Todo").replace("ACTIVE_COLUMN", "In Progress")
-                 .replace("who records them in BACKLOG_COLUMN.",
-                          "who records them in comments on the related seeded issues. "
-                          "Use only the three seeded issues and their existing project cards."))
+                 .replace("BACKLOG_COLUMN", "Backlog"))
         pulls = (skill / "recipes/pull-requests-github.md").read_text().split("```markdown\n", 1)[1].split("```", 1)[0]
         pulls = (pulls.replace("OWNER/REPO", QA_REPO).replace("BOARD_OWNER/BOARD_NUMBER", self.project)
                  .replace('owner=OWNER -F repo=REPO', f'owner={QA_OWNER} -F repo=factory-test')
@@ -878,6 +893,7 @@ class GitHubEvidence:
 
     def refresh_forge(self):
         evidence, repo = self.observer.evidence, self.repo
+        evidence.scoped = False
         project = repo.board()
         expected = {card["number"] for card in repo.manifest["issues"]}
         master_now = repo.branch_head("master")
@@ -888,9 +904,9 @@ class GitHubEvidence:
         tracking = {name: sha for name, sha in refs.items() if name.startswith(repo.prefix)}
         outside = {name: sha for name, sha in refs.items() if name not in tracking}
         repo.manifest["branches"] = [repo.branch_ref(name) for name in sorted(tracking)]
-        evidence.scoped = set(project) == expected and repo.base in tracking and outside == repo.other_refs
-        if not evidence.scoped:
+        if not expected <= project.keys() or repo.base not in tracking or outside != repo.other_refs:
             raise RuntimeError("the run's project or refs no longer match the fixture")
+        repo.record_discoveries(project.keys() - expected)
         params = urlencode({"state": "all", "base": repo.base, "per_page": 100})
         prs = repo.api(f"repos/{QA_REPO}/pulls?{params}")
         by_issue = {}
@@ -907,6 +923,7 @@ class GitHubEvidence:
         self.open_prs = {pr["number"]: (f"#{number}", pr["head"]["sha"])
                          for number, pr in by_issue.items() if pr["state"] == "open"}
         repo.save_manifest()
+        evidence.scoped = True
         if tracking[repo.base] != self.head:
             self.head = self.fetch_main()
             commits = git(self.inspection, "rev-list", "--first-parent", f"{repo.initial}..{self.head}").stdout.split()
