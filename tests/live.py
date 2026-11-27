@@ -2270,6 +2270,11 @@ class FixtureAdapter:
     def act_alone_each(self, commands):
         return "\n".join(self.act_alone(c) for c in commands)
 
+    def handoff_request(self, team, receipt, tok):
+        """The fake cannot read a skill: it sends the assignment itself and ends its turn, as the real one should."""
+        say = f"python3 {shlex.quote(str(team.script))} say lead-dev {shlex.quote(self.act_append(receipt, tok))}"
+        return f"ACT run {team.dir / 'handoff-receipt.txt'} {say}"
+
     def alone_output(self, command, others=(), prompt=None):
         out = self.team.dir / f"alone-{hashlib.sha1(command.encode()).hexdigest()[:12]}.txt"
         return out.read_text() if out.exists() else None
@@ -2340,7 +2345,7 @@ class RealAdapter(FixtureAdapter):
         full = list(table["permissions"]["full"])
         if harness in ("claude", "codex"):
             return argv + ["--model", model, *full], {}
-        thinking = table.get("default_thinking") or ("medium" if "medium" in table.get("thinking", []) else "default")
+        thinking = operator_thinking(harness)
         if harness in ("pi", "omp"):
             return argv + ["--model", model, "--thinking", thinking, *full], {}
         module = factory_module(self.team.script)
@@ -2365,6 +2370,12 @@ class RealAdapter(FixtureAdapter):
         3321bfc)."""
         return (f"Using your shell tool, run exactly this one command, by itself in its own tool call, with nothing"
                 f" added before or after it: {command} Then reply with the single word done.")
+
+    def handoff_request(self, team, receipt, tok):
+        """The owner's one request (phase_10.md §2); lead-dev without an @, which a composer picker can take."""
+        return (f"Read {team.skill / 'SKILL.md'} and follow it. Use {team.script} for all Factory commands. Read the"
+                f" Autonomous operation section of {team.skill / 'references' / 'leading.md'}. Assign lead-dev to"
+                f" append one line containing exactly {tok} to the file {receipt} and finish without reporting back.")
 
     def act_alone_each(self, commands):
         listed = " ".join(f"({i}) {c}" for i, c in enumerate(commands, 1))
@@ -2454,6 +2465,26 @@ class RealAdapter(FixtureAdapter):
         self.team.send(terminal, self.team.operator_command)
         Harness.attach(qa, self.team.operator_harness, terminal).settle(timeout=120)
         return True
+
+
+def operator_thinking(harness):
+    """The thinking level a QA operator starts with: the table's default, else medium where the harness has it."""
+    table = harness_table()[harness]
+    return table.get("default_thinking") or ("medium" if "medium" in table.get("thinking", []) else "default")
+
+
+def operator_model_selected(harness, model):
+    """The model string an operator's launch actually passes (agy's thinking suffix, OpenCode's #variant), for the
+    evidence beside the requested one (@lead-dev's pairing on 14cdca1)."""
+    if harness not in ("opencode", "agy"):
+        return model
+    module = factory_module(ROOT / "skill" / "scripts" / "factory.py")
+    m = {"name": "operator", "harness": harness, "model": model, "thinking": operator_thinking(harness),
+         "permissions": "full", "args": [], "dir": "/"}
+    argv, env = module.CODE[harness].argv(m, None, None)
+    if "--model" in argv:
+        return argv[argv.index("--model") + 1]
+    return json.loads(env.get("OPENCODE_CONFIG_CONTENT", "{}")).get("model", model)
 
 
 class QATeam:
@@ -3052,8 +3083,99 @@ def _operator_commands(run, team, harness, peer):
 
 
 def case_2(run, role, harness, adapter_class):
-    """idle-report, and for an operator profile operator-commands (phase_8.md §3.2, @architect's change 1)."""
-    names = [n for n, _ in subcases(2, role)]
+    """idle-report, and for an operator profile operator-commands and operator-handoff, the latter in a team of its
+    own (phase_8.md §3.2, phase_10.md §2)."""
+    _case_2_main(run, role, harness, adapter_class)
+    if role == "operator":
+        _operator_handoff(run, harness, adapter_class)
+
+
+def judge_handoff(f):
+    """operator-handoff (phase_10.md §2), from the observed facts: the operator committed the assignment to the
+    member, which acted once; the operator was seen working on it and then ready at a higher turn; and a quiet
+    note committed after the owner's request was delivered to that same operator terminal after its turn ended.
+    -> (status, reason). Polling (never ready again) and an earlier quiet note fail."""
+    if not f.get("assignment_id"):
+        return "fail", "the operator did not assign the member within the window"
+    if f.get("action_count") != 1:
+        return "fail", f"the member acted {f.get('action_count')} times, not once"
+    if not f.get("worked") or not f.get("ended_turn"):
+        return "fail", "the operator kept working after the assignment (polling or waiting instead of ending its turn)"
+    note = f.get("quiet_note") or {}
+    if not note or not note.get("new"):
+        return "fail", "no quiet note committed after the owner's request"
+    if note.get("term") != f.get("operator") or note.get("o") != "delivered" or not note.get("after_turn_end"):
+        return "fail", "the quiet note was not delivered to the operator's terminal after its turn ended"
+    return "pass", None
+
+
+def _operator_handoff(run, harness, adapter_class):
+    """operator-handoff: the owner's one request has the operator read the candidate skill and assign the member a
+    task that ends without a report; the operator must end its turn and be woken by Factory's own quiet note."""
+    team, peer = _team_for(adapter_class, "operator", harness, quiet_grace=30)
+    with team:
+        _operator_tab(team)
+        if not _up(team, run, 2, "operator", harness, ["operator-handoff"]):
+            return
+        if _team_quiet(team, hold=8, timeout=600) is None:
+            run.row(2, "operator-handoff", "operator", harness, "not_run", "case 2 operator-handoff",
+                    reason="the team was not quiet before the owner's request")
+            return
+        log = factory_log(team)
+        before = max((rec["id"] for rec in log.read_box()[0] if rec["t"] == "msg"), default=0)
+        receipt, tok = team.receipt("handoff"), token()
+        prompt = team.adapter.handoff_request(team, receipt, tok)
+        view = _rodeo(team, ["operator"])
+        view.keys("ctrl+b")
+        time.sleep(0.2)
+        view.keys("1")
+        time.sleep(0.8)
+        view.focused_terminal = team.operator
+        turn_at_request = team.get(team.operator)["turn"]
+        view.paste(prompt)                       # the last human input
+        start = time.monotonic()
+        facts = {"operator": team.operator, "turn_at_request": turn_at_request, "worked": False,
+                 "ended_turn": False, "peer": peer}
+        ended_at = None
+        deadline = start + 600                   # up to five minutes after the assignment (below)
+        while time.monotonic() < deadline:
+            records, box = log.read_box()
+            if not facts.get("assignment_id"):
+                facts["assignment_id"] = next((r["id"] for r in records if r["t"] == "msg" and r["id"] > before
+                                               and r.get("from") == "operator" and r.get("to") == ["lead-dev"]
+                                               and tok in (r.get("text") or "") and r["id"] in box.msgs), None)
+                if facts["assignment_id"]:
+                    deadline = min(deadline, time.monotonic() + 300)
+            state, turn = team.state(team.operator), team.get(team.operator)["turn"]
+            if state == "working":
+                facts["worked"] = True
+            if facts["assignment_id"] and facts["worked"] and state in READY and turn > turn_at_request \
+                    and ended_at is None:
+                ended_at, facts["ended_turn"], facts["turn_at_end"] = time.monotonic(), True, turn
+            # only a quiet note committed after the assignment counts, delivered once the operator's turn had ended
+            after = facts.get("assignment_id") or 10 ** 9
+            note = next((r for r in records if r["t"] == "msg" and r["id"] > after and r.get("kind") == "note"
+                         and (r.get("meta") or {}).get("what") == "quiet" and r.get("to") == ["operator"]), None)
+            if note and box.outcome(note["id"], "operator")["o"] == "delivered" and _lines(receipt).count(tok):
+                outcome = box.outcome(note["id"], "operator")
+                facts["quiet_note"] = {"id": note["id"], "new": True, "o": "delivered",
+                                       "term": outcome.get("term"), "after_turn_end": ended_at is not None}
+                break
+            time.sleep(0.5)
+        facts["action_count"] = _lines(receipt).count(tok)
+        facts["earlier_quiet_notes"] = [r["id"] for r in log.read_box()[0]
+                                        if r["t"] == "msg" and r.get("kind") == "note"
+                                        and (r.get("meta") or {}).get("what") == "quiet"
+                                        and r["id"] < (facts.get("assignment_id") or 10 ** 9)]
+        status, reason = judge_handoff(facts)
+        run.row(2, "operator-handoff", "operator", harness, status,
+                "after assigning work that ends without a report, the operator ends its turn and Factory's quiet note"
+                " wakes it, with no human or driver input in between", proof=facts,
+                elapsed=time.monotonic() - start, reason=reason)
+
+
+def _case_2_main(run, role, harness, adapter_class):
+    names = [n for n, _ in subcases(2, role) if n != "operator-handoff"]
     team, peer = _team_for(adapter_class, role, harness)
     with team:
         if role == "operator":
@@ -3104,10 +3226,14 @@ def case_9(run, role, harness, adapter_class):
         new = team.until(team.keeper, 60)
         acted = team.until(lambda: receipt.exists() and tok in receipt.read_text(), 300)
         member_harness = team.members["lead-dev"]       # the guarded one: the subject, or an operator's peer
+        preset = list(harness_table()[member_harness]["permissions"]["guarded"])
+        member = team.member("lead-dev")
+        argv = list(team.get(member).get("argv") or []) if member else []
+        carried = not preset or any(argv[i:i + len(preset)] == preset for i in range(len(argv)))   # as launched
         proof = {"old_keeper_finished": bool(gone), "new_keeper": bool(new) and new != old, "member_say_id": said,
-                 "guarded_args": harness_table()[member_harness]["permissions"]["guarded"],
-                 "guarded_member": member_harness, "peer": peer}
-        ok = bool(gone) and bool(new) and new != old and bool(acted) and said is not None
+                 "guarded_args": preset, "guarded_member": member_harness, "guarded_terminal": member,
+                 "argv_has_guarded_preset": carried, "peer": peer}
+        ok = bool(gone) and bool(new) and new != old and bool(acted) and said is not None and carried
         run.row(9, "guarded", role, harness, "pass" if ok else "fail",
                 "a guarded member's say reaches hc, restarts the keeper and is acted on", proof=proof,
                 reason=None if ok else "the keeper did not restart or the operator did not act")
@@ -5046,7 +5172,10 @@ def qualify(target, role=None, cases=None, json_path=None, fixture=False):
     for role_, harness, case in selected:
         print(f"qualify {role_} {harness} case {case}", file=sys.stderr)
         if not any(p["role"] == role_ and p["harness"] == harness for p in run.data["profiles"]):
-            run.profile(role_, harness, version=adapter.version(harness), model=adapter.model(harness))
+            facts = {"version": adapter.version(harness), "model": adapter.model(harness)}
+            if role_ == "operator" and adapter_class is RealAdapter:   # what the operator's launch really selects
+                facts["effective_model"] = operator_model_selected(harness, facts["model"])
+            run.profile(role_, harness, **facts)
         function = CASE_FUNCTIONS.get(case)
         if not subcases(case, role_):
             continue

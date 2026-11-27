@@ -7555,6 +7555,62 @@ class QualifyFrameworkTests(unittest.TestCase):
         self.assertEqual(adapter.operator_launch("pi", "openai-codex/x")[0][3], "openai-codex/x")
         adapter.team.skills_exempt = ("claude",)
         self.assertEqual(adapter.operator_launch("claude")[0][:2], ["/bin/claude", "--model"])
+        self.assertEqual(live.operator_model_selected("agy", "gemini-4-neon"), "gemini-4-neon-high")   # the evidence
+        self.assertEqual(live.operator_model_selected("pi", "openai-codex/x"), "openai-codex/x")
+
+    def test_the_handoff_judge_refuses_polling_and_an_earlier_note(self):
+        """phase_10.md §2's negative controls: an operator that keeps working after the assignment, a quiet note
+        from before it, one to another terminal or before the turn ended."""
+        import live
+        good = {"assignment_id": 3, "action_count": 1, "worked": True, "ended_turn": True, "operator": "t1",
+                "quiet_note": {"id": 4, "new": True, "o": "delivered", "term": "t1", "after_turn_end": True}}
+        self.assertEqual(live.judge_handoff(good), ("pass", None))
+        note = good["quiet_note"]
+        for broken, why in (({"ended_turn": False}, "kept working"), ({"quiet_note": None}, "no quiet note"),
+                            ({"quiet_note": {**note, "new": False}}, "no quiet note"),
+                            ({"quiet_note": {**note, "term": "t9"}}, "not delivered"),
+                            ({"quiet_note": {**note, "after_turn_end": False}}, "not delivered"),
+                            ({"action_count": 2}, "2 times"), ({"assignment_id": None}, "did not assign")):
+            status, reason = live.judge_handoff({**good, **broken})
+            self.assertEqual(status, "fail", broken)
+            self.assertIn(why, reason)
+
+    def test_the_operator_terminal_gets_the_launch_argv_and_env_directly_and_through_its_shell(self):
+        """@lead-dev's pairing on 14cdca1: OpenCode's model env reaches terminal.run in the direct and the shell
+        form, and the shell types exactly the launch argv."""
+        import live
+        calls = []
+
+        class Core:
+            def __init__(self, *args, **kwargs):
+                self.installed, self.bin, self.env, self.id = [], None, {}, "core"
+
+            def rpc(self, method, params, timeout=None):
+                calls.append((method, params))
+                return {"address": "t1"}
+
+            def stop(self):
+                pass
+        scratch = self.enterContext(tempfile.TemporaryDirectory())
+        self.enterContext(patch.object(live, "Core", Core))
+        self.enterContext(patch.object(live.tempfile, "gettempdir", return_value=scratch))
+        self.enterContext(patch.object(live.RealAdapter, "prepare", lambda self, harnesses: None))
+        self.enterContext(patch.object(live.RealAdapter, "model", lambda self, harness: "openrouter/x/y"))
+        self.enterContext(patch.object(live.shutil, "which", lambda name, *a, **k: f"/bin/{name}"))
+        self.enterContext(patch.object(live.QATeam, "send", lambda self, term, text, timeout=180: calls.append(
+            ("terminal.send", {"terminal": term, "text": text}))))
+        for shell in (False, True):
+            calls.clear()
+            team = live.QATeam(live.RealAdapter, "opencode", {"lead-dev": "codex"}, operator_shell=shell)
+            run = next(p for m, p in calls if m == "terminal.run")
+            self.assertEqual(json.loads(run["env"]["OPENCODE_CONFIG_CONTENT"])["model"].split("#")[0], "openrouter/x/y")
+            launch = team.adapter.operator_launch("opencode")[0]
+            if shell:
+                self.assertEqual(run["argv"][0], "bash")
+                typed = next(p["text"] for m, p in calls if m == "terminal.send")
+                self.assertEqual(shlex.split(typed), launch)
+            else:
+                self.assertEqual(run["argv"], launch)
 
     def test_defaults_and_scope(self):
         """Phase 10: every harness in both roles; an omitted role runs operator then member."""
@@ -7665,7 +7721,8 @@ class QualifyFixtureTests(unittest.TestCase):
         self.assertEqual((evidence["mode"], code), ("fixture", 0 if live.RODEO else 2))
         self.assertEqual(sorted((r["role"], r["subcase"], r["status"]) for r in evidence["rows"]),
                          [("member", "guarded", "pass"), ("member", "idle-report", "pass"),
-                          ("operator", "idle-report", commands), ("operator", "operator-commands", commands)])
+                          ("operator", "guarded", "pass"), ("operator", "idle-report", commands),
+                          ("operator", "operator-commands", commands), ("operator", "operator-handoff", commands)])
 
     @real_only
     def test_sigterm_during_a_run_stops_its_cores_and_removes_its_scratch(self):
