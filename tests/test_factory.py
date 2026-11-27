@@ -7714,6 +7714,16 @@ class E2ELocalEvidenceTests(unittest.TestCase):
 
 
 class SkillTextTests(unittest.TestCase):
+    def test_operator_ends_its_turn_to_wait(self):
+        """Phase 9: a Claude Code operator kept one turn polling after it assigned, so the team was never quiet
+        (@architect). The skill tells the operator to end its turn, except for a wait on its own command."""
+        leading = (factory.SKILL / "references" / "leading.md").read_text()
+        section = leading.split("## Messages and status", 1)[1].split("\n## ", 1)[0]
+        self.assertIn("end your turn", section)
+        self.assertIn("Do not poll", section)
+        self.assertIn("end your turn to wait for a teammate", (factory.SKILL / "SKILL.md").read_text())
+        self.assertIn("bounded CI wait", (factory.SKILL / "references" / "pull-requests.md").read_text())
+
     @staticmethod
     def pages():
         root = factory.SKILL.parent

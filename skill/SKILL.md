@@ -17,7 +17,7 @@ You are the operator. Form the team, assign tasks, decide architecture, review a
 
 Run `up` from the operator's pane. Hand off to another operator at the user's request. After compaction, reread the active command's reference, [leading.md](references/leading.md), `FACTORY.md` and the tracker. Keep owners, criteria, branches, verdicts and next steps in the tracker.
 
-Use `factory.py say` for every team message. Members send private drafts with `--file`. For several recipients, address each in one draft and send it once. Messages arrive as `[from @name]` and may start or steer a turn. Factory notes arrive as `[from factory]`. Use `factory.py inbox` to reread your messages and outcomes. Never start a wait, watcher or background task for Factory: messages are typed into your pane.
+Use `factory.py say` for every team message. Members send private drafts with `--file`. For several recipients, address each in one draft and send it once. Messages arrive as `[from @name]` and may start or steer a turn. Factory notes arrive as `[from factory]`. Use `factory.py inbox` to reread your messages and outcomes. Messages are typed into your pane and start your next turn, so end your turn to wait for a teammate. Never start a wait, watcher or background task for Factory.
 
 ## Before launch
 
