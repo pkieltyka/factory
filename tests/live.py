@@ -1481,7 +1481,7 @@ def rodeo_tabs():
                 return result
             time.sleep(2)
             steps = ((["2"], "a", "lead"), (["l"], "b", "dup2"), (["1"], "c", "op"), (["l"], "d", "dup1"),
-                     (["h"], "e", "op"), (["2"], "f", None), (["h"], "g", "lead"))
+                     (["h"], "e", "op"), (["2"], "f", ("lead", "dup2")), (["h"], "g", "lead"))
             seen, ok = {}, True
             for keys, marker, expected in steps:
                 before = {name: len(p.text()) for name, p in probes.items()}
@@ -1494,9 +1494,9 @@ def rodeo_tabs():
                 time.sleep(0.8)
                 got = [name for name, p in probes.items() if marker in p.text()[before[name]:]]
                 seen[f"prefix+{'+'.join(keys)} then {marker}"] = got
-                if expected is not None and got != [expected]:
-                    ok = False
-                if expected is None and len(got) != 1:  # tab 2 again: whichever pane rodeo kept focused
+                if isinstance(expected, tuple):          # tab 2 again: whichever of its panes rodeo kept focused
+                    ok = ok and len(got) == 1 and got[0] in expected
+                elif got != [expected]:
                     ok = False
             result["landed"] = seen
             result["result"] = "pass" if ok else "fail"
@@ -2019,6 +2019,12 @@ class RealAdapter(FixtureAdapter):
             qa.rpc("terminal.send", {"terminal": terminal, "text": {"claude": "/exit"}.get(self.team.operator_harness,
                                                                                          "/quit")}, timeout=60)
 
+    def quit_keys_only(self, qa, terminal):
+        """Quit with the owner's keys alone, Ctrl+C twice: no typed /exit, which a held send could merge with."""
+        for _ in range(2):
+            qa.rpc("terminal.keys", {"terminal": terminal, "keys": ["ctrl+c"]})
+            time.sleep(1)
+
     def restart(self, qa, terminal):
         """Type the same command at the shell prompt in that pane."""
         if not self.team.operator_command:
@@ -2032,7 +2038,7 @@ class QATeam:
     private copy of the skill (phase_8.md §2)."""
 
     def __init__(self, adapter_class, operator, members, draft_wait=None, permissions="full", operator_shell=False,
-                 startup_dialog=None, quiet_grace=None, setup=None, operator_model=None):
+                 startup_dialog=None, quiet_grace=None, setup=None, operator_model=None, operator_sink=False):
         self.operator_harness, self.members, self.permissions = operator, members, permissions
         self.startup_dialog = startup_dialog    # fixture only: the harness whose fake shows its declared dialog
         self.real = adapter_class is RealAdapter
@@ -2070,8 +2076,12 @@ class QATeam:
             params["env"]["FAKE_ECHO"] = "1"
             params["env"]["CODEX_THREAD_ID"] = f"thread-{token().lower()}"   # the fake operator's conversation
         self.operator_command = None
+        self.sink = None
         if self.real and operator_shell:    # an owner's shell: quitting the harness leaves the pane at its prompt
             self.operator_command = shlex.join(params["argv"])
+            if operator_sink:                # or, for a quit trial, a sink that executes nothing (phase_8.md §3.8)
+                self.sink = self.dir / "operator-sink.txt"
+                self.operator_command += f"; exec cat > {shlex.quote(str(self.sink))}"
             params["argv"] = ["bash", "--norc", "--noprofile", "-i"]
             params["env"]["PS1"] = "qa$ "
         self.operator = self.qa.rpc("terminal.run", params)["address"]
@@ -2739,10 +2749,12 @@ def case_7(run, role, harness, adapter_class):
                 "a long multi-line message: the markers at its beginning, middle and end acted on in order",
                 proof={"bytes": len(text.encode()), "order": [marks.index(m) for m in order]},
                 reason=None if ok else "a marker was missing or out of order")
-    _case_7_two_senders(run, role, harness, adapter_class)
-    _case_7_pending_restart(run, role, harness, adapter_class)
-    _case_7_upgrade(run, role, harness, adapter_class)
-    _case_7_held_quiet(run, role, harness, adapter_class)
+    for name, trial in (("two-senders", _case_7_two_senders), ("pending-restart", _case_7_pending_restart),
+                        ("upgrade", _case_7_upgrade), ("held-quiet", _case_7_held_quiet)):
+        try:                                             # each in its own team: one that cannot run stops only itself
+            trial(run, role, harness, adapter_class)
+        except NotRun as why:
+            run.row(7, name, role, harness, "not_run", f"case 7 {name}", reason=str(why))
 
 
 def _case_7_two_senders(run, role, harness, adapter_class):
@@ -2799,6 +2811,7 @@ def _case_7_pending_restart(run, role, harness, adapter_class):
             return
         subject = _subject(team, role)
         recipient = "operator" if role == "operator" else "lead-dev"
+        view = _rodeo(team, ["operator", "team"] if role == "operator" else ["team", "@lead-dev"])   # before faults
         _ask(team, role, team.adapter.blocked_request())
         if not team.until(lambda: team.state(subject) == "blocked", 300):
             run.row(7, "pending-restart", role, harness, "not_run", "case 7 pending-restart",
@@ -2816,7 +2829,7 @@ def _case_7_pending_restart(run, role, harness, adapter_class):
                     and (m.get("meta") or {}).get("what", "").startswith("blocked")]
         receipt, toks = team.receipt("restart"), [token(), token()]
         first = say(toks[0])
-        team.until(lambda: _outcome(log, first, recipient) == ("queued", "blocked"), 30)
+        queued_before = bool(team.until(lambda: _outcome(log, first, recipient) == ("queued", "blocked"), 30))
         if role == "member":
             team.until(lambda: notes(), 60)
         notes_before = notes()
@@ -2825,11 +2838,11 @@ def _case_7_pending_restart(run, role, harness, adapter_class):
         gone = team.until(lambda: team.get(old)["state"] == "finished", 30)
         second = say(toks[1])                            # this say starts a new keeper
         new = team.until(team.keeper, 60)
-        team.until(lambda: _outcome(log, second, recipient) == ("queued", "blocked"), 30)
+        # queued behind the blocked head: the keeper marks only the head "blocked", the rest wait
+        queued_after = bool(team.until(lambda: (_outcome(log, second, recipient) or ("",))[0] == "queued", 30))
         time.sleep(10)
         notes_after_restart = notes()
         typed = receipt.exists()
-        view = _rodeo(team, ["operator", "team"] if role == "operator" else ["team", "@lead-dev"])
         view.keys("ctrl+b")
         time.sleep(0.2)
         view.keys("1")
@@ -2845,11 +2858,12 @@ def _case_7_pending_restart(run, role, harness, adapter_class):
         finals = [_outcome(log, ident, recipient) for ident in (first, second)]
         one_note = role == "operator" or len(notes_after_restart) == 1 == len(notes_before)
         ok = (bool(gone) and bool(new) and new != old and not typed and counts == [1, 1] and one_note
-              and all((f or ("",))[0] == "delivered" for f in finals))
+              and queued_before and queued_after and all((f or ("",))[0] == "delivered" for f in finals))
         run.row(7, "pending-restart", role, harness, "pass" if ok else "fail",
                 "work queued on a blocked recipient across a keeper restart: each stored ID acted on once after the"
                 " answer, and one note for the episode", proof={
                     "keeper_replaced": bool(new) and new != old, "typed_while_blocked": typed, "counts": counts,
+                    "queued_blocked_before_kill": queued_before, "queued_after_restart": queued_after,
                     "final_outcomes": finals, "notes": {"before": len(notes_before), "after": len(notes_after_restart)}
                     if role == "member" else "not applicable: notes are about members", "peer": peer},
                 reason=None if ok else "see proof")
@@ -2936,7 +2950,8 @@ def _case_10_held_sender_exit(run, role, harness, adapter_class):
         time.sleep(10)
         count = _lines(receipt).count(tok)
         final = _outcome(log, found, recipient) if found else None
-        ok = (found is not None and seconds <= SAY_WAIT + 15 and (held or ("",))[0] == "sending" and not acted_early
+        ok = (found is not None and SAY_WAIT - 1 <= seconds <= SAY_WAIT + 15 and (held or ("",))[0] == "sending"
+              and not acted_early
               and count == 1 and (final or ("",))[0] == "delivered")
         run.row(10, "held-sender-exit", role, harness, "pass" if ok else "fail",
                 "say returns at its wait while the send is held by the owner's draft; after release, one action",
@@ -3255,7 +3270,7 @@ def _case_8_quit_during_hold(run, role, harness, adapter_class):
         run.row(8, "quit-during-hold", role, harness, "not_run", "case 8 quit-during-hold",
                 reason="a member's pane closes when its harness ends: there is no sink to read")
         return
-    team, peer = _team_for(adapter_class, role, harness, operator_shell=True, draft_wait=60)
+    team, peer = _team_for(adapter_class, role, harness, operator_shell=True, draft_wait=60, operator_sink=True)
     with team:
         _operator_tab(team)
         if not _up(team, run, 8, role, harness, ["quit-during-hold"]):
@@ -3275,15 +3290,21 @@ def _case_8_quit_during_hold(run, role, harness, adapter_class):
         found = _say_id(out)
         claimed = team.until(lambda: found and _outcome(log, found, "operator") == ("sending", None), 60)
         start = time.monotonic()
-        team.adapter.quit(team.qa, team.operator)
-        exited = team.until(lambda: team.state(team.operator) is None, 60)
+        if team.sink is not None:                        # a real harness: its exit starts cat into a fresh file
+            team.adapter.quit_keys_only(team.qa, team.operator)
+            exited = team.until(lambda: team.sink.exists(), 60)
+        else:                                            # the fake's loop reads a line and runs nothing
+            team.adapter.quit(team.qa, team.operator)
+            exited = team.until(lambda: team.state(team.operator) is None, 60)
         quit_s = round(time.monotonic() - start, 1) if exited else None
         held_at_exit = _outcome(log, found, "operator") if found else None
 
         def sink():
+            if team.sink is not None:                    # only what arrived after the exit
+                return team.sink.read_text() if team.sink.exists() else ""
             return "".join(team.qa.rpc("terminal.read", {"terminal": team.operator, "lines": 0}).get("text", "")
                            .split())
-        at_exit = sink().count(tok)                      # what was already on screen when the harness had gone
+        at_exit = sink().count(tok)                      # what was already there when the harness had gone
         time.sleep(75)                                   # past draft_wait: the hold has ended either way
         after = sink().count(tok)
         final = _outcome(log, found, "operator") if found else None
@@ -3793,13 +3814,28 @@ def _upgrade(team, peer):
         return "".join(team.qa.rpc("terminal.read", {"terminal": keeper, "lines": 0}).get("text", "").split())
     draining = team.until(lambda: f"keeper{new}installed" in keeper_screen(), 90)
     still_held = not first.exists()
-    second, tok2, said = team.receipt("second"), token(), {}
-    _member_says(team, team.adapter.act_append(second, tok2), record=said)   # queued during the drain, before release
-    queued = _say_id(said.get("out") or "")
+    second, tok2 = team.receipt("second"), token()
+    # queued during the drain, before release: a driver-run say from the member's terminal, instant, so the owner's
+    # hold cannot lapse while a slow harness runs it (agy's own say took long enough for the keeper to finish)
+    _, out = team.call("say", "operator", "--file", str(_note(team, team.adapter.act_append(second, tok2))),
+                       terminal=team.member("lead-dev"), timeout=60)
+    queued = _say_id(out)
     queued_while_draining = bool(queued) and _outcome(log, queued, "operator")[0] == "queued" and not second.exists()
+    module = sys.modules["factory_under_test"]
+    claimed_under = {}
+
+    def watch_claim():                                           # which image claimed the queued message
+        deadline = time.monotonic() + 300
+        while time.monotonic() < deadline and "version" not in claimed_under and queued:
+            outcome = _outcome(log, queued, "operator")[0]
+            if outcome != "queued":
+                beat = module.read_beat(log.state)
+                claimed_under.update(version=beat[1] if beat else None, seen_as=outcome)
+            time.sleep(0.05)
+    watcher = threading.Thread(target=watch_claim, daemon=True)
+    watcher.start()
     view.keys("enter")                                           # the owner sends the draft: the send finishes
     finished = team.until(lambda: first.exists() and tok1 in first.read_text(), 300)
-    module = sys.modules["factory_under_test"]
 
     def running_new():                                           # observed passively: the keeper's own beat and label
         beat = module.read_beat(log.state)
@@ -3808,6 +3844,7 @@ def _upgrade(team, peer):
     reexeced = team.until(running_new, 120)
     acted = team.until(lambda: second.exists() and tok2 in second.read_text(), 300)
     time.sleep(10)
+    watcher.join(timeout=5)
     keepers = [r["address"] for r in team.qa.rpc("terminal.list", {"all": False})["terminals"]
                if (r.get("labels") or {}).get("factory.kind") == "keeper"]
     first_outcome = log.read_box()[1].outcome(held, "operator") if held else {}
@@ -3817,11 +3854,13 @@ def _upgrade(team, peer):
              "draining_seen": bool(draining), "still_held_while_draining": still_held,
              "old_send_finished": bool(finished), "queued_id": int(queued.group(1)) if queued else None,
              "queued_while_draining": queued_while_draining, "beat_version": beat[1] if beat else None,
-             "new_image_running": bool(reexeced), "queued_final": _outcome(log, queued, "operator") if queued else None,
+             "new_image_running": bool(reexeced), "queued_claimed_under": claimed_under.get("version"),
+             "queued_final": _outcome(log, queued, "operator") if queued else None,
              "new_message_count": second.read_text().split().count(tok2) if second.exists() else 0,
              "draft_exact": draft_receipt.exists() and draft_receipt.read_text() == literal + "\n", "peer": peer}
     ok = (old != new and keepers == [keeper] and bool(held) and bool(draining) and still_held and bool(finished)
           and first_outcome.get("o") == "delivered" and queued_while_draining and bool(reexeced) and bool(acted)
+          and claimed_under.get("version") == new
           and proof["new_message_count"] == 1 and (proof["queued_final"] or ("",))[0] == "delivered")
     return ok, proof
 
@@ -4225,15 +4264,15 @@ def qualify(target, role=None, cases=None, json_path=None, fixture=False):
             first_row = len(run.data["rows"])
             try:
                 function(run, role_, harness, adapter_class)
-            except NotRun as why:                         # only the rows the case did not get to (@reviewer)
+            except NotRun as why:                         # only the rows this case did not get to (@reviewer)
                 for name, _ in subcases(case, role_):
                     if not any(r["subcase"] == name and r["case"] == case and r["role"] == role_
-                               and r["harness"] == harness for r in run.data["rows"]):
+                               and r["harness"] == harness for r in run.data["rows"][first_row:]):
                         run.row(case, name, role_, harness, "not_run", f"case {case} {name}", reason=str(why))
             except (RuntimeError, HcError, HcDown, OSError, subprocess.SubprocessError) as error:
                 for name, _ in subcases(case, role_):
                     if not any(r["subcase"] == name and r["case"] == case and r["role"] == role_
-                               for r in run.data["rows"]):
+                               for r in run.data["rows"][first_row:]):
                         run.row(case, name, role_, harness, "not_run", f"case {case} {name}",
                                 reason=f"the driver stopped: {type(error).__name__}: {error}")
             _file_evidence(run, first_row)
@@ -4260,7 +4299,28 @@ def _cycled(proof):
 
 # A stored pass is judged again by today's rule where its proof holds the facts (@reviewer): an older proof with
 # switched but no successful replacement stays unproved.
-REJUDGE = {(6, "resume"): _cycled, (6, "member-switch"): lambda p: p.get("switched") is True and _cycled(p)}
+def _esc_trials_hold(proof):
+    """case 4 owner-interrupt by today's rule: both Esc trials delivered M1 while the subject worked, found it still
+    pending with the subject working at the moment of Esc, and held. The imported Claude Code trials (their own
+    runner, checked by @architect-2) carry "trials" instead."""
+    if "trials" in proof:
+        return True
+    return all(isinstance(proof.get(t), dict) and proof[t].get("working_when_delivered") is True
+               and proof[t].get("pending_and_working_at_esc") is True and proof[t].get("holds") is True
+               for t in ("next-delivery", "owner-line"))
+
+
+REJUDGE = {(6, "resume"): _cycled, (6, "member-switch"): lambda p: p.get("switched") is True and _cycled(p),
+           (4, "owner-interrupt"): _esc_trials_hold,
+           # both queued observations, required since 7038415 (@architect-2)
+           (7, "pending-restart"): lambda p: p.get("queued_blocked_before_kill") is True
+           and p.get("queued_after_restart") is True,
+           # the queued message claimed under the new image, required since 7038415
+           (7, "upgrade"): lambda p: p.get("queued_claimed_under") is not None
+           and p.get("queued_claimed_under") == p.get("new_version"),
+           # say returned at its wait, not at once, required since 7038415
+           (10, "held-sender-exit"): lambda p: isinstance(p.get("say_seconds"), (int, float))
+           and p["say_seconds"] >= SAY_WAIT - 1}
 
 REPORT_BEGIN, REPORT_END = "<!-- qualify report: generated, do not edit -->", "<!-- end of generated report -->"
 
@@ -4284,19 +4344,19 @@ def report(paths, out):
         data = json.loads(pathlib.Path(path).read_text())
         if not isinstance(data, dict) or data.get("mode") != "real" or "rows" not in data:
             continue                                  # a check's results, or a fixture run
-        if data.get("run_id") and data["run_id"] in {r.get("run_id") for r in runs}:
-            continue                                  # the same run imported twice (§1)
-        runs.append(data)
+        if not data.get("run_id") or data["run_id"] not in {r.get("run_id") for r in runs}:
+            runs.append(data)                         # checkpoints of one run count once; their rows merge (§1)
         rank = (data.get("utc") or "", _commit_rank(data.get("source_head")))   # newest attempt by UTC (§1)
         for entry in data.get("trust_entries", []):
             trust.add((entry["harness"], entry["file"], entry["directory"]))
         for row in data["rows"]:
             key = (row["role"], row["harness"], row["case"], row["subcase"])
+            same_run = key in chosen and data.get("run_id") and chosen[key][2].get("run_id") == data.get("run_id")
             if key not in chosen or rank >= chosen[key][0]:
-                if key in chosen:
+                if key in chosen and not same_run:          # an earlier checkpoint of this run is not superseded
                     older.setdefault(key, []).append(chosen[key])
                 chosen[key] = (rank, row, data)
-            else:
+            elif not same_run:
                 older.setdefault(key, []).append((rank, row, data))
     out = pathlib.Path(out)
     out.mkdir(parents=True, exist_ok=True)
@@ -4343,11 +4403,12 @@ def report(paths, out):
                     text += ("; " if text else "") + f"partner {proof['peer']}"
                 run_head = (data.get("source_head") or "?")[:7]
                 lines.append(f"| {case} | {subcase} | {status} | {text} | {run_head} |")
-                if status != "pass" and status != "measured":
+                measured_only = dict(subcases(case, role)).get(subcase, False) if case in CASES else False
+                if status not in ("pass", "measured") and not measured_only:   # a measurement never decides
                     open_rows.append(f"{case} {subcase}")
             for case in CASES:
-                for name, _ in subcases(case, role):
-                    if (role, harness, case, name) not in rows:
+                for name, measured_only in subcases(case, role):
+                    if (role, harness, case, name) not in rows and not measured_only:
                         open_rows.append(f"{case} {name} (no run)")
             superseded = [f"- {key[2]} {key[3]}: {row['status']} at {(data.get('source_head') or '?')[:7]}, superseded"
                           f" by the {rows[key][1]['status']} above"
