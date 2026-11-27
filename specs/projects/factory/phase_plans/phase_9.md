@@ -116,7 +116,7 @@ Target: the private `pkieltyka/factory-test` (verified: private, default branch 
 
 | Row (per issue) | Evidence |
 |---|---|
-| `planned` | An issue comment starting `plan:` that the driver observed before the first implementation change for that issue (the first commit on its ticket branch, or the first change in the shared checkout, whichever it sees first); "before the pull request was opened" alone would let a plan be written after the work |
+| `planned` | An issue comment starting `plan:` is present by the first observation of implementation for that issue. This is the first change in the shared checkout or the first code commit on its ticket branch outside both integration refs, whichever the driver sees first. At that boundary the driver reads the comments immediately if it has not seen a plan already. A plan first found on a later read is too late. |
 | `reviewed` | A delivered `status: approve` from `reviewer` naming `#N` and `R` |
 | `checked` | On `R`, the `tests` job exists, ran at least one test (its log's count) and concluded `success`, with a completion time before the pull request's `mergedAt` |
 | `integrated` | One pull request for `#N` into `qa/<run_id>/main`, state `MERGED` by squash, whose head at merge was `R`; the acceptance check for the task passes in a fresh clone of the integration branch |
