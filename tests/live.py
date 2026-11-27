@@ -242,6 +242,8 @@ def installed_needles(installed):
     return sorted("".join(n.split()) for n in needles)
 
 
+OMP_BACKGROUNDED = re.compile(r"Backgrounded as job (bg_\d+)")
+OMP_JOB_DONE = re.compile(r"(bg_\d+) \((.*?)\) has completed\.\nResume your work using the result below\.\n(.*)", re.S)
 CODE_EXEC = re.compile(r'exec_command\(\{\s*cmd\s*:\s*("(?:[^"\\]|\\.)*")')
 # a statement that calls it directly, at the start of a line (@architect-2 at fd65f71)
 CODE_EXEC_DIRECT = re.compile(r'^[ \t]*(?:(?:const|let|var)\s+\w+\s*=\s*)?(?:await\s+)?(?:tools\.)?'
@@ -260,7 +262,7 @@ def tool_calls(text, pairing=False):
     Codex's shell or exec_command function_call (arguments' cmd or command), and a Codex code-mode call that runs
     exactly one exec_command. Searches, file reads and other tools are not executions and are left out; a result
     that reports failure (is_error, a non-zero exit) is None (@architect-2)."""
-    calls, results = {}, {}
+    calls, results, jobs = {}, {}, {}
 
     def command_of(node, kind):
         if kind == "tool_use":
@@ -291,6 +293,21 @@ def tool_calls(text, pairing=False):
     def walk(node):
         if isinstance(node, dict):
             kind = node.get("type")
+            if kind == "toolCall" and node.get("id") and node.get("name") == "bash":       # pi and omp
+                command = (node.get("arguments") or {}).get("command")
+                if isinstance(command, str):
+                    calls[node["id"]] = command
+            if node.get("role") == "toolResult" and node.get("toolCallId"):
+                text = "".join(c.get("text", "") for c in node.get("content") or [] if isinstance(c, dict))
+                results[node["toolCallId"]] = None if node.get("isError") is True else text
+                job = OMP_BACKGROUNDED.search(text)
+                if job:                          # omp ran it as a job: its own result comes later, by job name
+                    jobs[job.group(1)] = node["toolCallId"]
+                    results[node["toolCallId"]] = None
+            for key in ("text", "content"):      # omp's async-result notice: a plain string
+                done = OMP_JOB_DONE.search(node[key]) if isinstance(node.get(key), str) else None
+                if done and done.group(1) in jobs and calls.get(jobs[done.group(1)]) == done.group(2):
+                    results[jobs.pop(done.group(1))] = done.group(3)
             ident = node.get("id") if kind == "tool_use" else node.get("call_id")
             if kind in ("tool_use", "function_call", "custom_tool_call") and ident:
                 command = command_of(node, kind)
@@ -423,6 +440,15 @@ def qa_transcripts(roots, labelled=False):
                   for f in d.glob("*.jsonl")]
     except OSError:
         pass
+    for base, harness, ends in ((os.path.expanduser("~/.pi/agent/sessions"), "pi", "--"),
+                                (os.path.expanduser("~/.omp/agent/sessions"), "omp", "-")):
+        # one folder per working directory: its path with "/" as "-", wrapped in "--" (pi) or led by "-" (omp)
+        encoded = [ends + r.strip("/").replace("/", "-") + "-" for r in roots]
+        try:
+            found += [(harness, f) for d in pathlib.Path(base).iterdir() if any(d.name.startswith(e) for e in encoded)
+                      for f in d.glob("*.jsonl")]
+        except OSError:
+            pass
     sessions = pathlib.Path(os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")) / "sessions"
     for day in {time.strftime("%Y/%m/%d", time.localtime(time.time() - s)) for s in (0, 86400)}:
         for f in sorted((sessions / day).glob("rollout-*.jsonl")) if (sessions / day).is_dir() else []:

@@ -7014,6 +7014,38 @@ class QualifyJudgeTests(unittest.TestCase):
         self.assertIn("AttributeError", rows[(3, "draft-cleared")]["reason"])
         self.assertEqual(rows[(5, "blocked")]["status"], "pass")
 
+    def test_pi_and_omp_bash_calls_pair_with_their_results(self):
+        """pi's and omp's session files (pi- and omp-op-1-2-a4789d6): a toolCall named bash with arguments.command,
+        and a toolResult message with its toolCallId; isError leaves it None. omp may background a slow command
+        and inject its own result later as an async-result notice naming the job and the command."""
+        import live
+        status = "python3 /qa/skill/scripts/factory.py status"
+        lines = [{"type": "message", "message": {"role": "assistant", "content": [
+                     {"type": "toolCall", "id": "c1", "name": "bash", "arguments": {"command": status}}]}},
+                 {"type": "message", "message": {"role": "toolResult", "toolCallId": "c1", "toolName": "bash",
+                                                 "content": [{"type": "text", "text": "@lead-dev  lead-dev"}],
+                                                 "isError": False}},
+                 {"type": "message", "message": {"role": "assistant", "content": [
+                     {"type": "toolCall", "id": "c2", "name": "read", "arguments": {"path": status}}]}},
+                 {"type": "message", "message": {"role": "assistant", "content": [
+                     {"type": "toolCall", "id": "c3", "name": "bash", "arguments": {"command": "false"}}]}},
+                 {"type": "message", "message": {"role": "toolResult", "toolCallId": "c3", "content": [],
+                                                 "isError": True}}]
+        self.assertEqual(live.tool_calls("\n".join(json.dumps(x) for x in lines)),
+                         [(status, "@lead-dev  lead-dev"), ("false", None)])
+        omp = [{"type": "message", "message": {"role": "assistant", "content": [
+                   {"type": "toolCall", "id": "j1", "name": "bash", "arguments": {"i": "x", "command": status}}]}},
+               {"type": "message", "message": {"role": "toolResult", "toolCallId": "j1", "content": [
+                   {"type": "text", "text": "Backgrounded early to handle an incoming message.\n\nBackgrounded as job"
+                                            " bg_1 (killed once it has run 300s)"}], "isError": False}},
+               {"type": "custom_message", "customType": "async-result",
+                "content": f"<system-notice>\nBackground job bg_1 ({status}) has completed.\n"
+                           "Resume your work using the result below.\n@lead-dev idle"}]
+        self.assertEqual(live.tool_calls("\n".join(json.dumps(x) for x in omp)), [(status, "@lead-dev idle")])
+        self.assertEqual(live.tool_calls("\n".join(json.dumps(x) for x in omp[:2])), [(status, None)])   # not yet
+        other = {**omp[2], "content": omp[2]["content"].replace(status, "python3 /qa/other.py")}
+        self.assertEqual(live.tool_calls("\n".join(json.dumps(x) for x in [*omp[:2], other])), [(status, None)])
+
     def test_claude_code_bash_output_is_read_from_its_native_result(self):
         """claude-op-2-a65a1fe (@lead-dev): a successful Bash call's tool_result content is empty, and its output is
         the same line's toolUseResult.stdout. A failed call (is_error, an empty toolUseResult) stays None."""
