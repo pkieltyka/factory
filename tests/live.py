@@ -1208,9 +1208,12 @@ def lc7():
         result["settings_changed"] = changed(before, stamps(roots))   # paths only; nothing is read
         if not result["baseline"].startswith("dialog"):
             result["result"] = "inconclusive: the baseline showed no trust dialog"
+        elif not (result["answers"] and result["with_settings"].startswith("idle")):
+            result["result"] = "fail"
+        elif result["settings_changed"]:   # stat cannot tell a trust list from other state: never a pass
+            result["result"] = "inconclusive: agy changed files under its settings; check whether one is its trust list"
         else:
-            result["result"] = "pass" if result["answers"] and result["with_settings"].startswith("idle") else "fail"
-            result["note"] = "settings_changed lists every file agy touched; a trust list among them fails the check"
+            result["result"] = "pass"
     return harness_check("LC-7", ["agy"], body)
 
 
