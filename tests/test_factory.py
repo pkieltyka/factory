@@ -7319,6 +7319,9 @@ class E2EFixtureTests(unittest.TestCase):
             self.assertIn("records them in comments on the related seeded issues", brief)
             self.assertIn("Use only the three seeded issues and their existing project cards", brief)
             self.assertNotIn("who records them in Backlog", brief)
+            for placeholder in ("OWNER/REPO", "BOARD_OWNER/BOARD_NUMBER", "READY_COLUMN", "ACTIVE_COLUMN",
+                                "BACKLOG_COLUMN", "BASE_BRANCH", "CI_DESCRIPTION"):
+                self.assertNotIn(placeholder, brief)
             self.assertIn("--project 'pkieltyka/42'", github.ready_command(factory.SKILL))
             self.assertGreater(e2e.test_run(github.root, ci=True), 0)
 
