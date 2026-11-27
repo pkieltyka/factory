@@ -1,37 +1,33 @@
 # Bring the team back
 
-Use after agents exit, herdr restarts or you lose context, including when no member and no session is left. `FACTORY.md`, the tracker and Git must be enough to recover the project; sessions only make it faster.
+Use after agents exit, `hc` restarts or you lose context. Recover the project from `FACTORY.md`, the tracker and Git. Saved conversations help members pick up their work.
 
 ```bash
 factory.py status
-factory.py up                # every configured member, including those with closed panes
-factory.py up lead-dev       # selected member, even if its pane closed
-factory.py up --restart      # reapply settings to running members
-factory.py up lead-dev --fresh --restart  # new session
+factory.py up
+factory.py up lead-dev
+factory.py inbox
 ```
 
-Before any launch or restart, `up` checks the affected members with current `factory.toml` settings. A launch check failure exits 2. Integration status problems warn and launch continues. It names each member it starts fresh or resumes from its last noted session of the same harness. Use `--fresh` to bypass saved sessions. To keep a stopped member out, name the others or remove it from `factory.toml`. Observations live in `~/.cache/factory-skill/<repo>/sessions.jsonl`; herdr forgets a session when its agent exits.
+`up` tries each member's compatible saved conversation and says when it starts a fresh one instead. If a resumed harness exits before becoming ready, Factory retries it once with a new conversation. Use `factory.py up NAME --fresh` when you want a new conversation for a stopped member. Keep a stopped member out by naming only those you want to start.
 
-- Reuse the old shell pane only when its cwd matches the configured checkout and the harness needs no new pane environment. Otherwise create a replacement; clear the old label and leave that pane as a plain shell. Worktrees remain intact.
-- Codex receives an explicit working directory on resume; its saved session alone may point at an old checkout.
-- After a herdr restart, run `up --restart`: herdr restores names and sessions but omits factory launch settings and standing-instruction flags. Plain `up` names the members it finds running without their permission flags or `args`.
-- Failed resume: inspect the error and use `up <name> --fresh` if the saved session cannot reopen.
-- `up` exits 3 for failed launches or brief deliveries and reports the affected members by name.
-- The inbox outlives the team. A cold `up` (no member live, no `--restart`) announces unread messages. Use `factory.py wait --timeout 0` to read pending reports and `factory.py inbox 100` to reread the last 100 acknowledged messages.
+After an `hc` restart, `status` can report interrupted members as `gone`. Run `factory.py up NAME` for the members you want back. Members intentionally stopped with `down` stay stopped until selected by `up`.
+
+- Exit 2 reports a refusal or failed preflight. Exit 3 names the members it could not start, ready or brief. Follow the printed recovery command.
+- A pending first brief delivers when it can. For a live member with no confirmed or pending first brief, run `factory.py brief --send NAME`.
+- Messages survive `down` and a core restart. `factory.py inbox [N]` rereads yours. `factory.py status` shows pending recipients.
+- A cold `up` lists message files that were never delivered to everyone. Check their outcomes before resending or discarding them.
 
 ## Reconcile before assigning
 
-When everyone is running, `up` sends nothing. Check the tracker and Git and use `say` to ask the members concerned for a one-line status.
+1. Read `FACTORY.md`, `factory.toml` and project plans, then the tracker.
+2. Check Git, including each worktree's status and diff, and the current PRs and CI where applicable. Match each uncommitted change to an active item. Leave unexplained changes alone and ask the user.
+3. Summarize each open item, its evidence and next action to the user before reading member replies. Git and CI outrank the tracker when they disagree. Have the tracker owner correct a stale record.
+4. Read your recent messages with `factory.py inbox` and check pickup replies. Ask the members concerned for a status if needed. Assign or repeat a task only after verifying it still needs assignment.
+5. A verdict covers the commit or paths it names. Request a new review when the head moved, checks or verdict are missing, or approved changes were never committed.
 
-Read in this order: `FACTORY.md`, `factory.toml` and project plans; the tracker; Git (`git status`, `git log --oneline -10`, `git worktree list`, each worktree's `git -C <path> status` and `git diff <main>...<branch>`, and PRs and CI when the project has them); last, members' replies and the unread messages `wait --timeout 0` prints. Where they disagree, Git and CI outrank the tracker, and the tracker outranks anyone's memory, yours included. Have the tracker's owner correct a stale record; do not act on it.
-
-- Match every uncommitted change to an in-progress item before any member writes. A change no item explains is not built on, committed or discarded: ask the user.
-- A verdict covers only the commit or paths it names. Ask for a new review when the record has no verdict or no checks, when the branch moved past the reviewed commit, or when approved work was never committed.
-- Tell the user where the project stands: each open item with its state, evidence and next action, then anything unexplained or contradictory. Then carry on; stop only for those and for decisions that are the user's.
-- Send each fresh member its task again: goal, criteria, branch or files, the evidence so far and the required fixes still open. Resumed members report what they were doing; check it against the above.
-
-Then follow [leading.md](leading.md).
+Give a member that started fresh the relevant criteria, branch or files, evidence and remaining work when it needs the task again. Then follow [leading.md](leading.md).
 
 ## Change a running member's settings
 
-After an authorized `factory.toml` change, run `up <name> --restart`. It validates before closing the selected member's pane, then resumes in a new pane with current settings and standing instructions. Coordinate any active work first. Add `--fresh` for a new session; alone, `--fresh` leaves running agents alone.
+Coordinate active work first. After an authorized change to `factory.toml`, run `factory.py down NAME`, then `factory.py up NAME`. Use `--fresh` on `up` for a new conversation.

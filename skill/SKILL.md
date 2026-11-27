@@ -32,7 +32,7 @@ Use `factory.py say` for every team message. Members send private drafts with `-
 | `setup` | Read [cmd_setup.md](references/cmd_setup.md) to form or change the team. |
 | `up` | Start or resume the team. For unfinished work, [reconcile before assigning](references/cmd_continue.md#reconcile-before-assigning). |
 | `down` | `factory.py down [names]` stops the named members or all configured members. If it reports a removed member still running, use the named terminal to stop it. |
-| `status` | `factory.py status` shows members, pending messages, the keeper and the operator. See [leading.md](references/leading.md). |
+| `status` | `factory.py status` shows members, pending messages, the keeper and the operator. See [messages and status](references/leading.md#messages-and-status). |
 | `brief` | `factory.py brief` previews the team brief and `factory.py brief NAME` previews a member's instructions. `factory.py brief --send NAME` sends the brief to a running member. |
 | `say` | `factory.py say NAME --file PATH`. Separate recipients with spaces or commas. `all` selects other live members. The operator can pass quoted text in place of the file. |
 | `inbox` | `factory.py inbox [N] [--for NAME]` shows recent messages and their outcomes. It defaults to the last ten addressed to you. |
