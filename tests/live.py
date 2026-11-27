@@ -3332,14 +3332,14 @@ def case_1(run, role, harness, adapter_class):
         subject = _subject(team, role)
         receipt = team.receipt("states")
         before = team.get(subject)
-        states, app = [(before.get("status") or {}).get("state")], None
+        states, app, working_turn = [(before.get("status") or {}).get("state")], None, None
         _ask(team, role, team.adapter.act_run(receipt, "sleep 4"))
         deadline = time.monotonic() + 300
         while time.monotonic() < deadline and not (receipt.exists() and "exit" in receipt.read_text()):
             record = team.get(subject)
             state = (record.get("status") or {}).get("state")
-            if state == "working" and app is None:       # the live root status.app while it works
-                app = (record.get("status") or {}).get("app") or ""
+            if state == "working" and app is None:       # the live root status.app while it works, and that turn
+                app, working_turn = (record.get("status") or {}).get("app") or "", record.get("turn")
             if state != states[-1]:
                 states.append(state)
             time.sleep(0.25)
@@ -3348,7 +3348,8 @@ def case_1(run, role, harness, adapter_class):
         after = team.get(subject)
         proof = {"states": states, "turn": [before.get("turn"), after.get("turn")],
                  "action": receipt.read_text().strip() if receipt.exists() else None,
-                 "ready_after_up": getattr(team, "ready_states", None), "subject": subject, "working_app": app}
+                 "ready_after_up": getattr(team, "ready_states", None), "subject": subject, "working_app": app,
+                 "working_turn": working_turn}
         ok = (states[0] in READY and "working" in states and states[-1] in READY
               and after.get("turn", 0) > before.get("turn", 0) and proof["action"] == "exit 0")
         # a new operator's live app must be its own table key: Factory's between-turns rule selects by it, and the
