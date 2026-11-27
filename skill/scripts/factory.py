@@ -1734,6 +1734,16 @@ def pending_lines(state, operator, now=None):
     return lines
 
 
+def print_pending(args, operator):
+    """Bridge for the old up/status commands until Phase 5a replaces their launch and pane logic."""
+    try:
+        state = find_team(args)[1]
+    except (Problem, HcError) as error:
+        print(f"pending: unavailable ({error})")
+        return
+    print("\n".join(pending_lines(state, operator)))
+
+
 # ================================================================ keeper delivery
 
 def head_of(name, box, ready):
@@ -2033,6 +2043,8 @@ class Keeper:
 
     def _send(self, name, ident, term, wire):
         try:
+            if self.stop:
+                raise HcDown(False, "keeper stopped before sending")
             result = self.hc.send(term, wire)
         except Exception as error:
             result = error
@@ -2397,195 +2409,6 @@ def cmd_inbox(args):
             print(f"    {line}")
 
 
-class InboxDamage(ValueError):
-    def __init__(self, path, line, reason):
-        super().__init__(f"inbox needs repair: {path}, line {line}: {reason}. Operator messages are unavailable."
-                         " After repairing the file, run factory.py up.")
-
-
-class Inbox:
-    """Session-local transport. Hold the stable lock for file operations, never while waiting on agents."""
-    def __init__(self, cfg):
-        self.directory = cfg.cache
-        self.path = self.directory / f"inbox-{session_key()}.jsonl"
-        self.state_path = self.path.with_suffix(".json")
-        self.lock_path = self.path.with_suffix(".lock")
-
-    private_open = staticmethod(private_open)
-
-    def __enter__(self):
-        for path in (self.directory.parent, self.directory):
-            path.mkdir(parents=True, exist_ok=True, mode=0o700)
-            if not stat.S_ISDIR(path.stat().st_mode):
-                raise OSError(f"not a directory: {path}")
-            if stat.S_IMODE(path.stat().st_mode) != 0o700:
-                path.chmod(0o700)
-        self.lock = self.private_open(self.lock_path, os.O_CREAT | os.O_RDWR)
-        try:
-            fcntl.flock(self.lock, fcntl.LOCK_EX)
-            self.state = self.read_state()
-            raw = self.read(self.path) or b""
-            if raw and not raw.endswith(b"\n"):
-                raise InboxDamage(self.path, raw.count(b"\n") + 1, "incomplete line")
-            self.rows = [self.decode(line, self.path, n) for n, line in enumerate(raw.splitlines(), 1)]
-            self.validate_rows(self.rows, self.path)
-            return self
-        except BaseException:
-            os.close(self.lock)
-            raise
-
-    def __exit__(self, *_):
-        os.close(self.lock)
-
-    def read(self, path):
-        try:
-            fd = self.private_open(path, os.O_RDONLY)
-        except FileNotFoundError:
-            return None
-        with os.fdopen(fd, "rb") as f:
-            return f.read()
-
-    def read_state(self):
-        raw = self.read(self.state_path)
-        if raw is None:
-            return {"seen": 0}
-        state = self.decode(raw, self.state_path, 1)
-        if not isinstance(state, dict) or type(state.get("seen")) is not int or state["seen"] < 0:
-            raise InboxDamage(self.state_path, 1, "expected non-negative integer seen")
-        history = state.get("history", [])
-        self.validate_rows(history, self.state_path)
-        if len(history) > 100 or (history and history[-1]["id"] > state["seen"]):
-            raise InboxDamage(self.state_path, 1, "expected at most 100 acknowledged history entries, none above seen")
-        return {"seen": state["seen"], "history": history}
-
-    @staticmethod
-    def decode(raw, path, line):
-        try:
-            return json.loads(raw)
-        except (ValueError, UnicodeError) as e:
-            raise InboxDamage(path, line, str(e)) from e
-
-    @staticmethod
-    def validate_rows(rows, path):
-        if not isinstance(rows, list):
-            raise InboxDamage(path, 1, "expected a list of messages")
-        last = 0
-        for n, row in enumerate(rows, 1):
-            if (not isinstance(row, dict) or type(row.get("id")) is not int or row["id"] <= last
-                    or not all(isinstance(row.get(k), str) for k in ("at", "from", "text"))):
-                raise InboxDamage(path, n, "expected increasing positive id and at/from/text strings")
-            last = row["id"]
-
-    @property
-    def unread(self):
-        return [r for r in self.rows if r["id"] > self.state["seen"]]
-
-    @property
-    def highest(self):
-        return max([self.state["seen"], *(r["id"] for r in self.rows)])
-
-    def sync_directory(self):
-        fd = os.open(self.directory, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-
-    def replace(self, path, data):
-        fd, name = tempfile.mkstemp(prefix=path.name + ".", dir=self.directory)
-        try:
-            with os.fdopen(fd, "wb") as f:
-                f.write(data)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(name, path)
-            self.sync_directory()
-        finally:
-            pathlib.Path(name).unlink(missing_ok=True)
-
-    def save_state(self):
-        self.replace(self.state_path, (json.dumps(self.state) + "\n").encode())
-
-    def remove_seen(self):
-        unread = self.unread
-        if len(unread) != len(self.rows):
-            self.replace(self.path, b"".join((json.dumps(r, ensure_ascii=False) + "\n").encode() for r in unread))
-            self.rows = unread
-
-    def acknowledge(self, seen):
-        if seen < 0 or seen > self.highest:
-            raise ValueError(f"invalid inbox id {seen}; highest is {self.highest}")
-        if seen > self.state["seen"]:
-            moved = [r for r in self.unread if r["id"] <= seen]
-            self.state["history"] = (self.state.get("history", []) + moved)[-100:]
-            self.state["seen"] = seen
-            self.save_state()  # Save recovery text and seen together before removing inbox rows.
-        self.remove_seen()
-
-
-def print_messages(rows):
-    for row in rows:
-        print(f"[Message {row['id']} from @{row['from']} at {row['at']}]:")
-        print("\n".join("    " + line for line in row["text"].splitlines()))
-
-
-def _cmd_inbox_v1(args):
-    require_herdr()
-    if args.count < 1:
-        raise SystemExit("give a positive number of acknowledged messages")
-    cfg = cfg_of(args)
-    try:
-        with Inbox(cfg) as inbox:
-            rows = inbox.state.get("history", [])[-args.count:]
-        print_messages(rows)
-        if not rows:
-            print("no acknowledged messages kept")
-    except (OSError, ValueError) as e:
-        print(e, file=sys.stderr)
-        raise SystemExit(2)
-
-
-def operator_wait(harness):
-    return TABLE.get(harness, {}).get("operator_wait")
-
-
-def report_pending_messages(cfg):
-    try:
-        with Inbox(cfg) as inbox:
-            inbox.remove_seen()
-            unread = inbox.unread
-        if unread:
-            print(f"{len(unread)} unread message{'s' if len(unread) != 1 else ''}"
-                  " from the earlier team; run factory.py wait --timeout 0")
-    except (InboxDamage, OSError) as e:
-        print(str(e) if isinstance(e, InboxDamage) else f"inbox unavailable: {e}")
-
-
-def message_text(args):
-    if bool(args.file) == (args.message is not None):
-        raise SystemExit("give a message or --file, not both")
-    try:
-        text = pathlib.Path(args.file).read_text() if args.file else args.message
-    except (OSError, UnicodeError) as e:
-        raise SystemExit(f"cannot read message file {args.file}: {e}") from None
-    if not text.strip():
-        raise SystemExit("give a non-empty message")
-    return text
-
-
-def remove_delivered_draft(cfg, sender, filename):
-    """Only consume the sender's own managed draft. Other --file inputs belong to the caller."""
-    if not filename:
-        return
-    path = pathlib.Path(filename).absolute()
-    directory = cfg.messages / sender
-    if path.parent == directory and not any(p.is_symlink() for p in (cfg.session_dir, cfg.messages, directory)):
-        try:
-            path.unlink(missing_ok=True)
-        except OSError as e:
-            print(f"delivered, but could not remove {path}: {e}. Discard it without resending.", file=sys.stderr)
-
-
 def report_leftover_drafts(cfg):
     if cfg.session_dir.is_symlink() or cfg.messages.is_symlink():
         return
@@ -2603,31 +2426,6 @@ def report_leftover_drafts(cfg):
                     print(f"leftover draft for @{directory.name} ({minutes} min old): {path}. Check delivery before resending or discarding.")
         except OSError as e:
             print(f"warning: cannot scan drafts in {directory}: {e}", file=sys.stderr)
-
-
-def queue_message(cfg, sender, text):
-    started = False
-    try:
-        with Inbox(cfg) as inbox:
-            inbox.remove_seen()
-            row = {"id": inbox.highest + 1, "at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                   "from": sender, "text": text}
-            payload = (json.dumps(row, ensure_ascii=False) + "\n").encode()
-            fd = inbox.private_open(inbox.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
-            try:
-                started = True
-                while payload:
-                    written = os.write(fd, payload)
-                    if written == 0:
-                        raise OSError("inbox write made no progress")
-                    payload = payload[written:]
-                os.fsync(fd)
-                inbox.sync_directory()
-            finally:
-                os.close(fd)
-    except (OSError, ValueError) as e:
-        return ("unconfirmed" if started else "refused"), str(e)
-    return "queued", row["id"]
 
 
 class Checker:
@@ -2962,7 +2760,7 @@ def member_prompt(m, operator, cfg):
     for key, value in {"role_rules": cfg.roles[m["role"]][1], "name": m["name"], "role": m["role"], "operator": f"@{operator}",
                        "draft_dir": str(m["draft_dir"]),
                        "draft": shlex.quote(str(m["draft_dir"])) + "/FILENAME",
-                       "say": shlex.join(["python3", str(SKILL / "scripts/factory.py"), "say", "--cwd", str(cfg.root)]),
+                       "say": shlex.join(["python3", str(SCRIPT), "say"]),
                        "brief": str(cfg.brief_file), "where": where, "rules": "\n".join(rules),
                        "instructions": str(cfg.session_dir / f"{m['name']}.md"),
                        "notes": str(SKILL / "references/notes.md")}.items():
@@ -3451,10 +3249,6 @@ def cmd_up(args):
         raise SystemExit(f"no members in {CONF}; add one, then run `factory.py up`")
     require_herdr()
     info = caller_agent()
-    wait = operator_wait(info.get("agent"))
-    if not wait:
-        print(f"{info.get('agent') or 'unknown harness'} is not supported as operator yet.", file=sys.stderr)
-        sys.exit(2)
     # The operator pane may still carry a member name or label from an earlier team.
     team = Team(cfg, exclude_pane=os.environ.get("HERDR_PANE_ID"))
     cold = not any(team.live(n) for n in cfg.members)
@@ -3473,11 +3267,7 @@ def cmd_up(args):
         print(f"already running: {', '.join(running)}")
         report_launch_drift(team, [m for m in plans if m["name"] in running])
     operator = ensure_operator(cfg, tab=True, info=info)
-    if cold and not args.restart:
-        report_pending_messages(cfg)
-    print(f"members reach @{operator} through the inbox. Run factory.py wait"
-          + (" in a native background task." if wait == "background" else
-             " in the foreground during active work. This mode is not qualified for unattended idle delivery."))
+    print_pending(args, operator)
     if not ready:
         return
     pickup_text = ("We are picking up where we left off. Check the tracker the brief above names, then send"
@@ -3650,14 +3440,7 @@ def cmd_status(args):
         rows.append(("@" + name, p["role"], p["harness"], p["model"] or "?", p["thinking"], team.status(name),
                      (pane or {}).get("pane_id", "")))
     print_table(rows)
-    try:
-        with Inbox(cfg) as inbox:
-            unread = len(inbox.unread)
-            suffix = (f"; {unread} unread message{'s' if unread != 1 else ''}"
-                      " (factory.py wait --timeout 0 prints them)") if unread else ""
-            print(f"operator messages: inbox{suffix}")
-    except (OSError, ValueError) as e:
-        print(f"operator messages: unavailable ({e})")
+    print_pending(args, operator)
     for state, hint in (("blocked", "blocked: waiting on an approval or a question."),
                         ("gone", "gone: run `factory.py up {names}` to bring them back.")):
         hit = [r[0] for r in rows[2:] if state in r[5]]
@@ -3665,89 +3448,6 @@ def cmd_status(args):
             print(f"\n{', '.join(hit)} " + hint.format(names=" ".join(n.lstrip("@") for n in hit)))
     if not any(team.pane(n) for n in cfg.members):
         print(f"\nNo member of {CONF} has a pane in this herdr session. Run `factory.py up` to start or resume its members.")
-
-
-def cmd_wait(args):
-    """Read inbox messages or wait for reports and member events."""
-    require_herdr()
-    cfg = cfg_of(args)
-    watch = [n.lstrip("@") for n in args.names]
-    operator = cfg.operator["name"]
-    snapshot = not watch and args.timeout == 0
-    timeout = args.timeout
-    deadline = None if snapshot or timeout is None else time.monotonic() + timeout
-    seen, worked, looks = None, set(), 0
-    warned = False
-    while True:
-        try:
-            with Inbox(cfg) as inbox:
-                if args.seen is not None:
-                    inbox.acknowledge(args.seen)
-                    args.seen = None
-                unread = inbox.unread
-            if unread:
-                print_messages(unread)
-                print(f"{len(unread)} unread message{'s' if len(unread) != 1 else ''}."
-                      " After you have acted on or recorded these messages:"
-                      f" factory.py wait --seen {unread[-1]['id']} --timeout 0")
-            if unread or snapshot:
-                return
-        except (OSError, ValueError) as e:
-            if args.seen is not None or not watch:
-                print(e, file=sys.stderr)
-                raise SystemExit(2)
-            if not warned:
-                print(f"inbox unavailable: {e}" if isinstance(e, OSError) else str(e), flush=True)
-                warned = True
-        team = Team(cfg)
-        pane = team.pane(operator) or {}
-        harness = pane.get("agent")
-        wait = operator_wait(harness)
-        quiet = not watch and wait == "background"
-        state = {n: team.status(n) for n in cfg.members if (not watch or n in watch) and team.pane(n)}
-        if seen is None:  # the members this watch is about: a pane that closes later is noticed
-            if timeout is None:
-                if wait == "foreground" and pane["pane_id"] == team.agent_panes.get(operator):
-                    timeout = TABLE[harness].get("operator_wait_timeout", 60)
-                elif watch:
-                    timeout = 1800
-                if timeout is not None:
-                    deadline = time.monotonic() + timeout
-            missing = [n for n in watch if n not in state]
-            if missing or not state:
-                raise SystemExit(f"not started: {', '.join(missing) or 'any member'}")
-            seen = list(state)
-        looks += 1
-        closed = [n for n in seen if n not in state]
-        needs = [n for n, s in state.items() if s.startswith("blocked") or s == "gone"]
-        working = [n for n, s in state.items() if s.startswith("working")]
-        settled = [n for n, s in state.items() if s.startswith(("idle", "done"))]
-        unclear = [n for n in state if n not in needs + working + settled]  # herdr reports `unknown`, or nothing
-        # A prompt takes a moment to turn into `working`, so a named member counts as stopped, and the team as
-        # idle, only from the second look on. The same goes for a status herdr has not worked out yet.
-        stopped = [] if quiet else [n for n in settled if n in worked or (n in watch and looks > 1)]
-        if closed or needs or stopped or (not quiet and looks > 1 and (unclear or not working)):
-            break
-        if deadline is not None and time.monotonic() >= deadline:
-            activity = "still working: " + ", ".join("@" + n for n in working) if working else "nobody is working"
-            unknown = "; status unknown: " + ", ".join("@" + n for n in unclear) if unclear else ""
-            print(f"timeout after {timeout:g}s; {activity}{unknown}")
-            sys.exit(4)
-        worked.update(working)
-        time.sleep(args.interval)
-    for n in closed:
-        print(f"@{n}'s pane was closed, so it is no longer running. `factory.py up {n}` gives it a new pane.")
-    for n in needs:
-        if state[n] == "gone":
-            print(f"@{n} is gone: its agent exited. `factory.py up {n}` brings it back.")
-            continue
-        print(f"@{n} is {state[n]}: it needs an answer.")
-    for n in unclear:
-        print(f"@{n}: status unknown (herdr reports {state[n]!r}).")
-    for n in stopped:
-        print(f"@{n} stopped ({state[n]}).")
-    if not (closed or needs or unclear or stopped):
-        print(f"nobody is working: {', '.join('@' + n + ' ' + s for n, s in state.items())}")
 
 
 def cmd_brief(args):
@@ -3766,62 +3466,6 @@ def cmd_brief(args):
             sys.exit(1)
         return
     print(render_team_brief(cfg, [plan(cfg, n) for n in cfg.members], cfg.operator["name"]))
-
-
-def _cmd_say_v1(args):
-    """Send directly from the invoking member's pane, or as the operator."""
-    require_herdr()
-    cfg = cfg_of(args)
-    team = Team(cfg, record_sessions=False)
-    pane = os.environ.get("HERDR_PANE_ID")
-    member = next((n for n in cfg.members if pane and team.agent_panes.get(n) == pane), None)
-    if member and (team.pane(member) or {}).get("pane_id") != pane:
-        raise SystemExit(f"this @{member} agent is outside its team's labeled pane")
-    if member and args.file:
-        path = pathlib.Path(args.file)
-        if path.parent.resolve() == (cfg.messages / member).resolve() and not re.fullmatch(r"[A-Za-z0-9-]+\.[A-Za-z0-9]+", path.name):
-            raise SystemExit("nothing sent: use letters, digits and dashes in the draft name, plus a plain extension such as .md")
-    text = message_text(args)
-    sender = member or ensure_operator(cfg)
-    targets = re.findall(r"[^,\s]+", " ".join(args.to))
-    names = ([m["name"] for m in team.members() if m["name"] != member] if targets == ["all"]
-             else [n.lstrip("@") for n in targets])
-    operator = cfg.operator["name"]
-    if sender in names:
-        raise SystemExit("choose another teammate as the recipient")
-    if not names:
-        raise SystemExit("not running: any member")
-    refused, unconfirmed = [], False
-    for name in dict.fromkeys(names):
-        if name == operator:
-            outcome, detail = queue_message(cfg, sender, text)
-        elif name not in cfg.members or not team.live(name):
-            outcome, detail = "refused", f"not running: {name}"
-        else:
-            detail = prompt_error(name, f"{tag(sender)} {text}")
-            outcome = "submitted" if detail is None else "refused" if delivery_refused(detail) else "unconfirmed"
-        if outcome == "queued":
-            print(f"queued message {detail} for @{name}")
-        elif outcome == "submitted":
-            print(f"submitted your message to @{name}")
-        elif outcome == "refused":
-            print(f"not sent to @{name}: {detail}")
-            refused.append(name)
-        else:
-            print(f"delivery unconfirmed to @{name}: {detail}")
-            unconfirmed = True
-    if refused or unconfirmed:
-        if unconfirmed:
-            print("Delivery unconfirmed. Keep the draft and report the result without resending.")
-        elif args.file:
-            print_retry(cfg, refused, args.file)
-        sys.exit(1)
-    remove_delivered_draft(cfg, sender, args.file)
-
-
-def print_retry(cfg, names, filename):
-    cmd = ["python3", str(SKILL / "scripts/factory.py"), "say", "--cwd", str(cfg.root), *names, "--file", filename]
-    print(f"Retry once when ready: {shlex.join(cmd)}")
 
 
 def cmd_prompt(args):
@@ -3883,17 +3527,9 @@ def main(argv=None):
     st = sub.add_parser("status", help="members and whether they are running")
     common(st)
 
-    wt = sub.add_parser("wait", help="return for unread inbox messages or a blocked, gone or closed member; "
-                                     "outside a quiet watch also when a member stops or nobody is working")
-    wt.add_argument("names", nargs="*", help="watch only these members (default: every member)")
-    wt.add_argument("--timeout", type=float, help="seconds before giving up (exit 4); 0 without names reads the inbox once")
-    wt.add_argument("--interval", type=float, default=5, help="seconds between looks")
-    wt.add_argument("--seen", type=int, help="acknowledge inbox messages through this id, then wait. "
-                                            "Reread them with factory.py inbox")
-    common(wt)
-
-    ib = sub.add_parser("inbox", help="reprint recent acknowledged inbox messages")
-    ib.add_argument("count", nargs="?", type=int, default=5, help="last N messages (default 5, up to 100 kept)")
+    ib = sub.add_parser("inbox", help="print recent committed messages for a recipient")
+    ib.add_argument("count", nargs="?", type=int, default=10, help="last N messages (default 10)")
+    ib.add_argument("--for", dest="for_name", help="recipient name (default: this member or the operator)")
     common(ib)
 
     bf = sub.add_parser("brief", help="print the team brief as members get it, or --send it")
@@ -3905,7 +3541,6 @@ def main(argv=None):
     sy.add_argument("to", nargs="+", help="recipient names separated by spaces or commas, or all for members only; "
                     "the last argument is the message unless --file")
     sy.add_argument("--file", help="send this file's contents")
-    common(sy)
 
     pr = sub.add_parser("prompt", help="the standing instructions a member gets")
     pr.add_argument("name")
@@ -3916,9 +3551,9 @@ def main(argv=None):
 
     args = ap.parse_args(argv)
     if args.cmd == "say":
-        args.message = None if args.file else (args.to.pop() if len(args.to) > 1 else None)
+        args.message = args.to.pop() if args.file is None and len(args.to) > 1 else None
     {"init": cmd_init, "harnesses": cmd_harnesses, "check": cmd_check, "up": cmd_up, "down": cmd_down,
-     "status": cmd_status, "wait": cmd_wait, "inbox": _cmd_inbox_v1, "brief": cmd_brief, "say": _cmd_say_v1,
+     "status": cmd_status, "inbox": cmd_inbox, "brief": cmd_brief, "say": cmd_say,
      "prompt": cmd_prompt, "keeper": cmd_keeper}[args.cmd](args)
 
 
