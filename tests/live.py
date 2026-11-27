@@ -3830,7 +3830,10 @@ def _upgrade(team, peer):
     view.type(team.adapter.draft_request(f"../{name}", literal))
     time.sleep(1)
     first, tok1 = team.receipt("first"), token()
-    _member_says(team, team.adapter.act_append(first, tok1))
+    # both sends are driver-run says from the member's terminal, instant: a slow harness's own say (omp, agy) let
+    # the owner's 60 s hold lapse before the claim, so nothing was ever held
+    team.call("say", "operator", "--file", str(_note(team, team.adapter.act_append(first, tok1))),
+              terminal=team.member("lead-dev"), timeout=60)
     log = factory_log(team)
     held = team.until(lambda: next((ident for (ident, to), rec in log.read_box()[1].outcomes.items()
                                     if rec["o"] == "sending" and to == "operator"), None), 120)
