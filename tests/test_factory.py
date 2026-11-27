@@ -6482,6 +6482,59 @@ class HcCheckTests(unittest.TestCase):
             self.assertIn("too old", p.stdout)
 
 
+class QualifyFrameworkTests(unittest.TestCase):
+    """phase_8.md §1 and §5.1: selection, rows, the case rule, exit precedence and checkpoints, with no login."""
+
+    def test_defaults_and_scope(self):
+        self.assertEqual(live.select_profiles("codex", None), [("operator", "codex"), ("member", "codex")])
+        self.assertEqual(live.select_profiles("pi", None), [("member", "pi")])
+        for harness, role, why in (("pi", "operator", "member in this phase"), ("vim", None, "is not one of")):
+            with self.assertRaisesRegex(ValueError, why):
+                live.select_profiles(harness, role)
+
+    def test_bad_choices_are_refused_before_any_core(self):
+        with patch.object(live, "Core", side_effect=AssertionError("no core may start")):
+            for args, why in ((("pi", "operator", None), "member in this phase"), (("codex", None, [11]), "1 to 10"),
+                              (("cross", "member", None), "no --role")):
+                with self.subTest(args=args), self.assertRaisesRegex(ValueError, why):
+                    live.qualify(*args)
+
+    def test_the_case_rule_and_exit_precedence(self):
+        run = live.Qualification("fixture")
+        selected = [("member", "pi", 8)]
+        for name in ("dead-member", "unconfirmed-brief"):
+            run.row(8, name, "member", "pi", "pass", "x")
+        run.row(8, "quit-during-hold", "member", "pi", "measured", "x", observed="late text arrived")
+        self.assertEqual((run.case_status("member", "pi", 8), run.exit_code(selected)), ("pass", 0))
+        partial = live.Qualification("fixture")
+        partial.row(8, "dead-member", "member", "pi", "pass", "x")       # unconfirmed-brief missing
+        self.assertEqual((partial.case_status("member", "pi", 8), partial.exit_code(selected)), ("not_run", 2))
+        partial.row(8, "unconfirmed-brief", "member", "pi", "fail", "x", reason="retyped")
+        self.assertEqual((partial.case_status("member", "pi", 8), partial.exit_code(selected)), ("fail", 1))
+        mixed = selected + [("member", "pi", 9)]                          # one fails, one not run: fail wins
+        self.assertEqual(partial.exit_code(mixed), 1)
+
+    def test_rows_need_reasons_and_stay_bounded(self):
+        run = live.Qualification("real")
+        for status in ("fail", "not_run"):
+            with self.assertRaisesRegex(ValueError, "needs a reason"):
+                run.row(1, "states", "member", "pi", status, "x")
+        with self.assertRaisesRegex(ValueError, "unknown status"):
+            run.row(1, "states", "member", "pi", "passed", "x")
+        row = run.row(1, "states", "member", "pi", "pass", "x", observed="y" * 1000)
+        self.assertEqual(len(row["observed"]), live.BOUND + 1)
+
+    def test_a_fixture_run_says_so_and_checkpoints_each_case(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "evidence.json"
+            evidence, code = live.qualify("codex", "member", [1, 2], str(path), fixture=True)
+            self.assertEqual(evidence["mode"], "fixture")
+            self.assertEqual(json.loads(path.read_text())["rows"], evidence["rows"])
+            self.assertEqual(code, 2)                                     # nothing built yet: not run, not pass
+            self.assertEqual(evidence["summary"], {"member codex": {1: "not_run", 2: "not_run"}})
+            self.assertEqual(sorted(p.name for p in pathlib.Path(directory).iterdir()), ["evidence.json"])
+
+
 class LiveToolTests(unittest.TestCase):
     @staticmethod
     def scrubber(host="local-host", user="local-user"):

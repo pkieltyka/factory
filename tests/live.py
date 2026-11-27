@@ -1763,6 +1763,149 @@ CHECKS = {"lc1": lc1, "lc10": lc10, "lc13": lc13, "lc8": lc8, "rodeo_focus": rod
 LOGIN_CHECKS = {"lc2": lc2, "lc3": lc3, "lc4": lc4, "lc6": lc6, "lc7": lc7, "lc12": lc12}   # start real harnesses
 
 
+# Qualification (phase_8.md): functional_spec §10's ten cases over eight role profiles, the four cross cases once.
+# One JSON object on stdout (progress on stderr), checkpointed to --json after each case.
+
+QUALIFY_HARNESSES = ("claude", "codex", "pi", "omp", "opencode", "agy")
+OPERATOR_HARNESSES = ("claude", "codex")
+CROSS_CASES = ("two-teams", "multi-down", "owner-pane", "other-version")
+STATUSES = ("pass", "fail", "not_run", "measured")
+CASES = {   # case -> its subcases: (name, roles it is required for, measurement only)
+    1: (("states", "both", False), ("startup-dialog", "both", False)),
+    2: (("idle-report", "both", False), ("operator-commands", "operator", False)),
+    3: (("draft", "both", False), ("draft-cleared", "operator", False)),
+    4: (("mid-turn", "both", False), ("owner-interrupt", "both", False)),
+    5: (("blocked", "both", False),),
+    6: (("resume", "both", False), ("member-switch", "member", False), ("operator-switch", "operator", False)),
+    7: (("suffix", "both", False), ("multiline", "both", False), ("two-senders", "both", False),
+        ("pending-restart", "both", False), ("held-quiet", "both", False), ("upgrade", "both", False)),
+    8: (("dead-member", "member", False), ("operator-gone", "operator", False), ("same-pane", "operator", False),
+        ("unconfirmed-brief", "member", False), ("quit-during-hold", "both", True)),
+    9: (("guarded", "member", False),),
+    10: (("idle-latency", "both", False), ("idle-latency-times", "both", True), ("held-sender-exit", "both", False),
+         ("crash", "both", False)),
+}
+BOUND = 300   # characters kept of any observed or expected text
+
+
+def subcases(case, role):
+    """[(subcase, measurement only)] that a profile in role must cover for case."""
+    return [(name, measured) for name, roles, measured in CASES[case] if roles in ("both", role)]
+
+
+def select_profiles(harness, role):
+    """The (role, harness) profiles a qualify run covers; ValueError for an out-of-scope choice."""
+    if harness not in QUALIFY_HARNESSES:
+        raise ValueError(f"{harness} is not one of {', '.join(QUALIFY_HARNESSES)}")
+    roles = ("operator", "member") if harness in OPERATOR_HARNESSES else ("member",)
+    if role is not None and role not in roles:
+        raise ValueError(f"{harness} is qualified as {' and '.join(roles)} in this phase, not {role}")
+    return [(r, harness) for r in ((role,) if role else roles)]
+
+
+def _bounded(value):
+    if value is None:
+        return None
+    text = value if isinstance(value, str) else json.dumps(value, sort_keys=True)
+    return text if len(text) <= BOUND else text[:BOUND] + "…"
+
+
+class Qualification:
+    """One run's evidence: versions, profiles and rows, checkpointed after each case."""
+
+    def __init__(self, mode, path=None, versions=None):
+        if mode not in ("real", "fixture", "cross"):
+            raise ValueError(f"unknown mode {mode}")
+        self.path = pathlib.Path(path) if path else None
+        self.data = {"run_id": f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{os.getpid()}",
+                     "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "mode": mode,
+                     **(versions or {}), "profiles": [], "rows": []}
+
+    def profile(self, role, harness, **facts):
+        self.data["profiles"].append({"role": role, "harness": harness, **facts})
+
+    def row(self, case, subcase, role, harness, status, expected, observed=None, proof=None, elapsed=None,
+            reason=None):
+        if status not in STATUSES:
+            raise ValueError(f"unknown status {status}")
+        if status in ("fail", "not_run") and not reason:
+            raise ValueError(f"a {status} row needs a reason")
+        row = {"case": case, "subcase": subcase, "role": role, "harness": harness, "status": status,
+               "expected": _bounded(expected), "observed": _bounded(observed), "proof": proof}
+        if elapsed is not None:
+            row["elapsed"] = round(elapsed, 2)
+        if reason:
+            row["reason"] = _bounded(reason)
+        self.data["rows"].append(row)
+        return row
+
+    def checkpoint(self):
+        """Atomically replace --json with the evidence so far, so a later stop keeps every finished case."""
+        if self.path is None:
+            return
+        temporary = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
+        temporary.write_text(json.dumps(self.data, indent=2) + "\n")
+        os.replace(temporary, self.path)
+
+    def case_status(self, role, harness, case):
+        """fail if a required subcase failed, else not_run if one was not run or is missing, else pass.
+        Measurement-only subcases never decide it."""
+        rows = {r["subcase"]: r for r in self.data["rows"]
+                if (r["role"], r["harness"], r["case"]) == (role, harness, case)}
+        required = [name for name, measured in subcases(case, role) if not measured]
+        statuses = [rows[name]["status"] if name in rows else "not_run" for name in required]
+        return "fail" if "fail" in statuses else "not_run" if "not_run" in statuses else "pass"
+
+    def summary(self, selected):
+        """{"role harness": {case: status}} for the selected (role, harness, case) triples."""
+        out = {}
+        for role, harness, case in selected:
+            out.setdefault(f"{role} {harness}", {})[case] = self.case_status(role, harness, case)
+        return out
+
+    def exit_code(self, selected):
+        statuses = [self.case_status(*triple) for triple in selected]
+        return 1 if "fail" in statuses else 2 if "not_run" in statuses else 0
+
+
+def _source_head():
+    try:
+        return subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True,
+                              timeout=10, check=True).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def qualify(target, role=None, cases=None, json_path=None, fixture=False):
+    """Run the selected cases; -> (evidence, exit code)."""
+    if target == "cross":
+        if role is not None or cases:
+            raise ValueError("qualify cross takes no --role or --case")
+        selected, mode = [], "cross"
+    else:
+        cases = cases or list(range(1, 11))
+        bad = [c for c in cases if c not in CASES]
+        if bad:
+            raise ValueError(f"cases are 1 to 10, not {bad}")
+        selected = [(r, h, c) for r, h in select_profiles(target, role) for c in cases]
+        mode = "fixture" if fixture else "real"
+    versions = {"source_head": _source_head(), "hc_version": None, "rodeo_version": None, "factory_version": None}
+    run = Qualification(mode, json_path, versions)
+    if target == "cross":
+        for name in CROSS_CASES:
+            run.row("cross", name, "system", "fixture" if fixture else "system", "not_run",
+                    f"the {name} cross case", reason="not built yet")
+            run.checkpoint()
+        return run.data, 2
+    for role_, harness, case in selected:
+        print(f"qualify {role_} {harness} case {case}", file=sys.stderr)
+        for name, measured in subcases(case, role_):
+            run.row(case, name, role_, harness, "not_run", f"case {case} {name}", reason="not built yet")
+        run.checkpoint()
+    run.data["summary"] = run.summary(selected)
+    return run.data, run.exit_code(selected)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1772,7 +1915,20 @@ def main(argv=None):
     fix = sub.add_parser("fixtures")
     fix.add_argument("--out", default=str(pathlib.Path(__file__).with_name("hc_fixtures.json")))
     sub.add_parser("smoke")
+    qual = sub.add_parser("qualify", help="the live qualification of phase_8.md: a harness, or cross")
+    qual.add_argument("target", help=f"one of {', '.join(QUALIFY_HARNESSES)}, or cross")
+    qual.add_argument("--role", choices=["operator", "member"])
+    qual.add_argument("--case", type=int, action="append", dest="cases", help="1 to 10; repeat for several")
+    qual.add_argument("--json", help="checkpoint the evidence to this file after each case")
+    qual.add_argument("--fixture", action="store_true", help="fake agents only: never a qualification")
     args = parser.parse_args(argv)
+    if args.command == "qualify":
+        try:
+            evidence, code = qualify(args.target, args.role, args.cases, args.json, args.fixture)
+        except ValueError as error:
+            parser.exit(2, f"qualify: {error}\n")
+        print(json.dumps(evidence, indent=2))
+        sys.exit(code)
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
     if args.command == "smoke":
         try:
