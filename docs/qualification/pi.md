@@ -5,7 +5,7 @@
 - **Tested:** pi 1.6.1, model openai/gpt-6-astra, on hc 0.1.20 and rodeo 0.2.1, Linux, 2026-11-27. The operator is Codex.
 - **Configured mode:** the full preset.
 - **Session strategy:** `session_env = PI_SESSION_ID`. pi's own `say` does record a valid session ID; LC-6 at 325223a saw it unset in its probe, and its directory/continue route failed.
-- **Mid-turn:** a message to a working pi is queued for its next turn (case 4 mid-turn).
+- **Mid-turn:** a message to a working pi steers its current turn, and Factory keeps delivering mid-turn. The steering message can replace the rest of the task pi was running, so the sender restates any unfinished work. This is recorded pi behaviour (@operator), not a loss: Factory delivered both messages, and the steering message was acted on once. Reopen the between-turns decision if a pi run drops a message that was not superseded.
 
 ## Findings
 
@@ -15,6 +15,7 @@
   - The saved session now keeps the model of the terminal's own launch.
   - **At 50faa5f both case 6 rows pass.** Down and up replaced the terminal and resumed it, and it recalled the first word. After the owner's /new, PI_SESSION_ID changed. The next down and up resumed the switched ID, which follows from pi's `session_follow` default, and recalled the second word.
   - @operator withdrew the earlier "no resume for pi" limit. #208 (pi's own directory/continue flags) stays in the backlog.
+- **Case 4 mid-turn at cf4ec8f (@lead-dev): fail, as recorded pi behaviour.** Both tagged messages are whole in pi's transcript. The original task #3's waiting shell call returned at 21:38:55.514Z. pi recorded the steering prompt #4 1 ms later and ran #4's append once, but never ran #3's finish action. The driver recorded [started, second] with no finished. @operator decided: pi keeps mid-turn steering, with no between-turns change. owner-interrupt passed both trials in that run: after Esc, #4 acted once with the next keeper delivery (68.29 s) or with the owner's Enter (124.83 s), and the owner's line was exact.
 - **Blocked (case 5): not run.** pi never reported `blocked`.
 - **owner-interrupt at 4954e2f:** next-delivery held: both effects once, with M1 acting 68.54 s after Esc, after the next delivery.
   - The owner-line trial failed only on the driver's before-Enter screen check: pi's screen did not show the whole pasted line. M1 acted once after Enter, at 125.57 s, and the owner's receipt was byte-exact.
