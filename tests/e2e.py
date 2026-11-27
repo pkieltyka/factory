@@ -151,6 +151,7 @@ class Fault:
     assignment: int
     order: int
     offset: int
+    operator: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -181,6 +182,7 @@ class Evidence:
     factory_commands: int = 0
     within_budget: bool = False
     interrupt: Fault | None = None
+    interrupt_wait_reason: str | None = None
     kill: Fault | None = None
     recovered: dict = field(default_factory=dict)  # live replacement addresses -> observation order of their creation
     github: bool = False
@@ -215,8 +217,15 @@ def working_assignment(message, item, terminal, before_claim):
             and type(turn) is int and message.started is True and turn == message.turn == before_claim)
 
 
-def should_interrupt(message, ticket, terminal, before_claim, *, fired=False, reported=False):
-    return not fired and not reported and working_assignment(message, ticket.item, terminal, before_claim)
+def should_interrupt(message, ticket, terminal, before_claim, *, operator_ended, pending, fired=False, reported=False):
+    return (not fired and not reported and operator_ended and not pending
+            and working_assignment(message, ticket.item, terminal, before_claim))
+
+
+def operator_ended_turn(terminal, before):
+    return (before is not None and terminal is not None and terminal.get("state") == "live"
+            and terminal["address"] == before[0] and terminal["turn"] > before[1]
+            and (terminal.get("status") or {}).get("state") in {"idle", "done"})
 
 
 def should_kill(message, ticket, terminal, before_claim, first_integration, *, fired=False, pending=False):
@@ -255,7 +264,7 @@ def is_note(message, what):
 def interrupt_row(evidence, first):
     fault = evidence.interrupt
     if fault is None:
-        return row("quiet-then-chase", "not_run", detail="interrupt trigger did not fire")
+        return row("quiet-then-chase", "not_run", detail=evidence.interrupt_wait_reason or "interrupt trigger did not fire")
     note = next((msg for msg in evidence.messages if is_note(msg, "quiet") and msg.recipient == "operator"
                  and ordered(fault.order, msg.committed, msg.delivered)), None)
     report = next((msg for msg in evidence.messages if msg.sender == "lead-dev" and names_item(msg, fault.item)
@@ -350,6 +359,7 @@ class Observer:
         self.pairs = {}
         self.baselines = {}
         self.before_claim = {}
+        self.operator_turns = {}
         self.developer = None
         self.operator = None
         self.member_working = False
@@ -419,22 +429,47 @@ class Observer:
         if msg is None:
             return False
         baseline = self.before_claim.get((msg.ident, msg.recipient))
+        recipients = {"lead-dev"} if kill else {"lead-dev", "operator"}
+        pending = any(p.recipient in recipients and p.outcome in {"sending", "queued"} for p in self.pairs.values())
+        operator_transition = None
         if kill:
-            pending = any(p.recipient == "lead-dev" and p.outcome in {"sending", "queued"} for p in self.pairs.values())
             if not should_kill(msg, ticket, term, baseline, evidence.tickets[0].integrated,
                                fired=evidence.kill is not None, pending=pending):
                 return False
         else:
+            operator = self.operator
+            if operator and (operator.get("status") or {}).get("state") == "working":
+                self.operator_turns.setdefault(msg.ident, (operator["address"], operator["turn"]))
+            operator_before = self.operator_turns.get(msg.ident)
+            operator_ended = operator_ended_turn(operator, operator_before)
             reported = any(p.sender == "lead-dev" and names_item(p, ticket.item) and p.committed > msg.committed
                            for p in self.pairs.values())
-            if not should_interrupt(msg, ticket, term, baseline, fired=evidence.interrupt is not None, reported=reported):
+            if not reported and working_assignment(msg, ticket.item, term, baseline):
+                if not operator_ended:
+                    evidence.interrupt_wait_reason = (
+                        "operator did not end its turn while the developer worked on the assignment"
+                        if operator_before else "operator turn end after assignment delivery was not observed")
+                elif pending:
+                    evidence.interrupt_wait_reason = "message pending for the operator or developer"
+                else:
+                    evidence.interrupt_wait_reason = None
+            if not should_interrupt(msg, ticket, term, baseline, operator_ended=operator_ended, pending=pending,
+                                    fired=evidence.interrupt is not None, reported=reported):
                 return False
+            operator = self.qa.rpc("terminal.get", {"terminal": operator["address"]})
+            if not operator_ended_turn(operator, operator_before):
+                return False
+            operator_transition = {"terminal": operator["address"], "working_turn": operator_before[1],
+                                   "ended_turn": operator["turn"]}
         address = term["address"]
         # Recheck the address and turn immediately before the mutation.
         current = self.qa.rpc("terminal.get", {"terminal": address})
         if not working_assignment(msg, ticket.item, current, baseline):
             return False
-        fault = Fault(ticket.item, address, current["turn"], msg.delivered, self.stamp(), self.offset)
+        if not kill and self.log.read(self.offset)[1] != self.offset:
+            return False   # a new delivery or report must be observed before interrupting
+        fault = Fault(ticket.item, address, current["turn"], msg.delivered, self.stamp(), self.offset,
+                      operator_transition)
         if kill:
             result = self.qa.rpc("terminal.kill", {"terminal": address})
             if result["state"] != "finished" or result.get("reason") != "killed":
@@ -695,10 +730,27 @@ class GitHubFixture:
         if (board.get("truncated") is not False or project.get("title") != self.name
                 or f"{project.get('owner')}/{project.get('number')}" != self.project):
             raise RuntimeError("the GitHub project snapshot is incomplete or belongs to another project")
-        cards = [(card["number"], column["status"]) for column in board["columns"] for card in column["cards"]]
-        if len(dict(cards)) != len(cards):
-            raise RuntimeError("GitHub project returned duplicate issue numbers")
-        return dict(cards)
+        if board.get("hidden_items") != 0:
+            raise RuntimeError("the run's project has cards outside the visible scratch issues")
+        cards = {}
+        for column in board["columns"]:
+            for card in column["cards"]:
+                number = card["number"]
+                if card.get("url") != f"{QA_URL}/issues/{number}":
+                    raise RuntimeError("the run's project has a card outside factory-test")
+                if number in cards:
+                    raise RuntimeError("GitHub project returned duplicate issue numbers")
+                cards[number] = column["status"]
+        return cards
+
+    def record_discoveries(self, numbers):
+        """Retain every additional issue observed on the run's project."""
+        discoveries = self.manifest.setdefault("discoveries", [])
+        for number in sorted(numbers - {issue["number"] for issue in discoveries}):
+            issue = self.api(f"repos/{QA_REPO}/issues/{number}")
+            if issue.get("html_url") != f"{QA_URL}/issues/{number}" or not issue.get("node_id"):
+                raise RuntimeError("the run's project has a card outside factory-test")
+            discoveries.append({"number": number, "id": issue["node_id"], "url": issue["html_url"]})
 
     def wait_for_board(self, expected, timeout=20):
         """Read back recent GitHub writes until this exact set of cards and states is visible."""
@@ -801,14 +853,15 @@ class GitHubEvidence:
         evidence, repo = self.observer.evidence, self.repo
         branch = git(repo.root, "symbolic-ref", "--quiet", "--short", "HEAD", check=False).stdout.strip()
         changes = git(repo.root, "status", "--porcelain", "--", *CODE_PATHS).stdout
-        base = f"refs/heads/{repo.base}"
+        bases = git(repo.root, "for-each-ref", "--format=%(objectname)", f"refs/heads/{repo.base}",
+                    f"refs/remotes/origin/{repo.base}").stdout.split()
         tickets = []
         for ticket in evidence.tickets:
             name = repo.prefix + ticket.item[1:]
             if ticket.changed is None and ((branch == name and changes)
-                    or git(repo.root, "log", "-1", "--format=%H", f"{base}..refs/heads/{name}",
+                    or git(repo.root, "log", "-1", "--format=%H", f"refs/heads/{name}", "--not", *bases,
                            "--", *CODE_PATHS, check=False).stdout):
-                ticket = replace(ticket, changed=self.observer.stamp())
+                ticket = replace(self.observe_plan(ticket), changed=self.observer.stamp())
             tickets.append(ticket)
         evidence.tickets = tuple(tickets)
         self.observe_approvals()
@@ -830,8 +883,17 @@ class GitHubEvidence:
                 self.approvals[key] = (verdict,) if (pr["state"] == "open" and not pr.get("merged_at")
                                                       and pr["head"]["sha"] == revision) else ()
 
+    def observe_plan(self, ticket):
+        if ticket.planned is None:
+            number = ticket.item[1:]
+            comments = self.repo.api(f"repos/{QA_REPO}/issues/{number}/comments?per_page=100")
+            if any(re.match(r"\s*plan:\s*\S", note["body"], re.I) for note in comments):
+                return replace(ticket, planned=self.observer.stamp())
+        return ticket
+
     def refresh_forge(self):
         evidence, repo = self.observer.evidence, self.repo
+        evidence.scoped = False
         project = repo.board()
         expected = {card["number"] for card in repo.manifest["issues"]}
         master_now = repo.branch_head("master")
@@ -842,9 +904,9 @@ class GitHubEvidence:
         tracking = {name: sha for name, sha in refs.items() if name.startswith(repo.prefix)}
         outside = {name: sha for name, sha in refs.items() if name not in tracking}
         repo.manifest["branches"] = [repo.branch_ref(name) for name in sorted(tracking)]
-        evidence.scoped = set(project) == expected and repo.base in tracking and outside == repo.other_refs
-        if not evidence.scoped:
+        if not expected <= project.keys() or repo.base not in tracking or outside != repo.other_refs:
             raise RuntimeError("the run's project or refs no longer match the fixture")
+        repo.record_discoveries(project.keys() - expected)
         params = urlencode({"state": "all", "base": repo.base, "per_page": 100})
         prs = repo.api(f"repos/{QA_REPO}/pulls?{params}")
         by_issue = {}
@@ -861,6 +923,7 @@ class GitHubEvidence:
         self.open_prs = {pr["number"]: (f"#{number}", pr["head"]["sha"])
                          for number, pr in by_issue.items() if pr["state"] == "open"}
         repo.save_manifest()
+        evidence.scoped = True
         if tracking[repo.base] != self.head:
             self.head = self.fetch_main()
             commits = git(self.inspection, "rev-list", "--first-parent", f"{repo.initial}..{self.head}").stdout.split()
@@ -869,12 +932,8 @@ class GitHubEvidence:
         tickets = []
         for ticket in evidence.tickets:
             number = ticket.item[1:]
-            current = replace(ticket, state=project[int(number)])
+            current = self.observe_plan(replace(ticket, state=project[int(number)]))
             stamp = self.observer.stamp()
-            if current.planned is None:
-                comments = repo.api(f"repos/{QA_REPO}/issues/{number}/comments?per_page=100")
-                if any(re.match(r"\s*plan:\s*\S", note["body"], re.I) for note in comments):
-                    current = replace(current, planned=stamp)
             pr = by_issue.get(number)
             if pr and pr.get("merged_at"):
                 when, earlier = self.first_merges.setdefault(pr["number"], (stamp, self.previous))
@@ -1099,8 +1158,16 @@ class Rehearsal:
     def normal(self):
         self.wait_for(lambda: self.observer.developer and self.evidence.loaded, "candidate keeper and developer")
         item = self.plan(1)
+        release = self.root.parent / "finish-operator-turn"
+        wait = f"while [ ! -f {shlex.quote(str(release))} ]; do sleep 0.1; done"
+        self.observer.qa.rpc("terminal.send", {"terminal": self.operator, "text": f"ACT run {release}.ran {wait}"})
+        self.wait_for(lambda: self.observer.operator and self.observer.operator["status"]["state"] == "working",
+                      "operator working turn")
         self.factory("say", "lead-dev", f"Implement {item}\nFAKE: works_forever")
-        self.wait_for(self.observer.trigger, "first assignment working turn")
+        self.wait_for(lambda: self.observer.trigger() or self.observer.operator_turns,
+                      "first assignment while the operator is working")
+        release.touch()
+        self.wait_for(self.observer.trigger, "first assignment after the operator ends its turn")
         self.wait_for(lambda: self.note("quiet", self.evidence.interrupt.order), "quiet note after interrupt")
         self.factory("say", "lead-dev", f"What remains on {item}?\nFAKE: reports")
         self.integrate(1, item)

@@ -7314,7 +7314,12 @@ class E2EFixtureTests(unittest.TestCase):
             self.assertEqual(e2e.git(local.origin, "rev-parse", "master").stdout.strip(), remote_master)
             self.assertEqual(e2e.git(local.origin, "rev-list", "--count", github.base).stdout.strip(), "1")
             self.assertEqual(github.manifest["branches"][0]["name"], github.base)
-            self.assertIn("--repo pkieltyka/factory-test --project pkieltyka/42", (github.root / "FACTORY.md").read_text())
+            brief = (github.root / "FACTORY.md").read_text()
+            self.assertIn("--repo pkieltyka/factory-test --project pkieltyka/42", brief)
+            self.assertIn("who records them in Backlog", brief)
+            for placeholder in ("OWNER/REPO", "BOARD_OWNER/BOARD_NUMBER", "READY_COLUMN", "ACTIVE_COLUMN",
+                                "BACKLOG_COLUMN", "BASE_BRANCH", "CI_DESCRIPTION"):
+                self.assertNotIn(placeholder, brief)
             self.assertIn("--project 'pkieltyka/42'", github.ready_command(factory.SKILL))
             self.assertGreater(e2e.test_run(github.root, ci=True), 0)
 
@@ -7455,14 +7460,16 @@ class E2EJudgeTests(unittest.TestCase):
         first, second, _ = sample.tickets
         term = {"address": "t2", "state": "live", "turn": 3, "status": {"state": "working"}}
         receipt = sample.messages[0]
-        self.assertTrue(e2e.should_interrupt(receipt, first, term, 3))
+        gates = {"operator_ended": True, "pending": False}
+        self.assertTrue(e2e.should_interrupt(receipt, first, term, 3, **gates))
         for msg, terminal, turn, options in (
             (receipt, term, 2, {}), (receipt, {**term, "turn": 4}, 3, {}),
             (replace(receipt, terminal="t3"), term, 3, {}), (replace(receipt, kind="brief"), term, 3, {}),
             (replace(receipt, text="@reviewer joined"), term, 3, {}), (replace(receipt, started=False), term, 3, {}),
             (receipt, term, 3, {"fired": True}), (receipt, term, 3, {"reported": True}),
+            (receipt, term, 3, {"operator_ended": False}), (receipt, term, 3, {"pending": True}),
         ):
-            self.assertFalse(e2e.should_interrupt(msg, first, terminal, turn, **options))
+            self.assertFalse(e2e.should_interrupt(msg, first, terminal, turn, **(gates | options)))
         term["turn"] = 5
         receipt = sample.messages[3]
         self.assertTrue(e2e.should_kill(receipt, second, term, 5, first.integrated))
@@ -7546,7 +7553,48 @@ class E2EObserverTests(unittest.TestCase):
         receipt, = evidence.messages
         self.assertEqual(obs.before_claim[(1, "lead-dev")], 4)
         self.assertEqual(obs.offset, 400)
-        self.assertTrue(e2e.should_interrupt(receipt, evidence.tickets[0], working, 4))
+        self.assertTrue(e2e.working_assignment(receipt, evidence.tickets[0].item, working, 4))
+
+    def test_quiet_fault_waits_for_the_operator_turn_and_pending_pairs(self):
+        developer = {"address": "t3", "state": "live", "turn": 2, "status": {"state": "working"}}
+        operator = {"address": "t1", "state": "live", "turn": 5, "status": {"state": "working"}}
+        ended = {**operator, "turn": 6, "status": {"state": "done"}}
+        rpc = unittest.mock.Mock()
+        log = types.SimpleNamespace(read=lambda offset: ([], offset))
+        evidence = e2e.Evidence((e2e.Ticket("(1)"), e2e.Ticket("(2)")))
+        obs = e2e.Observer(types.SimpleNamespace(rpc=rpc), types.SimpleNamespace(open_log=lambda _: log),
+                           pathlib.Path("/scratch"), evidence)
+        obs.developer, obs.operator = developer, operator
+        msg = e2e.Message(3, "operator", "lead-dev", "Implement (1)", 1, delivered=2, terminal="t3", turn=2,
+                          started=True, outcome="delivered")
+        receipt = (3, "lead-dev")
+        obs.before_claim[receipt] = 2
+        obs.pairs[receipt] = msg
+        evidence.messages = (msg,)
+        self.assertFalse(obs.trigger())
+        self.assertIn("operator did not end its turn", e2e.interrupt_row(evidence, evidence.tickets[0])["detail"])
+
+        obs.operator = ended
+        for recipient, outcome in (("operator", "sending"), ("lead-dev", "queued")):
+            obs.pairs[4, recipient] = e2e.Message(4, "reviewer", recipient, "A report", 3, outcome=outcome)
+            self.assertFalse(obs.trigger())
+            self.assertIn("pending", e2e.interrupt_row(evidence, evidence.tickets[0])["detail"])
+            del obs.pairs[4, recipient]
+        rpc.assert_not_called()
+
+        rpc.return_value = operator  # the terminal recheck is working even though the list had shown done
+        self.assertFalse(obs.trigger())
+        self.assertEqual(rpc.call_args_list, [call("terminal.get", {"terminal": "t1"})])
+        rpc.reset_mock()
+        rpc.side_effect = [ended, developer]
+        with patch.object(log, "read", return_value=([], obs.offset + 1)):
+            self.assertFalse(obs.trigger())
+        self.assertIsNone(evidence.interrupt)
+        rpc.reset_mock()
+        rpc.side_effect = [ended, developer, {"outcome": "stopped"}]
+        self.assertTrue(obs.trigger())
+        self.assertEqual(evidence.interrupt.operator, {"terminal": "t1", "working_turn": 5, "ended_turn": 6})
+        self.assertEqual(rpc.call_args_list[-1], call("terminal.interrupt", {"terminal": "t3"}))
 
     def test_rehearsal_and_real_output_stay_distinct(self):
         parser = argparse.ArgumentParser()
@@ -7569,28 +7617,90 @@ class E2EObserverTests(unittest.TestCase):
 
 
 class E2EGitHubEvidenceTests(unittest.TestCase):
+    def test_scope_accepts_discoveries_and_rejects_missing_or_foreign_cards(self):
+        seeded = {1, 2, 3}
+        observation = {"truncated": False, "hidden_items": 0,
+                       "project": {"title": "factory-qa-fixture", "owner": "pkieltyka", "number": 42}}
+        for name, numbers, foreign_url, hidden, scoped in (
+                ("discovery", {1, 2, 3, 4}, None, 0, True),
+                ("missing seed", {1, 2, 4}, None, 0, False),
+                ("foreign card", {1, 2, 3, 4}, "https://github.com/pkieltyka/factory/issues/4", 0, False),
+                ("hidden card", seeded, None, 1, False)):
+            with self.subTest(name=name):
+                repo = e2e.GitHubFixture.__new__(e2e.GitHubFixture)
+                repo.name, repo.project = "factory-qa-fixture", "pkieltyka/42"
+                repo.prefix, repo.base = "qa/fixture/", "qa/fixture/main"
+                repo.master, repo.initial = "master-sha", "seed-sha"
+                repo.other_refs = {"master": repo.master}
+                repo.manifest = {"issues": [{"number": number} for number in sorted(seeded)]}
+                cards = [{"number": number, "url": foreign_url if number == 4 and foreign_url else
+                          f"{e2e.QA_URL}/issues/{number}"} for number in sorted(numbers)]
+                repo.todos = unittest.mock.Mock(return_value={**observation, "hidden_items": hidden,
+                    "columns": [{"status": "Todo", "cards": cards}]})
+                repo.branch_head = lambda _: repo.master
+                repo.refs = lambda: {**repo.other_refs, repo.base: repo.initial}
+                repo.save_manifest = unittest.mock.Mock()
+                issue_url = f"{e2e.QA_URL}/issues/4"
+                replies = {f"repos/{e2e.QA_REPO}/issues/4": {"node_id": "new-issue", "html_url": issue_url}}
+
+                def read(path):
+                    return replies[path] if path in replies else []
+
+                repo.api = unittest.mock.Mock(side_effect=read)
+                evidence = e2e.Evidence(tuple(e2e.Ticket(f"#{number}", planned=1) for number in sorted(seeded)),
+                                        github=True, scoped=True)
+                collector = e2e.GitHubEvidence.__new__(e2e.GitHubEvidence)
+                collector.repo, collector.head = repo, repo.initial
+                collector.observer = types.SimpleNamespace(evidence=evidence, stamp=lambda: 2)
+                if scoped:
+                    collector.refresh_forge()
+                    collector.refresh_forge()
+                    self.assertEqual(repo.manifest["discoveries"],
+                                     [{"number": 4, "id": "new-issue", "url": issue_url}])
+                    self.assertEqual(repo.api.call_args_list.count(call(f"repos/{e2e.QA_REPO}/issues/4")), 1)
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "the run's project"):
+                        collector.refresh_forge()
+                    repo.api.assert_not_called()
+                verdict = next(row for row in e2e.judge(evidence) if row["name"] == "scoped-writes")
+                self.assertEqual(verdict["status"], "pass" if scoped else "fail")
+
     def test_open_ticket_branch_does_not_inherit_earlier_implementation_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = e2e.make_local(pathlib.Path(directory), factory.SKILL)
             e2e.implement_fixture(repo.root, 1)
             e2e.git(repo.root, "add", "--", "calc", "tests")
             e2e.git(repo.root, "commit", "-m", "Integrate the first item")
-            e2e.git(repo.root, "switch", "-c", "qa/fixture/2")
+            e2e.git(repo.root, "push", "origin", "main")
+            e2e.git(repo.root, "switch", "-c", "qa/fixture/2", "origin/main")
+            e2e.git(repo.root, "update-ref", "refs/heads/main", repo.initial)
             evidence = e2e.Evidence((e2e.Ticket("#2"),))
             collector = e2e.GitHubEvidence.__new__(e2e.GitHubEvidence)
-            collector.repo = types.SimpleNamespace(root=repo.root, base="main", prefix="qa/fixture/")
-            collector.observer = types.SimpleNamespace(evidence=evidence, collect=lambda: None, stamp=lambda: 2)
+            api = unittest.mock.Mock()
+            collector.repo = types.SimpleNamespace(root=repo.root, base="main", prefix="qa/fixture/", api=api)
+            stamps = iter(range(1, 10))
+            collector.observer = types.SimpleNamespace(evidence=evidence, collect=lambda: None, stamp=stamps.__next__)
             collector.open_prs = {}
             collector.next_forge_read = float("inf")
             collector.collect()
             self.assertIsNone(evidence.tickets[0].changed)
-            evidence.tickets = (e2e.Ticket("#2", planned=1),)
+            api.assert_not_called()
             e2e.implement_fixture(repo.root, 2)
             e2e.git(repo.root, "add", "--", "calc", "tests")
             e2e.git(repo.root, "commit", "-m", "Implement the second item")
             e2e.git(repo.root, "switch", "main")
-            collector.collect()
-            self.assertEqual(evidence.tickets[0].changed, 2)
+            for posted in (True, False):
+                with self.subTest(plan_present_at_first_change=posted):
+                    evidence.tickets = (e2e.Ticket("#2"),)
+                    plan = {"body": "Plan: Add mean with tests"}
+                    api.reset_mock()
+                    api.return_value = [plan] if posted else []
+                    collector.collect()
+                    api.assert_called_once_with(f"repos/{e2e.QA_REPO}/issues/2/comments?per_page=100")
+                    ticket, = evidence.tickets
+                    api.return_value = [plan]
+                    ticket = collector.observe_plan(ticket)
+                    self.assertEqual(e2e.ordered(ticket.planned, ticket.changed), posted)
 
     def test_approval_between_forge_polls_requires_an_open_pr_at_the_same_head(self):
         revision = "a" * 40
