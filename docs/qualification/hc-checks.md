@@ -94,20 +94,23 @@ Verified facts about `hc` and `rodeo`, collected on isolated private cores (neve
 
 @lead-dev-3 ran these at `325223a` with the owner's own logins, on private cores, Linux 7.3.5. Each was run as its own command except where noted.
 
-- **LC-3, Claude Code 2.1.332: pass** on the standalone rerun. A fresh start with the assigned `--session-id` reached idle, and the environment's ID matched the assigned one. The ID was stored; a resume reached idle and recalled the word; the ID still matched after the resume.
+- **LC-3, Claude Code 2.1.332: pass** on the standalone rerun. A fresh start with the assigned `--session-id` reached idle, and the environment's ID matched the assigned one. The ID was stored; a resume reached idle and recalled the word; the ID still matched after the resume. It passed again at 7a90602 on the real HOME (@lead-dev-3, lc3-7a90602.json), with the same observations.
   - The first attempt, inside `check login`, timed out on a trust-dialog race ("Enter to confirm · Esc to cancel").
 - **LC-4 and LC-11, OpenCode v2.4.1: pass.**
   - A UUID4 session ID is rejected (`finished (code 1): at ["sessionID"]`).
   - A `ses_`-prefixed ID starts, is stored and reopens with recall.
   - `OPENCODE_SESSION_ID` equals the ID. After `/new` it no longer does, so `session_follow` stays false.
-- **LC-6, pi 1.6.1 and omp 19.2.1: fail.** For both harnesses, neither of the two member directories stored anything (`stored=false` on the first and the second fresh launch), and `continue` held nothing. pi's `PI_SESSION_ID` was not set.
-  - Consequence: neither directory/continue route can be enabled. pi's case 6 resume fails at 670dd76, consistent with this (see pi.md).
+- **LC-6, pi 1.6.1 and omp 19.2.1: pass** at db85120 on the real HOME (@lead-dev, lc6-db85120-pinned.json). The models were pinned to the ones the qualification uses: pi openrouter/openai/gpt-6-astra, omp openai-codex/gpt-6-astra.
+  - Both harnesses stored the conversation in each member directory, a second fresh launch recalled nothing, and `--continue` reopened that directory's own newest conversation (t2 for a, t3 for b). pi's `PI_SESSION_ID` was set.
+  - pi's default provider refused the connection (ECONNREFUSED after three attempts), so that run was stopped and left no verdict.
+  - Consequence, from 7cbd068 (@operator's decision): omp resumes with `--session-dir=<state>/sessions/<member>-omp` and `--continue`, and its case 6 resume passes at 3321bfc. pi stays on `PI_SESSION_ID`, which its case 6 proves.
+  - Superseded: an earlier LC-6 fail, where nothing was stored in either directory, consistent with omp's default model having no openrouter key. Its consequence at the time (omp started fresh, and no directory route could be enabled) no longer holds.
 - **LC-7, agy 1.5.18: not counted.** The baseline showed the trust dialog, and the session-only `--settings` suppressed it. But the run used the owner's real settings roots, and agy wrote under `~/.gemini/antigravity-cli/` during it.
   - phase_8.md §4 requires mutable trust state to be isolated before launch, so this LC-7 run does not count. It is to be rerun under an isolated HOME overlay.
-- **LC-12, Claude Code, Codex and agy: partial.**
-  - Claude Code: the child and the parent both ran, and the child's ID equals the parent's.
-  - Codex: both ran, but the child's ID differs, so `session_follow = false` stays.
-  - agy: neither the child nor the parent ran.
+- **LC-12, Claude Code, Codex and agy: pass** at db85120 on the real HOME (@lead-dev, lc12-db85120.json). Each harness started to idle, and its parent and an actual child each ran with the parent's ID present.
+  - Claude Code: the child's ID equals the parent's. That is the positive evidence `session_follow` needs, and @operator turned it on for Claude Code (spec §9.4). Case 6 is rerun on that build.
+  - Codex and agy: the child's ID differs, so `session_follow = false` stays.
+  - The stat-only check found no changed agy settings or trust file. The earlier partial run (agy's child and parent never ran, at 325223a) is superseded.
 
 ## Cross cases (Phase 8, phase_8.md §4)
 

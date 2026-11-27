@@ -246,9 +246,9 @@ class FakeHc:
                 "status": status, "screen": screen, "then": then, "error": error,
             }
 
-    def set_status(self, term, state, kind=None, msg=None):
+    def set_status(self, term, state, kind=None, msg=None, app="fake"):
         with self.state() as data:
-            fake_hc.set_status(data["terminals"][term], state, kind, msg)
+            fake_hc.set_status(data["terminals"][term], state, kind, msg, app)
 
     def finish(self, term, reason="exited", exit_code=0):
         with self.state() as state:
@@ -1699,6 +1699,43 @@ class DeliveryDecisionTests(unittest.TestCase):
                                           self.box, self.cfg, 10, since)
                 self.assertEqual(decision, expected)
 
+    def test_a_busy_operator_line_tells_the_sender_when_it_arrives(self):
+        lines, code = factory.outcome_lines({"operator": {"o": "queued", "why": "busy"}}, "operator", "lead-dev")
+        self.assertEqual(lines, ["@operator: queued (busy): Factory will deliver it when the operator's turn ends."])
+        self.assertEqual(code, 0)                       # queued is stored: say succeeds
+
+    def test_a_codex_operator_gets_messages_between_turns(self):
+        """keeper.md §9 (#173): the live app selects the rule, the formation's harness only when none is reported;
+        a Codex member and other operators are unchanged."""
+        def view(name, state, app, kind="operator"):
+            record = self.terminal(name, state, kind=kind)
+            if app is not None:
+                record["status"]["app"] = app
+            return factory.View([record])
+        for state, app, expected in (
+            ("working", "codex", ("queue", "busy")),
+            ("idle", "codex", ("send", "t-operator", "idle")),
+            ("done", "codex", ("send", "t-operator")),
+            ("error", "codex", ("send", "t-operator")),
+            ("blocked", "codex", ("queue", "blocked")),
+            ("working", "claude-code", ("send", "t-operator")),     # another harness now runs in the pane
+            ("working", "fake", ("send", "t-operator")),
+        ):
+            with self.subTest(state=state, app=app):
+                self.assertEqual(factory.decide("operator", {"kind": "say"}, view("operator", state, app),
+                                                self.box, self.cfg, 10, None), expected)
+        with patch.dict(self.cfg.operator, {"harness": "codex"}):
+            self.assertEqual(factory.decide("operator", {"kind": "say"}, view("operator", "working", None),
+                                            self.box, self.cfg, 10, None), ("queue", "busy"))
+            self.assertEqual(factory.decide("operator", {"kind": "say"}, view("operator", "working", "claude"),
+                                            self.box, self.cfg, 10, None), ("send", "t-operator"))
+        boss = types.SimpleNamespace(**{**vars(self.cfg), "operator": {"name": "boss"}})
+        self.assertEqual(factory.decide("boss", {"kind": "say"}, view("boss", "working", "codex"), self.box, boss, 10,
+                                        None), ("queue", "busy"))
+        self.briefed()
+        self.assertEqual(factory.decide("lead-dev", {"kind": "say"}, view("lead-dev", "working", "codex", "member"),
+                                        self.box, self.cfg, 0, None), ("send", "t-lead-dev"))
+
     def test_stale_note_takes_precedence_over_an_absent_operator(self):
         note = {"kind": "note", "meta": {"what": "quiet"}}
         self.assertEqual(factory.decide("operator", note, factory.View([]), self.box, self.cfg, 10, None,
@@ -2528,6 +2565,32 @@ class TeamCommandTests(TeamCase):
         self.assertIn("@reviewer gone: run `factory.py up reviewer`", out)
         self.assertNotIn("factory.py brief --send reviewer", out)
 
+    def test_brief_send_reaches_a_replacement_resting_in_done(self):
+        """Claude Code member case 8 at 97afeec: the replacement answered its unconfirmed brief and rested in done,
+        and brief --send refused it because only idle counted as ready. A dialog still stops it, and up's own
+        launch still waits for idle."""
+        self.cmd(self.operator, "up", "lead-dev")
+        term = self.terminal("reviewer")[0]
+        self.fake.set_status(term, "working")
+        self.fake.set_status(term, "done")                    # it took a turn, and the owner has not looked
+        code, out, err = self.cmd(self.operator, "brief", "--send", "reviewer")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("mention any work you have already picked up", self.fake.sent(term)[-1])
+        record = {"address": term}
+        clock = types.SimpleNamespace(t=0.0)
+        clock.monotonic = lambda: clock.t
+        clock.sleep = lambda s: setattr(clock, "t", clock.t + s)
+        hc = types.SimpleNamespace(get=lambda a: {"state": "live", "status": {"state": "done"}},
+                                   read=lambda a: "", keys=lambda a, k: None)
+        self.assertEqual(factory.await_ready(hc, {"x": (record, [])}, timeout=1, clock=clock),
+                         {"x": "not ready after 1 s (done)"})
+        self.assertEqual(factory.await_ready(hc, {"x": (record, [])}, timeout=1, clock=clock, ready=("idle", "done")),
+                         {"x": None})
+        hc.read = lambda a: "Do you trust the contents of this project?"
+        dialog = [["Do you trust the contents of this project?", []]]
+        self.assertIn("trust dialog", factory.await_ready(hc, {"x": (record, dialog)}, timeout=1, clock=clock,
+                                                          ready=("idle", "done"))["x"])
+
     def test_brief_send_closes_by_whether_the_terminal_was_briefed(self):
         self.cmd(self.operator, "up", "lead-dev")
         unbriefed = self.terminal("reviewer")[0]
@@ -3309,6 +3372,12 @@ class RealMemberNoteTests(TeamCase):
 
 
 class KeeperTests(TeamCase):
+    def deliver(self):
+        for _ in range(2):
+            self.keeper.tick()
+            self.run_jobs()
+        self.keeper.tick()
+
     def member(self, *, status="idle", briefed=True):
         term, agent_log = self.terminal("lead-dev", status=status)
         if briefed:
@@ -3359,6 +3428,67 @@ class KeeperTests(TeamCase):
         self.run_jobs()
         self.keeper.tick()
         self.assertEqual(self.inputs(term, None), ["[from @pm]\nfirst\n", "[from @pm]\nsecond\n"])
+
+    @fake_only
+    def test_a_working_codex_operator_gets_both_messages_after_its_turn(self):
+        """keeper.md §9 (#173): nothing is typed while a Codex operator works; the head reads busy once, the next
+        waiting; both are delivered once each, in order, when it is idle, through hc's idle guard."""
+        operator, _ = self.terminal("operator", kind="operator")
+        self.fake.set_status(operator, "working", app="codex")
+        sends = []
+        real_send = self.keeper.hc.send
+        self.enterContext(patch.object(self.keeper.hc, "send",
+                                       lambda term, text, cond=None: sends.append(cond) or real_send(term, text, cond)))
+        first = self.add("operator", "first")
+        second = self.add("operator", "second")
+        for _ in range(3):
+            self.keeper.tick()
+        self.assertEqual((self.outcome(first, "operator")["why"], self.outcome(second, "operator")["why"]),
+                         ("busy", "waiting"))
+        self.assertEqual(sum(f"#{first} @pm -> @operator queued: busy" in line for line in self.pane), 1)
+        self.assertEqual((self.jobs, self.inputs(operator, None)), ([], []))
+        for ident in (first, second):
+            self.fake.set_status(operator, "idle", app="codex")
+            self.deliver()
+            self.assertEqual(self.outcome(ident, "operator")["o"], "delivered")
+        self.assertEqual(self.inputs(operator, None), ["[from @pm]\nfirst\n", "[from @pm]\nsecond\n"])
+        self.assertEqual(sends, ["idle", "idle"])
+
+    @fake_only
+    def test_a_refused_idle_guard_requeues_the_same_message(self):
+        """The operator starts working between the decision and the typing: hc refuses (status_mismatch, nothing
+        typed), the same ID is queued busy, and it is delivered once when the turn ends."""
+        operator, _ = self.terminal("operator", kind="operator")
+        self.fake.set_status(operator, "idle", app="codex")
+        ident = self.add("operator", "report")
+        self.keeper.tick()
+        self.assertEqual(self.outcome(ident, "operator")["o"], "sending")
+        self.fake.set_status(operator, "working", app="codex")
+        self.run_jobs()
+        self.keeper.tick()
+        self.assertEqual(self.outcome(ident, "operator"), {**self.outcome(ident, "operator"), "o": "queued",
+                                                            "why": "busy"})
+        self.assertEqual(self.inputs(operator, None), [])
+        self.fake.set_status(operator, "done", app="codex")
+        self.deliver()
+        self.assertEqual(self.outcome(ident, "operator")["o"], "delivered")
+        self.assertEqual(self.inputs(operator, None), ["[from @pm]\nreport\n"])
+
+    @fake_only
+    def test_a_codex_operator_in_done_is_sent_unguarded_and_a_codex_member_mid_turn(self):
+        operator, _ = self.terminal("operator", kind="operator")
+        self.fake.set_status(operator, "done", app="codex")
+        term, _ = self.member()
+        self.fake.set_status(term, "working", app="codex")
+        sends = []
+        real_send = self.keeper.hc.send
+        self.enterContext(patch.object(self.keeper.hc, "send",
+                                       lambda t, text, cond=None: sends.append((t, cond)) or real_send(t, text, cond)))
+        to_operator, to_member = self.add("operator", "a"), self.add("lead-dev", "b")
+        self.deliver()
+        self.assertEqual(self.outcome(to_operator, "operator")["o"], "delivered")
+        self.assertEqual(self.outcome(to_member)["o"], "delivered")      # steering into a working member stays
+        self.assertEqual(sorted(sends), sorted([(operator, None), (term, None)]))
 
     @fake_only
     def test_blocked_queues_the_head_once_then_delivers(self):
@@ -5632,7 +5762,7 @@ class LogOutcomeTests(unittest.TestCase):
         box = self.box()
         for args, kwargs in (((9, "operator", "sending"), {}), ((1, "reviewer", "sending"), {}),
                              ((1, "operator", "lost"), {}), ((1, "operator", "sending"), {"why": "x"}),
-                             ((1, "operator", "queued"), {"why": "busy"}), ((1, "operator", "queued"), {}),
+                             ((1, "operator", "queued"), {"why": "lost"}), ((1, "operator", "queued"), {}),
                              ((1, "operator", "dropped"), {"why": " "}),
                              ((1, "operator", "delivered"), {"started": 1})):
             with self.subTest(args=args, kwargs=kwargs), self.assertRaises(ValueError):
@@ -6087,6 +6217,20 @@ class SessionTests(unittest.TestCase):
         self.assertEqual((newest["claude-dev"]["value"], skipped), ("bbb", 0))
         self.assertEqual(stat.S_IMODE(os.stat(self.state / factory.SESSIONS).st_mode), 0o600)
 
+    def test_claude_code_resumes_the_conversation_it_switched_to(self):
+        """claude-m6-14ed74a: after a followed /clear, up resumed the launch ID. With session_follow on in the
+        shipped table, a say from the switched conversation records its ID and the next up resumes it; the run's
+        post-switch say was the driver's compound line, which a sandbox does not exempt."""
+        self.assertTrue(factory.TABLE["claude"]["session_follow"])
+        m = self.m("claude-dev")
+        factory.launch_entry(self.state, m, "t1", "new", None)                   # a fresh launch
+        launch, switched = str(uuid.uuid4()), str(uuid.uuid4())
+        self.record("claude-dev", "t1", launch)                                   # its ready line
+        self.record("claude-dev", "t1", switched)                                 # a say after /clear
+        entry = factory.saved_sessions(self.state)[0]["claude-dev"]
+        self.assertEqual((entry["how"], entry["value"]), ("env", switched))
+        self.assertEqual(factory.session_plan(m, self.state, entry, fresh=False)["args"], ["--resume", switched])
+
     def test_without_follow_the_first_capture_of_a_launch_wins_in_either_order(self):
         self.assertFalse(factory.TABLE["codex"].get("session_follow", True))
         m = self.m("codex-dev")
@@ -6270,6 +6414,50 @@ class SessionTests(unittest.TestCase):
             m = {"name": "omp-dev", "harness": "omp", "model": "openai/gpt-6-astra"}
             self.assertEqual(factory.session_plan(m, self.state, None, False)["args"],
                              [f"--session-dir={self.state / 'sessions' / 'omp-dev-omp'}"])
+
+    def test_agy_models_is_read_without_the_ssh_login_variables(self):
+        """agy 1.5.18 says "Please sign in" while SSH_CLIENT, SSH_CONNECTION or SSH_TTY is set, signed in or not
+        (@lead-dev's bisect, db85120). Factory's model probe leaves exactly those out and keeps the rest."""
+        seen = {}
+
+        def run(argv, **kwargs):
+            seen.update(kwargs["env"])
+            return subprocess.CompletedProcess(argv, 0, "gemini-4-neon\tGemini 4 Neon\n", "")
+        ssh = {"SSH_CLIENT": "a", "SSH_CONNECTION": "b", "SSH_TTY": "c", "SSH_AUTH_SOCK": "d", "KEEP": "e"}
+        with patch.dict(os.environ, ssh), patch.object(factory.subprocess, "run", run):
+            self.assertEqual(factory.agy_models(), {"gemini-4-neon"})
+        self.assertFalse({"SSH_CLIENT", "SSH_CONNECTION", "SSH_TTY"} & seen.keys())
+        self.assertEqual((seen["SSH_AUTH_SOCK"], seen["KEEP"]), ("d", "e"))
+        seen.clear()
+        with patch.dict(os.environ, ssh), patch.object(factory.subprocess, "run", run):
+            factory.run_probe(["other"])
+        self.assertEqual(seen["SSH_TTY"], "c")                  # other harnesses' probes keep the whole environment
+
+    def test_omp_resumes_from_its_own_session_folder(self):
+        """LC-6 at db85120: omp stores each member's conversation in --session-dir and --continue reopens that
+        folder's newest one, so the shipped table resumes omp that way (launch_layout.md §4). pi keeps its
+        variable."""
+        self.assertEqual(factory.TABLE["omp"]["session"], "dir")
+        self.assertNotIn("session", factory.TABLE["pi"])
+        m = {"name": "omp-dev", "harness": "omp", "model": "openai-codex/gpt-6-astra"}
+        folder = self.state / "sessions" / "omp-dev-omp"
+        fresh = factory.session_plan(m, self.state, None, fresh=False)
+        self.assertEqual((fresh["resume"], fresh["args"]), (False, [f"--session-dir={folder}"]))
+        self.assertEqual(factory._launch_fact(m, self.state, fresh), ("dir", str(folder)))
+        entry = {"member": "omp-dev", "harness": "omp", "model": m["model"], "term": "t1", "how": "dir",
+                 "value": str(folder), "at": "x"}
+        again = factory.session_plan(m, self.state, entry, fresh=False)
+        self.assertEqual((again["resume"], again["args"]), (True, [f"--session-dir={folder}", "--continue"]))
+        self.assertEqual(factory._launch_fact(m, self.state, again), ("dir", str(folder)))   # recorded on a resume too
+        self.assertEqual(factory.session_plan(m, self.state, entry, fresh=True)["args"], [f"--session-dir={folder}"])
+        other = factory.session_plan({**m, "model": "z-ai/glm-5.3"}, self.state, entry, fresh=False)
+        self.assertEqual((other["resume"], other["args"]), (False, [f"--session-dir={folder}"]))
+        self.assertIn("is for omp openai-codex/gpt-6-astra", other["notice"])
+        full = {**m, "role": "lead-dev", "thinking": "high", "permissions": "full", "args": [], "dir": "/w",
+                "inbox_dir": "/s"}
+        argv, _ = factory.launch_argv(full, pathlib.Path("/p.md"), again)
+        self.assertEqual(argv[argv.index("--continue") - 1:argv.index("--continue") + 1],
+                         [f"--session-dir={folder}", "--continue"])
 
     def test_launch_arguments_stay_separate_items(self):
         prompt = pathlib.Path("/tmp/state dir/it's.md")
@@ -6589,6 +6777,162 @@ class QualifyJudgeTests(unittest.TestCase):
     def trials(self, *seconds, idle=True, outcome="delivered"):
         return [{"idle": idle, "seconds": s, "outcome": outcome} for s in seconds]
 
+    def test_between_turns_judges_refuse_the_old_failure(self):
+        """@architect-2: a report already typed and ignored must not pass as one Factory held (keeper.md §9)."""
+        import live
+        before = {"state": "working", "app": "codex", "outcome": ["queued", "busy"], "marker_on_screen": False}
+        self.assertTrue(live.judge_before_esc(before))
+        for change in ({"outcome": ["delivered", None]}, {"app": "fake"}, {"app": None}, {"marker_on_screen": True},
+                       {"state": "idle"}):
+            self.assertFalse(live.judge_before_esc({**before, **change}), change)
+        trial = {"between_turns": True, "before_esc": before, "holds": True, "held_behind_owner_line": True}
+        self.assertTrue(live._esc_trials_hold({"next-delivery": trial, "owner-line": trial}))
+        for broken in ({"before_esc": {**before, "outcome": ["delivered", None]}}, {"held_behind_owner_line": False},
+                       {"before_esc": {**before, "app": "unmapped"}}):
+            self.assertFalse(live._esc_trials_hold({"next-delivery": trial, "owner-line": {**trial, **broken}}), broken)
+        mid = {"between_turns": True, "app_selects_between_turns": True, "held_while_working": True,
+               "subject": "t1", "turn_at_start": 2,
+               "before_release": {"second_on_screen": False, "third_on_screen": False},
+               "deliveries": {"second": {"o": "delivered", "term": "t1", "turn": 3},
+                              "third": {"o": "delivered", "term": "t1", "turn": 4}},
+               "second_count": 1, "third_count": 1, "committed_order": ["third", "second"],
+               "order": ["finished", "third", "second"]}
+        self.assertTrue(live.judge_between_mid_turn(mid))
+        for broken in ({"deliveries": {**mid["deliveries"], "second": {"o": "delivered", "term": "t1", "turn": 2}}},
+                       {"before_release": {"second_on_screen": True, "third_on_screen": False}},
+                       {"order": ["finished", "second", "third"]}, {"third_count": 2},
+                       {"app_selects_between_turns": False},
+                       {"deliveries": {"second": mid["deliveries"]["second"]}}):
+            self.assertFalse(live.judge_between_mid_turn({**mid, **broken}), broken)
+        sent = {"o": "delivered", "started": True, "term": "t1", "turn": 4}
+        up = {"between_turns": True, "operator": "t1", "operator_seen": {"release": {"app": "codex", "turn": 3}},
+              "histories": {"held": [["sending", None], ["queued", "busy"], ["sending", None], ["delivered", None]]},
+              "deliveries": {"held": sent, "queued": {**sent, "turn": 5}},
+              "held_message_count": 1, "new_message_count": 1, "effect_order": ["held", "queued"]}
+        self.assertTrue(live.judge_between_upgrade(up))
+        for broken in ({"deliveries": {**up["deliveries"], "held": {**sent, "started": False}}},
+                       {"deliveries": {**up["deliveries"], "held": {**sent, "turn": 3}}},     # typed into the owner's
+                       {"deliveries": {**up["deliveries"], "held": {**sent, "term": "t9"}}},
+                       {"effect_order": ["queued", "held"]}, {"operator_seen": {"release": {"app": "fake", "turn": 3}}},
+                       {"histories": {"held": [["sending", None], ["queued", "waiting"], ["delivered", None]]}},
+                       {"histories": {"held": [["sending", None], ["delivered", None]]}}):        # never requeued
+            self.assertFalse(live.judge_between_upgrade({**up, **broken}), broken)
+
+    def test_command_output_counts_only_from_its_own_tool_call(self):
+        """@architect-2: a prompt or a plausible summary naming status and inbox is not their output; a call that
+        ran both is ambiguous; only a call of exactly that command, paired with its own result, counts."""
+        import live
+        status, inbox, up = "python3 /qa/f.py status", "python3 /qa/f.py inbox --for operator", "python3 /qa/f.py up"
+        prompt = f"run each: (1) {up} (2) {status} (3) {inbox}"
+        lines = [{"type": "user", "message": {"content": prompt}},
+                 {"type": "assistant", "message": {"content": [{"type": "text", "text":
+                  f"I ran {status} and {inbox}: @lead-dev is ready; no messages for @operator"}]}}]
+        home = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(patch.dict(os.environ, {"HOME": str(home), "CODEX_HOME": str(home / ".codex")}))
+        root = home / "qa"
+        project = home / ".claude" / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(root / "work"))
+        project.mkdir(parents=True)
+        transcript = project / "op.jsonl"
+
+        def write(extra):
+            transcript.write_text("\n".join(json.dumps(x) for x in lines + extra) + "\n")
+        adapter = live.RealAdapter.__new__(live.RealAdapter)
+        adapter.team = types.SimpleNamespace(dir=root)
+        write([])
+        self.assertIsNone(adapter.alone_output(status, [inbox, up], prompt))     # prose only: unproved
+        both = {"type": "tool_use", "id": "c1", "name": "Bash", "input": {"command": f"{status}; {inbox}"}}
+        write([{"type": "assistant", "message": {"content": [both]}},
+               {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "c1",
+                                                         "content": "@lead-dev idle\nno messages for @operator"}]}}])
+        self.assertIsNone(adapter.alone_output(status, [inbox, up], prompt))     # one call ran both: ambiguous
+        alone = {"type": "tool_use", "id": "c2", "name": "Bash", "input": {"command": status}}
+        write([{"type": "assistant", "message": {"content": [alone]}}])
+        self.assertIsNone(adapter.alone_output(status, [inbox, up], prompt))     # no result paired with it
+        write([{"type": "assistant", "message": {"content": [alone]}},
+               {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "c2",
+                                                         "content": "@lead-dev idle"}]}}])
+        self.assertIn("@lead-dev idle", adapter.alone_output(status, [inbox, up], prompt))
+        self.assertIsNone(adapter.alone_output(status, [inbox, up], "another conversation's prompt"))
+        grep = {"type": "tool_use", "id": "g1", "name": "Grep", "input": {"pattern": status}}   # a search, not a run
+        write([{"type": "assistant", "message": {"content": [grep]}},
+               {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "g1",
+                                                         "content": f"README: run {status} to see @lead-dev"}]}}])
+        self.assertIsNone(adapter.alone_output(status, [inbox, up], prompt))
+        write([{"type": "assistant", "message": {"content": [alone]}},
+               {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "c2", "is_error": True,
+                                                         "content": "Read-only file system @lead-dev"}]}}])
+        self.assertIsNone(adapter.alone_output(status, [inbox, up], prompt))     # an unsuccessful result
+        codex = [{"type": "response_item", "payload": {"type": "function_call", "call_id": "x1", "name": "shell",
+                                                       "arguments": json.dumps({"cmd": inbox})}},
+                 {"type": "response_item", "payload": {"type": "function_call_output", "call_id": "x1",
+                                                       "output": "[Message 3 from @lead-dev]"}}]
+        self.assertEqual([(inbox in c, o is not None) for c, o in live.tool_calls(
+            "\n".join(json.dumps(x) for x in codex))], [(True, True)])
+
+    def test_a_driver_crash_in_a_case_keeps_its_judged_rows_and_runs_the_next(self):
+        """Codex operator case 3 at 9cf44d9: a stale match-object use raised after the draft row was judged, and
+        the run lost both. Each row is on disk once judged, and a driver stop marks only the rest not_run."""
+        import live
+        path = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory())) / "run.json"
+
+        def case_3(run, role, harness, adapter_class):
+            run.row(3, "draft", role, harness, "pass", "x")
+            self.assertEqual(json.loads(path.read_text())["rows"][0]["subcase"], "draft")   # on disk already
+            raise AttributeError("'int' object has no attribute 'group'")
+        with patch.dict(live.CASE_FUNCTIONS, {3: case_3, 5: lambda run, role, harness, a: run.row(
+                5, "blocked", role, harness, "pass", "x")}), patch.object(live, "_versions", return_value={}), \
+                contextlib.redirect_stderr(io.StringIO()):
+            data, code = live.qualify("codex", "operator", [3, 5], json_path=path, fixture=True)
+        rows = {(r["case"], r["subcase"]): r for r in data["rows"]}
+        self.assertEqual(rows[(3, "draft")]["status"], "pass")
+        self.assertEqual(rows[(3, "draft-cleared")]["status"], "not_run")
+        self.assertIn("AttributeError", rows[(3, "draft-cleared")]["reason"])
+        self.assertEqual(rows[(5, "blocked")]["status"], "pass")
+
+    def test_operator_commands_reads_the_log_only_after_up_made_the_member(self):
+        """@architect-2: the log does not exist until up runs; a slow or failed up is a reasoned row."""
+        import live
+        run = live.Qualification("real")
+        view = types.SimpleNamespace(keys=lambda *k: None, paste=lambda text: None, focused_terminal=None)
+        team = types.SimpleNamespace(script=pathlib.Path("/qa/f.py"), receipt=lambda name: pathlib.Path("/qa/r"),
+                                     adapter=types.SimpleNamespace(act_append=lambda p, t: f"append {t}",
+                                                                   act_alone_each=lambda c: "run each"),
+                                     operator="t1", member=lambda name: None, until=lambda predicate, timeout: None)
+        with patch.object(live, "_operator_start", return_value=True), \
+                patch.object(live, "_rodeo", return_value=view), \
+                patch.object(live, "factory_log", side_effect=AssertionError("read before up")), \
+                patch.object(live.time, "sleep"):
+            self.assertTrue(live._operator_commands(run, team, "claude", "codex"))
+        row = run.data["rows"][0]
+        self.assertEqual((row["subcase"], row["status"]), ("operator-commands", "fail"))
+        self.assertIn("up did not run or did not finish", row["reason"])
+
+    def test_the_upgrade_row_fails_a_same_turn_delivery_before_calling_it_not_run(self):
+        """@architect-2: an observed delivery into the owner's turn is a fail, never a missed overlap."""
+        import live
+        later = {"o": "delivered", "started": True, "term": "t1", "turn": 4}
+        proof = {"between_turns": True, "operator": "t1", "operator_seen": {"release": {"app": "codex", "turn": 3}},
+                 "histories": {"held": [["sending", None], ["delivered", None]]},
+                 "deliveries": {"held": {**later, "turn": 3, "started": False}, "queued": later},
+                 "held_message_count": 1, "new_message_count": 1, "effect_order": ["held", "queued"]}
+        self.assertEqual(live.upgrade_row_status(True, proof)[0], "fail")              # typed into the owner's turn
+        proof["deliveries"] = {"held": later, "queued": {**later, "turn": 5}}
+        self.assertEqual(live.upgrade_row_status(True, proof)[0], "not_run")           # both later, no overlap seen
+        proof["histories"] = {"held": [["sending", None], ["queued", "busy"], ["sending", None], ["delivered", None]]}
+        self.assertEqual(live.upgrade_row_status(True, proof), ("pass", None))
+        self.assertEqual(live.upgrade_row_status(False, proof)[0], "fail")
+        self.assertEqual(live.upgrade_row_status(True, {"between_turns": False}), ("pass", None))   # cross control
+
+    def test_the_report_shows_an_old_codex_operator_steering_pass_unproved(self):
+        import live
+        self.assertTrue(live._between_needed(4, "mid-turn", "operator", "codex", {}))
+        self.assertFalse(live._between_needed(4, "mid-turn", "operator", "claude", {}))
+        self.assertFalse(live._between_needed(4, "mid-turn", "member", "codex", {}))
+        self.assertTrue(live._between_needed(7, "upgrade", "member", "omp", {"peer": "codex"}))
+        self.assertFalse(live._between_needed(7, "upgrade", "member", "omp", {"peer": "claude"}))
+        old = {"turn_at_start": 1, "order": ["started", "second", "finished"], "second_count": 1}
+        self.assertFalse(live.BETWEEN_TURNS[(4, "mid-turn")](old))
+
     def test_latency(self):
         self.assertEqual(live.judge_latency(self.trials(0.7, 0.9, 1.2))[0], "pass")
         self.assertEqual(live.judge_latency(self.trials(0.7, 0.9, 30))[0], "pass")     # one slow trial, reported
@@ -6742,12 +7086,197 @@ class QualifyReportTests(unittest.TestCase):
                                   "status": "fail", "reason": "late row", "proof": {}})
             (tmp / "early.json").write_text(json.dumps(early))
             (tmp / "final.json").write_text(json.dumps(final))
-            live.report([str(tmp / "early.json"), str(tmp / "final.json")], out)
-            self.assertIn("| 3 | draft | fail | late row", (out / "codex.md").read_text())
+            for order in (["early.json", "final.json"], ["final.json", "early.json"]):   # either import order
+                live.report([str(tmp / name) for name in order], out)
+                self.assertIn("| 3 | draft | fail | late row", (out / "codex.md").read_text())
+            repeated = json.loads(json.dumps(final))                     # a later --case repeat in one run
+            repeated["rows"] += [dict(final["rows"][-1], status="pass", reason=None)]
+            repeated["utc"] = "2026-11-27T03:20:00Z"
+            (tmp / "repeated.json").write_text(json.dumps(repeated))
+            for order in (["final.json", "repeated.json"], ["repeated.json", "final.json"]):
+                live.report([str(tmp / name) for name in order], out)
+                self.assertIn("| 3 | draft | pass |", (out / "codex.md").read_text())
 
 
 class QualifyFrameworkTests(unittest.TestCase):
     """phase_8.md §1 and §5.1: selection, rows, the case rule, exit precedence and checkpoints, with no login."""
+
+    def test_qa_environment_drops_every_herdr_variable(self):
+        """A runner started from the owner's herdr pane passes nothing of that session on (@architect, #173)."""
+        import live
+        caller = {"HERDR_ENV": "1", "HERDR_SOCKET_PATH": "/s", "HERDR_SESSION": "x", "HERDR_PANE_ID": "p",
+                  "HERDR_CONFIG_PATH": "/c", "HC_SOCKET": "/h", "RODEO_X": "r", "PATH": "/bin", "HOME": "/home/o"}
+        self.assertEqual(live.qa_environ(caller), {"PATH": "/bin", "HOME": "/home/o"})
+
+    @real_only
+    def test_a_qa_team_cannot_reach_herdr_or_another_factory(self):
+        """Every QA terminal sees a failing herdr first on PATH and no HERDR_* variable, and the scratch brief
+        names the candidate script as the team's only Factory command."""
+        import live
+        with patch.dict(os.environ, {"HERDR_ENV": "1", "HERDR_SOCKET_PATH": "/owner.sock", "HERDR_PANE_ID": "w1:p1"}):
+            team = live.QATeam(live.FixtureAdapter, "codex", {"lead-dev": "codex"})
+        with team:
+            self.assertFalse([k for k in team.qa.env if k.startswith("HERDR")])
+            self.assertFalse([k for k in team.env if k.startswith("HERDR")])
+            stub = shutil.which("herdr", path=team.env["PATH"])
+            self.assertEqual(stub, str(team.bin / "herdr"))
+            run = subprocess.run([stub, "status"], capture_output=True, text=True)
+            self.assertEqual(run.returncode, 1)
+            self.assertIn("not available", run.stderr)
+            brief = (team.work / "FACTORY.md").read_text()
+            self.assertIn(f"Factory's only command for this team is python3 {team.script}.", brief)
+
+    def test_installed_factory_skills_are_found_by_a_scan(self):
+        """Every skills/factory under a dot-directory, by path and resolved folder; a symlinked install resolves to
+        its target, and repositories, caches and other skills are left alone."""
+        import live
+        home = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
+        store = home / ".nix-config" / "extras" / "skills" / "factory"
+        (store / "scripts").mkdir(parents=True)
+        (store / "SKILL.md").write_text("x")
+        for parent in (".claude/skills", ".gemini/config/skills"):
+            (home / parent).mkdir(parents=True)
+            (home / parent / "factory").symlink_to(store)
+        copy = home / ".codex" / "skills" / "factory" / "scripts"
+        copy.mkdir(parents=True)
+        (copy / "factory.py").write_text("x")
+        for other in (".pi/agent/skills/review", ".cache/x/skills/factory", "Dev/skills/factory"):
+            (home / other).mkdir(parents=True)
+            (home / other / "SKILL.md").write_text("x")
+        (home / ".agents" / "skills" / "factory").mkdir(parents=True)      # empty: not a skill
+        elsewhere = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory())) / "dotfiles"
+        (elsewhere / "skills" / "factory").mkdir(parents=True)
+        (elsewhere / "skills" / "factory" / "SKILL.md").write_text("x")
+        (home / ".linked").symlink_to(elsewhere)                          # a symlinked dot-directory is walked
+        found = dict(live.installed_factory_skills(home))
+        self.assertEqual(found, {str(store): str(store), str(home / ".claude/skills/factory"): str(store),
+                                 str(home / ".gemini/config/skills/factory"): str(store),
+                                 str(home / ".codex/skills/factory"): str(home / ".codex/skills/factory"),
+                                 str(home / ".linked/skills/factory"): str((elsewhere / "skills/factory").resolve())})
+        self.assertEqual(set(dict(live.installed_factory_skills(home, exclude=(store,)))),
+                         {str(home / ".codex/skills/factory"), str(home / ".linked/skills/factory")})
+
+    def test_an_installed_factory_seen_fails_the_case(self):
+        import live
+        run = live.Qualification("real")
+        run.row(2, "idle-report", "member", "omp", "pass", "x")
+        with patch.dict(live.EVIDENCE, {"teams": [], "installed_factory_seen": ["t2 screen: ~/.codex/x"]}):
+            live._file_evidence(run, 0)
+        self.assertEqual(run.data["rows"][0]["status"], "fail")
+        self.assertIn("installed Factory script", run.data["rows"][0]["reason"])
+
+    def test_installed_factory_paths_are_found_in_screens_and_qa_transcripts_only(self):
+        """The owner's after-the-fact check: an installed copy's scripts/factory.py, by its path, its target or
+        with ~, in a terminal's screen (even wrapped) or in a Claude Code or Codex transcript of a QA folder."""
+        import live
+        home = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(patch.dict(os.environ, {"HOME": str(home), "CODEX_HOME": str(home / ".codex")}))
+        installed = [(str(home / ".codex/skills/factory"), "/store/factory")]
+        self.assertIn("~/.codex/skills/factory/scripts/factory.py", live.installed_needles(installed))
+        root = home / "qa-run"
+        claude = home / ".claude" / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(root / "work"))
+        claude.mkdir(parents=True)
+        (claude / "a.jsonl").write_text('{"cmd": "python3 /store/factory/scripts/factory.py wait"}\n')
+        other = home / ".claude" / "projects" / "-home-owner-project"
+        other.mkdir(parents=True)
+        (other / "b.jsonl").write_text('{"cmd": "python3 /store/factory/scripts/factory.py say"}\n')
+        day = home / ".codex" / "sessions" / time.strftime("%Y/%m/%d")
+        day.mkdir(parents=True)
+        (day / "rollout-1.jsonl").write_text(json.dumps({"payload": {"cwd": str(root / "work")}}) + "\n"
+                                             + '{"x": "cat ~/.codex/skills/factory/scripts/factory.py"}\n')
+        (day / "rollout-2.jsonl").write_text(json.dumps({"payload": {"cwd": "/elsewhere"}}) + "\n"
+                                             + '{"x": "/store/factory/scripts/factory.py"}\n')
+        self.assertEqual(sorted(p.name for p in live.qa_transcripts([root])), ["a.jsonl", "rollout-1.jsonl"])
+        screens = {"t1": "$ python3 /store/fac\ntory/scripts/factory.py status\n", "t2": "nothing here\n"}
+        core = live.Core.__new__(live.Core)
+        core.installed = installed
+        core.rpc = lambda method, params: ({"terminals": [{"address": t} for t in screens]} if method == "terminal.list"
+                                           else {"text": screens[params["terminal"]]})
+        seen = core.installed_seen([root], lambda record: {"t1": "agy"}.get(record["address"]))
+        self.assertEqual(len(seen), 3)
+        self.assertIn(("agy", "t1 screen: /store/factory/scripts/factory.py"), seen)
+        self.assertEqual({h for h, _ in seen}, {"agy", "claude", "codex"})
+        self.assertFalse(any("t2" in s or "b.jsonl" in s or "rollout-2" in s for _, s in seen))
+        failed, observed = live.split_seen(seen)
+        self.assertEqual(len(failed), 2)                  # Claude Code and Codex had their discovery off
+        self.assertEqual(observed, ["agy: t1 screen: /store/factory/scripts/factory.py"])
+        core.installed = []
+        self.assertEqual(core.installed_seen([root]), [])
+
+    def test_a_login_check_where_an_installed_factory_appears_fails(self):
+        import live
+        self.enterContext(patch.object(live, "harness_version", return_value="1.0"))
+        self.enterContext(patch.object(live.Core, "start", lambda core: None))
+        self.enterContext(patch.object(live.Core, "stop", lambda core: None))
+        self.enterContext(patch.object(live.tempfile, "gettempdir",
+                                       return_value=self.enterContext(tempfile.TemporaryDirectory())))
+        seen = [("codex", "t1 screen: /store/factory/scripts/factory.py")]
+        with patch.object(live.Core, "installed_seen", lambda core, roots, harness_of: seen):
+            result = live.harness_check("LC-6", ["sh"], lambda qa, result: result.update(result="pass"))
+        self.assertEqual(result["result"], "fail: an installed Factory script appeared in a QA terminal or transcript")
+        with patch.object(live.Core, "installed_seen", lambda core, roots, harness_of: [("agy", "t1 screen: x")]):
+            result = live.harness_check("LC-12", ["sh"], lambda qa, result: result.update(result="pass"))
+        self.assertEqual((result["result"], result["installed_factory_observed"]), ("pass", ["agy: t1 screen: x"]))
+        with patch.object(live.Core, "installed_seen", lambda core, roots, harness_of: []):
+            result = live.harness_check("LC-6", ["sh"], lambda qa, result: result.update(result="pass"))
+        self.assertEqual(result["result"], "pass")
+
+    def test_an_e2e_run_where_an_installed_factory_appears_fails(self):
+        import e2e
+        result = {"status": "pass"}
+        self.assertFalse(e2e.installed_verdict(result, [], []))
+        self.assertEqual(result, {"status": "pass"})
+        self.assertFalse(e2e.installed_verdict(result, [], ["opencode: t3 screen: x"]))
+        self.assertEqual((result["status"], result["installed_factory_observed"]), ("pass", ["opencode: t3 screen: x"]))
+        self.assertTrue(e2e.installed_verdict(result, ["t1 screen: x"]))
+        self.assertEqual(result["status"], "fail")
+        self.assertIn("installed Factory script", result["detail"])
+
+    def test_qa_agents_get_each_harness_s_switch_for_user_skills(self):
+        """The owner's decision: discovery off where a launch switch exists; none for OpenCode and agy."""
+        import live
+        installed = [("/home/o/.codex/skills/factory", "/store/factory")]
+        self.assertEqual(live.skills_off("pi", installed), ["--no-skills"])
+        self.assertEqual(live.skills_off("omp", installed), ["--no-skills"])
+        self.assertEqual(live.skills_off("claude", installed), ["--disable-slash-commands"])
+        flag, value = live.skills_off("codex", installed)
+        self.assertEqual(flag, "-c")
+        self.assertEqual(tomllib.loads(value)["skills"]["config"],
+                         [{"path": "/home/o/.codex/skills/factory/SKILL.md", "enabled": False},
+                          {"path": "/store/factory/SKILL.md", "enabled": False}])
+        self.assertEqual(live.skills_off("codex", []), [])
+        self.assertEqual((live.skills_off("opencode", installed), live.skills_off("agy", installed)), ([], []))
+        self.assertEqual(set(live.SKILLS_SWITCH), {"claude", "codex", "pi", "omp"})
+        # case 6 needs Claude Code's /clear, which the switch turns off (pilot at 0748216): exempt, and observed
+        self.assertEqual(live.skills_off("claude", installed, exempt=("claude",)), [])
+        self.assertEqual(live.skills_off("codex", installed, exempt=("claude",))[0], "-c")
+        seen = [("claude", "t3 screen: x"), ("codex", "t1 screen: y")]
+        self.assertEqual(live.split_seen(seen, exempt=("claude",)), (["t1 screen: y"], ["claude: t3 screen: x"]))
+        self.assertEqual(live.split_seen(seen), (["t3 screen: x", "t1 screen: y"], []))
+
+    def test_restart_waits_for_the_shell_prompt(self):
+        """claude-op-8 at 7a90602: a harness clears its status before it has exited, and a restart typed then is
+        lost. The real restart types only at the pane's own prompt, and says so when the prompt never returns."""
+        import live
+        screens = {"t1": "Resume this session with: claude --resume x\n"}
+
+        class QA:
+            def rpc(self, method, params, timeout=None):
+                if method == "terminal.read":
+                    return {"text": screens[params["terminal"]]}
+                sent.append(params["text"])
+                return {}
+
+        sent = []
+        self.assertFalse(live.shell_prompt(QA(), "t1"))
+        screens["t1"] += "qa$ \n\n"
+        self.assertTrue(live.shell_prompt(QA(), "t1"))
+        adapter = live.RealAdapter.__new__(live.RealAdapter)
+        screens["t1"] = "  esc to interrupt\n"
+        adapter.team = types.SimpleNamespace(operator_command="claude --model m", until=lambda p, t: p(),
+                                             send=lambda t, text: sent.append(text))
+        self.assertFalse(adapter.restart(QA(), "t1"))
+        self.assertEqual(sent, [])
 
     def test_defaults_and_scope(self):
         self.assertEqual(live.select_profiles("codex", None), [("operator", "codex"), ("member", "codex")])
@@ -6787,6 +7316,41 @@ class QualifyFrameworkTests(unittest.TestCase):
         self.assertEqual([(r["subcase"], r["status"]) for r in evidence["rows"]],
                          [("resume", "fail"), ("member-switch", "not_run")])
         self.assertEqual(code, 1)
+
+    def test_a_changed_settings_file_withholds_the_case_passes(self):
+        run = live.Qualification("real")
+        run.row(1, "states", "member", "agy", "pass", "x")
+        run.row(1, "startup-dialog", "member", "agy", "fail", "x", reason="r")
+        with patch.dict(live.EVIDENCE, {"teams": [], "settings_changed": ["~/.gemini/antigravity-cli/settings.json"]}):
+            live._file_evidence(run, 0)
+        rows = {r["subcase"]: r for r in run.data["rows"]}
+        self.assertEqual(rows["states"]["status"], "not_run")
+        self.assertIn("settings.json", rows["states"]["reason"])
+        self.assertEqual(rows["startup-dialog"]["status"], "fail")      # a failure stays a failure
+        self.assertEqual(rows["startup-dialog"]["settings_changed"], ["~/.gemini/antigravity-cli/settings.json"])
+
+    def test_a_failing_case_7_trial_does_not_stop_the_others(self):
+        ran = []
+
+        def trial(name):
+            def run_it(run, role, harness, adapter_class):
+                ran.append(name)
+                run.row(7, name, role, harness, "pass", "x")
+            return run_it
+
+        def boom(run, role, harness, adapter_class):
+            ran.append("two-senders")
+            raise subprocess.TimeoutExpired("say", 120)
+        run = live.Qualification("fixture")
+        with patch.multiple(live, _case_7_main=lambda *a: ran.append("main"), _case_7_two_senders=boom,
+                            _case_7_pending_restart=trial("pending-restart"), _case_7_upgrade=trial("upgrade"),
+                            _case_7_held_quiet=trial("held-quiet")):
+            live.case_7(run, "member", "codex", live.FixtureAdapter)
+        self.assertEqual(ran, ["main", "two-senders", "pending-restart", "upgrade", "held-quiet"])
+        rows = {r["subcase"]: (r["status"], r.get("reason") or "") for r in run.data["rows"]}
+        self.assertEqual(rows["two-senders"][0], "not_run")
+        self.assertIn("TimeoutExpired", rows["two-senders"][1])
+        self.assertEqual({rows[n][0] for n in ("pending-restart", "upgrade", "held-quiet")}, {"pass"})
 
     def test_rows_need_reasons_and_stay_bounded(self):
         run = live.Qualification("real")
@@ -7503,7 +8067,9 @@ class E2EObserverTests(unittest.TestCase):
                 team = types.SimpleNamespace(
                     dir=root, skill=factory.SKILL, script=factory.SCRIPT, operator_start={},
                     adapter=types.SimpleNamespace(model=lambda _: "qa", version=lambda _: "test"),
-                    qa=types.SimpleNamespace(id="12345678"), env={"XDG_CACHE_HOME": str(root / "cache")},
+                    qa=types.SimpleNamespace(id="12345678", installed=[], installed_seen=lambda roots, harness_of: []),
+                    harness_of=lambda record: None,
+                    env={"XDG_CACHE_HOME": str(root / "cache")},
                     call=unittest.mock.Mock(side_effect=down),
                 )
 

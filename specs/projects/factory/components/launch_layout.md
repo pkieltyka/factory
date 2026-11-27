@@ -23,12 +23,12 @@ Removed keys: `operator_wait`, `operator_wait_timeout`. New keys:
 |---|---|---|---|---|
 | claude | `id` | `CLAUDE_CODE_SESSION_ID` | `any` | v1's two (`down`, `enter`) |
 | codex | | `CODEX_THREAD_ID` | `any` | `["Trust and continue", ["enter"]]`, removed if LC-2 succeeds |
-| pi | `dir` | none | `provider` | none |
+| pi | | `PI_SESSION_ID` | `provider` | none |
 | omp | `dir` | none | `provider` | none |
 | opencode | `id` | none known (LC-11) | `provider` | none |
 | agy | | `ANTIGRAVITY_CONVERSATION_ID` | `any` | `["Do you trust the contents of this project?", []]`, removed if LC-7 succeeds |
 
-The variables were confirmed live by the team on 26 November 2026 (Claude Code 2.1.330, Codex 0.172, agy 1.5.14). `CODEX_SESSION_ID` also exists but names the session, not the current thread, and is not used. pi and omp have no `session_env` entry: each resumes only with `--continue` in its own session directory, which already reopens the member's newest conversation. (pi does export `PI_SESSION_ID`; Factory neither reads nor saves it. It is LC-6's fallback if `--continue` proves unreliable.)
+The variables were confirmed live by the team on 26 November 2026 (Claude Code 2.1.330, Codex 0.172, agy 1.5.14). `CODEX_SESSION_ID` also exists but names the session, not the current thread, and is not used. omp has no `session_env` entry: it resumes only with `--continue` in its own session directory, which reopens the member's newest conversation (LC-6 at db85120). pi resumes by `PI_SESSION_ID`, which its case 6 proves. LC-6 shows its folder works too, but pi keeps the variable (@operator).
 
 `resume_model` values are the architect's judgement, not a verified fact: the qualification run that resumes across a model change (§10.6) settles each one. `deliver` is reserved ([keeper.md](keeper.md) §9).
 
@@ -95,7 +95,7 @@ An entry is **compatible** when `entry["harness"] == m["harness"]`, its `value` 
 | codex | `--no-daemon` | | `resume <value>` before the options (v1) |
 | agy | | | `--conversation <value>` |
 | opencode | | `--session <new id>` in the format LC-4 finds (`assigned`) | `--session <value>` |
-| pi | `--session-dir <state>/sessions/<member>-pi` | | `--continue` |
+| pi | (`PI_SESSION_ID`, kept: case 6 proves it) | | `--session <value>` |
 | omp | `--session-dir=<state>/sessions/<member>-omp` | | `--continue` |
 
 A member that has run before (it has a finished record or a saved entry) and has no compatible entry gets the `notice` `@x starts in a new conversation: none was recorded for it`, and its brief carries the "new session" closing, so the operator gives it its task again (§9.5).
@@ -259,7 +259,7 @@ Sessions
 - `test_torn_last_line_is_repaired_under_the_lock`.
 - `test_session_follow_false_records_once_per_launch`: a second, different value from the same terminal is ignored.
 - `test_session_follow_false_first_capture_replaces_launch_entry`: both orders. (a) `up` writes the `new` entry, then the ready line: the ID is recorded and the next `up` resumes it. (b) The ready line first, then `up`'s step 14: no launch entry is added. In both, a later different value is ignored.
-- `test_pi_and_omp_never_record_env`: with `PI_SESSION_ID` set in the environment, `say` from a pi member saves nothing; the only entry is `up`'s `dir` entry and the resume argument is `--continue`.
+- `test_omp_resumes_from_its_own_session_folder`: omp's fresh launch gets `--session-dir=<folder>` and its resume adds `--continue`. The folder is recorded both times, and `--fresh` or another provider's entry starts fresh.
 - `test_resume_args_per_harness`: each cell of the launch-argument table.
 - `test_nothing_saved_before_brief_delivered`: a member that exits during start, or whose brief is `unconfirmed`, leaves no entry.
 - `test_ready_line_before_launch_entry_wins`: the member's `say` records ID X for the terminal, then `up` reaches step 14: no entry is added and the next `up` resumes X.

@@ -251,8 +251,12 @@ class Hc:
         return self.call("terminal.run", {"argv": argv, "cwd": cwd, "env": env, "labels": labels,
                                           "no_parent": True, "no_notify": True})
 
-    def send(self, term: str, text: str) -> dict:
-        return self.call("terminal.send", {"terminal": term, "text": text}, timeout=None)
+    def send(self, term: str, text: str, cond: str | None = None) -> dict:
+        """terminal.send; cond="idle" has hc type only into an idle terminal (status_mismatch, nothing typed)."""
+        params = {"terminal": term, "text": text}
+        if cond:
+            params["if"] = cond
+        return self.call("terminal.send", params, timeout=None)
 
     def keys(self, term: str, keys: list[str]) -> dict:
         return self.call("terminal.keys", {"terminal": term, "keys": keys})
@@ -476,10 +480,11 @@ def plan(cfg, name, state=None):
 
 # ================================================================ availability checks
 
-def run_probe(argv, env=None):
+def run_probe(argv, env=None, hide=()):
+    """argv's output, with env added to this process's environment and the names in hide left out."""
     try:
         p = subprocess.run(argv, capture_output=True, text=True, timeout=PROBE_TIMEOUT,
-                           env={**os.environ, **(env or {})})
+                           env={k: v for k, v in {**os.environ, **(env or {})}.items() if k not in hide})
     except (OSError, subprocess.TimeoutExpired) as e:
         raise Problem(f"`{' '.join(argv[:3])}` failed: {e}",
                       "Run factory.py outside any sandbox, or check that the harness starts on its own.")
@@ -543,8 +548,8 @@ def resolve_listed(model, listed, harness):
 LOG_KINDS = ("say", "brief", "note")
 OUTCOMES = ("sending", "delivered", "queued", "unconfirmed", "dropped")
 FINAL = ("delivered", "unconfirmed", "dropped")
-QUEUE_REASONS = ("waiting", "blocked", "not ready", "gone")
-READ_QUEUE_REASONS = QUEUE_REASONS + ("busy",)   # "busy" is reserved for the §8.3 fallback: read, never written
+QUEUE_REASONS = ("waiting", "blocked", "not ready", "gone", "busy")   # busy: a between-turns operator is working
+READ_QUEUE_REASONS = QUEUE_REASONS
 MOVES = {"sending": ("queued",), "delivered": ("sending",), "unconfirmed": ("sending",),
          "queued": ("queued", "sending"), "dropped": ("queued", "sending")}   # new outcome: allowed from these
 UTC = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
@@ -1765,6 +1770,14 @@ def decide(name, msg, view, box, cfg, now, op_null_since, still_true=True):
             return "hold",
         if status["state"] == "blocked":
             return "queue", "blocked"
+        # keeper.md §9: an operator harness that may ignore text typed into a working turn (Codex, #173) gets
+        # Factory's messages between turns. The live app decides, the formation's harness when none is reported.
+        app = status.get("app") or cfg.operator.get("harness")
+        if TABLE.get(app, {}).get("operator_deliver") == "idle":
+            if status["state"] == "working":
+                return "queue", "busy"
+            if status["state"] == "idle":
+                return "send", terminal["address"], "idle"   # hc refuses, typing nothing, if it starts working
         return "send", terminal["address"]
 
     state = view.state(name)
@@ -2320,7 +2333,7 @@ class Keeper:
                     continue
                 action, detail = "queue", ["gone"]
             if action == "send":
-                self._claim(msg, name, detail[0])
+                self._claim(msg, name, detail[0], detail[1] if len(detail) > 1 else None)
                 continue
             why = detail[0]
             outcome = "queued" if action == "queue" else "dropped"
@@ -2336,7 +2349,7 @@ class Keeper:
             if outcome == "dropped" and _quiet_or_ready_note(msg) and msg["meta"]["what"] == "quiet":
                 self.quiet_since = None              # a dropped quiet note: a full grace before the next
 
-    def _claim(self, msg, name, term):
+    def _claim(self, msg, name, term, cond=None):
         if self.stop or not self._record(msg, name, "sending", term=term) or self.stop:
             return
         ident = msg["id"]
@@ -2347,15 +2360,15 @@ class Keeper:
             wire += "\n"
         self.inflight[name] = ident
         try:
-            self.spawn(functools.partial(self._send, name, ident, term, wire))
+            self.spawn(functools.partial(self._send, name, ident, term, wire, cond))
         except RuntimeError as error:
             self.results.put((name, ident, term, HcDown(False, str(error))))
 
-    def _send(self, name, ident, term, wire):
+    def _send(self, name, ident, term, wire, cond=None):
         try:
             if self.stop:
                 raise HcDown(False, "keeper stopped before sending")
-            result = self.hc.send(term, wire)
+            result = self.hc.send(term, wire, cond) if cond else self.hc.send(term, wire)
         except Exception as error:
             result = error
         self.results.put((name, ident, term, result))
@@ -2403,7 +2416,8 @@ class Keeper:
         if isinstance(result, HcDown) and not result.sent:
             why = "waiting"
         elif isinstance(result, HcError):
-            why = {"blocked": "blocked", "not_found": "gone", "finished": "gone"}.get(result.kind)
+            why = {"blocked": "blocked", "not_found": "gone", "finished": "gone",
+                   "status_mismatch": "busy"}.get(result.kind)   # the idle guard refused: nothing was typed
             if why is None and _unsettled_refusal(result, term):
                 why = "waiting"                      # nothing was typed: send it again once the output settles
         if why is None:
@@ -2846,6 +2860,8 @@ def outcome_lines(outcomes, operator, sender):
             missing.append(f"@{name}")
         if name == operator and outcome == "queued" and record["why"] == "gone":
             line += ": operator not running; message queued"
+        if name == operator and outcome == "queued" and record["why"] == "busy":
+            line += ": Factory will deliver it when the operator's turn ends."
         lines.append(line)
     if missing:
         instruction = "Do not resend unless asked"
@@ -3235,8 +3251,15 @@ def agy_choice(member):
     return model, str(member.get("thinking") or agy_effort(model) or default)
 
 
+# agy 1.5.18 answers "Please sign in" while any of these is set (an SSH login), even when it is signed in
+# (@lead-dev's bisect on the real HOME, db85120). Its model list is read without them. A launch needs nothing:
+# hc 0.1.20 already leaves these three out of every terminal it starts.
+AGY_HIDDEN_ENV = ("SSH_CLIENT", "SSH_CONNECTION", "SSH_TTY")
+
+
 def agy_models():
-    return {line.partition("\t")[0] for line in run_probe(["agy", "models"]).splitlines() if "\t" in line}
+    return {line.partition("\t")[0] for line in run_probe(["agy", "models"], hide=AGY_HIDDEN_ENV).splitlines()
+            if "\t" in line}
 
 
 def model_agy(checker, model, harness):
@@ -3586,9 +3609,10 @@ def _last_line(hc, address):
     return lines[-1] if lines else ""
 
 
-def await_ready(hc, started, timeout=LAUNCH_TIMEOUT, clock=time):
+def await_ready(hc, started, timeout=LAUNCH_TIMEOUT, clock=time, ready=("idle",)):
     """started: {member: (its terminal record, its harness's dialogs)}. Polls every member every 0.5 s until each
-    is settled or the deadline passes. -> {member: None when ready, else the reason it is not}."""
+    is settled or the deadline passes. -> {member: None when ready, else the reason it is not}. A launch waits for
+    idle; brief --send also takes done, the state a real harness rests in after any turn."""
     deadline = clock.monotonic() + timeout
     outcome, answered, shown, words = {}, {name: set() for name in started}, {}, {}
     seen = {}                                        # the dialog each member showed at its last poll
@@ -3625,7 +3649,7 @@ def await_ready(hc, started, timeout=LAUNCH_TIMEOUT, clock=time):
                     seen[name] = text
                     continue
                 seen.pop(name, None)
-                if word == "idle":
+                if word in ready:
                     outcome[name] = None
             except (HcError, HcDown) as error:
                 outcome[name] = f"could not be watched: {error}"
@@ -4589,7 +4613,10 @@ def _brief_send_locked(cfg, state, hc, me, names):
                 print(f"{pending}; run factory.py status")
                 code = 1
                 continue
-            why = await_ready(hc, {name: (record, TABLE[m["harness"]].get("dialogs", []))}, timeout=5)[name]
+            # done as well as idle: a replacement that already answered its unconfirmed brief rests in done
+            # (Claude Code member case 8 at 97afeec), and a dialog on screen still stops it, as at launch
+            why = await_ready(hc, {name: (record, TABLE[m["harness"]].get("dialogs", []))}, timeout=5,
+                              ready=("idle", "done"))[name]
             if why:
                 print(f"@{name} is not ready: {why}")
                 code = 1

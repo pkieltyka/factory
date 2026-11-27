@@ -52,7 +52,7 @@ class Hc:
     def list(self, team: str) -> list[dict]                       # terminal.list {all: true, labels: {factory.team: team}} -> ["terminals"]
     def get(self, term: str) -> dict                              # terminal.get
     def run(self, argv: list[str], cwd: str, env: dict, labels: dict) -> dict   # terminal.run; always no_parent=True, no_notify=True; never name, keep, size
-    def send(self, term: str, text: str) -> dict                  # terminal.send {terminal, text}; timeout=None
+    def send(self, term: str, text: str, cond: str | None = None) -> dict   # terminal.send {terminal, text[, if]}; timeout=None
     def keys(self, term: str, keys: list[str]) -> dict            # terminal.keys
     def read(self, term: str) -> str                              # terminal.read {lines: 0} -> ["text"]
     def label(self, term: str, labels: dict) -> dict              # terminal.label; "" removes a label

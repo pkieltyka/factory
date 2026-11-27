@@ -21,7 +21,7 @@ PUSHBACK = bytearray()   # input that arrived while a tool ran, read before the 
 def report(state, kind=None):
     if state is not None:
         extra = f":kind={kind}" if kind else ""
-        os.write(1, f"\x1b]7501;state={state}:app=fake{extra}\x1b\\".encode())
+        os.write(1, f"\x1b]7501;state={state}:app={os.environ.get('FAKE_APP', 'fake')}{extra}\x1b\\".encode())
 
 
 def read_input():

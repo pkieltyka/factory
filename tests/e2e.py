@@ -1024,12 +1024,15 @@ def add_arguments(parser):
     parser.add_argument("--json", type=pathlib.Path)
 
 
-def write_formation(root, ready, agents, *, worktree):
+def write_formation(root, ready, agents, *, worktree, off=lambda harness: []):
     lines = ['user = "qa"', "quiet_grace = 30", f"ready_check_every = {READY_PERIOD}",
              f"ready_check = {json.dumps(ready)}"]
     for section, harness, model in agents:
         lines.extend((f"\n[{section}]", f"harness = {json.dumps(harness)}", f"model = {json.dumps(model)}",
                       'thinking = "medium"'))
+        args = off(harness) if section.startswith("members.") else []
+        if args:                      # the owner's rule: user skill discovery off where the harness can
+            lines.append(f"args = {json.dumps(args)}")
         if worktree and section == "members.lead-dev":
             lines.extend(("worktree = true",))
     if worktree:
@@ -1341,7 +1344,8 @@ def run_real(args, live):
         else:
             fixture = make_local(team.dir, team.skill, empty=args.empty)
             ready = ready_command(team.skill)
-        write_formation(fixture.root, ready, agents, worktree=not github)
+        write_formation(fixture.root, ready, agents, worktree=not github,
+                        off=lambda harness: live.skills_off(harness, team.qa.installed))
         result["fixture"] = {"root": str(fixture.root), "initial": fixture.initial, "developer_worktree": not github}
         return fixture.root
 
@@ -1397,6 +1401,8 @@ def run_real(args, live):
                 if result["status"] == "running":
                     result.update(status="fail", detail="the runner ended the run before a verdict")
                 checkpoint(judge(evidence))
+                if installed_verdict(result, *live.split_seen(team.qa.installed_seen([team.dir], team.harness_of))):
+                    report.checkpoint()
                 try:
                     code, out = team.call("down", timeout=60)
                     if code != 0:
@@ -1407,6 +1413,19 @@ def run_real(args, live):
             subprocess.SubprocessError) as error:
         result.update(status="not_run", detail=str(error))
     return result
+
+
+def installed_verdict(result, failed, observed=()):
+    """The owner's rule: an installed Factory script seen in a QA terminal or transcript fails the run where the
+    harness's skill discovery was switched off (failed), and is recorded for one without a switch (observed).
+    Returns whether it failed."""
+    if observed:
+        result["installed_factory_observed"] = list(observed)
+    if not failed:
+        return False
+    result.update(status="fail", installed_factory_seen=failed,
+                  detail=f"an installed Factory script appeared in a QA terminal or transcript: {failed}")
+    return True
 
 
 def run(args, core, rodeo, skill, hc, live=None):

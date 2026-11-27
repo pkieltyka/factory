@@ -104,7 +104,9 @@ action = decide(name, msg, view, box, cfg, now, op_null_since, still_true)
 | O2 | operator | status null for less than `LATCH_AFTER` (5 s) | `("hold",)` |
 | O3 | operator | status null for `LATCH_AFTER` or longer | `("latch",)` |
 | O4 | operator | `status.state == "blocked"` | `("queue", "blocked")` |
-| O5 | operator | otherwise | `("send", address)` |
+| O5 | operator | between-turns harness (§9) and `working` | `("queue", "busy")` |
+| O6 | operator | between-turns harness and `idle` | `("send", address, "idle")` |
+| O7 | operator | otherwise | `("send", address)` |
 | M1 | member | `view.state(name) == "not started"` | `("drop", "stopped by down")` |
 | M2 | member | `view.state(name) == "gone"` | `("queue", "gone")` |
 | M3 | member | `starting` | `("hold",)` |
@@ -124,7 +126,7 @@ Applying the action:
 | `hold` | nothing; the default `queued (waiting)` stands |
 | `latch` | `hc.label(operator terminal, {"factory.kind": "operator-lost"})`, then as `("queue", "gone")` (§7.4) |
 
-The keeper builds the wire text after claiming the pair: `"[from @" + sender + "]\n" + text`, with `"\n"` appended when `text` does not end with one. The sender line is `[from factory]` for notes (§8.1). `_send` calls `hc.send(term, wire)` with no reply timeout, then puts `(name, id, term, result_or_exception)` on `results`.
+The keeper builds the wire text after claiming the pair: `"[from @" + sender + "]\n" + text`, with `"\n"` appended when `text` does not end with one. The sender line is `[from factory]` for notes (§8.1). `_send` calls `hc.send(term, wire)`, or `hc.send(term, wire, "idle")` for O6, with no reply timeout, then puts `(name, id, term, result_or_exception)` on `results`.
 
 The view is at most a few milliseconds old when `hc.send` is called: the "checked right before each send" of §8.2. The known limit (a harness that quits during `draft_wait`) is `hc`'s.
 
@@ -137,6 +139,7 @@ Settled results free the recipient's slot in `inflight`. A withheld result holds
 | Result with an integer `turn` and a boolean or null `started` (which may be absent) | `delivered` with `term`, `started`, `turn` | If every recipient is now `delivered` and its `file` is managed, unlink it |
 | `HcError` `blocked` | `queued`, `blocked` | Members use the stop check below |
 | `HcError` `not_found` or `finished` | `queued`, `gone` | Members use the stop check below |
+| `HcError` `status_mismatch` (the idle guard of O6) | `queued`, `busy`, same ID | hc typed nothing; the next tick decides again |
 | `HcDown(sent=False)` | `queued`, `waiting` | Members use the stop check below |
 | `HcError` `unavailable` with exactly `<term> is still starting: its output has not settled` | `queued`, `waiting` | hc refuses before typing anything (0.1.20 `input.rs`; its hint says nothing was typed); the pair is sent again once the terminal settles. Members use the stop check below. Any other `unavailable` stays `unconfirmed` |
 | any other failure or an unexpected result | `unconfirmed`, with the reason | Final. Later messages to that recipient can go on |
@@ -268,9 +271,15 @@ Called by `up` (`force=True`), `say`, `brief --send` and `status`.
 
 The keeper is always started without a pane. Only `up` gives it one: it adds the returned terminal to the layout in the same edit as the members, whenever that terminal has no block there ([launch_layout.md](launch_layout.md) §6). So a keeper restarted by `say` or `status` runs headless until the next `up`, and a healthy headless keeper gets its pane back on the next `up`.
 
-## 9. Reserved: delivery only between turns (§8.3)
+## 9. Delivery only between turns, for an operator harness (§8.3)
 
-Not built in v2.0 unless a harness fails §10.4. If one does: `harnesses.toml` gets `deliver = "idle"` for it; `decide` gains one row before M6 ("that harness and `working`": `("queue", "busy")`); `hc.send` gains `cond` and passes `if: "idle"` when the member is `idle`; `status_mismatch` maps to `queued`, `busy`. `hc`'s `if` accepts only `idle` or `working` (V9), so a `done` or `error` member is sent to without the guard.
+Built for Codex as operator (#173): in both failing upgrade trials a report was submitted whole into the operator's working turn and the model acted only on the instruction that started the turn. `harnesses.toml` has `operator_deliver = "idle"` on `[codex]`. The operator rows read the routed terminal's live root status: `app = status.get("app") or cfg.operator.get("harness")`, and the rule applies when `TABLE.get(app, {}).get("operator_deliver") == "idle"`, so a reported app wins over the formation, and another harness in a former Codex pane is not affected. A null status keeps O2 and O3. Members are not affected; a working Codex member still takes messages mid-turn.
+
+- `working` → `queued (busy)` for the head, written once while unchanged; later messages stay `queued (waiting)` behind it. Each tick decides again; no wakeup is needed.
+- `idle` → `hc.send(term, wire, "idle")`. hc refuses with `status_mismatch` and types nothing when the terminal is no longer idle, including a send held behind the owner's draft and released into the owner's turn (measured on private hc 0.1.20). The same ID goes back to `queued (busy)`.
+- `done` or `error` → an ordinary send, from the tick's own view. hc's `if` names one state, so these are not guarded: the state can change after the read, including during a full draft hold (#178 request 4).
+
+Limits. An operator that never leaves `working` receives nothing from Factory; `status` shows the backlog. `inbox` prints a queued message's text before it is typed, so an operator that acts on it there can repeat the work when Factory types it later: `leading.md` tells it to leave queued rows to Factory. `say` adds to the operator's `queued (busy)` line: "Factory will deliver it when the operator's turn ends."
 
 ## 10. What a one-second poll does not see
 

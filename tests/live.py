@@ -31,6 +31,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import traceback
 import time
 import uuid
 
@@ -163,10 +164,174 @@ class Conn:
             self.p.stdout.close()
 
 
+def qa_environ(environ):
+    """The caller's environment without any hc, rodeo or herdr variable: a runner started from the owner's herdr
+    pane must not hand its session and pane IDs to the QA terminals, where a harness that finds the owner's
+    installed v1 skill could act in that session (@architect, #173)."""
+    return {k: v for k, v in environ.items() if not k.startswith(("HC_", "RODEO_", "HERDR"))}
+
+
+HERDR_STUB = "#!/bin/sh\necho 'herdr is not available in a Factory qualification run' >&2\nexit 1\n"
+def installed_factory_skills(home, exclude=(), depth=4):
+    """[(path, resolved folder)] of every Factory skill installed under home's dot-directories: a folder named
+    factory in a skills folder, holding SKILL.md or scripts/factory.py, found by a scan at run start so a later
+    install is caught (the owner's rule: no QA run may use an installed copy). Folders under exclude are skipped."""
+    home, found, seen = pathlib.Path(home), [], set()
+    excluded = [pathlib.Path(e).resolve() for e in exclude]
+    try:
+        tops = [t for t in home.iterdir() if t.name.startswith(".") and t.is_dir() and t.name not in (".cache", ".npm")]
+    except OSError:
+        return found
+    walked = set()
+    for top in tops:                       # a symlinked dot-directory is walked too, once per target
+        if top.resolve() in walked:
+            continue
+        walked.add(top.resolve())
+        for dirpath, dirnames, _ in os.walk(top, onerror=lambda error: None):
+            here = pathlib.Path(dirpath)
+            if here.name == "skills" and "factory" in dirnames:
+                path = here / "factory"
+                resolved = path.resolve()
+                if ((resolved / "SKILL.md").is_file() or (resolved / "scripts" / "factory.py").is_file()) \
+                        and not any(resolved == e or e in resolved.parents for e in excluded) and path not in seen:
+                    seen.add(path)
+                    found.append((str(path), str(resolved)))
+            if len(here.relative_to(top).parts) >= depth - 1:
+                dirnames[:] = []
+    return found
+
+
+SKILLS_SWITCH = ("claude", "codex", "pi", "omp")   # harnesses whose user skill discovery a launch switch turns off
+
+
+def skills_off(harness, installed, exempt=()):
+    """QA launch arguments that turn off a harness's user skill discovery, where it has a switch (the owner's
+    decision; each read from its own --help, Codex's checked offline with codex debug prompt-input on 0.172.0).
+    [] for OpenCode and agy, which have none: their installed copy may run, harmless with no HERDR_* and the herdr
+    stub, and is recorded, not failed. exempt: harnesses a case needs with their commands on (case 6's /clear)."""
+    if harness in exempt:
+        return []
+    if harness in ("pi", "omp"):
+        return ["--no-skills"]
+    if harness == "claude":
+        return ["--disable-slash-commands"]               # "Disable all skills and commands"
+    if harness == "codex":
+        paths = sorted({f"{folder}/SKILL.md" for path, resolved in installed for folder in (path, resolved)})
+        if paths:                                         # only the factory skill, by every path it is found at
+            return ["-c", "skills.config=[" + ",".join("{path=" + json.dumps(p) + ",enabled=false}"
+                                                      for p in paths) + "]"]
+    return []
+
+
+def installed_needles(installed):
+    """The whitespace-free forms of each installed copy's scripts/factory.py: its path, its target, with ~."""
+    home, needles = os.path.expanduser("~"), set()
+    for path, resolved in installed:
+        for folder in (path, resolved):
+            script = f"{folder}/scripts/factory.py"
+            needles.add(script)
+            if script.startswith(home + "/"):
+                needles.add("~" + script[len(home):])
+    return sorted("".join(n.split()) for n in needles)
+
+
+CODE_EXEC = re.compile(r'exec_command\(\{\s*cmd\s*:\s*("(?:[^"\\]|\\.)*")')
+
+
+def tool_calls(text):
+    """[(command, result text or None)] for every shell execution in a Claude Code or Codex transcript (JSONL),
+    paired by the call's own ID, with its actual command argument: Claude Code's Bash tool_use (input.command),
+    Codex's shell or exec_command function_call (arguments' cmd or command), and a Codex code-mode call that runs
+    exactly one exec_command. Searches, file reads and other tools are not executions and are left out; a result
+    that reports failure (is_error, a non-zero exit) is None (@architect-2)."""
+    calls, results = {}, {}
+
+    def command_of(node, kind):
+        if kind == "tool_use":
+            return (node.get("input") or {}).get("command") if node.get("name") == "Bash" else None
+        if kind == "function_call" and node.get("name") in ("shell", "exec_command", "local_shell"):
+            try:
+                args = json.loads(node.get("arguments") or "{}")
+            except ValueError:
+                return None
+            cmd = args.get("cmd", args.get("command"))
+            return " ".join(cmd) if isinstance(cmd, list) else cmd
+        if kind == "custom_tool_call":
+            found = CODE_EXEC.findall(node.get("input") or "")
+            if len(found) == 1 and (node.get("input") or "").count("exec_command(") == 1:
+                try:
+                    return json.loads(found[0])
+                except ValueError:
+                    return None
+        return None
+
+    def failed(node, kind, output):
+        if kind == "tool_result":
+            return node.get("is_error") is True
+        match = re.search(r"(?:Exit code|exit_code)\D{0,4}(-?\d+)", output or "")
+        return bool(match) and match.group(1) != "0"
+
+    def walk(node):
+        if isinstance(node, dict):
+            kind = node.get("type")
+            ident = node.get("id") if kind == "tool_use" else node.get("call_id")
+            if kind in ("tool_use", "function_call", "custom_tool_call") and ident:
+                command = command_of(node, kind)
+                if isinstance(command, str):
+                    calls[ident] = command
+            elif kind in ("tool_result", "function_call_output", "custom_tool_call_output"):
+                key = node.get("tool_use_id") if kind == "tool_result" else node.get("call_id")
+                output = node.get("content") if kind == "tool_result" else node.get("output")
+                output = output if isinstance(output, str) else json.dumps(output)
+                if key:
+                    results[key] = None if failed(node, kind, output) else output
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+    for line in text.splitlines():
+        try:
+            walk(json.loads(line))
+        except ValueError:
+            continue
+    return [(command, results.get(ident)) for ident, command in calls.items()]
+
+
+def qa_transcripts(roots, labelled=False):
+    """Claude Code and Codex session files of conversations whose working directory is under one of roots, read
+    from their normal places (never anything else there); with labelled, [(harness, path)]."""
+    roots = [str(pathlib.Path(r)) for r in roots]
+    if not roots:
+        return []
+    found = []
+    projects = pathlib.Path(os.path.expanduser("~/.claude/projects"))
+    prefixes = [re.sub(r"[^A-Za-z0-9]", "-", r) for r in roots]
+    try:
+        found += [("claude", f) for d in projects.iterdir() if any(d.name.startswith(p) for p in prefixes)
+                  for f in d.glob("*.jsonl")]
+    except OSError:
+        pass
+    sessions = pathlib.Path(os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")) / "sessions"
+    for day in {time.strftime("%Y/%m/%d", time.localtime(time.time() - s)) for s in (0, 86400)}:
+        for f in sorted((sessions / day).glob("rollout-*.jsonl")) if (sessions / day).is_dir() else []:
+            try:
+                with f.open() as stream:
+                    cwd = (json.loads(stream.readline()).get("payload") or {}).get("cwd") or ""
+            except (OSError, ValueError):
+                continue
+            if any(cwd == r or cwd.startswith(r + "/") for r in roots):
+                found.append(("codex", f))
+    return found if labelled else [f for _, f in found]
+
+
 class Core:
     """A private hc core in its own temporary directory."""
 
-    def __init__(self, tag, config="", extra_env=None):
+    def __init__(self, tag, config="", extra_env=None, protect=False):
+        """protect: a core for real harnesses under the owner's rule that no QA run may use an installed Factory
+        skill (the owner's simpler approach): a herdr stub that always fails is first on PATH, the installed
+        copies are scanned for, and installed_seen() finds any trace of one afterwards."""
         self.dir = pathlib.Path(tempfile.mkdtemp(prefix=f"hc-{tag}-", dir=tempfile.gettempdir()))
         d = self.dir
         for sub in ("run", "state", "config/herdr-core", "home"):
@@ -174,8 +339,17 @@ class Core:
         os.chmod(d / "run", 0o700)
         if config:
             (d / "config/herdr-core/config.toml").write_text(config)
-        env = {k: v for k, v in os.environ.items()
-               if not k.startswith(("HC_", "RODEO_")) and k != "HERDR_CONFIG_PATH"}
+        self.bin, self.installed = None, []
+        if protect:
+            self.bin = d / "bin"
+            self.bin.mkdir()
+            stub = self.bin / "herdr"
+            stub.write_text(HERDR_STUB)
+            stub.chmod(0o755)
+            self.installed = installed_factory_skills(os.path.expanduser("~"), exclude=(ROOT, d))
+        env = qa_environ(os.environ)
+        if self.bin is not None:
+            env["PATH"] = f"{self.bin}:{env.get('PATH', '')}"
         env.update(HC_SESSION=f"factory-{tag}-{os.getpid()}", HC_SOCKET=str(d / "hc.sock"),
                    XDG_RUNTIME_DIR=str(d / "run"), XDG_STATE_HOME=str(d / "state"),
                    XDG_CONFIG_HOME=str(d / "config"), HOME=str(d / "home"))
@@ -193,6 +367,29 @@ class Core:
         except BaseException:
             self.stop()   # stops only a core whose id was verified; otherwise leaves the directory and says so
             raise
+
+    def installed_seen(self, roots=(), harness_of=lambda record: None):
+        """The owner's after-the-fact check: every installed factory.py path that appears in the screen of one of
+        this core's terminals, or in a Claude Code or Codex transcript whose working directory is under one of
+        roots. -> [(harness or None, what was seen)], bounded; [] for an unprotected core."""
+        needles = installed_needles(self.installed)
+        if not needles:
+            return []
+        hits = set()
+        for record in self.rpc("terminal.list", {"all": True})["terminals"]:
+            try:
+                text = self.rpc("terminal.read", {"terminal": record["address"], "lines": 0}).get("text", "")
+            except (HcError, HcDown):
+                continue
+            flat = "".join(text.split())                 # a screen wraps long paths
+            hits.update((harness_of(record), f"{record['address']} screen: {n}") for n in needles if n in flat)
+        for harness, path in qa_transcripts(roots, labelled=True):
+            try:
+                flat = "".join(path.read_text(errors="replace").split())
+            except OSError:
+                continue
+            hits.update((harness, f"{path.name}: {n}") for n in needles if n in flat)
+        return [(h, _bounded(text)) for h, text in sorted(hits, key=lambda hit: hit[1])[:10]]
 
     def start(self):
         out = subprocess.run([HC, "server", "start", "--json"], env=self.start_env,
@@ -1004,8 +1201,11 @@ class Harness:
             raise NotRun(f"{harness} is not on PATH")
         self.qa, self.harness = qa, harness
         self.dialogs = harness_table().get(harness, {}).get("dialogs", [])
-        self.argv = [exe, *args]
-        self.record = qa.rpc("terminal.run", {"argv": self.argv, "cwd": str(cwd), "env": {**owner_env(), **(env or {})},
+        self.argv = [exe, *skills_off(harness, getattr(qa, "installed", [])), *args]   # before a subcommand
+        env = {**owner_env(), **(env or {})}
+        if getattr(qa, "bin", None) is not None:          # a protected core's herdr stub first
+            env["PATH"] = f"{qa.bin}:{env.get('PATH', '')}"
+        self.record = qa.rpc("terminal.run", {"argv": self.argv, "cwd": str(cwd), "env": env,
                                               "size": {"cols": cols, "rows": rows}, "labels": {"name": "@lc-" + harness}})
         self.term = self.record["address"]
         self.answered = []
@@ -1144,6 +1344,19 @@ def harness_version(name):
     return text.splitlines()[0] if text else "unknown"
 
 
+def split_seen(seen, exempt=()):
+    """(failures, observations): a sighting fails where the harness's skill discovery was switched off (or the
+    harness is unknown), and is only recorded for one without a switch or exempt from it (the owner's decision)."""
+    off = [h for h in SKILLS_SWITCH if h not in exempt]
+    failed = [text for harness, text in seen if harness is None or harness in off]
+    return failed, [f"{harness}: {text}" for harness, text in seen if harness is not None and harness not in off]
+
+
+def lc_harness(record):
+    name = (record.get("labels") or {}).get("name", "")
+    return name[len("@lc-"):] if name.startswith("@lc-") else None
+
+
 def harness_check(name, harnesses, body):
     """Common frame: versions, a private QA core with no draft hold, NotRun as "not run: <why>"."""
     result = {"check": name, "versions": {h: harness_version(h) for h in harnesses},
@@ -1153,10 +1366,20 @@ def harness_check(name, harnesses, body):
         result["result"] = f"not run: {', '.join(missing)} not on PATH"
         return result
     try:
-        with Core(name.lower().replace("-", "").replace("+", ""), config="draft_wait = 0\n") as qa:
-            body(qa, result)
+        with Core(name.lower().replace("-", "").replace("+", ""), config="draft_wait = 0\n", protect=True) as qa:
+            try:
+                body(qa, result)
+            finally:
+                seen = qa.installed_seen([qa.dir], lc_harness)
+                failed, observed = split_seen(seen)
+                if observed:
+                    result["installed_factory_observed"] = observed
+                if failed:            # discovery was off for that harness: the check fails whatever it observed
+                    result.update(result="fail: an installed Factory script appeared in a QA terminal or transcript",
+                                  installed_factory_seen=failed)
     except NotRun as why:
-        result["result"] = f"not run: {why}"
+        if "installed_factory_seen" not in result:
+            result["result"] = f"not run: {why}"
     return result
 
 
@@ -1912,6 +2135,19 @@ class FixtureAdapter:
     def act_run(self, path, command):
         return f"ACT run {path} {command}"
 
+    def act_alone(self, command):
+        """The fake runs it as ACT run does (it has no sandbox); its receipt is thrown away, and its output is kept
+        where alone_output finds it (a real harness's is in its own transcript)."""
+        out = self.team.dir / f"alone-{hashlib.sha1(command.encode()).hexdigest()[:12]}.txt"
+        return f"ACT run {self.team.dir / 'alone-receipt.txt'} {command} > {out} 2>&1"
+
+    def act_alone_each(self, commands):
+        return "\n".join(self.act_alone(c) for c in commands)
+
+    def alone_output(self, command, others=(), prompt=None):
+        out = self.team.dir / f"alone-{hashlib.sha1(command.encode()).hexdigest()[:12]}.txt"
+        return out.read_text() if out.exists() else None
+
     def blocked_request(self):
         return "FAKE: blocks_once"
 
@@ -1943,6 +2179,7 @@ class FixtureAdapter:
     def restart(self, qa, terminal):
         """Start the fake operator again in its open pane (its loop waits for Enter)."""
         qa.rpc("terminal.keys", {"terminal": terminal, "keys": ["enter"]})
+        return True
 
 
 class RealAdapter(FixtureAdapter):
@@ -1964,8 +2201,8 @@ class RealAdapter(FixtureAdapter):
 
     def operator_argv(self, harness, model=None):
         """The operator as the owner would start it, with the profile's model pinned (as Factory pins a member's)."""
-        return [shutil.which(harness), "--model", model or self.model(harness),
-                *harness_table()[harness]["permissions"]["full"]]
+        return [shutil.which(harness), *skills_off(harness, self.team.qa.installed, self.team.skills_exempt), "--model",
+                model or self.model(harness), *harness_table()[harness]["permissions"]["full"]]
 
     def act_append(self, path, token):
         return (f"Using your shell tool, append one line containing exactly {token} to the file {path}"
@@ -1974,6 +2211,34 @@ class RealAdapter(FixtureAdapter):
     def act_run(self, path, command):
         return (f"Using your shell tool, run exactly this command: {command}; echo \"exit $?\" >> {path}"
                 " Then reply with the single word done.")
+
+    def act_alone(self, command):
+        """One command in its own tool call, nothing added: how a member runs say (a guarded Claude Code's
+        sandbox exempts exactly 'python3 <script> say *', which a compound line does not match; case 9 at
+        3321bfc)."""
+        return (f"Using your shell tool, run exactly this one command, by itself in its own tool call, with nothing"
+                f" added before or after it: {command} Then reply with the single word done.")
+
+    def act_alone_each(self, commands):
+        listed = " ".join(f"({i}) {c}" for i, c in enumerate(commands, 1))
+        return (f"Using your shell tool, run each of these {len(commands)} commands in order, each by itself in its own"
+                f" tool call, exactly as written, with nothing added before or after it: {listed} Then reply with"
+                " the single word done.")
+
+    def alone_output(self, command, others=(), prompt=None):
+        """What the command printed, from an actual tool call in the operator's own transcript of this run (Claude
+        Code and Codex; the one holding the owner's prompt): the result paired with the call that ran this command
+        and none of the others. None when no such call and result exist, so the command stays unproved: no screen,
+        prose or prompt text counts (@architect-2)."""
+        found = None
+        for path in qa_transcripts([self.team.dir]):
+            text = path.read_text(errors="replace")
+            if prompt and prompt not in text and json.dumps(prompt)[1:-1] not in text:
+                continue                                  # another conversation (a member's)
+            for call, output in tool_calls(text):
+                if " ".join(call.split()) == " ".join(command.split()) and output is not None:
+                    found = output                        # this command, executed, and its own successful result
+        return found
 
     def blocked_request(self):
         return ("Before doing anything else, ask me one multiple-choice question with your question tool, and"
@@ -2012,25 +2277,36 @@ class RealAdapter(FixtureAdapter):
         quit command if it is still reporting."""
         if not self.team.operator_command:
             raise NotRun("this team's operator was not started from a shell")
-        for _ in range(2):
+        for _ in range(2):                  # inside the harness's "press again to exit" window
             qa.rpc("terminal.keys", {"terminal": terminal, "keys": ["ctrl+c"]})
-            time.sleep(1)
+            time.sleep(0.3)
         if not self.team.until(lambda: self.team.state(terminal) is None, 15):
             qa.rpc("terminal.send", {"terminal": terminal, "text": {"claude": "/exit"}.get(self.team.operator_harness,
                                                                                          "/quit")}, timeout=60)
 
-    def quit_keys_only(self, qa, terminal):
-        """Quit with the owner's keys alone, Ctrl+C twice: no typed /exit, which a held send could merge with."""
+    def quit_keys_only(self, qa, terminal, stop=lambda: False):
+        """The owner's quit, Ctrl+C twice 0.3 s apart (@lead-dev-3's probe: Claude Code and Codex exit only when the
+        second press comes inside their "press again" window, under 1 s). The first press also clears any draft.
+        No typed /exit, which a held send could merge with; the second press is skipped once stop() is true."""
         for _ in range(2):
+            if stop():
+                return
             qa.rpc("terminal.keys", {"terminal": terminal, "keys": ["ctrl+c"]})
-            time.sleep(1)
+            deadline = time.monotonic() + 0.3
+            while time.monotonic() < deadline and not stop():
+                time.sleep(0.02)
 
     def restart(self, qa, terminal):
-        """Type the same command at the shell prompt in that pane."""
+        """Type the same command at the shell prompt in that pane, once the prompt is really back: a harness clears
+        its status before it has finished exiting, and keys typed then go to the dying harness (claude-op-8 at
+        7a90602: the restart was lost, the next say queued gone). False when the prompt never came back."""
         if not self.team.operator_command:
             raise NotRun("this team's operator was not started from a shell")
+        if not self.team.until(lambda: shell_prompt(qa, terminal), 60):
+            return False
         self.team.send(terminal, self.team.operator_command)
         Harness.attach(qa, self.team.operator_harness, terminal).settle(timeout=120)
+        return True
 
 
 class QATeam:
@@ -2038,17 +2314,27 @@ class QATeam:
     private copy of the skill (phase_8.md §2)."""
 
     def __init__(self, adapter_class, operator, members, draft_wait=None, permissions="full", operator_shell=False,
-                 startup_dialog=None, quiet_grace=None, setup=None, operator_model=None, operator_sink=False):
+                 startup_dialog=None, quiet_grace=None, setup=None, operator_model=None, operator_sink=False,
+                 skills_exempt=()):
         self.operator_harness, self.members, self.permissions = operator, members, permissions
+        self.skills_exempt = tuple(skills_exempt)   # harnesses started with their commands on (case 6's /clear)
         self.startup_dialog = startup_dialog    # fixture only: the harness whose fake shows its declared dialog
+        # agy on the real HOME (@operator): its settings files' size and mtime before and after, never contents
+        self.agy_roots = ([os.path.expanduser(p) for p in AGY_SETTINGS]
+                          if adapter_class is RealAdapter and "agy" in {operator, *members.values()} else [])
+        self.agy_before = stamps(self.agy_roots) if self.agy_roots else {}
         self.real = adapter_class is RealAdapter
         home = os.path.expanduser("~")
         extra = {"HOME": home} if self.real else None   # a real harness needs the owner's login (testing.md §6)
+        # a real harness: the protected core (the owner's rule: no QA terminal may find or run an installed Factory)
         self.qa = Core("qualify", config=f"draft_wait = {draft_wait}\n" if draft_wait is not None else "",
-                       extra_env=extra)
+                       extra_env=extra, protect=self.real)
         self.dir = pathlib.Path(tempfile.mkdtemp(prefix=QA_PREFIX, dir=tempfile.gettempdir()))
         self.bin, self.home = self.dir / "bin", (pathlib.Path(home) if self.real else self.dir / "home")
         self.bin.mkdir()
+        stub = self.bin / "herdr"          # first on every QA PATH: no QA agent reaches the owner's herdr
+        stub.write_text(HERDR_STUB)
+        stub.chmod(0o755)
         self.skill = self.dir / "skill"
         shutil.copytree(ROOT / "skill", self.skill, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
         self.script = self.skill / "scripts" / "factory.py"
@@ -2074,6 +2360,8 @@ class QATeam:
         if not self.real:
             params["env"]["FAKE_LOG"] = str(self.dir / "operator-input.jsonl")   # every input the fake received
             params["env"]["FAKE_ECHO"] = "1"
+            if harness_table().get(operator, {}).get("operator_deliver"):
+                params["env"]["FAKE_APP"] = operator      # reported as the real one is, so Factory's rule applies
             params["env"]["CODEX_THREAD_ID"] = f"thread-{token().lower()}"   # the fake operator's conversation
         self.operator_command = None
         self.sink = None
@@ -2093,13 +2381,17 @@ class QATeam:
         work = self.dir / "work"
         work.mkdir()
         subprocess.run(["git", "init", "-q", "-b", "main", str(work)], check=True)
-        (work / "FACTORY.md").write_text("Qualification team: answer every request exactly as asked.\n")
+        (work / "FACTORY.md").write_text(
+            "Qualification team: answer every request exactly as asked.\n"
+            f"Factory's only command for this team is python3 {self.script}. Never run another copy of Factory"
+            " (an installed skill's script) or herdr.\n")
         lines = [f'[operator]\nharness = "{self.operator_harness}"\n']
         if quiet_grace:
             lines.insert(0, f"quiet_grace = {quiet_grace}\n")
         for name, harness in self.members.items():
+            off = skills_off(harness, self.qa.installed, self.skills_exempt) if self.real else []
             lines.append(f'[members.{name}]\nharness = "{harness}"\nmodel = "{self.adapter.model(harness)}"\n'
-                         f'permissions = "{self.permissions}"\n')
+                         f'permissions = "{self.permissions}"\n' + (f"args = {json.dumps(off)}\n" if off else ""))
         (work / "factory.toml").write_text("\n".join(lines))
         subprocess.run(["git", "-C", str(work), "add", "-A"], check=True)
         subprocess.run(["git", "-C", str(work), "-c", "user.name=qa", "-c", "user.email=qa@example.invalid",
@@ -2153,10 +2445,40 @@ class QATeam:
                     raise
             time.sleep(1)
 
+    def harness_of(self, record):
+        """The harness running in one of this team's terminals, from its Factory labels."""
+        labels = record.get("labels") or {}
+        if labels.get("factory.kind") in ("operator", "operator-lost"):
+            return self.operator_harness
+        return self.members.get(labels.get("factory.member")) if labels.get("factory.member") else None
+
     def receipt(self, name):
-        return self.dir / f"receipt-{name}-{random.randrange(16 ** 6):06x}.txt"
+        """A file a harness writes for the driver: in its work directory, where a sandboxed shell may write (the
+        owner's Claude Code sandbox applies at full too; case 6 at 14ed74a), left out of git status."""
+        return self.scratch() / f"receipt-{name}-{random.randrange(16 ** 6):06x}.txt"
+
+    def scratch(self):
+        folder = self.work / ".factory-qa"
+        if not folder.exists():
+            folder.mkdir()
+            exclude = self.work / ".git" / "info" / "exclude"
+            if exclude.parent.is_dir():
+                with exclude.open("a") as stream:
+                    stream.write(".factory-qa/\n")
+        return folder
 
     def close(self):
+        try:
+            failed, observed = split_seen(self.qa.installed_seen([self.dir], self.harness_of), self.skills_exempt)
+            EVIDENCE.setdefault("installed_factory_seen", []).extend(failed)
+            EVIDENCE.setdefault("installed_factory_observed", []).extend(observed)
+        except (OSError, HcError, HcDown) as error:
+            EVIDENCE.setdefault("installed_factory_seen", []).append(f"the check could not run: {error}"[:BOUND])
+        if self.agy_roots:
+            home = os.path.expanduser("~")
+            touched = [p for p in changed(self.agy_before, stamps(self.agy_roots))
+                       if pathlib.Path(p).name == "settings.json" or "trust" in pathlib.Path(p).name.lower()]
+            EVIDENCE.setdefault("settings_changed", []).extend(p.replace(home, "~", 1) for p in touched)
         try:
             EVIDENCE["teams"].append(self.diagnostics())
         except (OSError, HcError, HcDown, RuntimeError, ValueError) as error:
@@ -2280,6 +2602,7 @@ class Qualification:
         if reason:
             row["reason"] = _bounded(reason)
         self.data["rows"].append(row)
+        self.checkpoint()                 # on disk as soon as judged: a later crash cannot lose it (@operator)
         return row
 
     def checkpoint(self):
@@ -2311,9 +2634,10 @@ class Qualification:
         return 1 if "fail" in statuses else 2 if "not_run" in statuses else 0
 
 
-def _team_for(adapter_class, role, harness, **options):
-    """A two-member-or-less team where the profile's harness has its role (phase_8.md §1)."""
-    peer = _peer(role, harness)
+def _team_for(adapter_class, role, harness, peer=None, **options):
+    """A two-member-or-less team where the profile's harness has its role (phase_8.md §1); peer overrides the
+    default counterpart."""
+    peer = peer or _peer(role, harness)
     operator, member = (harness, peer) if role == "operator" else (peer, harness)
     if adapter_class is FixtureAdapter:
         member = "codex"           # fake agents stand in; the formation needs a harness Factory can check offline
@@ -2350,6 +2674,13 @@ def _up(team, run, case, role, harness, names):
     return True
 
 
+def shell_prompt(qa, terminal):
+    """The operator pane's own shell shows its prompt (QATeam's PS1) as the last line: the harness has gone."""
+    lines = [line for line in qa.rpc("terminal.read", {"terminal": terminal, "lines": 0}).get("text", "").splitlines()
+             if line.strip()]
+    return bool(lines) and lines[-1].rstrip() == "qa$"
+
+
 def _team_quiet(team, hold, timeout):
     """Wait until the operator and every member have been ready (idle or done) for hold seconds together, so
     the members' ready reports and the operator's turns on them are over. Returns the seconds it took, or None."""
@@ -2384,21 +2715,33 @@ def _trust_entries(run, team, directories=None):
     run.checkpoint()
 
 
-def _member_says(team, text, timeout=300, record=None):
-    """Have the member itself run say to the operator through its own tool, with text in a file."""
-    member = team.member("lead-dev")
+def _member_says(team, text, timeout=300):
+    """Have the member itself run say to the operator through its own tool, with text in a file, by itself in its
+    own tool call as its standing instructions say: a sandbox exempts exactly 'python3 <script> say *', which the
+    earlier compound line (redirect, '; echo') did not match (cases 6 and 9 at 14ed74a and 3321bfc). -> what the log
+    shows of it, never the command's own exit or output: {"id", "from", "to", "outcome", "observed": "log"} for a
+    committed message from @lead-dev to @operator with exactly this text, its outcome read after up to say's own
+    wait; None when none appeared."""
     body = team.dir / f"report-{random.randrange(16 ** 6):06x}.md"
     body.write_text(text)
-    out = team.dir / f"say-out-{random.randrange(16 ** 6):06x}.txt"     # the say's own output: its message ID
-    command = (f"python3 {shlex.quote(str(team.script))} say operator --file {shlex.quote(str(body))}"
-               f" > {shlex.quote(str(out))} 2>&1")
-    done = team.receipt("member-say")
-    team.send(member, team.adapter.act_run(done, command))
-    result = team.until(lambda: done.exists() and "exit" in done.read_text() and done.read_text().strip(), timeout)
-    team.last_say = out.read_text() if out.exists() else None
-    if record is not None:
-        record["out"] = team.last_say
-    return result
+    log = factory_log(team)
+    before = max((rec["id"] for rec in log.read_box()[0] if rec["t"] == "msg"), default=0)
+    command = f"python3 {shlex.quote(str(team.script))} say operator --file {shlex.quote(str(body))}"
+    team.send(team.member("lead-dev"), team.adapter.act_alone(command))
+
+    def found():
+        records, box = log.read_box()
+        return next((rec["id"] for rec in records if rec["t"] == "msg" and rec["id"] > before
+                     and rec["id"] in box.msgs and rec.get("from") == "lead-dev" and rec.get("to") == ["operator"]
+                     and rec.get("text") == text), None)
+    if not team.until(found, timeout):
+        return None
+    ident = found()
+    deadline = time.monotonic() + SAY_WAIT            # what say itself waits for before it reports
+    while time.monotonic() < deadline and _outcome(log, ident, "operator")[0] == "sending":
+        time.sleep(0.2)
+    return {"id": ident, "from": "lead-dev", "to": ["operator"], "outcome": list(_outcome(log, ident, "operator")),
+            "observed": "log"}
 
 
 # Pure judgements, each unit-tested for its false-pass paths (@architect-2's review of the first PR).
@@ -2501,14 +2844,14 @@ def _operator_commands(run, team, harness, peer):
     has it run up, say to a member, status and inbox --for itself through its own tool; no driver up."""
     if not _operator_start(team, run, 2, "operator", harness, ["operator-commands"]):
         return False
-    exits, tok = team.receipt("operator-commands"), token()
-    member_receipt = team.receipt("member")
+    tok, member_receipt = token(), team.receipt("member")
     py = f"python3 {shlex.quote(str(team.script))}"
-    message = shlex.quote(team.adapter.act_append(member_receipt, tok))
-    outs = {name: team.dir / f"out-{name}-{token().lower()}.txt" for name in ("up", "say", "status", "inbox")}
-    commands = {"up": f"{py} up", "say": f"{py} say lead-dev {message}", "status": f"{py} status",
+    message = team.adapter.act_append(member_receipt, tok)
+    # each command alone, one per tool call, as Factory's instructions say: an owner's sandbox exempts only a
+    # standalone say or inbox, and a compound line ran in it first (Claude Code at 709f1a3, @operator)
+    commands = {"up": f"{py} up", "say": f"{py} say lead-dev {shlex.quote(message)}", "status": f"{py} status",
                 "inbox": f"{py} inbox --for operator"}
-    prompt = "\n".join(team.adapter.act_run(exits, f"{commands[name]} > {outs[name]} 2>&1") for name in commands)
+    prompt = team.adapter.act_alone_each(list(commands.values()))
     view = _rodeo(team, ["operator"])
     view.keys("ctrl+b")
     time.sleep(0.2)
@@ -2517,25 +2860,42 @@ def _operator_commands(run, team, harness, peer):
     view.focused_terminal = team.operator
     start = time.monotonic()
     view.paste(prompt)
-    lines = team.until(lambda: exits.exists() and len(exits.read_text().split()) >= 8 and exits.read_text(), 900)
-    codes = [line for line in (lines or "").splitlines() if line.startswith("exit")]
-    reached = bool(codes == ["exit 0"] * 4
-                   and team.until(lambda: member_receipt.exists() and tok in member_receipt.read_text(), 300))
-    full = {name: path.read_text() if path.exists() else None for name, path in outs.items()}
+    # up's own effect first: the member's terminal (the log exists only once up has run, @architect-2)
+    member = team.until(lambda: team.member("lead-dev"), 900)
+    if not member:
+        run.row(2, "operator-commands", "operator", harness, "fail",
+                "the owner's first prompt has the operator run up, say, status and inbox --for itself",
+                proof={"up_member": None, "peer": peer}, elapsed=time.monotonic() - start,
+                reason="no @lead-dev terminal within 900 s of the owner's prompt: up did not run or did not finish")
+        return True
+    log = factory_log(team)
 
+    def said_by_operator():          # the committed say in the log, from the operator to the member, this text
+        records, box = log.read_box()
+        return next((rec["id"] for rec in records if rec["t"] == "msg" and rec.get("from") == "operator"
+                     and rec.get("to") == ["lead-dev"] and rec.get("text") == message and rec["id"] in box.msgs),
+                    None)
+    reached = bool(team.until(lambda: member_receipt.exists() and tok in member_receipt.read_text(), 900))
+    team.until(lambda: team.state(team.operator) in READY, 300)      # its turn over: status and inbox have run
+    time.sleep(3)
     member = team.member("lead-dev")
-    box = factory_log(team).read_box()[1] if member else None
+    box = log.read_box()[1]
     briefed = bool(box) and member in box.briefed()
+    say_id = said_by_operator()
+    say_outcome = list(_outcome(log, say_id, "lead-dev")) if say_id else None
     to_operator = sorted({ident for (ident, to) in box.outcomes if to == "operator"}) if box else []
-    listed = sorted({int(n) for n in re.findall(r"^\[Message (\d+) ", full["inbox"] or "", re.M)})
+    full = {name: team.adapter.alone_output(commands[name], [c for n, c in commands.items() if n != name], prompt)
+            for name in ("status", "inbox")}
+    listed = sorted({int(n) for n in re.findall(r"\[Message (\d+) ", full["inbox"] or "")})
     inbox_ok = bool(full["inbox"]) and set(listed) <= set(to_operator) and (
         bool(listed) or "no messages for @operator" in full["inbox"])
     status_ok = "@lead-dev" in (full["status"] or "")
-    proof = {"exits": codes, "member_acted": reached, "member_briefed": briefed, "status_names_member": status_ok,
-             "inbox_ids": listed, "operator_ids_in_log": to_operator,
-             "exits_by_command": dict(zip(commands, codes)), "peer": peer,
+    proof = {"member_acted": reached, "member_briefed": briefed, "say_id": say_id, "say_outcome": say_outcome,
+             "status_names_member": status_ok, "inbox_ids": listed, "operator_ids_in_log": to_operator,
+             "inbox_seen": full["inbox"] is not None, "status_seen": full["status"] is not None, "peer": peer,
+             "observed_in": "Factory's log and each command's own tool result in the operator's transcript",
              "prompted_by": "the owner's paste and Enter through rodeo into a fresh operator (prefix+1)"}
-    ok = codes == ["exit 0"] * 4 and reached and briefed and status_ok and inbox_ok
+    ok = reached and briefed and bool(say_id) and (say_outcome or [""])[0] == "delivered" and status_ok and inbox_ok
     run.row(2, "operator-commands", "operator", harness, "pass" if ok else "fail",
             "the owner's first prompt has the operator run up, say, status and inbox --for itself; the brief is"
             " delivered, the member acts on the say, status names it and the inbox lists the operator's messages",
@@ -2565,8 +2925,7 @@ def case_2(run, role, harness, adapter_class):
         acted = team.until(lambda: receipt.exists() and tok in receipt.read_text(), 300)
         acted_at = time.monotonic() - start
         ended = team.until(lambda: team.state(team.operator) in READY and team.get(team.operator)["turn"] > turn, 120)
-        found = _say_id(team.last_say or "")
-        ident = int(found.group(1)) if found else None
+        ident = said["id"] if said else None
         proof = {"member_say": said, "sender_message_id": ident,
                  "operator_turn": [turn, team.get(team.operator)["turn"]], "turn_completed": bool(ended),
                  "action_at_s": round(acted_at, 2), "peer": peer,
@@ -2592,12 +2951,13 @@ def case_9(run, role, harness, adapter_class):
         team.qa.rpc("terminal.kill", {"terminal": old})
         gone = team.until(lambda: team.get(old)["state"] == "finished", 30)
         receipt, tok = team.receipt("operator"), token()
-        said = _member_says(team, team.adapter.act_append(receipt, tok))
+        said = _member_says(team, team.adapter.act_append(receipt, tok))   # the say by itself, as members do
+        said = said["id"] if said else None
         new = team.until(team.keeper, 60)
         acted = team.until(lambda: receipt.exists() and tok in receipt.read_text(), 300)
-        proof = {"old_keeper_finished": bool(gone), "new_keeper": bool(new) and new != old, "member_say": said,
+        proof = {"old_keeper_finished": bool(gone), "new_keeper": bool(new) and new != old, "member_say_id": said,
                  "guarded_args": harness_table()[harness]["permissions"]["guarded"], "peer": peer}
-        ok = bool(gone) and bool(new) and new != old and bool(acted) and "exit 0" in (said or "")
+        ok = bool(gone) and bool(new) and new != old and bool(acted) and said is not None
         run.row(9, "guarded", role, harness, "pass" if ok else "fail",
                 "a guarded member's say reaches hc, restarts the keeper and is acted on", proof=proof,
                 reason=None if ok else "the keeper did not restart or the operator did not act")
@@ -2707,7 +3067,27 @@ def case_1(run, role, harness, adapter_class):
 
 
 def case_7(run, role, harness, adapter_class):
-    """suffix and multiline in one team; two-senders, pending-restart, upgrade and held-quiet in their own (§3.7)."""
+    """suffix and multiline in one team; two-senders, pending-restart, upgrade and held-quiet in their own (§3.7).
+    Each runs whatever happened to the ones before it."""
+    for names, trial in ((("suffix", "multiline"), _case_7_main), (("two-senders",), _case_7_two_senders),
+                         (("pending-restart",), _case_7_pending_restart), (("upgrade",), _case_7_upgrade),
+                         (("held-quiet",), _case_7_held_quiet)):
+        first_row = len(run.data["rows"])
+        try:
+            trial(run, role, harness, adapter_class)
+        except NotRun as why:
+            reason = str(why)
+        except (RuntimeError, HcError, HcDown, OSError, subprocess.SubprocessError) as error:
+            reason = f"the driver stopped: {type(error).__name__}: {error}"
+        else:
+            continue
+        for name in names:                               # only the rows this trial did not record
+            if not any(r["case"] == 7 and r["subcase"] == name and r["role"] == role and r["harness"] == harness
+                       for r in run.data["rows"][first_row:]):
+                run.row(7, name, role, harness, "not_run", f"case 7 {name}", reason=reason)
+
+
+def _case_7_main(run, role, harness, adapter_class):
     team, peer = _team_for(adapter_class, role, harness)
     with team:
         if not _up(team, run, 7, role, harness, ["suffix", "multiline"]):
@@ -2749,13 +3129,6 @@ def case_7(run, role, harness, adapter_class):
                 "a long multi-line message: the markers at its beginning, middle and end acted on in order",
                 proof={"bytes": len(text.encode()), "order": [marks.index(m) for m in order]},
                 reason=None if ok else "a marker was missing or out of order")
-    for name, trial in (("two-senders", _case_7_two_senders), ("pending-restart", _case_7_pending_restart),
-                        ("upgrade", _case_7_upgrade), ("held-quiet", _case_7_held_quiet)):
-        try:                                             # each in its own team: one that cannot run stops only itself
-            trial(run, role, harness, adapter_class)
-        except NotRun as why:
-            run.row(7, name, role, harness, "not_run", f"case 7 {name}", reason=str(why))
-
 
 def _case_7_two_senders(run, role, harness, adapter_class):
     """two-senders (phase_8.md §3.7): two senders say to one recipient at the same moment; both IDs are acted on
@@ -3034,8 +3407,9 @@ def _rodeo(team, titles):
 
 def case_5(run, role, harness, adapter_class):
     """blocked (phase_8.md §3.5): nothing typed while blocked, one note, the queued message delivered once after
-    the owner answers through rodeo, with no Factory command between."""
-    team, peer = _team_for(adapter_class, role, harness)
+    the owner answers through rodeo, with no Factory command between. An operator's blocked peer is Claude Code:
+    its question tool blocks it, where a Codex member asked the same never did (Claude Code operator at 709f1a3)."""
+    team, peer = _team_for(adapter_class, role, harness, peer="claude" if role == "operator" else None)
     with team:
         if not _up(team, run, 5, role, harness, ["blocked"]):
             return
@@ -3099,7 +3473,7 @@ def factory_log(team):
 def _outcome(log, ident, name):
     if not ident:
         return None
-    record = log.read_box()[1].outcome(int(ident[1]), name)
+    record = log.read_box()[1].outcome(ident if isinstance(ident, int) else int(ident[1]), name)
     return record["o"], record.get("why")
 
 
@@ -3152,7 +3526,14 @@ def _case_8_main(run, role, harness, adapter_class):
                     proof=proof, reason=None if ok else "see proof")
             return
         operator = team.operator
-        # operator-gone: the harness stops reporting in an open pane; messages queue until up.
+        # operator-gone: the harness stops reporting in an open pane; messages queue until up. Each quit is of an
+        # idle operator: Ctrl+C in a working turn interrupts it instead.
+        if _team_quiet(team, hold=8, timeout=600) is None:
+            run.row(8, "operator-gone", role, harness, "not_run", "case 8 operator-gone",
+                    reason="the team was not quiet before the quit")
+            run.row(8, "same-pane", role, harness, "not_run", "case 8 same-pane",
+                    reason="operator-gone did not start")
+            return
         team.adapter.quit(team.qa, operator)
         stopped = team.until(lambda: team.state(operator) is None, 120)
         receipt, toks, ids = team.receipt("gone"), [token(), token()], []
@@ -3162,8 +3543,7 @@ def _case_8_main(run, role, harness, adapter_class):
             ids.append(_say_id(out))
         latched = team.until(lambda: (team.get(operator).get("labels") or {}).get("factory.kind")
                              == "operator-lost", 60)
-        team.adapter.restart(team.qa, operator)
-        back = team.until(lambda: team.state(operator) in READY, 120)
+        back = team.adapter.restart(team.qa, operator) and team.until(lambda: team.state(operator) in READY, 120)
         time.sleep(5)
         held = not receipt.exists()
         up_code, _ = team.call("up", timeout=240)
@@ -3177,10 +3557,19 @@ def _case_8_main(run, role, harness, adapter_class):
                 "an operator gone from an open pane: messages queue until up, then arrive in order",
                 proof=proof, reason=None if ok else "see proof")
         # same-pane: a quick quit and restart with nothing pending, then a message succeeds without up.
+        quiet = _team_quiet(team, hold=8, timeout=600)
         team.adapter.quit(team.qa, operator)
-        team.until(lambda: team.state(operator) is None, 60)
-        team.adapter.restart(team.qa, operator)
-        team.until(lambda: team.state(operator) in READY, 60)
+        stopped2 = team.until(lambda: team.state(operator) is None, 60)
+        restarted2 = bool(stopped2) and team.adapter.restart(team.qa, operator)
+        back2 = restarted2 and team.until(lambda: team.state(operator) in READY, 120)
+        if quiet is None or not back2:
+            run.row(8, "same-pane", role, harness, "not_run", "case 8 same-pane",
+                    reason="the team was not quiet before the quit" if quiet is None else
+                    "the operator did not stop reporting after the quit" if not stopped2 else
+                    "the shell prompt did not come back after the quit" if not restarted2 else
+                    "the restarted operator did not report ready within 120 s",
+                    proof={"stopped": bool(stopped2), "restarted": bool(restarted2), "state": team.state(operator)})
+            return
         receipt2, tok2 = team.receipt("same-pane"), token()
         code, out = team.call("say", "operator", "--file", str(_note(team, team.adapter.act_append(receipt2, tok2))),
                               terminal=team.member("lead-dev"), timeout=60)
@@ -3242,7 +3631,7 @@ def _case_8_unconfirmed_brief(run, role, harness, adapter_class):
         held = _outcome(log, ordinary, "lead-dev")
         time.sleep(10)
         early = tok in _lines(receipt)
-        send_code, _ = team.call("brief", "--send", "lead-dev", timeout=240)
+        send_code, send_out = team.call("brief", "--send", "lead-dev", timeout=240)
         team.until(lambda: tok in _lines(receipt), 300)
         time.sleep(10)
         count = _lines(receipt).count(tok)
@@ -3258,7 +3647,8 @@ def _case_8_unconfirmed_brief(run, role, harness, adapter_class):
                 "an interrupted first brief is unconfirmed; an ordinary message waits not ready and is delivered once,"
                 " after a new brief --send", proof={
                     "brief_id": hit["id"], "brief_outcome": [brief.get("o"), brief.get("why")], "held": held,
-                    "acted_before_new_brief": early, "brief_send_exit": send_code, "new_brief_id": new_brief,
+                    "acted_before_new_brief": early, "brief_send_exit": send_code,
+                    "brief_send_output": _bounded(send_out.strip()), "new_brief_id": new_brief,
                     "delivery_order": order, "action_count": count, "peer": peer},
                 reason=None if ok else "see proof")
 
@@ -3276,6 +3666,10 @@ def _case_8_quit_during_hold(run, role, harness, adapter_class):
         if not _up(team, run, 8, role, harness, ["quit-during-hold"]):
             return
         log = factory_log(team)
+        if _team_quiet(team, hold=8, timeout=600) is None:   # a working operator's Ctrl+C interrupts, not quits
+            run.row(8, "quit-during-hold", role, harness, "not_run", "case 8 quit-during-hold",
+                    reason="the team was not quiet before the draft")
+            return
         view = _rodeo(team, ["operator", "team"])
         view.keys("ctrl+b")
         time.sleep(0.2)
@@ -3289,9 +3683,11 @@ def _case_8_quit_during_hold(run, role, harness, adapter_class):
                               timeout=60)
         found = _say_id(out)
         claimed = team.until(lambda: found and _outcome(log, found, "operator") == ("sending", None), 60)
+        state_at_quit = team.state(team.operator)
+        held_at_quit = _outcome(log, found, "operator") if found else None
         start = time.monotonic()
         if team.sink is not None:                        # a real harness: its exit starts cat into a fresh file
-            team.adapter.quit_keys_only(team.qa, team.operator)
+            team.adapter.quit_keys_only(team.qa, team.operator, stop=team.sink.exists)
             exited = team.until(lambda: team.sink.exists(), 60)
         else:                                            # the fake's loop reads a line and runs nothing
             team.adapter.quit(team.qa, team.operator)
@@ -3307,10 +3703,13 @@ def _case_8_quit_during_hold(run, role, harness, adapter_class):
         at_exit = sink().count(tok)                      # what was already there when the harness had gone
         time.sleep(75)                                   # past draft_wait: the hold has ended either way
         after = sink().count(tok)
+        recorder_alive = team.sink is None or team.get(team.operator)["state"] == "live"   # cat still reading
         final = _outcome(log, found, "operator") if found else None
-        missing = ("the send was not claimed and held" if not claimed else "the harness was not seen to exit"
+        missing = ("the send was not claimed and held" if not claimed else "the send was no longer held when the quit"
+                   " began" if (held_at_quit or ("",))[0] != "sending" else "the harness was not seen to exit"
                    if not exited else "the send was no longer held when the harness had exited"
-                   if (held_at_exit or ("",))[0] != "sending" else None)
+                   if (held_at_exit or ("",))[0] != "sending" else "the sink stopped reading before the hold ended"
+                   if not recorder_alive else None)
         reached = after > at_exit
         observed = None if missing else (
             f"the harness exited after {quit_s} s with the send held; afterwards the token"
@@ -3318,7 +3717,9 @@ def _case_8_quit_during_hold(run, role, harness, adapter_class):
         run.row(8, "quit-during-hold", role, harness, "not_run" if missing else "measured",
                 "what reaches the pane after a quit during a held send", observed=observed,
                 proof={"id": int(found.group(1)) if found else None, "claimed": bool(claimed), "quit_s": quit_s,
-                       "held_at_exit": held_at_exit, "token_count_at_exit": at_exit, "token_count_after": after,
+                       "held_at_quit": held_at_quit, "held_at_exit": held_at_exit, "state_at_quit": state_at_quit,
+                       "token_count_at_exit": at_exit, "token_count_after": after,
+                       "recorder_alive": recorder_alive,
                        "reached_after_exit": reached if not missing else None, "final": final,
                        "peer": peer}, reason=missing)
 
@@ -3361,16 +3762,14 @@ def case_3(run, role, harness, adapter_class):
         report = team.dir / "report.md"
         report.write_text(team.adapter.act_append(receipt, tok))
         member = team.member("lead-dev")
-        said = team.receipt("member-say")
         command = f"python3 {shlex.quote(str(team.script))} say operator --file {shlex.quote(str(report))}"
-        team.send(member, team.adapter.act_run(said, command))
+        team.send(member, team.adapter.act_alone(command))       # alone, as members say (not a compound line)
         log = factory_log(team)
         claimed = team.until(lambda: next((ident for (ident, to), rec in log.read_box()[1].outcomes.items()
                                            if rec["o"] == "sending" and to == "operator"), None), 300)
         if not claimed:                                 # the member never said: nothing about the draft hold is shown
             run.row(3, "draft", role, harness, "not_run", "a report held by the owner's draft",
-                    proof={"member_say": said.read_text().strip() if said.exists() else None,
-                           "member_state": team.state(member), "peer": peer},
+                    proof={"member_state": team.state(member), "peer": peer},
                     reason="the member's say was never claimed for the operator within 300 s")
             view.keys("enter")
             if role == "operator":
@@ -3408,9 +3807,9 @@ def _case_3_draft_cleared(run, team, harness, view, peer):
     view.focused_terminal = team.operator
     view.type(draft)
     time.sleep(1)
-    receipt, tok, said = team.receipt("report-cleared"), token(), {}
-    _member_says(team, team.adapter.act_append(receipt, tok), record=said)
-    found = _say_id(said.get("out") or "")
+    receipt, tok = team.receipt("report-cleared"), token()
+    said = _member_says(team, team.adapter.act_append(receipt, tok)) or {}
+    found = said.get("id")
     log = factory_log(team)
     claimed = team.until(lambda: found and _outcome(log, found, "operator") == ("sending", None), 60) or (
         found and _outcome(log, found, "operator")[0] == "sending")
@@ -3437,7 +3836,7 @@ def _case_3_draft_cleared(run, team, harness, view, peer):
             "a report held by a draft the owner then deletes without sending: the report is acted on once, the"
             " deleted draft does nothing, and the next sent line has no stray characters",
             observed=f"report acted on {released_after} s after the draft was deleted" if acted else None,
-            proof={"report_id": int(found.group(1)) if found else None, "claimed": bool(claimed),
+            proof={"report_id": found, "claimed": bool(claimed),
                    "held_past_8s": held, "keyboard": f"backspace x{len(draft)}",
                    "released_after_clear_s": released_after,
                    "report_count": count, "cleared_draft_acted": not no_draft_action, "next_line_exact": exact,
@@ -3446,7 +3845,9 @@ def _case_3_draft_cleared(run, team, harness, view, peer):
 
 def case_6(run, role, harness, adapter_class):
     """resume and member-switch for a member; operator-switch for an operator (phase_8.md §3.6)."""
-    team, peer = _team_for(adapter_class, role, harness)
+    # Claude Code's skills switch also turns off its native /clear (@lead-dev's pilot at 0748216: "Unknown command"),
+    # which the switch trials need: its teams here start with commands on, and a sighting is recorded, not failed
+    team, peer = _team_for(adapter_class, role, harness, skills_exempt=("claude",))
     with team:
         names = [n for n, _ in subcases(6, role)]
         if role == "operator":
@@ -3573,6 +3974,16 @@ def case_6(run, role, harness, adapter_class):
                 else "another conversation")
 
 
+def between_turns(harness, role):
+    """Whether Factory delivers to this profile only between turns (keeper.md §9): Codex as operator."""
+    return role == "operator" and harness_table().get(harness, {}).get("operator_deliver") == "idle"
+
+
+def _app_selects(app):
+    """Whether a live status app selects between-turns delivery in the table (keeper.md §9's lookup)."""
+    return bool(app) and harness_table().get(app, {}).get("operator_deliver") == "idle"
+
+
 def _ask_later(team, role, text):
     """_ask in a thread: a say to a working recipient may wait for delivery, and the case must go on meanwhile.
     box["out"] gets the say's own output (its message ID) when it returns."""
@@ -3583,7 +3994,7 @@ def _ask_later(team, role, text):
             code, out = team.call("say", "lead-dev", text, timeout=600)
             box.update(out=out, code=code)
         else:
-            box["code"] = _member_says(team, text, timeout=600, record=box)
+            box.update(_member_says(team, text, timeout=600) or {"id": None}, done=True)   # this job's own
     thread = threading.Thread(target=ask, daemon=True)
     thread.start()
     return thread, box
@@ -3636,9 +4047,9 @@ def case_4(run, role, harness, adapter_class):
             started, finished, second = token(), token(), token()
 
             def said(box, log=None):
-                found = _say_id(box.get("out") or "")
-                return (int(found.group(1)) if found else None,
-                        _outcome(log or factory_log(team), found, recipient) if found else None)
+                found = box.get("id") if "id" in box else _say_id(box.get("out") or "")
+                ident = found if isinstance(found, int) or found is None else int(found.group(1))
+                return ident, (_outcome(log or factory_log(team), ident, recipient) if ident else None)
 
             began_at = time.monotonic()
 
@@ -3659,14 +4070,33 @@ def case_4(run, role, harness, adapter_class):
                         run.row(4, trial, role, harness, "not_run", f"case 4 {trial}", reason=why)
                     continue
                 turn = team.get(subject)["turn"]
+                between = between_turns(harness, role)
+                app = (team.get(subject).get("status") or {}).get("app")     # the live root status, working
                 later = _ask_later(team, role, team.adapter.act_append(work, second))
-                delivered = team.until(lambda: later[1].get("out") and said(later[1])[1]
-                                       and said(later[1])[1][0] == "delivered", 30)
+                third, later3 = token(), None
+                if between and trial == "mid-turn":     # two reports in one working turn (keeper.md §9)
+                    later3 = _ask_later(team, role, team.adapter.act_append(work, third))
+                if between:                             # Factory keeps it queued while the operator works
+                    delivered = team.until(lambda: later[1].get("done") and said(later[1])[1] == ("queued", "busy"),
+                                           60)
+                else:
+                    delivered = team.until(lambda: (later[1].get("out") or later[1].get("done")) and said(later[1])[1]
+                                           and said(later[1])[1][0] == "delivered", 30)
                 time.sleep(5)
                 proof = {"peer": peer, "turn_at_start": turn, "second_id": said(later[1])[0],
                          "second_outcome_while_working": said(later[1])[1],
                          "working_when_delivered": team.state(subject) == "working",
-                         "pending_before_esc": second not in _lines(work)}
+                         "pending_before_esc": second not in _lines(work),
+                         "operator_app": app, "between_turns": between}
+                if between:
+                    proof["app_selects_between_turns"] = _app_selects(app)
+                if later3 is not None:
+                    team.until(lambda: later3[1].get("done"), 60)
+                    proof.update(third_id=said(later3[1])[0], third_outcome_while_working=said(later3[1])[1],
+                                 held_while_working=(sorted([said(later[1])[1] or ("",), said(later3[1])[1] or ("",)])
+                                                     == [("queued", "busy"), ("queued", "waiting")]
+                                                     and second not in _lines(work) and third not in _lines(work)
+                                                     and team.state(subject) == "working"))
                 if trial != "mid-turn":
                     view = _rodeo(team, ["operator", "team"] if role == "operator" else ["team", "@lead-dev"])
                     view.keys("ctrl+b")
@@ -3679,6 +4109,11 @@ def case_4(run, role, harness, adapter_class):
                         view.focus("@lead-dev")
                     keys = team.adapter.interrupt_keys(harness)
                     pending_at_esc = second not in _lines(work) and team.state(subject) == "working"
+                    if between:                      # the same terminal, just before the key (@architect-2)
+                        snap = team.get(subject)
+                        proof["before_esc"] = {"terminal": subject, "state": (snap.get("status") or {}).get("state"),
+                                               "turn": snap.get("turn"), "app": (snap.get("status") or {}).get("app"),
+                                               "outcome": said(later[1])[1], "marker_on_screen": second in flat()}
                     view.keys(*keys)
                     esc_at = time.monotonic()
                     watch = {}
@@ -3692,8 +4127,14 @@ def case_4(run, role, harness, adapter_class):
                     if trial == "owner-line":                # the owner types straight after Esc, no Enter yet
                         extra, owner = f"owner line {token()}", team.receipt("owner")
                         view.paste(team.adapter.act_append(owner, extra), submit=False)
-                        moved = team.until(lambda: second in _lines(work), 120)   # Claude Code took 5-21 s
-                        proof["queued_turn_started"] = bool(moved)
+                        if between:    # still Factory's: it waits behind the owner's line, which goes first
+                            time.sleep(5)             # well inside draft_wait: past it hc types after the line
+                            proof["held_behind_owner_line"] = (second not in _lines(work)
+                                                               and (said(later[1])[1] or ("",))[0] in ("queued",
+                                                                                                       "sending"))
+                        else:
+                            moved = team.until(lambda: second in _lines(work), 120)   # Claude Code took 5-21 s
+                            proof["queued_turn_started"] = bool(moved)
                         screen = flat()
                         proof["input_once_queued_ran"] = look(screen)
                         proof["owner_line_whole_before_enter"] = "".join(extra.split()) in screen
@@ -3704,8 +4145,11 @@ def case_4(run, role, harness, adapter_class):
                     # on screen at all: in the input or in the transcript, which a screen cannot tell apart
                     proof["second_on_screen_after_esc"] = second in screen
                     proof["pending_and_working_at_esc"] = pending_at_esc
+                    # between turns: committed and still queued in Factory at Esc, nothing typed to it yet
                     proof["precondition"] = (bool(delivered) and proof["working_when_delivered"]
                                              and proof["pending_before_esc"] and pending_at_esc)
+                    if between:                      # still Factory's at Esc: queued, nothing of it typed
+                        proof["precondition"] = judge_before_esc(proof["before_esc"]) and pending_at_esc
                 if trial == "next-delivery":                # touch nothing: the keeper's next delivery
                     while time.monotonic() - esc_at < 65:    # past the QA core's draft_wait (60 s) since Esc
                         time.sleep(1)
@@ -3722,13 +4166,18 @@ def case_4(run, role, harness, adapter_class):
                     view.keys("enter")
                     team.until(lambda: owner.exists() and extra in owner.read_text()
                                and second in _lines(work), 300)
+                if between and trial == "mid-turn":      # neither report typed into the original turn
+                    screen = flat()
+                    proof["before_release"] = {"turn": team.get(subject)["turn"], "second_on_screen": second in screen,
+                                               "third_on_screen": third in screen,
+                                               "outcomes": [said(later[1])[1], said(later3[1])[1]]}
                 release.write_text("go\n")
                 team.until(lambda: second in _lines(work), 300)
                 if trial == "mid-turn":
                     team.until(lambda: finished in _lines(work), 300)
                 team.until(lambda: team.state(subject) in READY, 120)
                 time.sleep(15)                               # time for a duplicate to show
-                for thread, _ in (first, later):
+                for thread, _ in (first, later, *((later3,) if later3 else ())):
                     thread.join(timeout=60)
                 proof["at_deadline"] = look()
                 if trial != "mid-turn":
@@ -3741,6 +4190,28 @@ def case_4(run, role, harness, adapter_class):
                 log = factory_log(team)
                 proof.update(turn=[turn, team.get(subject)["turn"]], order=order, second_count=count,
                              second_final=said(later[1], log)[1], at_end=look())
+                if trial == "mid-turn" and between:
+                    order3 = [{finished: "finished", second: "second", third: "third"}[line] for line in lines
+                              if line in (finished, second, third)]
+                    proof.update(order=order3, third_count=lines.count(third),
+                                 third_final=said(later3[1], log)[1])
+                    committed = [name for _, name in sorted([(proof["second_id"] or 0, "second"),
+                                                             (proof["third_id"] or 0, "third")])]
+                    proof["committed_order"] = committed          # the two says can commit in either order
+                    box = log.read_box()[1]
+                    proof["deliveries"] = {name: {k: box.outcome(i, recipient).get(k) for k in ("o", "term", "turn")}
+                                           for name, i in (("second", proof["second_id"]), ("third", proof["third_id"]))
+                                           if i}
+                    proof["subject"] = subject
+                    ok = judge_between_mid_turn(proof)
+                    how = "held by Factory until the turn ended, then both acted on once, in order"
+                    proof["classification"] = how if ok else "not held, lost or repeated"
+                    run.row(4, "mid-turn", role, harness, "pass" if ok else "fail",
+                            "two instructions while working: Factory types neither until the turn ends, then each"
+                            " is acted on exactly once, in order", observed=how if ok else None, proof=proof,
+                            reason=None if ok else "see proof" if proof["app_selects_between_turns"] else
+                            f"the live operator reported app {app!r}, which does not select between-turns delivery")
+                    continue
                 if trial == "mid-turn":
                     ok = count == 1 and finished in lines
                     how = ("steered this turn" if ok and order.index("second") < order.index("finished")
@@ -3761,7 +4232,8 @@ def case_4(run, role, harness, adapter_class):
                     proof.update(owner_exact=seen == extra + "\n", owner_seen=_bounded(seen))
                     # the receipt's exact bytes show the line arrived whole; a screen may fold a paste
                     # ("[Pasted text]"), so the before-Enter screen fact is recorded, not required
-                    proof["holds"] = count == 1 and proof["owner_exact"]
+                    proof["holds"] = count == 1 and proof["owner_exact"] and (
+                        not between or proof.get("held_behind_owner_line") is True)
                     proof["released_by"] = _released_by(proof, count, "the owner's Enter")
                 results[trial] = dict(proof, ran=True)
             finally:
@@ -3795,15 +4267,27 @@ def _upgrade(team, peer):
     view.keys("1")
     time.sleep(0.8)
     view.focused_terminal = team.operator
+    between = between_turns(team.operator_harness, "operator")
+
+    def operator_now():                   # the operator at a moment of the trial (@architect-2)
+        snap = team.get(team.operator)
+        return {"state": (snap.get("status") or {}).get("state"), "turn": snap.get("turn"),
+                "app": (snap.get("status") or {}).get("app")}
+    seen = {"owner_first_key": operator_now()}
     name = f"draft-{random.randrange(16 ** 6):06x}.txt"          # the owner's draft holds the first send
     draft_receipt, literal = team.dir / name, f"owner draft {token()}"
     view.type(team.adapter.draft_request(f"../{name}", literal))
     time.sleep(1)
-    first, tok1 = team.receipt("first"), token()
-    _member_says(team, team.adapter.act_append(first, tok1))
+    effects, tok1 = team.receipt("upgrade"), token()             # one file: both effects, in the order they ran
+    first = second = effects
+    # both sends are driver-run says from the member's terminal, instant: a slow harness's own say (omp, agy) let
+    # the owner's 60 s hold lapse before the claim, so nothing was ever held
+    team.call("say", "operator", "--file", str(_note(team, team.adapter.act_append(first, tok1))),
+              terminal=team.member("lead-dev"), timeout=60)
     log = factory_log(team)
     held = team.until(lambda: next((ident for (ident, to), rec in log.read_box()[1].outcomes.items()
                                     if rec["o"] == "sending" and to == "operator"), None), 120)
+    seen["claim"] = operator_now()
     text = team.script.read_text()                               # a second valid copy, comment-only change
     staged = team.script.with_name(".factory.py.new")
     staged.write_text(text + f"\n# qualification other-version {token()}\n")
@@ -3813,56 +4297,117 @@ def _upgrade(team, peer):
     def keeper_screen():
         return "".join(team.qa.rpc("terminal.read", {"terminal": keeper, "lines": 0}).get("text", "").split())
     draining = team.until(lambda: f"keeper{new}installed" in keeper_screen(), 90)
-    still_held = not first.exists()
-    second, tok2 = team.receipt("second"), token()
+    still_held = tok1 not in _lines(effects)
+    tok2 = token()
     # queued during the drain, before release: a driver-run say from the member's terminal, instant, so the owner's
     # hold cannot lapse while a slow harness runs it (agy's own say took long enough for the keeper to finish)
     _, out = team.call("say", "operator", "--file", str(_note(team, team.adapter.act_append(second, tok2))),
                        terminal=team.member("lead-dev"), timeout=60)
     queued = _say_id(out)
-    queued_while_draining = bool(queued) and _outcome(log, queued, "operator")[0] == "queued" and not second.exists()
+    queued_while_draining = (bool(queued) and _outcome(log, queued, "operator")[0] == "queued"
+                             and tok2 not in _lines(effects))
     module = sys.modules["factory_under_test"]
     claimed_under = {}
 
-    def watch_claim():                                           # which image claimed the queued message
+    def watch_claim():                    # the image whose beat stands when the queued claim is first seen
         deadline = time.monotonic() + 300
         while time.monotonic() < deadline and "version" not in claimed_under and queued:
             outcome = _outcome(log, queued, "operator")[0]
             if outcome != "queued":
                 beat = module.read_beat(log.state)
                 claimed_under.update(version=beat[1] if beat else None, seen_as=outcome)
-            time.sleep(0.05)
+            time.sleep(0.02)
     watcher = threading.Thread(target=watch_claim, daemon=True)
     watcher.start()
+    seen["release"] = operator_now()
     view.keys("enter")                                           # the owner sends the draft: the send finishes
-    finished = team.until(lambda: first.exists() and tok1 in first.read_text(), 300)
+    finished = team.until(lambda: tok1 in _lines(effects), 300)
 
     def running_new():                                           # observed passively: the keeper's own beat and label
         beat = module.read_beat(log.state)
         return bool(beat) and beat[1] == new and beat[2] == keeper and (
             (team.get(keeper).get("labels") or {}).get("factory.version") == new)
     reexeced = team.until(running_new, 120)
-    acted = team.until(lambda: second.exists() and tok2 in second.read_text(), 300)
+    acted = team.until(lambda: tok2 in _lines(effects), 300)
     time.sleep(10)
     watcher.join(timeout=5)
+    screen = keeper_screen()
+    # a failed exec says so and keeps serving with the old image: its later claim must not count as the new one
+    exec_failed = "keepercouldnotrestartitself" in screen
+    restart_seen = "keeperrestarting:newFactoryversion" in screen
     keepers = [r["address"] for r in team.qa.rpc("terminal.list", {"all": False})["terminals"]
                if (r.get("labels") or {}).get("factory.kind") == "keeper"]
     first_outcome = log.read_box()[1].outcome(held, "operator") if held else {}
     beat = module.read_beat(log.state)
+    records, box = log.read_box()
+    queued_id = int(queued.group(1)) if queued else None
+
+    def history(ident):                   # every outcome the log holds for this pair, in order
+        return [[rec["o"], rec.get("why")] for rec in records
+                if rec["t"] == "out" and rec["id"] == ident and rec["to"] == "operator"]
+
+    def delivery(ident):
+        rec = box.outcome(ident, "operator") if ident else {}
+        return {k: rec.get(k) for k in ("o", "term", "turn", "started")}
+    lines = _lines(effects)
     proof = {"old_version": old, "new_version": new, "keeper_before": keeper, "keepers_after": keepers,
              "held_send_id": held, "held_send_outcome": [first_outcome.get("o"), first_outcome.get("why")],
              "draining_seen": bool(draining), "still_held_while_draining": still_held,
              "old_send_finished": bool(finished), "queued_id": int(queued.group(1)) if queued else None,
              "queued_while_draining": queued_while_draining, "beat_version": beat[1] if beat else None,
              "new_image_running": bool(reexeced), "queued_claimed_under": claimed_under.get("version"),
+             "restart_seen": restart_seen, "exec_failed": exec_failed,
              "queued_final": _outcome(log, queued, "operator") if queued else None,
-             "new_message_count": second.read_text().split().count(tok2) if second.exists() else 0,
+             "new_message_count": lines.count(tok2), "held_message_count": lines.count(tok1),
+             "effect_order": [{tok1: "held", tok2: "queued"}[t] for t in lines if t in (tok1, tok2)],
+             "histories": {"held": history(held), "queued": history(queued_id)},
+             "deliveries": {"held": delivery(held), "queued": delivery(queued_id)},
+             "operator_seen": seen, "between_turns": between, "operator": team.operator,
              "draft_exact": draft_receipt.exists() and draft_receipt.read_text() == literal + "\n", "peer": peer}
     ok = (old != new and keepers == [keeper] and bool(held) and bool(draining) and still_held and bool(finished)
           and first_outcome.get("o") == "delivered" and queued_while_draining and bool(reexeced) and bool(acted)
-          and claimed_under.get("version") == new
-          and proof["new_message_count"] == 1 and (proof["queued_final"] or ("",))[0] == "delivered")
+          and claimed_under.get("version") == new and restart_seen and not exec_failed
+          and proof["new_message_count"] == 1 and (proof["queued_final"] or ("",))[0] == "delivered"
+          and proof["held_message_count"] == 1 and proof["effect_order"] == ["held", "queued"])
     return ok, proof
+
+
+def upgrade_row_status(ok, proof):
+    """case 7 upgrade's row: the general verdict, and for a between-turns operator (keeper.md §9) the overlap
+    (@architect-2): a message typed into the owner's turn fails first; with both in later turns of their own but no
+    busy requeue the overlap never came (not_run); otherwise the between-turns judge decides."""
+    if not ok:
+        return "fail", "see proof"
+    if not proof.get("between_turns") or judge_between_upgrade(proof):
+        return "pass", None
+    release = ((proof.get("operator_seen") or {}).get("release") or {}).get("turn")
+    deliveries = (proof.get("deliveries") or {}).values()
+    if any(d.get("started") is not True or not isinstance(d.get("turn"), int) or not isinstance(release, int)
+           or d["turn"] <= release or d.get("term") != proof.get("operator") for d in deliveries):
+        return "fail", "see proof: a message was not delivered between turns (in the owner's turn or elsewhere)"
+    held = (proof.get("histories") or {}).get("held") or []
+    if not any(a == ["sending", None] and b == ["queued", "busy"] for a, b in zip(held, held[1:])):
+        return "not_run", ("the owner's turn never overlapped the held send (no busy requeue): between-turns"
+                           " delivery was not exercised")
+    return "fail", "see proof"
+
+
+def judge_between_upgrade(p):
+    """case 7 upgrade with a between-turns operator: the live app selected the rule, both messages ended delivered
+    each starting a turn of its own (none typed into the owner's turn), each acted on once, held first; a held
+    message the guard refused shows the requeue (sending, then queued busy) in its history."""
+    seen, histories, deliveries = p.get("operator_seen") or {}, p.get("histories") or {}, p.get("deliveries") or {}
+    held = histories.get("held") or []
+    # positive evidence of the overlap: the guard refused the held send in the owner's turn (sending, then
+    # queued busy), and it was sent again afterwards (@architect-2: a sending-then-delivered history proves nothing)
+    requeued = any(a == ["sending", None] and b == ["queued", "busy"] for a, b in zip(held, held[1:]))
+    release = (seen.get("release") or {}).get("turn")
+    after = all(d.get("o") == "delivered" and d.get("started") is True and d.get("term") == p.get("operator")
+                and isinstance(d.get("turn"), int) and isinstance(release, int) and d["turn"] > release
+                for d in deliveries.values())
+    return bool(p.get("between_turns") and any(_app_selects(s.get("app")) for s in seen.values())
+                and len(deliveries) == 2 and after and requeued and p.get("held_message_count") == 1
+                and p.get("new_message_count") == 1 and p.get("effect_order") == ["held", "queued"])
 
 
 def cross_other_version(run, fixture):
@@ -3940,10 +4485,11 @@ def _case_7_upgrade(run, role, harness, adapter_class):
         if not _up(team, run, 7, role, harness, ["upgrade"]):
             return
         ok, proof = _upgrade(team, peer)
-        run.row(7, "upgrade", role, harness, "pass" if ok else "fail",
+        status, reason = upgrade_row_status(ok, proof)
+        run.row(7, "upgrade", role, harness, status,
                 "a new Factory version under a live keeper while this profile works: the held send finishes, the"
                 " keeper restarts in its pane, and the next message is delivered once by the new image",
-                proof=proof, reason=None if ok else "see proof")
+                proof=proof, reason=reason)
 
 def _second_team(team, name="b"):
     """A second checkout on the same QA core, with the same member names and its own fake operator: (work, operator,
@@ -4181,9 +4727,22 @@ CASE_FUNCTIONS = {1: case_1, 2: case_2, 3: case_3, 4: case_4, 5: case_5, 6: case
 
 
 def _file_evidence(run, first_row):
-    """Attach the case's team diagnostics to each of its rows (bounded; for a team per trial, in order)."""
+    """Attach the case's team diagnostics to each of its rows (bounded; for a team per trial, in order). A settings
+    file agy changed during the case withholds its passes: the stamp cannot tell which process wrote it."""
+    touched = sorted(set(EVIDENCE.get("settings_changed") or []))
+    installed = EVIDENCE.get("installed_factory_seen") or []
     for row in run.data["rows"][first_row:]:
         row["diagnostics"] = EVIDENCE["teams"]
+        if EVIDENCE.get("installed_factory_observed"):   # a harness with no switch: recorded, not failed
+            row["installed_factory_observed"] = EVIDENCE["installed_factory_observed"]
+        if installed:          # the owner's rule was broken: the case fails whatever it observed
+            row.update(status="fail", reason=_bounded("an installed Factory script appeared in a QA terminal or"
+                                                      f" transcript: {installed}"))
+            row["installed_factory_seen"] = installed
+        if touched and row["status"] == "pass":
+            row.update(status="not_run", reason=_bounded(f"a settings file changed during the case: {touched}"))
+        if touched:
+            row["settings_changed"] = touched
 
 
 def _tool_version(executable):
@@ -4225,7 +4784,8 @@ def qualify(target, role=None, cases=None, json_path=None, fixture=False):
     EVIDENCE["rodeo_tabs"] = None                       # probed once, by the first case that uses rodeo
     if target == "cross":
         for name in CROSS_CASES:
-            EVIDENCE.update(teams=[], tokens=[])
+            EVIDENCE.update(teams=[], tokens=[], settings_changed=[], installed_factory_seen=[],
+                            installed_factory_observed=[])
             first_row = len(run.data["rows"])
             function = CROSS_FUNCTIONS.get(name)
             try:
@@ -4260,7 +4820,8 @@ def qualify(target, role=None, cases=None, json_path=None, fixture=False):
             for name, measured in subcases(case, role_):
                 run.row(case, name, role_, harness, "not_run", f"case {case} {name}", reason="not built yet")
         else:
-            EVIDENCE.update(teams=[], tokens=[])
+            EVIDENCE.update(teams=[], tokens=[], settings_changed=[], installed_factory_seen=[],
+                            installed_factory_observed=[])
             first_row = len(run.data["rows"])
             try:
                 function(run, role_, harness, adapter_class)
@@ -4269,12 +4830,14 @@ def qualify(target, role=None, cases=None, json_path=None, fixture=False):
                     if not any(r["subcase"] == name and r["case"] == case and r["role"] == role_
                                and r["harness"] == harness for r in run.data["rows"][first_row:]):
                         run.row(case, name, role_, harness, "not_run", f"case {case} {name}", reason=str(why))
-            except (RuntimeError, HcError, HcDown, OSError, subprocess.SubprocessError) as error:
+            except Exception as error:            # any driver stop: its rows say so, later cases still run
+                where = traceback.extract_tb(error.__traceback__)[-1]
                 for name, _ in subcases(case, role_):
                     if not any(r["subcase"] == name and r["case"] == case and r["role"] == role_
                                for r in run.data["rows"][first_row:]):
                         run.row(case, name, role_, harness, "not_run", f"case {case} {name}",
-                                reason=f"the driver stopped: {type(error).__name__}: {error}")
+                                reason=f"the driver stopped: {type(error).__name__}: {error}"
+                                       f" (tests/live.py:{where.lineno} {where.name})")
             _file_evidence(run, first_row)
         run.checkpoint()
     run.data["summary"] = run.summary(selected)
@@ -4291,6 +4854,7 @@ def qualify(target, role=None, cases=None, json_path=None, fixture=False):
 PROOF_NEEDED = {(1, "startup-dialog"): ("seen",), (2, "idle-report"): ("turn_completed",),
                 (2, "operator-commands"): ("member_briefed",), (4, "owner-interrupt"): ("next-delivery", "trials"),
                 (5, "blocked"): ("action_count",), (6, "operator-switch"): ("switched",), (6, "resume"): ("replaced",),
+                (9, "guarded"): ("member_say_id",),     # a compound say's "exit 0" may have run unsandboxed
                 (6, "member-switch"): ("switched",), (10, "idle-latency"): ("trials",)}
 
 def _cycled(proof):
@@ -4299,15 +4863,41 @@ def _cycled(proof):
 
 # A stored pass is judged again by today's rule where its proof holds the facts (@reviewer): an older proof with
 # switched but no successful replacement stays unproved.
+def judge_before_esc(before):
+    """A between-turns owner-interrupt precondition, from the snapshot taken just before Esc: the operator is
+    working, its live app selects the rule, the report is still queued in Factory, and none of it is on screen."""
+    return (isinstance(before, dict) and before.get("state") == "working" and _app_selects(before.get("app"))
+            and (before.get("outcome") or ("",))[0] == "queued" and before.get("marker_on_screen") is False)
+
+
+def judge_between_mid_turn(p):
+    """case 4 mid-turn for a between-turns operator (keeper.md §9): both reports held while it worked and neither on
+    screen before the release, both delivered to the subject in a later turn than the original one, each acted on
+    once, in committed order, after the original task finished, and the live app selected the rule."""
+    deliveries, before = p.get("deliveries") or {}, p.get("before_release") or {}
+    later = all(isinstance(d.get("turn"), int) and isinstance(p.get("turn_at_start"), int)
+                and d["turn"] > p["turn_at_start"] and d.get("o") == "delivered" and d.get("term") == p.get("subject")
+                for d in deliveries.values()) and len(deliveries) == 2
+    return bool(p.get("between_turns") and p.get("app_selects_between_turns") and p.get("held_while_working")
+                and before.get("second_on_screen") is False and before.get("third_on_screen") is False and later
+                and p.get("second_count") == 1 and p.get("third_count") == 1
+                and p.get("order") == ["finished", *(p.get("committed_order") or ["?"])])
+
+
 def _esc_trials_hold(proof):
     """case 4 owner-interrupt by today's rule: both Esc trials delivered M1 while the subject worked, found it still
     pending with the subject working at the moment of Esc, and held. The imported Claude Code trials (their own
     runner, checked by @architect-2) carry "trials" instead."""
     if "trials" in proof:
         return True
-    return all(isinstance(proof.get(t), dict) and proof[t].get("working_when_delivered") is True
-               and proof[t].get("pending_and_working_at_esc") is True and proof[t].get("holds") is True
-               for t in ("next-delivery", "owner-line"))
+    trials = [proof.get(t) for t in ("next-delivery", "owner-line")]
+    if not all(isinstance(t, dict) for t in trials):
+        return False
+    if any(t.get("between_turns") for t in trials):  # the report was Factory's at Esc, then acted on once
+        return all(t.get("between_turns") and judge_before_esc(t.get("before_esc")) and t.get("holds") is True
+                   for t in trials) and trials[1].get("held_behind_owner_line") is True
+    return all(t.get("working_when_delivered") is True and t.get("pending_and_working_at_esc") is True
+               and t.get("holds") is True for t in trials)
 
 
 REJUDGE = {(6, "resume"): _cycled, (6, "member-switch"): lambda p: p.get("switched") is True and _cycled(p),
@@ -4321,6 +4911,24 @@ REJUDGE = {(6, "resume"): _cycled, (6, "member-switch"): lambda p: p.get("switch
            # say returned at its wait, not at once, required since 7038415
            (10, "held-sender-exit"): lambda p: isinstance(p.get("say_seconds"), (int, float))
            and p["say_seconds"] >= SAY_WAIT - 1}
+
+# A Codex operator takes Factory's messages between turns from 539acb1 (keeper.md §9): its case 4 rows, and any
+# upgrade with it as operator, count only with the between-turns facts (@architect-2). Older steering passes stay
+# in the report as history, shown unproved.
+BETWEEN_TURNS = {(4, "mid-turn"): judge_between_mid_turn,
+                 (4, "owner-interrupt"): lambda p: _esc_trials_hold(p) and all(
+                     isinstance(p.get(t), dict) and p[t].get("between_turns") for t in ("next-delivery", "owner-line")),
+                 (7, "upgrade"): judge_between_upgrade}
+
+
+def _between_needed(case, subcase, role, harness, proof):
+    if (case, subcase) not in BETWEEN_TURNS:
+        return False
+    if case == 4:
+        return between_turns(harness, role)
+    operator = harness if role == "operator" else proof.get("peer")
+    return between_turns(operator, "operator")
+
 
 REPORT_BEGIN, REPORT_END = "<!-- qualify report: generated, do not edit -->", "<!-- end of generated report -->"
 
@@ -4340,20 +4948,27 @@ def report(paths, out):
     trust entries already listed stay listed (a partial import must not drop one the owner still has to remove)."""
     runs, chosen, trust, older = [], {}, set(), {}
     paths = [*paths, *sorted(str(p) for p in (ROOT / "docs" / "qualification" / "imported").glob("*.json"))]
+    loaded, snapshots = [], {}
     for path in dict.fromkeys(paths):
         data = json.loads(pathlib.Path(path).read_text())
         if not isinstance(data, dict) or data.get("mode") != "real" or "rows" not in data:
             continue                                  # a check's results, or a fixture run
-        if not data.get("run_id") or data["run_id"] not in {r.get("run_id") for r in runs}:
-            runs.append(data)                         # checkpoints of one run count once; their rows merge (§1)
-        rank = (data.get("utc") or "", _commit_rank(data.get("source_head")))   # newest attempt by UTC (§1)
-        for entry in data.get("trust_entries", []):
+        for entry in data.get("trust_entries", []):  # every snapshot's cleanup entries count
             trust.add((entry["harness"], entry["file"], entry["directory"]))
+        if not data.get("run_id"):
+            loaded.append(data)
+            continue
+        best = snapshots.get(data["run_id"])          # checkpoints are cumulative: keep the most complete one
+        if best is None or (len(data["rows"]), data.get("utc") or "") > (len(best["rows"]), best.get("utc") or ""):
+            snapshots[data["run_id"]] = data
+    for data in [*loaded, *snapshots.values()]:
+        runs.append(data)
+        rank = (data.get("utc") or "", _commit_rank(data.get("source_head")))   # newest attempt by UTC (§1)
         for row in data["rows"]:
             key = (row["role"], row["harness"], row["case"], row["subcase"])
-            same_run = key in chosen and data.get("run_id") and chosen[key][2].get("run_id") == data.get("run_id")
+            same_run = key in chosen and chosen[key][2] is data     # a repeated --case: its last row stands
             if key not in chosen or rank >= chosen[key][0]:
-                if key in chosen and not same_run:          # an earlier checkpoint of this run is not superseded
+                if key in chosen and not same_run:
                     older.setdefault(key, []).append(chosen[key])
                 chosen[key] = (rank, row, data)
             elif not same_run:
@@ -4394,6 +5009,9 @@ def report(paths, out):
                     status = "unproved (an older driver's weaker check)"
                 elif status == "pass" and (case, subcase) in REJUDGE and not REJUDGE[(case, subcase)](proof):
                     status = "unproved (its proof does not meet today's check)"
+                elif status == "pass" and _between_needed(case, subcase, role, harness, proof) \
+                        and not BETWEEN_TURNS[(case, subcase)](proof):
+                    status = "unproved (not yet proved between turns, keeper.md §9)"
                 text = str(row.get("observed") or row.get("reason") or "")
                 false = [k for k, v in proof.items() if v is False]
                 if row.get("reason") == "see proof" and false:   # name what the proof found false
