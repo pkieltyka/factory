@@ -7302,7 +7302,8 @@ class E2EJudgeTests(unittest.TestCase):
         sample = self.normal()
         for status in ("approve", "approved"):
             verdict = replace(sample.messages[6], recipient="lead-dev",
-                              text=f"- **Status:** `{status}` for item `(1)`. The reviewed commit is `{self.revision}`.")
+                              text=f"- **Status:** `{status}` for item `(1)`. The reviewed commit is `{self.revision}`."
+                                   "\nNo changes required.")
             messages = (*sample.messages[:6], verdict, *sample.messages[7:])
             self.assertEqual(self.status(replace(sample, messages=messages), "reviewed", "(1)"), "pass")
 
