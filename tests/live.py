@@ -3764,9 +3764,9 @@ def _upgrade(team, peer):
 
 
 def cross_other_version(run, fixture):
-    """other-version (phase_8.md §4), once for the system: on fake agents, since the case is Factory's."""
-    adapter_class = FixtureAdapter if fixture else RealAdapter
-    team, peer = _team_for(adapter_class, "operator", "codex" if fixture else "claude", draft_wait=60)
+    """other-version (phase_8.md §4), once for the system, on real hc and rodeo with scripted fake agents: the case is
+    Factory's, and a scripted peer may stand in (§1). Case 7's upgrade runs the same trial with each real profile."""
+    team, peer = _team_for(FixtureAdapter, "operator", "codex", draft_wait=60)
     with team:
         _operator_tab(team)
         if not _up(team, run, "cross", "system", "system", []):
@@ -3774,7 +3774,7 @@ def cross_other_version(run, fixture):
                     reason="the team did not come up")
             return
         ok, proof = _upgrade(team, peer)
-        proof["agents"] = "fake agents (the case is Factory's, not a harness's)" if fixture else "real"
+        proof["agents"] = "fake agents (the case is Factory's, not a harness's)"
         run.row("cross", "other-version", "system", "system", "pass" if ok else "fail",
                 "a new script under a live keeper: the held send finishes, the keeper restarts in its pane, the next"
                 " message is delivered once by the new image", proof=proof, reason=None if ok else "see proof")
@@ -3843,7 +3843,207 @@ def _case_7_upgrade(run, role, harness, adapter_class):
                 " keeper restarts in its pane, and the next message is delivered once by the new image",
                 proof=proof, reason=None if ok else "see proof")
 
-CROSS_FUNCTIONS = {"other-version": cross_other_version}
+def _second_team(team, name="b"):
+    """A second checkout on the same QA core, with the same member names and its own fake operator: (work, operator,
+    call). Its team key, state and keeper are its own."""
+    work = team.dir / f"work-{name}"
+    work.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(work)], check=True)
+    (work / "FACTORY.md").write_text("Second qualification team.\n")
+    (work / "factory.toml").write_text((team.work / "factory.toml").read_text())
+    subprocess.run(["git", "-C", str(work), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(work), "-c", "user.name=qa", "-c", "user.email=qa@example.invalid",
+                    "-c", "commit.gpgsign=false", "commit", "-q", "-m", "qa"], check=True)
+    env = {k: team.env[k] for k in ("HC_BIN", "PATH", "XDG_CACHE_HOME", "HOME") if k in team.env}
+    if "CODEX_HOME" in team.env:
+        env["CODEX_HOME"] = team.env["CODEX_HOME"]
+    operator = team.qa.rpc("terminal.run", {"argv": team.adapter.operator_argv(team.operator_harness),
+                                            "cwd": str(work), "env": env})["address"]
+
+    def call(*args, terminal=None, timeout=120):
+        done = subprocess.run([sys.executable, str(team.script), *args], cwd=work,
+                              env=dict(team.env, HC_TERMINAL_ID=terminal or operator), capture_output=True,
+                              text=True, timeout=timeout, check=False)
+        return done.returncode, done.stdout + done.stderr
+    return work, operator, call
+
+
+def _team_terms(team, key):
+    return [r for r in team.qa.rpc("terminal.list", {"all": False})["terminals"]
+            if (r.get("labels") or {}).get("factory.team") == key]
+
+
+def cross_two_teams(run, fixture):
+    """two-teams (phase_8.md §4): two checkouts with identical member names on one QA core. Concurrent says reach
+    only their own team's member; each team's tab holds only its own terminals; after team A is stopped, team B
+    still sends and receives. Fake agents: the case is Factory's."""
+    team = QATeam(FixtureAdapter, "codex", {"lead-dev": "codex"})
+    with team:
+        if not _up(team, run, "cross", "system", "system", []):
+            run.row("cross", "two-teams", "system", "system", "not_run", "the two-teams cross case",
+                    reason="team A did not come up")
+            return
+        work_b, op_b, call_b = _second_team(team)
+        code_b, out_b = call_b("up", timeout=240)
+        module = sys.modules.get("factory_under_test") or (factory_log(team) and sys.modules["factory_under_test"])
+        key_a, key_b = module.team_key(team.work), module.team_key(work_b)
+        if code_b != 0 or key_a == key_b:
+            run.row("cross", "two-teams", "system", "system", "not_run", "the two-teams cross case",
+                    observed=_bounded(out_b), reason="team B did not come up" if code_b else "the team keys match")
+            return
+        receipts = {"a": team.receipt("team-a"), "b": team.receipt("team-b")}
+        toks = {"a": token(), "b": token()}
+        calls = {"a": team.call, "b": call_b}
+        threads = [threading.Thread(target=lambda t=t: calls[t]("say", "lead-dev", team.adapter.act_append(
+            receipts[t], toks[t]), timeout=120), daemon=True) for t in ("a", "b")]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=180)
+        team.until(lambda: all(toks[t] in _lines(receipts[t]) for t in toks), 300)
+        own = {t: _lines(receipts[t]).count(toks[t]) == 1 and toks["b" if t == "a" else "a"] not in _lines(receipts[t])
+               for t in toks}
+        doc = team.qa.rpc("doc.get", {"name": "herdr-app"})["value"] or {"spaces": []}
+        team_of = {r["address"]: (r.get("labels") or {}).get("factory.team")
+                   for r in team.qa.rpc("terminal.list", {"all": False})["terminals"]}
+        tabs = []
+        for space in doc["spaces"]:
+            for tab in space["tabs"]:
+                found = set()
+
+                def walk(node):
+                    if node.get("type") == "block":
+                        found.add(team_of.get((node.get("content") or {}).get("terminal")))
+                    for child in node.get("children", []):
+                        walk(child)
+                walk(tab["root"])
+                tabs.append(sorted(k or "none" for k in found))
+        tabs_separate = all(len({k for k in keys if k != "none"}) <= 1 for keys in tabs)
+        members_a = [r["address"] for r in _team_terms(team, key_a) if (r.get("labels") or {}).get("factory.kind")
+                     == "member"]
+        down_a, _ = team.call("down", timeout=120)
+        team.until(lambda: not [r for r in _team_terms(team, key_a)
+                                if (r.get("labels") or {}).get("factory.kind") == "member"], 60)
+        after = team.receipt("team-b-after")
+        tok2 = token()
+        call_b("say", "lead-dev", team.adapter.act_append(after, tok2), timeout=120)
+        still = team.until(lambda: tok2 in _lines(after), 300)
+        b_members = [r for r in _team_terms(team, key_b) if (r.get("labels") or {}).get("factory.kind") == "member"]
+        code_i, inbox_b = call_b("inbox", "--for", "lead-dev", timeout=60)
+        ok = all(own.values()) and tabs_separate and down_a == 0 and bool(still) and len(b_members) == 1
+        run.row("cross", "two-teams", "system", "system", "pass" if ok else "fail",
+                "two teams with the same member names on one core stay apart, and B works after A stops",
+                proof={"keys_differ": key_a != key_b, "own_actions": own, "tabs": tabs, "tabs_separate": tabs_separate,
+                       "a_members_before_down": len(members_a), "down_a_exit": down_a, "b_after_a_down": bool(still),
+                       "b_members": len(b_members), "inbox_b_exit": code_i,
+                       "agents": "fake agents (the case is Factory's)"}, reason=None if ok else "see proof")
+
+
+def cross_multi_down(run, fixture):
+    """multi-down (phase_8.md §4): two live, briefed members stopped together. No member-exit or lost note follows
+    an intentional stop, their terminals go, and a message pending for one of them is dropped as stopped by down."""
+    team = QATeam(FixtureAdapter, "codex", {"lead-dev": "codex", "reviewer": "codex"})
+    with team:
+        if not _up(team, run, "cross", "system", "system", []):
+            run.row("cross", "multi-down", "system", "system", "not_run", "the multi-down cross case",
+                    reason="the team did not come up")
+            return
+        log = factory_log(team)
+        reviewer = team.member("reviewer")
+        team.call("say", "reviewer", "FAKE: blocks", timeout=60)
+        team.until(lambda: team.state(reviewer) == "blocked", 60)
+        code, out = team.call("say", "reviewer", f"pending {token()}", timeout=60)
+        pending = _say_id(out)
+        team.until(lambda: _outcome(log, pending, "reviewer") == ("queued", "blocked"), 30)
+        cursor = len(log.read_box()[0])
+        terms = [team.member("lead-dev"), reviewer]
+        down, _ = team.call("down", "lead-dev", "reviewer", timeout=120)
+        gone = team.until(lambda: all(team.member(n) is None for n in ("lead-dev", "reviewer")), 60)
+        time.sleep(15)                                   # past the keeper's next looks
+        records, box = log.read_box()
+        new_notes = [box.msgs[r["id"]]["meta"].get("what") for r in records[cursor:]
+                     if r["t"] == "ok" and box.msgs.get(r["id"], {}).get("kind") == "note"]
+        exit_notes = [w for w in new_notes if w in ("exit", "lost") or (w or "").startswith("exit")]
+        final = _outcome(log, pending, "reviewer")
+        ok = down == 0 and bool(gone) and not exit_notes and final == ("dropped", "stopped by down")
+        run.row("cross", "multi-down", "system", "system", "pass" if ok else "fail",
+                "two members stopped together: no exit or lost notes, terminals gone, pending work dropped",
+                proof={"down_exit": down, "terminals": len(terms), "gone": bool(gone), "new_notes": new_notes,
+                       "pending_final": final, "agents": "fake agents (the case is Factory's)"},
+                reason=None if ok else "see proof")
+
+
+def cross_owner_pane(run, fixture):
+    """owner-pane (phase_8.md §4): the owner's own block, seeded in the layout doc beside the operator, survives up,
+    a repeated up, down of one member and then the last, with its identity and contents; Factory's blocks go; the
+    owner's pane still takes a marker typed through rodeo."""
+    team = QATeam(FixtureAdapter, "codex", {"lead-dev": "codex", "reviewer": "codex"})
+    with team:
+        _operator_tab(team)
+        owner = Probe(team.qa, "owner", fields="none", wait_status=False)
+        seed = f"seed{token().lower()}"
+        doc = team.qa.rpc("doc.get", {"name": "herdr-app"})
+        value = doc["value"]
+        tab = value["spaces"][0]["tabs"][0]
+        block = {"id": "p" + "e" * 32, "type": "block", "title": "owner", "content": {"terminal": owner.address}}
+        tab["root"]["children"].append(block)
+        team.qa.rpc("doc.set", {"name": "herdr-app", "value": value, "version": doc["version"]})
+        team.qa.rpc("terminal.label", {"terminal": owner.address, "labels": {
+            "herdr.space": value["spaces"][0]["id"], "herdr.tab": tab["id"], "herdr.seen": "0"}})
+        team.qa.rpc("terminal.keys", {"terminal": owner.address, "keys": list(seed)})
+        steps = []
+
+        def owner_block():
+            current = team.qa.rpc("doc.get", {"name": "herdr-app"})["value"] or {"spaces": []}
+            found = []
+
+            def walk(node):
+                if node.get("id") == block["id"]:
+                    found.append(node)
+                for child in node.get("children", []):
+                    walk(child)
+            for space in current["spaces"]:
+                for t in space["tabs"]:
+                    walk(t["root"])
+            return found
+
+        def snapshot(what, code):
+            blocks = owner_block()
+            steps.append({"step": what, "exit": code, "owner_block": len(blocks) == 1
+                          and blocks[0]["content"]["terminal"] == owner.address and blocks[0]["title"] == "owner",
+                          "owner_live": team.get(owner.address)["state"] == "live",
+                          "members": len([n for n in ("lead-dev", "reviewer") if team.member(n)])})
+        if not _up(team, run, "cross", "system", "system", []):
+            run.row("cross", "owner-pane", "system", "system", "not_run", "the owner-pane cross case",
+                    reason="the team did not come up")
+            return
+        snapshot("up", 0)
+        snapshot("up again", team.call("up", timeout=240)[0])
+        snapshot("down lead-dev", team.call("down", "lead-dev", timeout=120)[0])
+        snapshot("down reviewer", team.call("down", "reviewer", timeout=120)[0])
+        contents = seed in owner.text()
+        view = _rodeo(team, ["operator"])
+        view.keys("ctrl+b")
+        time.sleep(0.2)
+        view.keys("1")
+        time.sleep(0.8)
+        view.focused_terminal = team.operator
+        view.focus("owner")
+        marker = "m" + token().lower()
+        before = len(owner.text())
+        view.type(marker)
+        time.sleep(1)
+        accepts = marker in owner.text()[before:]
+        ok = (all(s["owner_block"] and s["owner_live"] and s["exit"] == 0 for s in steps) and steps[-1]["members"] == 0
+              and contents and accepts)
+        run.row("cross", "owner-pane", "system", "system", "pass" if ok else "fail",
+                "the owner's own block and terminal survive up, a repeated up and down, and still take input",
+                proof={"steps": steps, "contents_kept": contents, "accepts_marker": accepts,
+                       "agents": "fake agents (the case is Factory's)"}, reason=None if ok else "see proof")
+
+
+CROSS_FUNCTIONS = {"two-teams": cross_two_teams, "multi-down": cross_multi_down, "owner-pane": cross_owner_pane,
+                   "other-version": cross_other_version}
 
 
 CASE_FUNCTIONS = {1: case_1, 2: case_2, 3: case_3, 4: case_4, 5: case_5, 6: case_6, 7: case_7, 8: case_8, 9: case_9,
@@ -3912,6 +4112,8 @@ def qualify(target, role=None, cases=None, json_path=None, fixture=False):
             run.checkpoint()
         rows = [r for r in run.data["rows"] if r["case"] == "cross"]
         run.data["summary"] = {r["subcase"]: r["status"] for r in rows}
+        if EVIDENCE["rodeo_tabs"] is not None:
+            run.data["rodeo_tabs"] = {k: EVIDENCE["rodeo_tabs"].get(k) for k in ("result", "rodeo_version", "landed")}
         run.checkpoint()
         return run.data, 1 if any(r["status"] == "fail" for r in rows) else (
             2 if any(r["status"] == "not_run" for r in rows) else 0)
