@@ -14,6 +14,7 @@ only after server.status names that id, so the owner's sessions are never reache
 
 import argparse
 import atexit
+import hashlib
 import json
 import os
 import pathlib
@@ -2039,6 +2040,18 @@ class QATeam:
             time.sleep(0.5)
         return None
 
+    def send(self, terminal, text, timeout=180):
+        """terminal.send, waiting out hc's refusal while a fresh terminal's output has not settled (a real harness
+        still drawing its startup screen); any other error, or the refusal past the timeout, is raised."""
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                return self.qa.rpc("terminal.send", {"terminal": terminal, "text": text}, timeout=60)
+            except HcError as error:
+                if "still starting" not in str(error) or time.monotonic() >= deadline:
+                    raise
+            time.sleep(1)
+
     def receipt(self, name):
         return self.dir / f"receipt-{name}-{random.randrange(16 ** 6):06x}.txt"
 
@@ -2192,6 +2205,13 @@ def _up(team, run, case, role, harness, names):
         for name in names:
             run.row(case, name, role, harness, "not_run", f"case {case} {name}", reason="the operator never idled")
         return False
+    waiting = [name for name in team.members                 # members past their startup before any case sends
+               if not team.until(lambda: team.member(name) and team.state(team.member(name)) == "idle", 180)]
+    if waiting:
+        for name in names:
+            run.row(case, name, role, harness, "not_run", f"case {case} {name}",
+                    reason=f"never idle after up: {', '.join(waiting)}")
+        return False
     return True
 
 
@@ -2216,7 +2236,7 @@ def _member_says(team, text, timeout=300):
     body.write_text(text)
     command = f"python3 {shlex.quote(str(team.script))} say operator --file {shlex.quote(str(body))}"
     done = team.receipt("member-say")
-    team.qa.rpc("terminal.send", {"terminal": member, "text": team.adapter.act_run(done, command)}, timeout=60)
+    team.send(member, team.adapter.act_run(done, command))
     return team.until(lambda: done.exists() and "exit" in done.read_text() and done.read_text().strip(), timeout)
 
 
@@ -2248,7 +2268,7 @@ def case_2(run, role, harness, adapter_class):
         message = shlex.quote(team.adapter.act_append(member_receipt, tok2))
         commands = [f"{py} status", f"{py} inbox", f"{py} say lead-dev {message}", f"{py} up"]
         prompt = "\n".join(team.adapter.act_run(exits, command) for command in commands)
-        team.qa.rpc("terminal.send", {"terminal": team.operator, "text": prompt}, timeout=60)
+        team.send(team.operator, prompt)
         lines = team.until(lambda: exits.exists() and len(exits.read_text().split()) >= 8 and exits.read_text(), 600)
         codes = [line for line in (lines or "").splitlines() if line.startswith("exit")]
         reached = member_receipt.exists() and tok2 in member_receipt.read_text()
@@ -2522,7 +2542,7 @@ def case_8(run, role, harness, adapter_class):
             return
         operator = team.operator
         # operator-gone: the harness stops reporting in an open pane; messages queue until up.
-        team.qa.rpc("terminal.send", {"terminal": operator, "text": team.adapter.quit_request()}, timeout=60)
+        team.send(operator, team.adapter.quit_request())
         stopped = team.until(lambda: team.state(operator) is None, 120)
         receipt, toks, ids = team.receipt("gone"), [token(), token()], []
         for tok in toks:
@@ -2546,7 +2566,7 @@ def case_8(run, role, harness, adapter_class):
                 "an operator gone from an open pane: messages queue until up, then arrive in order",
                 proof=proof, reason=None if ok else "see proof")
         # same-pane: a quick quit and restart with nothing pending, then a message succeeds without up.
-        team.qa.rpc("terminal.send", {"terminal": operator, "text": team.adapter.quit_request()}, timeout=60)
+        team.send(operator, team.adapter.quit_request())
         team.until(lambda: team.state(operator) is None, 60)
         team.adapter.restart(team.qa, operator)
         team.until(lambda: team.state(operator) == "idle", 60)
@@ -2603,7 +2623,7 @@ def case_3(run, role, harness, adapter_class):
         member = team.member("lead-dev")
         said = team.receipt("member-say")
         command = f"python3 {shlex.quote(str(team.script))} say operator --file {shlex.quote(str(report))}"
-        team.qa.rpc("terminal.send", {"terminal": member, "text": team.adapter.act_run(said, command)}, timeout=60)
+        team.send(member, team.adapter.act_run(said, command))
         log = factory_log(team)
         claimed = team.until(lambda: any(rec["o"] == "sending" and to == "operator"
                                          for (ident, to), rec in log.read_box()[1].outcomes.items()), 60)
@@ -2632,8 +2652,7 @@ def case_6(run, role, harness, adapter_class):
             return
         adapter = team.adapter
         if role == "operator":
-            team.qa.rpc("terminal.send", {"terminal": team.operator, "text": adapter.switch_request(harness)},
-                        timeout=60)
+            team.send(team.operator, adapter.switch_request(harness))
             team.until(lambda: team.state(team.operator) == "idle", 120)
             receipt, tok = team.receipt("operator-switch"), token()
             said = _member_says(team, adapter.act_append(receipt, tok))
@@ -2695,6 +2714,20 @@ CASE_FUNCTIONS = {1: case_1, 2: case_2, 3: case_3, 5: case_5, 6: case_6, 7: case
                   10: case_10}
 
 
+def _tool_version(executable):
+    if not executable or not shutil.which(executable):
+        return None
+    out = subprocess.run([executable, "--version"], capture_output=True, text=True, timeout=30, check=False)
+    return (out.stdout or out.stderr).strip().splitlines()[0] if (out.stdout or out.stderr).strip() else "unknown"
+
+
+def _versions():
+    """What every qualification records: the source, hc, rodeo and the candidate factory.py's VERSION."""
+    script = ROOT / "skill" / "scripts" / "factory.py"
+    return {"source_head": _source_head(), "hc_version": _tool_version(HC), "rodeo_version": _tool_version(RODEO),
+            "factory_version": hashlib.sha1(script.read_bytes()).hexdigest()[:12]}
+
+
 def _source_head():
     try:
         return subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True,
@@ -2716,8 +2749,7 @@ def qualify(target, role=None, cases=None, json_path=None, fixture=False):
             raise ValueError(f"cases are 1 to 10, not {bad}")
         selected = [(r, h, c) for r, h in select_profiles(target, role) for c in cases]
         mode = "fixture" if fixture else "real"
-    versions = {"source_head": _source_head(), "hc_version": None, "rodeo_version": None, "factory_version": None}
-    run = Qualification(mode, json_path, versions)
+    run = Qualification(mode, json_path, _versions())
     if target == "cross":
         for name in CROSS_CASES:
             run.row("cross", name, "system", "fixture" if fixture else "system", "not_run",
@@ -2725,8 +2757,11 @@ def qualify(target, role=None, cases=None, json_path=None, fixture=False):
             run.checkpoint()
         return run.data, 2
     adapter_class = FixtureAdapter if fixture else RealAdapter
+    adapter = adapter_class(None)                     # version and model need no team
     for role_, harness, case in selected:
         print(f"qualify {role_} {harness} case {case}", file=sys.stderr)
+        if not any(p["role"] == role_ and p["harness"] == harness for p in run.data["profiles"]):
+            run.profile(role_, harness, version=adapter.version(harness), model=adapter.model(harness))
         function = CASE_FUNCTIONS.get(case)
         if not subcases(case, role_):
             continue

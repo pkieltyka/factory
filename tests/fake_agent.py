@@ -78,7 +78,8 @@ def act(text):
         parts = line.split(" ", 2)
         if parts[0] != "ACT" or len(parts) < 2 or parts[1] not in ("remember", "recall", "switch"):
             continue
-        memory = pathlib.Path(os.environ.get("FAKE_MEMORY_DIR", ".")) / f"{os.environ.get('CODEX_THREAD_ID', 'none')}.mem"
+        thread = os.environ.get("CODEX_THREAD_ID", "none")
+        memory = pathlib.Path(os.environ.get("FAKE_MEMORY_DIR", ".")) / f"{thread}.mem"
         if parts[1] == "remember":
             memory.write_text(parts[2])
         elif parts[1] == "recall":
