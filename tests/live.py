@@ -2815,7 +2815,7 @@ def _case_7_pending_restart(run, role, harness, adapter_class):
 
 
 def case_10(run, role, harness, adapter_class):
-    """idle-latency with its measured times; held-sender-exit and crash are not built yet (phase_8.md §3.10)."""
+    """idle-latency with its measured times, held-sender-exit and crash, each in its own team (§3.10)."""
     team, peer = _team_for(adapter_class, role, harness)
     with team:
         if not _up(team, run, 10, role, harness, ["idle-latency", "idle-latency-times"]):
@@ -2842,7 +2842,114 @@ def case_10(run, role, harness, adapter_class):
                 reason=reason)
         run.row(10, "idle-latency-times", role, harness, "measured", "three warm say times",
                 observed=json.dumps([t["seconds"] for t in trials]), proof={"seconds": [t["seconds"] for t in trials]})
-        _not_built(run, 10, role, harness, ["held-sender-exit", "crash"])
+    _case_10_held_sender_exit(run, role, harness, adapter_class)
+    _case_10_crash(run, role, harness, adapter_class)
+
+
+def _draft_in(team, role):
+    """rodeo, focused on the recipient's pane, with an owner's unsent one-line draft typed there."""
+    view = _rodeo(team, ["operator", "team"] if role == "operator" else ["team", "@lead-dev"])
+    view.keys("ctrl+b")
+    time.sleep(0.2)
+    view.keys("1")
+    time.sleep(0.8)
+    if role == "operator":
+        view.focused_terminal = team.operator
+    else:
+        view.focus("@lead-dev")
+    view.type(f"owner draft {token()}")
+    time.sleep(1)
+    return view
+
+
+def _say_to(team, role, text, timeout=120):
+    """A say to the subject from its peer, as a driver-run command: (exit, output, seconds)."""
+    start = time.monotonic()
+    if role == "member":
+        code, out = team.call("say", "lead-dev", "--file", str(_note(team, text)), timeout=timeout)
+    else:
+        code, out = team.call("say", "operator", "--file", str(_note(team, text)),
+                              terminal=team.member("lead-dev"), timeout=timeout)
+    return code, out, round(time.monotonic() - start, 2)
+
+
+def _case_10_held_sender_exit(run, role, harness, adapter_class):
+    """held-sender-exit (phase_8.md §3.10): say exits on its own at its wait while hc holds the send for the
+    owner's draft; after the owner sends the draft, the recipient acts once."""
+    team, peer = _team_for(adapter_class, role, harness, draft_wait=120)
+    with team:
+        if role == "operator":
+            _operator_tab(team)
+        if not _up(team, run, 10, role, harness, ["held-sender-exit"]):
+            return
+        recipient = "operator" if role == "operator" else "lead-dev"
+        view = _draft_in(team, role)
+        receipt, tok = team.receipt("held"), token()
+        code, out, seconds = _say_to(team, role, team.adapter.act_append(receipt, tok))
+        found = _say_id(out)
+        log = factory_log(team)
+        held = _outcome(log, found, recipient) if found else None
+        acted_early = receipt.exists()
+        view.keys("enter")                               # the owner sends the draft: the hold ends
+        team.until(lambda: tok in _lines(receipt), 300)
+        time.sleep(10)
+        count = _lines(receipt).count(tok)
+        final = _outcome(log, found, recipient) if found else None
+        ok = (found is not None and seconds <= SAY_WAIT + 15 and (held or ("",))[0] == "sending" and not acted_early
+              and count == 1 and (final or ("",))[0] == "delivered")
+        run.row(10, "held-sender-exit", role, harness, "pass" if ok else "fail",
+                "say returns at its wait while the send is held by the owner's draft; after release, one action",
+                observed=f"say returned after {seconds} s with the send {(held or ('?',))[0]}",
+                proof={"id": int(found.group(1)) if found else None, "say_exit": code, "say_seconds": seconds,
+                       "held_at_exit": held, "acted_before_release": acted_early, "action_count": count,
+                       "final": final, "draft_wait": 120, "peer": peer}, reason=None if ok else "see proof")
+
+
+def _case_10_crash(run, role, harness, adapter_class):
+    """crash (phase_8.md §3.10): the keeper is killed (SIGKILL, its PID from the beat, checked against its QA
+    terminal) while hc holds a claimed send; a normal up restarts it. One claim total, final unconfirmed, no
+    second dispatch; whether the old hc client still types after release is counted, not required."""
+    team, peer = _team_for(adapter_class, role, harness, draft_wait=120)
+    with team:
+        if role == "operator":
+            _operator_tab(team)
+        if not _up(team, run, 10, role, harness, ["crash"]):
+            return
+        recipient = "operator" if role == "operator" else "lead-dev"
+        view = _draft_in(team, role)
+        receipt, tok = team.receipt("crash"), token()
+        code, out, _ = _say_to(team, role, team.adapter.act_append(receipt, tok))
+        found = _say_id(out)
+        log = factory_log(team)
+        claimed = team.until(lambda: found and _outcome(log, found, recipient) == ("sending", None), 30)
+        keeper = team.keeper()
+        beat = sys.modules["factory_under_test"].read_beat(log.state)
+        verified = bool(beat) and beat[2] == keeper and team.get(keeper).get("pid") == beat[0]
+        if not (found and claimed and verified):
+            run.row(10, "crash", role, harness, "not_run", "case 10 crash", proof={
+                "id": int(found.group(1)) if found else None, "claimed": bool(claimed), "beat_verified": verified},
+                reason="no held claim, or the keeper's beat did not match its terminal")
+            view.keys("enter")
+            return
+        os.kill(beat[0], signal.SIGKILL)
+        died = team.until(lambda: team.get(keeper)["state"] == "finished", 30)
+        up_code, _ = team.call("up", timeout=240)          # a normal command restarts the keeper
+        new = team.until(lambda: team.keeper() not in (None, keeper) and team.keeper(), 60)
+        team.until(lambda: _outcome(log, found, recipient)[0] != "sending", 60)
+        view.keys("enter")                                 # release: the old hc client may still type
+        time.sleep(30)
+        ident = int(found.group(1))
+        records = [(r["o"], r.get("why")) for r in log.read_box()[0]
+                   if r["t"] == "out" and r["id"] == ident and r["to"] == recipient]
+        claims = sum(1 for o, _ in records if o == "sending")
+        final = _outcome(log, found, recipient)
+        count = _lines(receipt).count(tok)
+        ok = bool(died) and up_code == 0 and bool(new) and claims == 1 and final[0] == "unconfirmed" and count <= 1
+        run.row(10, "crash", role, harness, "pass" if ok else "fail",
+                "keeper killed during a held claim, restarted by up: one claim, final unconfirmed, no second dispatch",
+                observed=f"{claims} claim(s), final {final[0]}, the held text was acted on {count} time(s)",
+                proof={"id": ident, "outcomes": records, "keeper_replaced": bool(new), "up_exit": up_code,
+                       "action_count": count, "peer": peer}, reason=None if ok else "see proof")
 
 
 def _note(team, text):
