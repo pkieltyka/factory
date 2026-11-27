@@ -150,6 +150,7 @@ def main():
         if script == "dialog":
             if text == os.environ.get("FAKE_DIALOG_KEYS", ""):
                 script = "reports"
+                os.write(1, b"\x1b[2J\x1b[Hfake agent ready\r\n")   # the dialog is gone, as a harness redraws
                 report("idle")
             continue
         if waiting:

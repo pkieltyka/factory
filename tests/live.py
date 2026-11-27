@@ -1862,6 +1862,16 @@ class FixtureAdapter:
     def version(self, harness):
         return "fake_agent"
 
+    def _agent(self, harness):
+        """The fake's command line: for the harness named in startup_dialog, one that first shows that harness's
+        declared Enter-answered dialog, as a fresh start of it would."""
+        dialog = next((text for text, keys in harness_table().get(harness, {}).get("dialogs", []) if keys == ["enter"]),
+                      None) if getattr(self.team, "startup_dialog", None) == harness else None
+        if dialog is None:
+            return shlex.join(self.agent)
+        return (f"env FAKE_DIALOG={shlex.quote(dialog)} FAKE_DIALOG_KEYS= FAKE_DIALOG_STATE=none "
+                + shlex.join([*self.agent[:-1], "dialog"]))
+
     def model(self, harness):
         return f"fixture-{harness}"
 
@@ -1871,11 +1881,12 @@ class FixtureAdapter:
         memory.mkdir(exist_ok=True)
         for harness in harnesses:   # a conversation per launch, or the one "resume <id>" names (Codex's argv)
             wrapper = self.team.bin / harness
+            agent = self._agent(harness)
             wrapper.write_text("#!/bin/sh\n"
                                'id="thread-$(od -An -N4 -tx1 /dev/urandom | tr -d \' \\n\')"\n'
                                'while [ "$#" -gt 0 ]; do [ "$1" = resume ] && id="$2"; shift; done\n'
                                f'export CODEX_THREAD_ID="$id" FAKE_MEMORY_DIR={shlex.quote(str(memory))} FAKE_ECHO=1\n'
-                               f"exec {shlex.join(self.agent)}\n")
+                               f"exec {agent}\n")
             wrapper.chmod(0o755)
         codex = self.team.home / ".codex"
         codex.mkdir(parents=True, exist_ok=True)
@@ -1885,7 +1896,7 @@ class FixtureAdapter:
 
     def operator_argv(self, harness):
         """The fake operator in a loop that waits for Enter between runs: quitting it leaves its pane open."""
-        return ["sh", "-c", f"while :; do {shlex.join(self.agent)}; stty sane; read line; done"]
+        return ["sh", "-c", f"while :; do {self._agent(harness)}; stty sane; read line; done"]
 
     def act_append(self, path, token):
         return f"ACT append {path} {token}"
@@ -2010,8 +2021,10 @@ class QATeam:
     """A scratch project, a private QA core, a team with an operator terminal, and Factory's real commands from a
     private copy of the skill (phase_8.md §2)."""
 
-    def __init__(self, adapter_class, operator, members, draft_wait=None, permissions="full", operator_shell=False):
+    def __init__(self, adapter_class, operator, members, draft_wait=None, permissions="full", operator_shell=False,
+                 startup_dialog=None):
         self.operator_harness, self.members, self.permissions = operator, members, permissions
+        self.startup_dialog = startup_dialog    # fixture only: the harness whose fake shows its declared dialog
         self.real = adapter_class is RealAdapter
         home = os.path.expanduser("~")
         extra = {"HOME": home} if self.real else None   # a real harness needs the owner's login (testing.md §6)
@@ -2047,6 +2060,7 @@ class QATeam:
         if not self.real:
             params["env"]["FAKE_LOG"] = str(self.dir / "operator-input.jsonl")   # every input the fake received
             params["env"]["FAKE_ECHO"] = "1"
+            params["env"]["CODEX_THREAD_ID"] = f"thread-{token().lower()}"   # the fake operator's conversation
         self.operator_command = None
         if self.real and operator_shell:    # an owner's shell: quitting the harness leaves the pane at its prompt
             self.operator_command = shlex.join(params["argv"])
@@ -2347,11 +2361,78 @@ def _member_says(team, text, timeout=300, record=None):
     return result
 
 
+# Pure judgements, each unit-tested for its false-pass paths (@architect-2's review of the first PR).
+
+SAY_WAIT = 10   # factory.py's SAY_WAIT: how long say waits to report the outcome
+
+
+def judge_latency(trials):
+    """trials: [{"idle": recipient idle when timing began, "seconds": wall time, "outcome": the say's report}].
+    Delivery is normally within SAY_WAIT when all three started idle, all were delivered and the median is within
+    SAY_WAIT; one slower trial is allowed and reported. -> (status, observed, reason)."""
+    if len(trials) < 3 or not all(t["idle"] for t in trials):
+        return "not_run", None, "a trial did not start from an idle recipient"
+    if not all(t["outcome"] == "delivered" for t in trials):
+        return "fail", None, "a say was not delivered"
+    times = sorted(t["seconds"] for t in trials)
+    median, over = times[len(times) // 2], sum(1 for s in times if s > SAY_WAIT)
+    observed = f"median {median} s of {len(times)} warm says; {over} over SAY_WAIT ({SAY_WAIT} s)"
+    if median > SAY_WAIT:
+        return "fail", observed, f"the median is over SAY_WAIT ({SAY_WAIT} s)"
+    return "pass", observed, None
+
+
+def judge_dialog(declared, seen, ready):
+    """declared: the table's [text, keys] dialogs; seen: the declared text observed on the subject's screen during
+    this fresh start, or None; ready: the start finished. A known prompt answered by Factory passes once the start
+    finishes; an owner-only prompt (no keys) passes when it is left. A declared dialog that never showed proves
+    nothing. -> (status, observed, reason)."""
+    keys = {text: k for text, k in declared}
+    if seen is None:
+        if not declared:
+            return "pass", "no startup dialog declared; none of the known prompts appeared", None
+        return "not_run", None, "the declared dialog did not appear in this start"
+    if keys.get(seen):
+        if ready:
+            return "pass", f'"{seen}" was shown, answered and the start finished', None
+        return "fail", f'"{seen}" was shown', "the start did not finish after it"
+    if ready:
+        return "fail", f'"{seen}" (owner only) was shown', "the start finished past an owner-only dialog"
+    return "pass", f'"{seen}" (owner only) was shown and left to the owner', None
+
+
+def judge_blocked(notes, member, term, queued, typed_while_blocked, final, count):
+    """notes: [{"about", "term", "outcome"}] for the blocked notes this episode produced; the member's queued pair,
+    whether anything was typed while it was blocked, its final outcome and how many times its action ran."""
+    facts = []
+    if len(notes) != 1:
+        facts.append(f"{len(notes)} blocked notes")
+    elif notes[0]["about"] != member or notes[0]["term"] != term or notes[0]["outcome"] != "delivered":
+        facts.append(f"the note was about @{notes[0]['about']} at {notes[0]['term']}, {notes[0]['outcome']}")
+    if not queued:
+        facts.append("the message was not queued as blocked")
+    if typed_while_blocked:
+        facts.append("something was typed while blocked")
+    if final != "delivered":
+        facts.append(f"final outcome {final}")
+    if count != 1:
+        facts.append(f"the action ran {count} times")
+    return ("pass", None) if not facts else ("fail", "; ".join(facts))
+
+
+def judge_switch(before, after):
+    """A native conversation switch is shown by the harness's own session variable changing in its tool's
+    environment: both values seen, and different."""
+    if not before or not after:
+        return False, "the session variable was not seen before and after"
+    return before != after, None if before != after else "the session variable did not change"
+
+
 def _operator_start(team, run, case, role, harness, names):
-    """A real operator past its own startup dialogs before the owner's first input; a fake one needs nothing."""
-    if not team.real:
-        return True
-    _trust_entries(run, team)
+    """The operator past its own startup dialogs before the owner's first input, answered on the second poll as up
+    does (a fake one shows one only for case 1)."""
+    if team.real:
+        _trust_entries(run, team)
     watcher = Harness.attach(team.qa, team.operator_harness, team.operator)
     settled = watcher.settle(timeout=120)
     team.operator_start = {"settled": settled, "answered": watcher.answered}
@@ -2389,7 +2470,7 @@ def _operator_commands(run, team, harness, peer):
     reached = bool(codes == ["exit 0"] * 4
                    and team.until(lambda: member_receipt.exists() and tok in member_receipt.read_text(), 300))
     full = {name: path.read_text() if path.exists() else None for name, path in outs.items()}
-    text = {name: _bounded(value) if value is not None else None for name, value in full.items()}
+
     member = team.member("lead-dev")
     box = factory_log(team).read_box()[1] if member else None
     briefed = bool(box) and member in box.briefed()
@@ -2399,7 +2480,8 @@ def _operator_commands(run, team, harness, peer):
         bool(listed) or "no messages for @operator" in full["inbox"])
     status_ok = "@lead-dev" in (full["status"] or "")
     proof = {"exits": codes, "member_acted": reached, "member_briefed": briefed, "status_names_member": status_ok,
-             "inbox_ids": listed, "operator_ids_in_log": to_operator, "outputs": text, "peer": peer,
+             "inbox_ids": listed, "operator_ids_in_log": to_operator,
+             "exits_by_command": dict(zip(commands, codes)), "peer": peer,
              "prompted_by": "the owner's paste and Enter through rodeo into a fresh operator (prefix+1)"}
     ok = codes == ["exit 0"] * 4 and reached and briefed and status_ok and inbox_ok
     run.row(2, "operator-commands", "operator", harness, "pass" if ok else "fail",
@@ -2433,7 +2515,7 @@ def case_2(run, role, harness, adapter_class):
         ended = team.until(lambda: team.state(team.operator) in READY and team.get(team.operator)["turn"] > turn, 120)
         found = _say_id(team.last_say or "")
         ident = int(found.group(1)) if found else None
-        proof = {"member_say": said, "say_output": _bounded(team.last_say or ""), "sender_message_id": ident,
+        proof = {"member_say": said, "sender_message_id": ident,
                  "operator_turn": [turn, team.get(team.operator)["turn"]], "turn_completed": bool(ended),
                  "action_at_s": round(acted_at, 2), "peer": peer,
                  "prompted_by": "hc terminal.send to the member (the report is the member's say)"}
@@ -2489,9 +2571,48 @@ def _ask(team, role, text):
 
 def case_1(run, role, harness, adapter_class):
     """states and startup-dialog (phase_8.md §3.1)."""
-    team, peer = _team_for(adapter_class, role, harness)
+    team, peer = _team_for(adapter_class, role, harness, startup_dialog=harness)
     with team:
-        if not _up(team, run, 1, role, harness, ["states", "startup-dialog"]):
+        declared = harness_table().get(harness, {}).get("dialogs", [])
+        seen = {}
+
+        def watch():                                  # the member's screen while up starts it
+            deadline = time.monotonic() + 400
+            while time.monotonic() < deadline and not seen.get("done"):
+                address = team.member("lead-dev")
+                if address and "dialog" not in seen:
+                    try:
+                        flat = "".join(team.qa.rpc("terminal.read", {"terminal": address, "lines": 0})
+                                       .get("text", "").split())
+                    except (HcError, HcDown):
+                        flat = ""
+                    found = next((text for text, _ in declared if "".join(text.split()) in flat), None)
+                    if found:
+                        seen["dialog"] = found
+                time.sleep(0.25)
+        watcher = threading.Thread(target=watch, daemon=True)
+        if role == "member":
+            watcher.start()
+        ready = _up(team, run, 1, role, harness, [])
+        seen["done"] = True
+        if role == "member":
+            watcher.join(timeout=5)
+            observed_dialog = seen.get("dialog")
+        else:
+            start = getattr(team, "operator_start", {})
+            settled = start.get("settled") or ""
+            observed_dialog = (start.get("answered") or [None])[0] or (
+                settled[len("dialog: "):] if settled.startswith("dialog: ") else None)
+        status, observed, reason = judge_dialog(declared, observed_dialog, bool(ready))
+        run.row(1, "startup-dialog", role, harness, status,
+                "a declared startup dialog is seen and answered on its second poll, or left to the owner; none is"
+                " invented", observed=observed, reason=reason,
+                proof={"declared": [text for text, _ in declared], "seen": observed_dialog,
+                       "start_finished": bool(ready),
+                       "handled_by": "the driver's operator watcher, as up does" if role == "operator" else "up",
+                       "mode": team.adapter.mode})
+        if not ready:
+            run.row(1, "states", role, harness, "not_run", "case 1 states", reason="the team did not come up")
             return
         subject = _subject(team, role)
         receipt = team.receipt("states")
@@ -2515,14 +2636,6 @@ def case_1(run, role, harness, adapter_class):
         run.row(1, "states", role, harness, "pass" if ok else "fail",
                 "idle, working through a real tool action, idle again with the turn advanced", proof=proof,
                 reason=None if ok else "the states or the action were not as expected")
-        dialogs = harness_table().get(harness, {}).get("dialogs", [])
-        how = (getattr(team, "operator_start", {"settled": "not watched (fixture operator)"}) if role == "operator"
-               else "up's readiness check: started, briefed and idle")
-        observed = "no startup dialog declared" if not dialogs else f"declared: {[d[0] for d in dialogs]}"
-        run.row(1, "startup-dialog", role, harness, "pass",
-                "a declared startup dialog is answered on its second poll, or left to the owner; none is invented",
-                observed=observed, proof={"started_idle": states[0] in READY, "handled_by": how,
-                                          "mode": team.adapter.mode})
 
 
 def case_7(run, role, harness, adapter_class):
@@ -2577,24 +2690,28 @@ def case_10(run, role, harness, adapter_class):
     with team:
         if not _up(team, run, 10, role, harness, ["idle-latency", "idle-latency-times"]):
             return
-        times, outcomes = [], []
+        trials = []
         recipient = "lead-dev" if role == "member" else "operator"
         for _ in range(3):
-            team.until(lambda: team.state(_subject(team, role)) in READY, 300)
+            idle = bool(team.until(lambda: team.state(_subject(team, role)) in READY, 300))
+            time.sleep(1)                              # past the previous turn's end
             start = time.monotonic()
             if role == "member":
                 code, out = team.call("say", "lead-dev", f"latency {token()}", timeout=60)
             else:
                 code, out = team.call("say", "operator", "--file", str(_note(team, f"latency {token()}")),
                                       terminal=team.member("lead-dev"), timeout=60)
-            times.append(round(time.monotonic() - start, 2))
-            outcomes.append("delivered" if f"@{recipient}: delivered" in out else out.strip().splitlines()[-1:])
-        ok = all(o == "delivered" for o in outcomes)
-        run.row(10, "idle-latency", role, harness, "pass" if ok else "fail",
-                f"say to an idle recipient reports delivered within SAY_WAIT ({10} s)", proof={"outcomes": outcomes},
-                reason=None if ok else "a say did not report delivered within its wait")
+            found = _say_id(out)
+            trials.append({"idle": idle, "seconds": round(time.monotonic() - start, 2),
+                           "outcome": "delivered" if f"@{recipient}: delivered" in out else "not delivered",
+                           "id": int(found.group(1)) if found else None, "exit": code})
+        status, observed, reason = judge_latency(trials)
+        run.row(10, "idle-latency", role, harness, status,
+                f"say to an idle recipient is normally delivered within SAY_WAIT ({SAY_WAIT} s): all three from"
+                " idle, all delivered, the median within the wait", observed=observed, proof={"trials": trials},
+                reason=reason)
         run.row(10, "idle-latency-times", role, harness, "measured", "three warm say times",
-                observed=json.dumps(times), proof={"seconds": times})
+                observed=json.dumps([t["seconds"] for t in trials]), proof={"seconds": [t["seconds"] for t in trials]})
         _not_built(run, 10, role, harness, ["held-sender-exit", "crash"])
 
 
@@ -2634,8 +2751,13 @@ def case_5(run, role, harness, adapter_class):
         ident = re.search(r"^message (\d+)$", out, re.M)
         log = factory_log(team)
         queued = team.until(lambda: _outcome(log, ident, "lead-dev") == ("queued", "blocked"), 30) if ident else None
-        notes = [m for m in log.read_box()[1].msgs.values()
-                 if m["kind"] == "note" and (m.get("meta") or {}).get("what", "").startswith("blocked")]
+
+        def blocked_notes():
+            box = log.read_box()[1]
+            return [{"id": m["id"], "about": m["meta"].get("about"), "term": m["meta"].get("term"),
+                     "outcome": box.outcome(m["id"], "operator")["o"]} for m in box.msgs.values()
+                    if m["kind"] == "note" and (m.get("meta") or {}).get("what", "").startswith("blocked")]
+        team.until(lambda: any(n["outcome"] == "delivered" for n in blocked_notes()), 60)
         typed_while_blocked = receipt.exists()
         view = _rodeo(team, ["team", "@lead-dev"])
         view.keys("ctrl+b")
@@ -2644,15 +2766,19 @@ def case_5(run, role, harness, adapter_class):
         time.sleep(0.5)
         view.focus("@lead-dev")
         view.keys("enter")                         # the owner answers the prompt
-        acted = team.until(lambda: receipt.exists() and tok in receipt.read_text(), 300)
+        team.until(lambda: receipt.exists() and tok in receipt.read_text(), 300)
+        time.sleep(15)                             # time for a duplicate to show
         final = _outcome(log, ident, "lead-dev") if ident else None
-        proof = {"queued": bool(queued), "notes": len(notes), "typed_while_blocked": typed_while_blocked,
-                 "outcome_after": final, "acted": bool(acted), "peer": peer}
-        ok = (bool(queued) and len(notes) == 1 and not typed_while_blocked and acted and bool(final)
-              and final[0] == "delivered")
-        run.row(5, "blocked", role, harness, "pass" if ok else "fail",
-                "blocked: nothing typed, one note, the queued message delivered and acted on once after the answer",
-                proof=proof, reason=None if ok else "see proof")
+        count = receipt.read_text().split().count(tok) if receipt.exists() else 0
+        notes = blocked_notes()
+        status, reason = judge_blocked(notes, "lead-dev", member, bool(queued), typed_while_blocked,
+                                       final[0] if final else None, count)
+        proof = {"message_id": int(ident.group(1)) if ident else None, "queued_blocked": bool(queued),
+                 "notes": notes, "typed_while_blocked": typed_while_blocked, "final_outcome": final,
+                 "action_count": count, "peer": peer}
+        run.row(5, "blocked", role, harness, status,
+                "blocked: nothing typed, one note about this member's episode delivered to the operator, the queued"
+                " message delivered and acted on exactly once after the answer", proof=proof, reason=reason)
 
 
 def factory_log(team):
@@ -2711,7 +2837,7 @@ def case_8(run, role, harness, adapter_class):
             acted = team.until(lambda: receipt.exists() and tok in receipt.read_text(), 300)
             fresh = team.member("lead-dev")
             proof = {"ended": bool(ended), "queued_gone": bool(gone), "nothing_typed": nothing,
-                     "up_exit": up_code, "up_output": _bounded(up_out), "new_terminal": fresh not in (None, member),
+                     "up_exit": up_code, "new_terminal": fresh not in (None, member),
                      "acted_after_up": bool(acted), "message_id": int(ident.group(1)) if ident else None,
                      "final_outcome": _outcome(log, ident, "lead-dev"),
                      "new_terminal_state": team.state(fresh) if fresh else None}
@@ -2828,7 +2954,7 @@ def case_3(run, role, harness, adapter_class):
         proof = {"claimed": bool(claimed), "report_id": claimed, "report_outcome": [final.get("o"), final.get("why")],
                  "held_past_8s": held, "draft_exact": exact, "report_acted": bool(acted), "draft_wait": 60,
                  "peer": peer, "draft_seen": _bounded(drafted), "draft_sent": _bounded(literal),
-                 "operator_screen_tail": _bounded(screen[-BOUND:])}
+                 "markers_on_operator_screen": [m for m in (tok, literal.split()[-1]) if m in "".join(screen.split())]}
         ok = bool(claimed) and held and exact and bool(acted)
         run.row(3, "draft", role, harness, "pass" if ok else "fail",
                 "a report is held while the owner has an unsent draft; the draft arrives byte for byte, then the report",
@@ -2863,25 +2989,46 @@ def case_6(run, role, harness, adapter_class):
             view.type(adapter.switch_request(harness))
             time.sleep(0.5)
             view.keys("enter")
+        variable = harness_table().get(harness, {}).get("session_env")
+
+        def session(terminal):
+            """The harness's own session variable, as its tool sees it (observation through hc)."""
+            if not variable:
+                return None
+            out, done = team.receipt("session"), team.receipt("session-run")
+            team.send(terminal, adapter.act_run(done, f'printf "%s\\n" "${{{variable}:-}}" > {shlex.quote(str(out))}'))
+            team.until(lambda: done.exists() and "exit" in done.read_text(), 300)
+            team.until(lambda: team.state(terminal) in READY, 120)
+            return out.read_text().strip() if out.exists() else None
         if role == "operator":
+            before = session(team.operator)
             switch()
             team.until(lambda: team.state(team.operator) in READY, 120)
+            after = session(team.operator)
+            switched, why = judge_switch(before, after)
             receipt, tok = team.receipt("operator-switch"), token()
             said = _member_says(team, adapter.act_append(receipt, tok))
             acted = team.until(lambda: receipt.exists() and tok in receipt.read_text(), 300)
-            run.row(6, "operator-switch", role, harness, "pass" if acted else "fail",
-                    "after the operator switches conversation in its terminal, a member's report reaches it and is"
-                    " acted on", proof={"member_say": said, "acted": bool(acted)},
-                    reason=None if acted else "no action after the switch")
+            count = receipt.read_text().split().count(tok) if receipt.exists() else 0
+            status = ("pass" if count == 1 else "fail") if switched else "not_run"   # an unproved switch proves nothing
+            run.row(6, "operator-switch", role, harness, status,
+                    "after the operator switches conversation natively in its terminal (its session variable changes),"
+                    " a member's report reaches it and is acted on once",
+                    proof={"variable": variable, "switched": switched, "member_say": said, "action_count": count},
+                    reason=None if status == "pass" else why or f"the action ran {count} times" if switched
+                    else why or f"no {variable or 'session variable'} to show the switch")
             return
 
         def idle():
             return team.until(lambda: team.member("lead-dev") and team.state(team.member("lead-dev")) in READY, 300)
 
         def relaunch():
-            team.call("down", "lead-dev", timeout=120)
+            old = team.member("lead-dev")
+            down, _ = team.call("down", "lead-dev", timeout=120)
             code, out = team.call("up", "lead-dev", timeout=240)
-            return code, out
+            new = team.member("lead-dev")
+            return {"down_exit": down, "up_exit": code, "replaced": bool(new) and new != old,
+                    "resumed": "resumed @lead-dev" in out}
 
         def recall():
             receipt = team.receipt("recall")
@@ -2894,32 +3041,44 @@ def case_6(run, role, harness, adapter_class):
         team.call("say", "lead-dev", adapter.remember(first), timeout=60)
         idle()
         time.sleep(2)
-        code, out = relaunch()
+        launch = relaunch()
         idle()
         got = recall()
-        run.row(6, "resume", role, harness, "pass" if got == first[::-1] else "fail",
-                "down then up reopens the member's conversation: it recalls a word from before",
-                observed=f"recalled {'the word' if got == first[::-1] else repr(got)}",
-                proof={"up_exit": code, "resumed": "resumed @lead-dev" in out},
-                reason=None if got == first[::-1] else "the recalled word did not match")
+        cycled = launch["down_exit"] == 0 and launch["up_exit"] == 0 and launch["replaced"]
+        ok = cycled and got == first[::-1]
+        run.row(6, "resume", role, harness, "pass" if ok else "fail",
+                "down then up starts a new terminal that reopens the member's conversation: it recalls a word from"
+                " before", observed=f"recalled {'the word' if got == first[::-1] else repr(got)}", proof=launch,
+                reason=None if ok else "down or up failed, or the same terminal stayed" if not cycled
+                else "the recalled word did not match")
         _member_says(team, "ready again")               # this launch's first say: its ready line
+        before = session(team.member("lead-dev"))
         switch()
         idle()
+        after = session(team.member("lead-dev"))
+        switched, why = judge_switch(before, after)
         second = token()
         team.call("say", "lead-dev", adapter.remember(second), timeout=60)
         idle()
         _member_says(team, "switched")                   # its next say sees the new conversation's ID
         time.sleep(2)
-        relaunch()
+        launch = relaunch()
         idle()
+        argv = " ".join(team.get(team.member("lead-dev")).get("argv") or [])
+        launch["resumed_conversation"] = ("launch" if before and before in argv       # the ID the new terminal's argv
+                                          else "switched" if after and after in argv else "neither")   # carries
+        launch["ids"] = {"launch": _alias(before), "switched": _alias(after)}
         got = recall()
         follow = harness_table()[harness].get("session_follow", True) if team.real else False
         expected = second if follow else first
         which = "second" if got == second[::-1] else "first" if got == first[::-1] else repr(got)
-        run.row(6, "member-switch", role, harness, "pass" if got == expected[::-1] else "fail",
-                f"after a switch and a say, up resumes the {'switched' if follow else 'launch'} conversation"
-                f" (session_follow = {str(follow).lower()})", observed=f"recalled the {which} word",
-                proof={"session_follow": follow}, reason=None if got == expected[::-1] else "another conversation")
+        status = "pass" if switched and got == expected[::-1] else "not_run" if not switched else "fail"
+        run.row(6, "member-switch", role, harness, status,
+                f"after a native switch (its session variable changes) and a say, up resumes the"
+                f" {'switched' if follow else 'launch'} conversation (session_follow = {str(follow).lower()})",
+                observed=f"recalled the {which} word", proof=dict(launch, session_follow=follow, variable=variable,
+                                                               switched=switched),
+                reason=None if status == "pass" else why if not switched else "another conversation")
 
 
 def _ask_later(team, role, text):
@@ -2950,6 +3109,11 @@ def _released_by(proof, count, offer):
     if count != 1 or acted is None:
         return "nothing" if count == 0 else f"{count} actions"
     return "itself" if offered is None or acted < offered else offer
+
+
+def _alias(value):
+    """A session ID's stand-in for exported proof (phase_8.md §2)."""
+    return hashlib.sha1(value.encode()).hexdigest()[:8] if value else None
 
 
 def _lines(path):
@@ -2986,12 +3150,14 @@ def case_4(run, role, harness, adapter_class):
 
             began_at = time.monotonic()
 
-            def look():
-                screen = _screen(team, role, harness, subject)
-                flat = "".join(screen.split())
+            def flat():
+                return "".join(_screen(team, role, harness, subject).split())
+
+            def look(screen=None):
+                """Facts, not the screen: the offset, state, turn and which test markers are visible."""
+                screen = flat() if screen is None else screen
                 return {"t": round(time.monotonic() - began_at, 1), "state": team.state(subject),
-                        "turn": team.get(subject)["turn"], "screen": _bounded(screen[-BOUND:]),
-                        "markers": [m for m in EVIDENCE["tokens"] if m in flat]}
+                        "turn": team.get(subject)["turn"], "markers": [m for m in EVIDENCE["tokens"] if m in screen]}
             try:
                 first = _ask_later(team, role, team.adapter.long_task(work, started, release, finished))
                 if not team.until(lambda: started in _lines(work) and team.state(subject) == "working", 300):
@@ -3035,14 +3201,15 @@ def case_4(run, role, harness, adapter_class):
                         view.paste(team.adapter.act_append(owner, extra), submit=False)
                         moved = team.until(lambda: second in _lines(work), 120)   # Claude Code took 5-21 s
                         proof["queued_turn_started"] = bool(moved)
-                        proof["input_once_queued_ran"] = shown = look()
-                        proof["owner_line_whole_before_enter"] = extra in "".join(shown["screen"].split()) or (
-                            extra.replace(" ", "") in "".join(shown["screen"].split()))
+                        screen = flat()
+                        proof["input_once_queued_ran"] = look(screen)
+                        proof["owner_line_whole_before_enter"] = "".join(extra.split()) in screen
                     time.sleep(2)                            # what the harness did with the pending text
                     proof["interrupt_keys"] = keys
-                    proof["after_esc"] = after = look()
+                    screen = flat()
+                    proof["after_esc"] = look(screen)
                     # on screen at all: in the input or in the transcript, which a screen cannot tell apart
-                    proof["second_on_screen_after_esc"] = second in "".join(after["screen"].split())
+                    proof["second_on_screen_after_esc"] = second in screen
                     proof["precondition"] = bool(delivered) and proof["pending_before_esc"]
                 if trial == "next-delivery":                # touch nothing: the keeper's next delivery
                     while time.monotonic() - esc_at < 65:    # past the QA core's draft_wait (60 s) since Esc
@@ -3055,7 +3222,7 @@ def case_4(run, role, harness, adapter_class):
                     team.until(lambda: extra in _lines(work) and second in _lines(work), 300)
                 elif trial == "owner-line":                 # then one Enter for the owner's line
                     team.until(lambda: team.state(subject) in READY, 300)
-                    proof["input_before_enter"] = look()["screen"]
+                    proof["owner_line_on_screen_before_enter"] = "".join(extra.split()) in flat()
                     proof["release_offer_after_esc_s"] = round(time.monotonic() - esc_at, 1)
                     view.keys("enter")
                     team.until(lambda: owner.exists() and extra in owner.read_text()
@@ -3078,7 +3245,7 @@ def case_4(run, role, harness, adapter_class):
                          or (trial == "next-delivery" and line == extra)]
                 log = factory_log(team)
                 proof.update(turn=[turn, team.get(subject)["turn"]], order=order, second_count=count,
-                             second_final=said(later[1], log)[1], screen_at_end=look()["screen"])
+                             second_final=said(later[1], log)[1], at_end=look())
                 if trial == "mid-turn":
                     ok = count == 1 and finished in lines
                     how = ("steered this turn" if ok and order.index("second") < order.index("finished")
@@ -3097,7 +3264,9 @@ def case_4(run, role, harness, adapter_class):
                 else:
                     seen = owner.read_text() if owner.exists() else ""
                     proof.update(owner_exact=seen == extra + "\n", owner_seen=_bounded(seen))
-                    proof["holds"] = count == 1 and proof["owner_exact"] and proof["owner_line_whole_before_enter"]
+                    # the receipt's exact bytes show the line arrived whole; a screen may fold a paste
+                    # ("[Pasted text]"), so the before-Enter screen fact is recorded, not required
+                    proof["holds"] = count == 1 and proof["owner_exact"]
                     proof["released_by"] = _released_by(proof, count, "the owner's Enter")
                 results[trial] = dict(proof, ran=True)
             finally:
@@ -3115,6 +3284,73 @@ def case_4(run, role, harness, adapter_class):
     run.row(4, "owner-interrupt", role, harness, "pass" if ok else "fail",
             "a message pending at the owner's Esc is acted on exactly once, with the next delivery and with the"
             " owner's next line, each intact", observed=observed, proof=proof, reason=None if ok else "see proof")
+
+
+def cross_other_version(run, fixture):
+    """other-version (phase_8.md §4): with the keeper alive and a send held by the owner's draft, a second valid
+    copy of the script is installed atomically at the same path. The old send finishes, the keeper restarts in the
+    same pane, and a message queued after that is delivered once by the new image without a wakeup."""
+    adapter_class = FixtureAdapter if fixture else RealAdapter
+    team, peer = _team_for(adapter_class, "operator", "codex" if fixture else "claude", draft_wait=60)
+    with team:
+        _operator_tab(team)
+        if not _up(team, run, "cross", "system", "system", []):
+            run.row("cross", "other-version", "system", "system", "not_run", "the other-version cross case",
+                    reason="the team did not come up")
+            return
+        keeper = team.keeper()
+        old = hashlib.sha1(team.script.read_bytes()).hexdigest()[:12]
+        view = _rodeo(team, ["operator", "team"])
+        view.keys("ctrl+b")
+        time.sleep(0.2)
+        view.keys("1")
+        time.sleep(0.8)
+        view.focused_terminal = team.operator
+        name = f"draft-{random.randrange(16 ** 6):06x}.txt"          # the owner's draft holds the first send
+        draft_receipt, literal = team.dir / name, f"owner draft {token()}"
+        view.type(team.adapter.draft_request(f"../{name}", literal))
+        time.sleep(1)
+        first, tok1 = team.receipt("first"), token()
+        _member_says(team, team.adapter.act_append(first, tok1))
+        log = factory_log(team)
+        held = team.until(lambda: next((ident for (ident, to), rec in log.read_box()[1].outcomes.items()
+                                        if rec["o"] == "sending" and to == "operator"), None), 120)
+        text = team.script.read_text()                               # a second valid copy, comment-only change
+        staged = team.script.with_name(".factory.py.new")
+        staged.write_text(text + f"\n# qualification other-version {token()}\n")
+        os.replace(staged, team.script)
+        new = hashlib.sha1(team.script.read_bytes()).hexdigest()[:12]
+        def keeper_screen():
+            return "".join(team.qa.rpc("terminal.read", {"terminal": keeper, "lines": 0}).get("text", "").split())
+        draining = team.until(lambda: f"keeper{new}installed" in keeper_screen(), 90)
+        still_held = not first.exists()
+        view.keys("enter")                                           # the owner sends the draft: the send finishes
+        finished = team.until(lambda: first.exists() and tok1 in first.read_text(), 300)
+        restarted = team.until(lambda: "keeperrestarting:newFactoryversion" in keeper_screen(), 120)
+        time.sleep(3)
+        second, tok2 = team.receipt("second"), token()
+        _member_says(team, team.adapter.act_append(second, tok2))
+        acted = team.until(lambda: second.exists() and tok2 in second.read_text(), 300)
+        time.sleep(10)
+        keepers = [r["address"] for r in team.qa.rpc("terminal.list", {"all": False})["terminals"]
+                   if (r.get("labels") or {}).get("factory.kind") == "keeper"]
+        first_outcome = log.read_box()[1].outcome(held, "operator") if held else {}
+        proof = {"old_version": old, "new_version": new, "keeper_before": keeper, "keepers_after": keepers,
+                 "held_send_id": held, "held_send_outcome": [first_outcome.get("o"), first_outcome.get("why")],
+                 "draining_seen": bool(draining), "still_held_while_draining": still_held,
+                 "old_send_finished": bool(finished), "restart_seen": bool(restarted),
+                 "new_message_count": second.read_text().split().count(tok2) if second.exists() else 0,
+                 "draft_exact": draft_receipt.exists() and draft_receipt.read_text() == literal + "\n",
+                 "agents": "fake agents (the case is Factory's, not a harness's)" if fixture else "real", "peer": peer}
+        ok = (old != new and keepers == [keeper] and bool(held) and bool(draining) and still_held and bool(finished)
+              and first_outcome.get("o") == "delivered" and bool(restarted) and bool(acted)
+              and proof["new_message_count"] == 1)
+        run.row("cross", "other-version", "system", "system", "pass" if ok else "fail",
+                "a new script under a live keeper: the held send finishes, the keeper restarts in its pane, the next"
+                " message is delivered once by the new image", proof=proof, reason=None if ok else "see proof")
+
+
+CROSS_FUNCTIONS = {"other-version": cross_other_version}
 
 
 CASE_FUNCTIONS = {1: case_1, 2: case_2, 3: case_3, 4: case_4, 5: case_5, 6: case_6, 7: case_7, 8: case_8, 9: case_9,
@@ -3165,10 +3401,26 @@ def qualify(target, role=None, cases=None, json_path=None, fixture=False):
     run = Qualification(mode, json_path, _versions())
     if target == "cross":
         for name in CROSS_CASES:
-            run.row("cross", name, "system", "fixture" if fixture else "system", "not_run",
-                    f"the {name} cross case", reason="not built yet")
+            EVIDENCE.update(teams=[], tokens=[])
+            first_row = len(run.data["rows"])
+            function = CROSS_FUNCTIONS.get(name)
+            try:
+                if function is None:
+                    raise NotRun("not built yet")
+                function(run, fixture)
+            except NotRun as why:
+                run.row("cross", name, "system", "system", "not_run", f"the {name} cross case", reason=str(why))
+            except (RuntimeError, HcError, HcDown, OSError, subprocess.SubprocessError) as error:
+                if not any(r["case"] == "cross" and r["subcase"] == name for r in run.data["rows"]):
+                    run.row("cross", name, "system", "system", "not_run", f"the {name} cross case",
+                            reason=f"the driver stopped: {type(error).__name__}: {error}")
+            _file_evidence(run, first_row)
             run.checkpoint()
-        return run.data, 2
+        rows = [r for r in run.data["rows"] if r["case"] == "cross"]
+        run.data["summary"] = {r["subcase"]: r["status"] for r in rows}
+        run.checkpoint()
+        return run.data, 1 if any(r["status"] == "fail" for r in rows) else (
+            2 if any(r["status"] == "not_run" for r in rows) else 0)
     adapter_class = FixtureAdapter if fixture else RealAdapter
     adapter = adapter_class(None)                     # version and model need no team
     for role_, harness, case in selected:
@@ -3204,6 +3456,13 @@ def qualify(target, role=None, cases=None, json_path=None, fixture=False):
 
 # The qualification report (phase_8.md §5.4): docs/qualification/<harness>.md from the runs' JSON evidence.
 
+# A pass counts only with the fact the current judgement needs (@architect-2): older drivers passed these rows on
+# weaker evidence, and the report shows that gap instead of the pass.
+PROOF_NEEDED = {(1, "startup-dialog"): ("seen",), (2, "idle-report"): ("turn_completed",),
+                (2, "operator-commands"): ("member_briefed",), (4, "owner-interrupt"): ("next-delivery", "trials"),
+                (5, "blocked"): ("action_count",), (6, "operator-switch"): ("switched",), (6, "resume"): ("replaced",),
+                (6, "member-switch"): ("switched",), (10, "idle-latency"): ("trials",)}
+
 REPORT_BEGIN, REPORT_END = "<!-- qualify report: generated, do not edit -->", "<!-- end of generated report -->"
 
 
@@ -3219,8 +3478,9 @@ def _commit_rank(head):
 def report(paths, out):
     """For each role, harness, case and subcase keep the row of the newest run (by source head, then time) and
     write one Markdown report per harness plus trust-entries.md; text outside the generated block is kept."""
-    runs, chosen, trust = [], {}, set()
-    for path in paths:
+    runs, chosen, trust, older = [], {}, set(), {}
+    paths = [*paths, *sorted(str(p) for p in (ROOT / "docs" / "qualification" / "imported").glob("*.json"))]
+    for path in dict.fromkeys(paths):
         data = json.loads(pathlib.Path(path).read_text())
         if not isinstance(data, dict) or data.get("mode") != "real" or "rows" not in data:
             continue                                  # a check's results, or a fixture run
@@ -3231,7 +3491,11 @@ def report(paths, out):
         for row in data["rows"]:
             key = (row["role"], row["harness"], row["case"], row["subcase"])
             if key not in chosen or rank >= chosen[key][0]:
+                if key in chosen:
+                    older.setdefault(key, []).append(chosen[key])
                 chosen[key] = (rank, row, data)
+            else:
+                older.setdefault(key, []).append((rank, row, data))
     out = pathlib.Path(out)
     out.mkdir(parents=True, exist_ok=True)
     written = []
@@ -3239,7 +3503,8 @@ def report(paths, out):
         mine = {k: v for k, v in chosen.items() if k[1] == harness}
         if not mine:
             continue
-        lines = [REPORT_BEGIN, "", f"Generated by `tests/live.py report` from {len(runs)} real runs.", ""]
+        lines = [REPORT_BEGIN, "", f"Generated by `tests/live.py report` from {len(runs)} real runs. A result marked"
+                 " unproved passed under an older driver's weaker check and needs a run at a current head.", ""]
         for role in ("operator", "member"):
             rows = {k: v for k, v in mine.items() if k[0] == role
                     and (k[2] not in CASES or k[3] in {n for n, _ in subcases(k[2], role)})}   # in today's table
@@ -3261,21 +3526,32 @@ def report(paths, out):
                 case, subcase = key[2], key[3]
                 _, row, data = rows[key]
                 proof = row.get("proof") if isinstance(row.get("proof"), dict) else {}
+                status = row["status"]
+                needed = PROOF_NEEDED.get((case, subcase))
+                if status == "pass" and needed and not any(key in proof for key in needed):
+                    status = "unproved (an older driver's weaker check)"
                 text = str(row.get("observed") or row.get("reason") or "")
-                if row.get("reason") == "see proof":  # name what the proof found false
-                    text += ": " + ", ".join(k for k, v in proof.items() if v is False)
-                text = " ".join(text.split()).replace("|", "/")[:140]
+                false = [k for k, v in proof.items() if v is False]
+                if row.get("reason") == "see proof" and false:   # name what the proof found false
+                    text += ": " + ", ".join(false)
+                text = " ".join(text.split()).replace("|", "/")[:300]
                 if proof.get("peer"):
                     text += ("; " if text else "") + f"partner {proof['peer']}"
                 run_head = (data.get("source_head") or "?")[:7]
-                lines.append(f"| {case} | {subcase} | {row['status']} | {text} | {run_head} |")
-                if row["status"] in ("fail", "not_run"):
+                lines.append(f"| {case} | {subcase} | {status} | {text} | {run_head} |")
+                if status != "pass" and status != "measured":
                     open_rows.append(f"{case} {subcase}")
             for case in CASES:
                 for name, _ in subcases(case, role):
                     if (role, harness, case, name) not in rows:
                         open_rows.append(f"{case} {name} (no run)")
+            superseded = [f"- {key[2]} {key[3]}: {row['status']} at {(data.get('source_head') or '?')[:7]}, superseded"
+                          f" by the {rows[key][1]['status']} above"
+                          for key in sorted(rows, key=place) for _, row, data in older.get(key, [])
+                          if row["status"] in ("pass", "fail") and row["status"] != rows[key][1]["status"]]
             lines += ["", f"Unresolved as {role}: {', '.join(open_rows) or 'none'}.", ""]
+            if superseded:
+                lines += [f"Superseded results as {role}:", "", *superseded, ""]
         lines.append(REPORT_END)
         target = out / f"{harness}.md"
         old = target.read_text() if target.exists() else f"# {harness} qualification\n\n{REPORT_BEGIN}\n{REPORT_END}\n"

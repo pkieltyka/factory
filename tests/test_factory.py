@@ -6547,6 +6547,50 @@ class HcCheckTests(unittest.TestCase):
             self.assertIn("too old", p.stdout)
 
 
+class QualifyJudgeTests(unittest.TestCase):
+    """The false-pass paths @architect-2 named in the first PR's review."""
+
+    def trials(self, *seconds, idle=True, outcome="delivered"):
+        return [{"idle": idle, "seconds": s, "outcome": outcome} for s in seconds]
+
+    def test_latency(self):
+        self.assertEqual(live.judge_latency(self.trials(0.7, 0.9, 1.2))[0], "pass")
+        self.assertEqual(live.judge_latency(self.trials(0.7, 0.9, 30))[0], "pass")     # one slow trial, reported
+        self.assertIn("1 over", live.judge_latency(self.trials(0.7, 0.9, 30))[1])
+        self.assertEqual(live.judge_latency(self.trials(30, 30, 30))[0], "fail")       # delivered, but 30 s each
+        self.assertEqual(live.judge_latency(self.trials(1, 1, 1, idle=False))[0], "not_run")
+        self.assertEqual(live.judge_latency(self.trials(1, 1, 1, outcome="queued"))[0], "fail")
+        self.assertEqual(live.judge_latency(self.trials(1, 1))[0], "not_run")
+
+    def test_dialog(self):
+        declared = [["Trust and continue", ["enter"]]]
+        self.assertEqual(live.judge_dialog(declared, "Trust and continue", True)[0], "pass")
+        self.assertEqual(live.judge_dialog(declared, None, True)[0], "not_run")         # up succeeded, none shown
+        self.assertEqual(live.judge_dialog(declared, "Trust and continue", False)[0], "fail")
+        self.assertEqual(live.judge_dialog([], None, True)[0], "pass")
+        owner = [["Do you trust the contents of this project?", []]]
+        self.assertEqual(live.judge_dialog(owner, owner[0][0], False)[0], "pass")
+        self.assertEqual(live.judge_dialog(owner, owner[0][0], True)[0], "fail")
+
+    def test_blocked(self):
+        note = {"about": "lead-dev", "term": "t3", "outcome": "delivered"}
+        good = ([note], "lead-dev", "t3", True, False, "delivered", 1)
+        self.assertEqual(live.judge_blocked(*good)[0], "pass")
+        for index, value in ((0, []), (0, [note, note]), (0, [dict(note, outcome="queued")]),
+                             (0, [dict(note, about="pm")]), (0, [dict(note, term="t9")]), (3, False), (4, True),
+                             (5, "unconfirmed"), (6, 2), (6, 0)):
+            with self.subTest(index=index, value=value):
+                bad = list(good)
+                bad[index] = value
+                self.assertEqual(live.judge_blocked(*bad)[0], "fail")
+
+    def test_switch(self):
+        self.assertEqual(live.judge_switch("a", "b"), (True, None))
+        self.assertFalse(live.judge_switch("a", "a")[0])                                # switch() did nothing
+        self.assertFalse(live.judge_switch("", "b")[0])
+        self.assertFalse(live.judge_switch("a", None)[0])
+
+
 class QualifyReportTests(unittest.TestCase):
     def test_newest_run_wins_and_hand_text_is_kept(self):
         head = subprocess.run(["git", "-C", str(live.ROOT), "rev-parse", "HEAD"], capture_output=True,

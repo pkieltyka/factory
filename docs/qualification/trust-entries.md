@@ -33,12 +33,15 @@ Claude Code and Codex may record per-directory trust for each QA scratch project
 | claude | `~/.claude.json` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-gqt0ab29/work` |
 | claude | `~/.claude.json` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-gw1usic5/work` |
 | claude | `~/.claude.json` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-i0ubutvg/work` |
+| claude | `~/.claude.json` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-i9uim6cc/work` |
 | claude | `~/.claude.json` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-igaaqyyr/work` |
 | claude | `~/.claude.json` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-j0q3d43w/work` |
 | claude | `~/.claude.json` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-j27oz8po/work` |
 | claude | `~/.claude.json` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-j80hfwvy/work` |
 | claude | `~/.claude.json` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-j9bng8rr/work` |
 | claude | `~/.claude.json` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-kb9nn8rp/work` |
+| claude | `~/.claude.json` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-knkuov6i/work` |
+| claude | `~/.claude.json` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-kxb2wfvx/work` |
 | claude | `~/.claude.json` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-m3ucqrys/work` |
 | claude | `~/.claude.json` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-ndtizyxo/work` |
 | claude | `~/.claude.json` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-o1ei315_/work` |
@@ -60,6 +63,7 @@ Claude Code and Codex may record per-directory trust for each QA scratch project
 | claude | `~/.claude.json` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-w5oa6ovq/work` |
 | claude | `~/.claude.json` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-wer6v9xo/work` |
 | claude | `~/.claude.json` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-wlfjiy0w/work` |
+| claude | `~/.claude.json` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-x0xn1fi3/work` |
 | claude | `~/.claude.json` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-x9e0qibv/work` |
 | claude | `~/.claude.json` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-xrdqn9ce/work` |
 | claude | `~/.claude.json` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-ywniyjg3/work` |
@@ -70,6 +74,7 @@ Claude Code and Codex may record per-directory trust for each QA scratch project
 | claude | `~/.claude.json` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-zg88hg09/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-0_gnt80h/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-15rooruk/work` |
+| codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-1nhj5ia3/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-1xrbxya_/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-2bwe22yq/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-31m_vyhb/work` |
@@ -77,11 +82,13 @@ Claude Code and Codex may record per-directory trust for each QA scratch project
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-46p32v8y/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-4efqfo6u/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-4etlfvcn/work` |
+| codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-4hxcqhu5/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-50gu18ax/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-59zvbwqy/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-5fcti25g/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-7g1vb7mc/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-7mvav1bd/work` |
+| codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-7y09fhw8/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-9zm3pm80/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-_93o55n0/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-_p35fkyu/work` |
@@ -96,9 +103,11 @@ Claude Code and Codex may record per-directory trust for each QA scratch project
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-c6jhobke/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-ctyer4px/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-dox6ydfg/work` |
+| codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-fhtvf63m/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-gqt0ab29/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-gw1usic5/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-i0ubutvg/work` |
+| codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-i9uim6cc/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-igaaqyyr/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-ixp6ma7k/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-j0q3d43w/work` |
@@ -107,6 +116,8 @@ Claude Code and Codex may record per-directory trust for each QA scratch project
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-j9bng8rr/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-jwyqrwqm/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-kb9nn8rp/work` |
+| codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-knkuov6i/work` |
+| codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-kxb2wfvx/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-lclwfguj/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-m3ucqrys/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-msvvzjf1/work` |
@@ -120,7 +131,9 @@ Claude Code and Codex may record per-directory trust for each QA scratch project
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-pemh6gxw/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-pvwof30w/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-q4vbl05r/work` |
+| codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-qksrpanp/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-qm1s82mp/work` |
+| codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-r0l06_fm/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-s87e0ysg/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-snhnqwnn/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-t8i06j1e/work` |
@@ -131,6 +144,7 @@ Claude Code and Codex may record per-directory trust for each QA scratch project
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-w5oa6ovq/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-wer6v9xo/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-wlfjiy0w/work` |
+| codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-x0xn1fi3/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-x9e0qibv/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-xrdqn9ce/work` |
 | codex | `~/.codex/config.toml` | `/tmp/factory-qa-173-UpEck3QO/scratch/factory-qa-ypi4syp1/work` |
