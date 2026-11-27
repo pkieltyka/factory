@@ -1849,9 +1849,15 @@ class FixtureAdapter:
 
     def prepare(self, harnesses):
         """A wrapper per harness that runs the fake agent with a log named after the member's model."""
-        for harness in harnesses:
+        memory = self.team.dir / "memory"
+        memory.mkdir(exist_ok=True)
+        for harness in harnesses:   # a conversation per launch, or the one "resume <id>" names (Codex's argv)
             wrapper = self.team.bin / harness
-            wrapper.write_text("#!/bin/sh\n" + f"exec {shlex.join(self.agent)}\n")
+            wrapper.write_text("#!/bin/sh\n"
+                               'id="thread-$(od -An -N4 -tx1 /dev/urandom | tr -d \' \\n\')"\n'
+                               'while [ "$#" -gt 0 ]; do [ "$1" = resume ] && id="$2"; shift; done\n'
+                               f'export CODEX_THREAD_ID="$id" FAKE_MEMORY_DIR={shlex.quote(str(memory))}\n'
+                               f"exec {shlex.join(self.agent)}\n")
             wrapper.chmod(0o755)
         codex = self.team.home / ".codex"
         codex.mkdir(parents=True, exist_ok=True)
@@ -1875,6 +1881,15 @@ class FixtureAdapter:
     def draft_request(self, path, literal):
         """A one-line owner draft that rodeo can type key by key (letters, digits, spaces and ,.-/')."""
         return f"ACT append {path} {literal}"
+
+    def remember(self, word):
+        return f"ACT remember {word}"
+
+    def recall(self, path):
+        return f"ACT recall {path}"
+
+    def switch_request(self, harness):
+        return "ACT switch"
 
     def end_request(self):
         return "FAKE: crashes"
@@ -1922,6 +1937,21 @@ class RealAdapter(FixtureAdapter):
     def draft_request(self, path, literal):
         return (f"Append one line containing exactly {literal} to the file {path} with your shell tool,"
                 " then reply done.")
+
+    def remember(self, word):
+        return REMEMBER.format(token=word)
+
+    def recall(self, path):
+        return ("Append the code word I gave you earlier in this conversation, spelled backwards in capital letters,"
+                f" as one line to the file {path} using your shell tool; append NONE if I gave you none. Then reply"
+                " done.")
+
+    def switch_request(self, harness):
+        command = {"claude": "/clear", "codex": "/new", "opencode": "/new", "pi": "/new",
+                   "omp": "/new"}.get(harness)
+        if command is None:
+            raise NotRun(f"no known way to start a new conversation in {harness}")
+        return command
 
     def end_request(self):
         return "Exit your session now: quit this program."
@@ -2039,7 +2069,7 @@ CASES = {   # case -> its subcases: (name, roles it is required for, measurement
     3: (("draft", "both", False), ("draft-cleared", "operator", False)),
     4: (("mid-turn", "both", False), ("owner-interrupt", "both", False)),
     5: (("blocked", "both", False),),
-    6: (("resume", "both", False), ("member-switch", "member", False), ("operator-switch", "operator", False)),
+    6: (("resume", "member", False), ("member-switch", "member", False), ("operator-switch", "operator", False)),
     7: (("suffix", "both", False), ("multiline", "both", False), ("two-senders", "both", False),
         ("pending-restart", "both", False), ("held-quiet", "both", False), ("upgrade", "both", False)),
     8: (("dead-member", "member", False), ("operator-gone", "operator", False), ("same-pane", "operator", False),
@@ -2593,7 +2623,76 @@ def case_3(run, role, harness, adapter_class):
             _not_built(run, 3, role, harness, ["draft-cleared"])
 
 
-CASE_FUNCTIONS = {1: case_1, 2: case_2, 3: case_3, 5: case_5, 7: case_7, 8: case_8, 9: case_9, 10: case_10}
+def case_6(run, role, harness, adapter_class):
+    """resume and member-switch for a member; operator-switch for an operator (phase_8.md §3.6)."""
+    team, peer = _team_for(adapter_class, role, harness)
+    with team:
+        names = [n for n, _ in subcases(6, role)]
+        if not _up(team, run, 6, role, harness, names):
+            return
+        adapter = team.adapter
+        if role == "operator":
+            team.qa.rpc("terminal.send", {"terminal": team.operator, "text": adapter.switch_request(harness)},
+                        timeout=60)
+            team.until(lambda: team.state(team.operator) == "idle", 120)
+            receipt, tok = team.receipt("operator-switch"), token()
+            said = _member_says(team, adapter.act_append(receipt, tok))
+            acted = team.until(lambda: receipt.exists() and tok in receipt.read_text(), 300)
+            run.row(6, "operator-switch", role, harness, "pass" if acted else "fail",
+                    "after the operator switches conversation in its terminal, a member's report reaches it and is"
+                    " acted on", proof={"member_say": said, "acted": bool(acted)},
+                    reason=None if acted else "no action after the switch")
+            return
+
+        def idle():
+            return team.until(lambda: team.member("lead-dev") and team.state(team.member("lead-dev")) == "idle", 300)
+
+        def relaunch():
+            team.call("down", "lead-dev", timeout=120)
+            code, out = team.call("up", "lead-dev", timeout=240)
+            return code, out
+
+        def recall():
+            receipt = team.receipt("recall")
+            team.call("say", "lead-dev", adapter.recall(receipt), timeout=60)
+            got = team.until(lambda: receipt.exists() and receipt.read_text().strip(), 300)
+            return (got or "").strip().splitlines()[-1:] and (got or "").strip().splitlines()[-1]
+
+        _member_says(team, "ready")                      # the member's own say records its conversation
+        first = token()
+        team.call("say", "lead-dev", adapter.remember(first), timeout=60)
+        idle()
+        time.sleep(2)
+        code, out = relaunch()
+        idle()
+        got = recall()
+        run.row(6, "resume", role, harness, "pass" if got == first[::-1] else "fail",
+                "down then up reopens the member's conversation: it recalls a word from before",
+                observed=f"recalled {'the word' if got == first[::-1] else repr(got)}",
+                proof={"up_exit": code, "resumed": "resumed @lead-dev" in out},
+                reason=None if got == first[::-1] else "the recalled word did not match")
+        _member_says(team, "ready again")               # this launch's first say: its ready line
+        team.call("say", "lead-dev", adapter.switch_request(harness), timeout=60)
+        idle()
+        second = token()
+        team.call("say", "lead-dev", adapter.remember(second), timeout=60)
+        idle()
+        _member_says(team, "switched")                   # its next say sees the new conversation's ID
+        time.sleep(2)
+        relaunch()
+        idle()
+        got = recall()
+        follow = harness_table()[harness].get("session_follow", True) if team.real else False
+        expected = second if follow else first
+        which = "second" if got == second[::-1] else "first" if got == first[::-1] else repr(got)
+        run.row(6, "member-switch", role, harness, "pass" if got == expected[::-1] else "fail",
+                f"after a switch and a say, up resumes the {'switched' if follow else 'launch'} conversation"
+                f" (session_follow = {str(follow).lower()})", observed=f"recalled the {which} word",
+                proof={"session_follow": follow}, reason=None if got == expected[::-1] else "another conversation")
+
+
+CASE_FUNCTIONS = {1: case_1, 2: case_2, 3: case_3, 5: case_5, 6: case_6, 7: case_7, 8: case_8, 9: case_9,
+                  10: case_10}
 
 
 def _source_head():

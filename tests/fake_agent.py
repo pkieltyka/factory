@@ -74,6 +74,19 @@ def act(text):
             done = subprocess.run(["sh", "-c", rest], stdin=subprocess.DEVNULL, capture_output=True, text=True)
             with path.open("a") as stream:
                 stream.write(f"exit {done.returncode}\n")
+    for line in text.splitlines():   # a fake conversation: memory kept per thread, in FAKE_MEMORY_DIR
+        parts = line.split(" ", 2)
+        if parts[0] != "ACT" or len(parts) < 2 or parts[1] not in ("remember", "recall", "switch"):
+            continue
+        memory = pathlib.Path(os.environ.get("FAKE_MEMORY_DIR", ".")) / f"{os.environ.get('CODEX_THREAD_ID', 'none')}.mem"
+        if parts[1] == "remember":
+            memory.write_text(parts[2])
+        elif parts[1] == "recall":
+            word = memory.read_text().strip() if memory.exists() else "NONE"
+            with pathlib.Path(parts[2]).open("a") as stream:
+                stream.write((word[::-1] if word != "NONE" else word) + "\n")
+        else:                          # a new conversation in the same terminal: later commands see its ID
+            os.environ["CODEX_THREAD_ID"] = f"thread-{os.urandom(4).hex()}"
 
 
 def main():
