@@ -10,6 +10,7 @@ only after server.status names that id, so the owner's sessions are never reache
     python3 tests/live.py check lc2|lc3|lc4|lc6|lc7|lc12|login [--json PATH]   # real harnesses, the owner's login
     python3 tests/live.py fixtures [--out tests/hc_fixtures.json]
     python3 tests/live.py smoke
+    python3 tests/live.py e2e --tracker file|github [--operator claude|codex] [--empty] [--rehearse]
 """
 
 import argparse
@@ -1961,9 +1962,10 @@ class RealAdapter(FixtureAdapter):
         if missing:
             raise NotRun(f"{', '.join(missing)} not on PATH")
 
-    def operator_argv(self, harness):
+    def operator_argv(self, harness, model=None):
         """The operator as the owner would start it, with the profile's model pinned (as Factory pins a member's)."""
-        return [shutil.which(harness), "--model", self.model(harness), *harness_table()[harness]["permissions"]["full"]]
+        return [shutil.which(harness), "--model", model or self.model(harness),
+                *harness_table()[harness]["permissions"]["full"]]
 
     def act_append(self, path, token):
         return (f"Using your shell tool, append one line containing exactly {token} to the file {path}"
@@ -2030,7 +2032,7 @@ class QATeam:
     private copy of the skill (phase_8.md §2)."""
 
     def __init__(self, adapter_class, operator, members, draft_wait=None, permissions="full", operator_shell=False,
-                 startup_dialog=None, quiet_grace=None):
+                 startup_dialog=None, quiet_grace=None, setup=None, operator_model=None):
         self.operator_harness, self.members, self.permissions = operator, members, permissions
         self.startup_dialog = startup_dialog    # fixture only: the harness whose fake shows its declared dialog
         self.real = adapter_class is RealAdapter
@@ -2044,27 +2046,25 @@ class QATeam:
         self.skill = self.dir / "skill"
         shutil.copytree(ROOT / "skill", self.skill, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
         self.script = self.skill / "scripts" / "factory.py"
-        self.work = self.dir / "work"
-        self.work.mkdir()
-        subprocess.run(["git", "init", "-q", "-b", "main", str(self.work)], check=True)
         self.adapter = adapter_class(self)
-        self.adapter.prepare({operator, *members.values()})
-        (self.work / "FACTORY.md").write_text("Qualification team: answer every request exactly as asked.\n")
-        lines = ([f"quiet_grace = {quiet_grace}\n"] if quiet_grace else []) + [f'[operator]\nharness = "{operator}"\n']
-        for name, harness in members.items():
-            lines.append(f'[members.{name}]\nharness = "{harness}"\nmodel = "{self.adapter.model(harness)}"\n'
-                         f'permissions = "{permissions}"\n')
-        (self.work / "factory.toml").write_text("\n".join(lines))
-        subprocess.run(["git", "-C", str(self.work), "add", "-A"], check=True)
-        subprocess.run(["git", "-C", str(self.work), "-c", "user.name=qa", "-c", "user.email=qa@example.invalid",
-                        "-c", "commit.gpgsign=false", "commit", "-q", "-m", "qa"], check=True)
+        try:
+            self.adapter.prepare({operator, *members.values()})
+            self.work = setup(self) if setup is not None else self._qualification_workspace(quiet_grace)
+        except BaseException:
+            try:
+                self.qa.stop()
+            finally:
+                shutil.rmtree(self.dir, ignore_errors=True)
+            raise
         # What Factory's commands see, from the driver or from the operator's own tool: the private Factory cache
         # (never the owner's), the fixture's wrappers first on PATH, and the fake Codex home.
         shared = {"HC_BIN": shutil.which(HC) or HC, "PATH": f"{self.bin}:{os.environ.get('PATH', '')}",
                   "XDG_CACHE_HOME": str(self.dir / "cache"), "HOME": str(self.home)}
         if not self.real:
             shared["CODEX_HOME"] = str(self.home / ".codex")
-        params = {"argv": self.adapter.operator_argv(operator), "cwd": str(self.work), "env": dict(shared)}
+        argv = (self.adapter.operator_argv(operator, operator_model) if self.real
+                else self.adapter.operator_argv(operator))
+        params = {"argv": argv, "cwd": str(self.work), "env": dict(shared)}
         if not self.real:
             params["env"]["FAKE_LOG"] = str(self.dir / "operator-input.jsonl")   # every input the fake received
             params["env"]["FAKE_ECHO"] = "1"
@@ -2078,6 +2078,23 @@ class QATeam:
         if self.operator_command:
             self.send(self.operator, self.operator_command)
         self.env = {**self.qa.env, **shared, "HC_TERMINAL_ID": self.operator}
+
+    def _qualification_workspace(self, quiet_grace):
+        work = self.dir / "work"
+        work.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "main", str(work)], check=True)
+        (work / "FACTORY.md").write_text("Qualification team: answer every request exactly as asked.\n")
+        lines = [f'[operator]\nharness = "{self.operator_harness}"\n']
+        if quiet_grace:
+            lines.insert(0, f"quiet_grace = {quiet_grace}\n")
+        for name, harness in self.members.items():
+            lines.append(f'[members.{name}]\nharness = "{harness}"\nmodel = "{self.adapter.model(harness)}"\n'
+                         f'permissions = "{self.permissions}"\n')
+        (work / "factory.toml").write_text("\n".join(lines))
+        subprocess.run(["git", "-C", str(work), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(work), "-c", "user.name=qa", "-c", "user.email=qa@example.invalid",
+                        "-c", "commit.gpgsign=false", "commit", "-q", "-m", "qa"], check=True)
+        return work
 
     def call(self, *args, terminal=None, timeout=60):
         """A Factory command as the operator (or as terminal): (exit code, output)."""
@@ -2343,14 +2360,17 @@ def _team_quiet(team, hold, timeout):
 TRUST_FILES = {"claude": "~/.claude.json", "codex": "~/.codex/config.toml"}
 
 
-def _trust_entries(run, team):
+def _trust_entries(run, team, directories=None):
     """The per-directory trust a real Claude Code or Codex start may add for this run's scratch project, listed
     for the owner to remove (@operator's decision; phase_8.md §2)."""
     entries = run.data.setdefault("trust_entries", [])
-    for harness in {team.operator_harness, *team.members.values()} & set(TRUST_FILES):
-        entry = {"harness": harness, "file": TRUST_FILES[harness], "directory": str(team.work)}
-        if entry not in entries:
-            entries.append(entry)
+    profiles = {"operator": team.operator_harness, **team.members}
+    for name, harness in profiles.items():
+        if harness in TRUST_FILES:
+            directory = directories.get(name, team.work) if directories is not None else team.work
+            entry = {"harness": harness, "file": TRUST_FILES[harness], "directory": str(directory)}
+            if entry not in entries:
+                entries.append(entry)
     run.checkpoint()
 
 
@@ -2450,11 +2470,11 @@ def judge_switch(before, after):
     return before != after, None if before != after else "the session variable did not change"
 
 
-def _operator_start(team, run, case, role, harness, names):
+def _operator_start(team, run, case, role, harness, names, trust_directories=None):
     """The operator past its own startup dialogs before the owner's first input, answered on the second poll as up
     does (a fake one shows one only for case 1)."""
     if team.real:
-        _trust_entries(run, team)
+        _trust_entries(run, team, trust_directories)
     watcher = Harness.attach(team.qa, team.operator_harness, team.operator)
     settled = watcher.settle(timeout=120)
     team.operator_start = {"settled": settled, "answered": watcher.answered}
@@ -4376,6 +4396,11 @@ def main(argv=None):
     rep = sub.add_parser("report", help="write docs/qualification/<harness>.md from qualify --json evidence")
     rep.add_argument("evidence", nargs="+", help="qualify --json files from real runs")
     rep.add_argument("--out", default=str(ROOT / "docs" / "qualification"))
+    if __package__:
+        from . import e2e
+    else:
+        import e2e
+    e2e.add_arguments(sub.add_parser("e2e"))
     args = parser.parse_args(argv)
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))   # cleanup (with-blocks, atexit) runs on SIGTERM too
     if args.command == "report":
@@ -4389,6 +4414,17 @@ def main(argv=None):
             parser.exit(2, f"qualify: {error}\n")
         print(json.dumps(evidence, indent=2))
         sys.exit(code)
+    if args.command == "e2e":
+        if args.rehearse and args.tracker != "file":
+            parser.error("the rehearsal uses the file tracker")
+        if args.budget is not None and not 0 < args.budget < float("inf"):
+            parser.error("--budget must be positive and finite")
+        if not RODEO:
+            parser.exit(2, "rodeo not found (set RODEO_BIN)\n")
+        try:
+            return e2e.run(args, Core, Rodeo, ROOT / "skill", shutil.which(HC) or HC, sys.modules[__name__])
+        except (RuntimeError, HcError, HcDown, subprocess.SubprocessError) as error:
+            parser.exit(1, f"FAIL {error}\n")
     if args.command == "smoke":
         try:
             smoke()
@@ -4409,4 +4445,4 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

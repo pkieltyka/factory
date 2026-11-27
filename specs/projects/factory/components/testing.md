@@ -177,6 +177,8 @@ CI leaves harness qualification and the rodeo cases to local runs.
 
 Results go to `docs/qualification/e2e-<date>.md` with the versions tested.
 
+For each fault, bind the assignment to the recipient terminal and its working turn. `hc` increments `turn` when the terminal leaves `working`. The turn observed before the claim, the receipt's `turn` and the current working turn are therefore equal when the assignment's receipt reports `started: true`.
+
 ## 8. CI
 
 `.github/workflows/test.yml` runs `python3 tests/test_factory.py` in fake mode on every push and pull request. The `test-real-hc` job verifies the SHA-256 of the pinned hc 0.1.20 Linux release and runs the same suite with `FACTORY_TEST_HC=real`. The installation was verified in LC-9. [Qualification record](../../../../docs/qualification/hc-checks.md)

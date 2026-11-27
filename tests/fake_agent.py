@@ -58,7 +58,7 @@ def add_typed(pending, data):
             pending.append(byte)
 
 
-def submitted_lines():
+def submitted_lines(interruptible=False):
     """Accept bracketed paste with embedded newlines, and Enter outside a paste."""
     pending = bytearray()
     incoming = b""
@@ -91,6 +91,11 @@ def submitted_lines():
                 incoming = incoming[len(START):]
                 paste = True
             elif START.startswith(incoming):
+                if interruptible and incoming == b"\x1b" and not select.select([0], [], [], 0.02)[0]:
+                    pending.clear()
+                    incoming = b""
+                    yield None
+                    continue
                 break
             elif incoming[:1] == b"\x1b":
                 pending.append(incoming[0])
@@ -156,10 +161,13 @@ def main():
         report("idle")
 
     waiting = False
-    for text in submitted_lines():
+    for text in submitted_lines(interruptible=os.environ.get("FAKE_INTERRUPT") == "1"):
         if text == "\x04":                      # Ctrl+D on its own line: quit to the shell, as "quits" does
             report("clear")
             return 0
+        if text is None:
+            report("idle")
+            continue
         if log:
             with pathlib.Path(log).open("a") as stream:
                 stream.write(json.dumps({"at": time.time(), "text": text}) + "\n")

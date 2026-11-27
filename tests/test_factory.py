@@ -1,8 +1,10 @@
 """Factory tests with fake harnesses and a fake or private real hc core."""
+import argparse
 import importlib.util
 import concurrent.futures
 import contextlib
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 import datetime
 import errno
 import fcntl
@@ -32,8 +34,9 @@ from urllib.parse import unquote, urlsplit
 from unittest.mock import call, patch
 
 if __package__:
-    from . import fake_hc, live
+    from . import e2e, fake_hc, live
 else:
+    import e2e
     import fake_hc
     import live
 
@@ -7206,6 +7209,459 @@ class ListingTests(unittest.TestCase):
                "│ z-ai/glm-5.3       │      1M │\n│ z-ai/glm-5.3-flash │      1M │\n└─────┴─────┘\n"
                "ollama (1)\n┌─────┬─────┐\n│ model    │ context │\n├─────┼─────┤\n│ qwen3:8b │    128K │\n└─────┴─────┘\n")
         self.assertEqual(factory.listed_models(omp), ["openrouter/z-ai/glm-5.3", "openrouter/z-ai/glm-5.3-flash", "ollama/qwen3:8b"])
+
+
+class E2EFixtureTests(unittest.TestCase):
+    def test_trust_entries_use_each_profile_working_directory(self):
+        repo = pathlib.Path("/tmp/factory-qa-fixture/repo")
+        worktree = repo.parent / "worktrees/qa-lead-dev"
+        team = types.SimpleNamespace(work=repo, operator_harness="claude",
+                                     members={"lead-dev": "codex", "reviewer": "claude"})
+        report = live.Qualification("real")
+        live._trust_entries(report, team, {"lead-dev": worktree})
+        entries = report.data["trust_entries"]
+        self.assertEqual({(e["harness"], e["directory"]) for e in entries},
+                         {("claude", str(repo)), ("codex", str(worktree))})
+        self.assertEqual(len(entries), 2)
+
+    def test_local_tracker_fixture(self):
+        command = e2e.ready_command(factory.SKILL)
+        for empty, count in ((False, 3), (True, 0)):
+            with self.subTest(empty=empty), tempfile.TemporaryDirectory() as directory:
+                fixture = e2e.make_local(pathlib.Path(directory), factory.SKILL, empty=empty)
+                self.assertEqual(e2e.git(fixture.origin, "rev-parse", "main").stdout.strip(), fixture.initial)
+                self.assertGreater(e2e.test_run(fixture.root, ci=True), 0)
+                self.assertFalse(any(e2e.accepts(fixture.root, item) for item in range(1, 4)))
+                ready = subprocess.run(["sh", "-c", command], cwd=fixture.root, capture_output=True, text=True)
+                self.assertEqual(ready.returncode, 0 if count else 1)
+                self.assertEqual(len(ready.stdout.splitlines()), count)
+
+    def test_empty_successful_suite_does_not_count(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            e2e.write_project(root)
+            (root / "tests/test_calc.py").unlink()
+            self.assertEqual(e2e.test_run(root), 0)
+            self.assertEqual(e2e.test_run(root, ci=True), 0)
+
+    def test_github_seed_pushes_one_orphan_commit_without_changing_master(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            local = e2e.make_local(root, factory.SKILL)
+            e2e.git(local.root, "push", "origin", "main:refs/heads/master")
+            e2e.git(local.origin, "symbolic-ref", "HEAD", "refs/heads/master")
+            remote_master = e2e.git(local.origin, "rev-parse", "master").stdout.strip()
+            github = e2e.GitHubFixture.__new__(e2e.GitHubFixture)
+            github.root = root / "shared"
+            github.root.mkdir()
+            github.base = "qa/fixture/main"
+            github.prefix = "qa/fixture/"
+            github.name = "factory-qa-fixture"
+            github.project = "pkieltyka/42"
+            github.report = live.Qualification("real")
+            github.manifest = {"branches": []}
+            with patch.object(e2e, "QA_URL", str(local.origin.with_suffix(""))):
+                github.seed_repo(factory.SKILL)
+            self.assertEqual(e2e.git(local.origin, "rev-parse", "master").stdout.strip(), remote_master)
+            self.assertEqual(e2e.git(local.origin, "rev-list", "--count", github.base).stdout.strip(), "1")
+            self.assertEqual(github.manifest["branches"][0]["name"], github.base)
+            self.assertIn("--repo pkieltyka/factory-test --project pkieltyka/42", (github.root / "FACTORY.md").read_text())
+            self.assertIn("--project 'pkieltyka/42'", github.ready_command(factory.SKILL))
+            self.assertGreater(e2e.test_run(github.root, ci=True), 0)
+
+
+class E2EJudgeTests(unittest.TestCase):
+    revision = "a" * 40
+
+    def message(self, ident, sender, recipient, text, committed, **fields):
+        return e2e.Message(ident, sender, recipient, text, committed,
+                           **{"delivered": committed + 1, "outcome": "delivered", **fields})
+
+    def normal(self, github=False):
+        names = ("#31", "#32", "#33") if github else ("(1)", "(2)", "(3)")
+        first, second, _ = names
+        messages = [
+            self.message(1, "operator", "lead-dev", f"Assign {first}", 10, terminal="t2", turn=3, started=True),
+            self.message(2, "factory", "operator", "team quiet", 15, kind="note", meta={"what": "quiet"}),
+            self.message(3, "operator", "lead-dev", f"What remains on {first}?", 17),
+            self.message(4, "operator", "lead-dev", f"Assign {second}", 50, terminal="t2", turn=5, started=True),
+            self.message(5, "factory", "operator", "@lead-dev was killed", 55,
+                         kind="note", meta={"what": "exit", "term": "t2"}),
+            self.message(6, "operator", "lead-dev", "Pick up your work", 60, kind="brief", terminal="t4"),
+        ]
+        tickets = []
+        main_code = set()
+        for n, item in enumerate(names):
+            revision = chr(ord("a") + n) * 40
+            offset = n * 50
+            introduced = frozenset({revision, f"earlier-{n}"})
+            main_code.update(introduced)
+            tickets.append(e2e.Ticket(item, planned=2 + offset, changed=7 + offset, revision=revision,
+                                      checked_revision=revision, test_count=2, timely_check=True,
+                                      integrated=42 + offset, branch_proof=True, introduced=introduced,
+                                      accepted=True, closed=43 + offset, state="Done"))
+            messages.append(self.message(7 + n, "reviewer", "operator",
+                                         f"status: approve; item {item}; commit {revision}", 40 + offset))
+        return e2e.Evidence(tuple(tickets), tuple(messages), frozenset(main_code), ci_count=2, loaded=True, prompts=1,
+                            within_budget=True, interrupt=e2e.Fault(first, "t2", 3, 11, 13, 1080),
+                            kill=e2e.Fault(second, "t2", 5, 51, 53, 3700), recovered={"t4": 57},
+                            github=github, scoped=True)
+
+    def status(self, evidence, name, item=None):
+        return next(r["status"] for r in e2e.judge(evidence) if r["name"] == name and r.get("item") == item)
+
+    def test_all_normal_rows_pass_with_multi_commit_reviewed_branch(self):
+        for github in (False, True):
+            with self.subTest(github=github):
+                self.assertTrue(all(r["status"] == "pass" for r in e2e.judge(self.normal(github))))
+
+    def test_each_ticket_needs_plan_approval_check_integration_and_closure(self):
+        sample = self.normal()
+        for label, changes in (
+            ("planned", {"planned": 8}), ("checked", {"test_count": 0}),
+            ("checked", {"checked_revision": "b" * 40}), ("integrated", {"branch_proof": False}),
+            ("integrated", {"accepted": False}), ("closed", {"closed": 35}),
+            ("closed", {"state": "In progress"}),
+        ):
+            with self.subTest(label=label, changes=changes):
+                tickets = (replace(sample.tickets[0], **changes), *sample.tickets[1:])
+                self.assertEqual(self.status(replace(sample, tickets=tickets), label, "(1)"), "fail")
+        original = sample.messages[6]
+        for changes in ({"text": original.text.replace("approve", "changes required")},
+                        {"text": original.text.replace("(1)", "(2)")},
+                        {"text": original.text.replace(self.revision, "d" * 40)},
+                        {"text": original.text + "\nChanges required before integration."}, {"delivered": 43}):
+            with self.subTest(changes=changes):
+                messages = (*sample.messages[:6], replace(original, **changes), *sample.messages[7:])
+                self.assertEqual(self.status(replace(sample, messages=messages), "reviewed", "(1)"), "fail")
+
+    def test_reviewer_can_send_a_formatted_approval_to_the_developer(self):
+        sample = self.normal()
+        for status in ("approve", "approved"):
+            verdict = replace(sample.messages[6], recipient="lead-dev",
+                              text=f"- **Status:** `{status}` for item `(1)`. The reviewed commit is `{self.revision}`."
+                                   "\nNo changes required.")
+            messages = (*sample.messages[:6], verdict, *sample.messages[7:])
+            self.assertEqual(self.status(replace(sample, messages=messages), "reviewed", "(1)"), "pass")
+
+    def test_run_rows_reject_direct_code_missing_ci_extra_input_and_wrong_build(self):
+        sample = self.normal()
+        for name, changes in (
+            ("no-direct-code", {"main_code": sample.main_code | {"direct"}}), ("ci-green", {"ci_count": 0}),
+            ("one-prompt", {"prompts": 2}), ("one-prompt", {"factory_commands": 1}),
+            ("loaded-version", {"loaded": False}), ("within-budget", {"within_budget": False}),
+            ("no-unconfirmed", {"messages": (replace(sample.messages[0], outcome="unconfirmed"), *sample.messages[1:])}),
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(self.status(replace(sample, **changes), name), "fail")
+        github = self.normal(github=True)
+        self.assertEqual(self.status(replace(github, scoped=False), "scoped-writes"), "fail")
+        tickets = (replace(github.tickets[0], timely_check=False), *github.tickets[1:])
+        self.assertEqual(self.status(replace(github, tickets=tickets), "checked", "#31"), "fail")
+
+    def test_interrupt_needs_silent_turn_and_item_specific_chase_after_note(self):
+        sample = self.normal()
+        chase = sample.messages[2]
+        for messages in ((sample.messages[:2] + sample.messages[3:]),
+                         (sample.messages[:2] + (replace(chase, text="Please review (2)"),) + sample.messages[3:]),
+                         (sample.messages[:2] + (replace(chase, delivered=14),) + sample.messages[3:])):
+            self.assertEqual(self.status(replace(sample, messages=messages), "quiet-then-chase"), "fail")
+        for committed in (12, 14):
+            report = self.message(12, "lead-dev", "operator", "I sent my progress on (1)", committed, delivered=None)
+            self.assertEqual(self.status(replace(sample, messages=(*sample.messages, report)), "quiet-then-chase"),
+                             "not_run")
+        self.assertEqual(self.status(replace(sample, interrupt=None), "quiet-then-chase"), "not_run")
+
+    def test_exit_note_and_replacement_must_match_the_kill(self):
+        sample = self.normal()
+        for changes in ({"recovered": {}}, {"recovered": {"t4": 50}},
+                        {"messages": (*sample.messages[:4], replace(sample.messages[4], meta={"what": "exit", "term": "x"}),
+                                      *sample.messages[5:])},
+                        {"messages": (*sample.messages[:5], replace(sample.messages[5], terminal="t2"), *sample.messages[6:])}):
+            self.assertEqual(self.status(replace(sample, **changes), "exit-then-up"), "fail")
+
+    def test_empty_board_requires_silence_and_pickup_of_the_moved_item(self):
+        sample = e2e.Evidence((e2e.Ticket("(1)", state="In progress"),), (
+            self.message(1, "factory", "operator", "team quiet", 2, kind="note", meta={"what": "quiet"}),
+            self.message(2, "factory", "operator", "ready work:\n- [ ] (1) Fix calc", 12, kind="note",
+                         meta={"what": "ready"}),
+            self.message(3, "operator", "lead-dev", "Assign (1)", 14),
+        ), loaded=True, prompts=1, within_budget=True, empty=True, moved=10, quiet_seconds=900, ready_seconds=63)
+        self.assertTrue(all(r["status"] == "pass" for r in e2e.judge(sample)))
+        for what, name in (("quiet", "one-quiet-note"), ("error", "silence")):
+            other = self.message(4, "factory", "operator", what, 5, kind="note", meta={"what": what}, delivered=None)
+            self.assertEqual(self.status(replace(sample, messages=(*sample.messages, other)), name), "fail")
+        self.assertEqual(self.status(replace(sample, quiet_seconds=899), "silence"), "fail")
+        self.assertEqual(self.status(replace(sample, ready_seconds=121), "ready-note"), "fail")
+        note = replace(sample.messages[1], text="ready work:\n- [ ] (2) Fix calc")
+        self.assertEqual(self.status(replace(sample, messages=(sample.messages[0], note, sample.messages[2])),
+                                     "ready-note"), "fail")
+        other = replace(sample.messages[2], text="Assign (2)")
+        self.assertEqual(self.status(replace(sample, messages=(*sample.messages[:2], other)), "item-taken", "(1)"), "fail")
+        waiting = replace(sample.tickets[0], state="Ready")
+        self.assertEqual(self.status(replace(sample, tickets=(waiting,)), "item-taken", "(1)"), "fail")
+
+    def test_triggers_correlate_receipt_to_the_observed_working_turn(self):
+        sample = self.normal()
+        first, second, _ = sample.tickets
+        term = {"address": "t2", "state": "live", "turn": 3, "status": {"state": "working"}}
+        receipt = sample.messages[0]
+        self.assertTrue(e2e.should_interrupt(receipt, first, term, 3))
+        for msg, terminal, turn, options in (
+            (receipt, term, 2, {}), (receipt, {**term, "turn": 4}, 3, {}),
+            (replace(receipt, terminal="t3"), term, 3, {}), (replace(receipt, kind="brief"), term, 3, {}),
+            (replace(receipt, text="@reviewer joined"), term, 3, {}), (replace(receipt, started=False), term, 3, {}),
+            (receipt, term, 3, {"fired": True}), (receipt, term, 3, {"reported": True}),
+        ):
+            self.assertFalse(e2e.should_interrupt(msg, first, terminal, turn, **options))
+        term["turn"] = 5
+        receipt = sample.messages[3]
+        self.assertTrue(e2e.should_kill(receipt, second, term, 5, first.integrated))
+        for options in ({"fired": True}, {"pending": True}):
+            self.assertFalse(e2e.should_kill(receipt, second, term, 5, first.integrated, **options))
+        self.assertFalse(e2e.should_kill(receipt, second, term, 5, receipt.delivered))
+
+
+class E2EObserverTests(unittest.TestCase):
+    def test_interrupted_run_checkpoints_collected_evidence_before_down(self):
+        for interruption in (KeyboardInterrupt(), SystemExit(1)):
+            with self.subTest(interruption=type(interruption).__name__), tempfile.TemporaryDirectory() as directory:
+                root = pathlib.Path(directory)
+                report = root / "result.json"
+                parser = argparse.ArgumentParser()
+                e2e.add_arguments(parser)
+                args = parser.parse_args(["--tracker", "file", "--json", str(report)])
+
+                def down(command, *, timeout):
+                    self.assertEqual(command, "down")
+                    saved = json.loads(report.read_text())
+                    self.assertEqual(saved["status"], "fail")
+                    self.assertIn("runner interrupted", saved["detail"])
+                    self.assertTrue(saved["cutoff_utc"])
+                    rows = {row["name"]: row["status"] for row in saved["rows"]}
+                    self.assertEqual(rows["one-prompt"], "pass")
+                    self.assertEqual(rows["loaded-version"], "pass")
+                    self.assertEqual(saved["faults"][0]["terminal"], "t3")
+                    return 0, ""
+
+                team = types.SimpleNamespace(
+                    dir=root, skill=factory.SKILL, script=factory.SCRIPT, operator_start={},
+                    adapter=types.SimpleNamespace(model=lambda _: "qa", version=lambda _: "test"),
+                    qa=types.SimpleNamespace(id="12345678"), env={"XDG_CACHE_HOME": str(root / "cache")},
+                    call=unittest.mock.Mock(side_effect=down),
+                )
+
+                @contextlib.contextmanager
+                def real_team(*_args, setup, **_kwargs):
+                    setup(team)
+                    yield team
+
+                def collect(_collector, observer, _move, _deadline, _checkpoint):
+                    observer.evidence.loaded = True
+                    observer.evidence.interrupt = e2e.Fault("(1)", "t3", 2, 1, 2, 10)
+                    raise interruption
+
+                rodeo = types.SimpleNamespace(paste=unittest.mock.Mock())
+                with (patch.object(live, "QATeam", real_team), patch.object(live, "_versions", return_value={}),
+                      patch.object(live, "_operator_start", return_value=True), patch.object(live, "_operator_tab"),
+                      patch.object(live, "_rodeo", return_value=rodeo), patch.object(e2e, "collect_run", collect),
+                      contextlib.redirect_stdout(io.StringIO())):
+                    self.assertEqual(e2e.run(args, None, None, None, None, live), 1)
+                team.call.assert_called_once_with("down", timeout=60)
+                rodeo.paste.assert_called_once()
+
+    def test_observation_uses_only_log_and_core_reads(self):
+        state = pathlib.Path("/scratch/factory-skill/team/core")
+        idle = {"address": "t5", "state": "live", "turn": 4, "created_ms": 5, "status": {"state": "idle"},
+                "labels": {"factory.dir": str(state), "factory.kind": "member", "factory.member": "lead-dev"}}
+        working = {**idle, "status": {"state": "working"}}
+        records = [
+            {"t": "msg", "id": 1, "from": "operator", "to": ["lead-dev"], "kind": "say", "text": "Start (1)"},
+            {"t": "ok", "id": 1},
+            {"t": "out", "id": 1, "to": "lead-dev", "o": "sending", "term": "t5"},
+            {"t": "out", "id": 1, "to": "lead-dev", "o": "delivered", "term": "t5", "turn": 4, "started": True},
+        ]
+        log = types.SimpleNamespace(read=lambda offset: ([], 100) if offset == 0 else (records, 400))
+        states = iter((idle, working))
+
+        def read_core(method):
+            self.assertEqual(method, "terminal.list")
+            return {"terminals": [next(states)]}
+
+        evidence = e2e.Evidence((e2e.Ticket("(1)"),))
+        obs = e2e.Observer(types.SimpleNamespace(rpc=read_core), types.SimpleNamespace(open_log=lambda _: log),
+                           state, evidence)
+        with patch.object(e2e.subprocess, "run", side_effect=AssertionError("observer ran a command")):
+            obs.collect()
+            obs.collect()
+        receipt, = evidence.messages
+        self.assertEqual(obs.before_claim[(1, "lead-dev")], 4)
+        self.assertEqual(obs.offset, 400)
+        self.assertTrue(e2e.should_interrupt(receipt, evidence.tickets[0], working, 4))
+
+    def test_rehearsal_and_real_output_stay_distinct(self):
+        parser = argparse.ArgumentParser()
+        e2e.add_arguments(parser)
+        real = parser.parse_args(["--tracker", "github", "--empty", "--operator", "codex"])
+        fixture = parser.parse_args(["--tracker", "file", "--rehearse"])
+        self.assertTrue(real.empty)
+        self.assertEqual(real.operator, "codex")
+        with (patch.object(e2e, "rehearse", return_value={"mode": "fixture", "status": "pass"}) as rehearsal,
+              patch.object(e2e, "run_real", return_value={"mode": "real", "status": "not_run"}) as actual):
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(e2e.run(real, None, None, None, None), 2)
+                self.assertEqual(json.loads(output.getvalue())["mode"], "real")
+            actual.assert_called_once()
+            rehearsal.assert_not_called()
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(e2e.run(fixture, None, None, None, None), 0)
+                self.assertEqual(json.loads(output.getvalue())["mode"], "fixture")
+            rehearsal.assert_called_once()
+
+
+class E2EGitHubEvidenceTests(unittest.TestCase):
+    def test_open_ticket_branch_does_not_inherit_earlier_implementation_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = e2e.make_local(pathlib.Path(directory), factory.SKILL)
+            e2e.implement_fixture(repo.root, 1)
+            e2e.git(repo.root, "add", "--", "calc", "tests")
+            e2e.git(repo.root, "commit", "-m", "Integrate the first item")
+            e2e.git(repo.root, "switch", "-c", "qa/fixture/2")
+            evidence = e2e.Evidence((e2e.Ticket("#2"),))
+            collector = e2e.GitHubEvidence.__new__(e2e.GitHubEvidence)
+            collector.repo = types.SimpleNamespace(root=repo.root, base="main", prefix="qa/fixture/")
+            collector.observer = types.SimpleNamespace(evidence=evidence, collect=lambda: None, stamp=lambda: 2)
+            collector.open_prs = {}
+            collector.next_forge_read = float("inf")
+            collector.collect()
+            self.assertIsNone(evidence.tickets[0].changed)
+            evidence.tickets = (e2e.Ticket("#2", planned=1),)
+            e2e.implement_fixture(repo.root, 2)
+            e2e.git(repo.root, "add", "--", "calc", "tests")
+            e2e.git(repo.root, "commit", "-m", "Implement the second item")
+            e2e.git(repo.root, "switch", "main")
+            collector.collect()
+            self.assertEqual(evidence.tickets[0].changed, 2)
+
+    def test_approval_between_forge_polls_requires_an_open_pr_at_the_same_head(self):
+        revision = "a" * 40
+        verdict = e2e.Message(7, "reviewer", "operator", f"status: approve; item #2; commit {revision}",
+                              1, delivered=2)
+        for state, head in (("open", revision), ("closed", revision), ("open", "b" * 40)):
+            with self.subTest(state=state, head=head):
+                evidence = e2e.Evidence((e2e.Ticket("#2"),), messages=(verdict,))
+                collector = e2e.GitHubEvidence.__new__(e2e.GitHubEvidence)
+                api = unittest.mock.Mock(return_value={"state": state, "head": {"sha": head},
+                                                       "merged_at": "2026-11-27T11:00:00Z" if state == "closed" else None})
+                collector.repo = types.SimpleNamespace(api=api)
+                collector.observer = types.SimpleNamespace(evidence=evidence, stamp=lambda: 3)
+                collector.open_prs = {10: ("#2", revision)}
+                collector.approvals = {}
+                collector.observe_approvals()
+                collector.observe_approvals()
+                expected = (verdict,) if state == "open" and head == revision else ()
+                self.assertEqual(collector.approvals[10, revision], expected)
+                api.assert_called_once_with(f"repos/{e2e.QA_REPO}/pulls/10")
+
+    def test_fresh_verifier_can_fetch_the_latest_integration_commit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            repo = e2e.make_local(root, factory.SKILL)
+            inspection = root / "inspection.git"
+            e2e.git(root, "clone", "--bare", "--no-local", str(repo.origin), str(inspection))
+            collector = e2e.GitHubEvidence.__new__(e2e.GitHubEvidence)
+            collector.repo = types.SimpleNamespace(base="main")
+            collector.inspection = inspection
+            e2e.git(inspection, "remote", "add", "forge", str(repo.origin))
+            e2e.implement_fixture(repo.root, 1)
+            e2e.git(repo.root, "add", "--", "calc", "tests")
+            e2e.git(repo.root, "commit", "-m", "Integrate the clamp change")
+            e2e.git(repo.root, "push", "origin", "main")
+            head = collector.fetch_main()
+            self.assertNotEqual(head, repo.initial)
+            self.assertTrue(e2e.LocalEvidence.verify(inspection, head, lambda checkout: e2e.accepts(checkout, 1)))
+
+    def test_fixture_waits_for_the_exact_board_after_recent_writes(self):
+        fixture = e2e.GitHubFixture.__new__(e2e.GitHubFixture)
+        expected = {1: "Todo", 2: "Todo", 3: "Todo"}
+        incomplete = {1: "Todo", 2: "Todo"}
+        with (patch.object(fixture, "board", side_effect=[incomplete, expected]) as board,
+              patch.object(e2e.time, "sleep") as sleep):
+            fixture.wait_for_board(expected)
+        self.assertEqual(board.call_count, 2)
+        sleep.assert_called_once_with(1)
+        with patch.object(fixture, "board", return_value={**expected, 4: "Todo"}):
+            with self.assertRaisesRegex(RuntimeError, "does not show exactly this run's cards"):
+                fixture.wait_for_board(expected, timeout=0)
+
+    def test_check_requires_a_real_test_job_completed_before_merge(self):
+        revision = "a" * 40
+        merge = e2e.forge_time("2026-11-27T10:20:00Z")
+        for completion, log_reads, expected in (
+                ("2026-11-27T10:10:00Z", ["12:00:00 Ran 3 tests in 0.01s\n"], 3),
+                ("2026-11-27T10:10:00Z", ["12:00:00 Ran 0 tests in 0.01s\n"], 0),
+                ("2026-11-27T10:30:00Z", [], 0),
+                ("2026-11-27T10:10:00Z", [RuntimeError("pass --allow-escape-sequences to output it anyway"),
+                                          "12:00:00 \x1b[32mRan \x1b[1m5\x1b[0m tests in 0.01s\n"], 5)):
+            with self.subTest(completion=completion, log_reads=log_reads):
+                api = f"repos/{e2e.QA_REPO}/actions"
+                responses = {
+                    f"{api}/runs?head_sha={revision}&status=success": {"workflow_runs": [
+                        {"id": 1, "head_branch": "qa/fixture/7", "head_sha": revision, "name": "Tests"}]},
+                    f"{api}/runs/1/jobs": {"jobs": [
+                        {"id": 4, "name": "tests", "conclusion": "success", "completed_at": completion}]},
+                }
+                forge = e2e.GitHubEvidence.__new__(e2e.GitHubEvidence)
+                forge.repo = types.SimpleNamespace(prefix="qa/fixture/", api=responses.__getitem__, gh=None)
+                forge.checks = {}
+                with patch.object(forge.repo, "gh", side_effect=log_reads) as read_logs:
+                    self.assertEqual(forge.checked(revision, merge), expected)
+                expected_reads = [call("run", "view", "--repo", e2e.QA_REPO, "--job", "4", "--log", text=True)]
+                if len(log_reads) == 2:
+                    expected_reads.append(call("api", "--allow-escape-sequences", f"{api}/jobs/4/logs", text=True))
+                self.assertEqual(read_logs.call_args_list, expected_reads if log_reads else [])
+
+
+class E2ELocalEvidenceTests(unittest.TestCase):
+    def test_approval_must_precede_the_local_merge_not_just_its_push(self):
+        for late in (False, True):
+            with self.subTest(late=late), tempfile.TemporaryDirectory() as directory:
+                repo = e2e.make_local(pathlib.Path(directory), factory.SKILL)
+                e2e.git(repo.root, "worktree", "add", "-b", "qa/lead-dev", str(repo.developer), repo.initial)
+                tickets = tuple(e2e.Ticket(f"({n})") for n in range(1, 4))
+                evidence = e2e.Evidence(tickets)
+                counter = iter(range(1, 100))
+                observer = types.SimpleNamespace(evidence=evidence, collect=lambda: None, stamp=counter.__next__)
+                local = e2e.LocalEvidence(repo, observer)
+                e2e.move_file_item(repo.root, "(1)", "In progress", "plan: clamp the value and cover its boundaries")
+                local.collect()
+                e2e.implement_fixture(repo.developer, 1)
+                e2e.git(repo.developer, "add", "--", "calc", "tests")
+                e2e.git(repo.developer, "commit", "-m", "Implement (1)")
+                revision = e2e.git(repo.developer, "rev-parse", "HEAD").stdout.strip()
+                local.collect()
+
+                def send_verdict():
+                    evidence.messages = (e2e.Message(1, "reviewer", "lead-dev",
+                        f"**status:** approve for (1) at `{revision}`", observer.stamp(),
+                        delivered=observer.stamp(), outcome="delivered"),)
+                    local.collect()
+
+                if not late:
+                    send_verdict()
+                e2e.git(repo.root, "merge", "--no-ff", "-m", "Integrate (1)", revision)
+                local.collect()
+                if late:
+                    send_verdict()
+                merge = e2e.git(repo.root, "rev-parse", "HEAD").stdout.strip()
+                e2e.move_file_item(repo.root, "(1)", "Done", f"work: {merge}")
+                e2e.git(repo.root, "push", "origin", "main")
+                local.collect()
+                first = evidence.tickets[0]
+                self.assertEqual(first.branch_proof, not late)
+                self.assertEqual(first.revision, "" if late else revision)
+                self.assertEqual(first.test_count, 0 if late else 2)
+                self.assertEqual(first.closed is None, late)
 
 
 class SkillTextTests(unittest.TestCase):
