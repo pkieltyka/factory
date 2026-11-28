@@ -2472,8 +2472,9 @@ class Keeper:
                 continue
             label = TABLE[harness].get("label", harness)
             text = (f"@{name} did not start a turn: message #{ident} was typed into {term}, and {label} can hold a"
-                    f" large message unsent in its input. Ask a person to inspect the input in {term} and press Enter"
-                    f" only if they see message #{ident} waiting.")
+                    f" large message unsent in its input. Find #{ident} with"
+                    f" {factory_command('inbox', '--for', name)}, and ask a person to compare its sender and text"
+                    f" with the input in {term}; they press Enter there only if that message is still waiting.")
             meta = {"what": "unstarted", "about": name, "term": term, "id": ident}
             note = self.log.add("factory", [operator], text, kind="note", meta=meta)[0]
             self.log.refresh(self.box)
@@ -4553,23 +4554,22 @@ def _down(cfg, hc, team, state, names):
 
 def operator_unstarted(terminal, box, cfg):
     """keeper.md §5, the operator's case of an unstarted delivery: shown by status, never typed into its input.
-    -> a line when the newest delivery to the operator did not start a turn and it is still idle at that turn, on
-    a harness that can hold a typed message unsent; else None."""
+    -> one line per delivery to the operator (notes excepted) that did not start a turn while it is still idle at
+    that turn, on a harness that can hold a typed message unsent; [] otherwise."""
     status = terminal.get("status") or {}
     harness = harness_for_app(status.get("app")) if status.get("app") else cfg.operator.get("harness")
     if TABLE.get(harness or "", {}).get("unstarted") != "note":
-        return None
+        return []
     name = cfg.operator["name"]
-    delivered = [(ident, rec) for (ident, to), rec in box.outcomes.items()
-                 if to == name and rec.get("o") == "delivered"]
-    if not delivered:
-        return None
-    ident, rec = max(delivered, key=lambda pair: pair[0])
-    if rec.get("started") is not False or status.get("state") not in ("idle", "done") \
-            or terminal.get("turn") != rec.get("turn") or rec.get("term") != terminal.get("address"):
-        return None
-    return (f"operator: unstarted message #{ident} in {terminal.get('address')}: typed but did not start a turn; ask a"
-            f" person to look at the operator's input and press Enter there if it is still waiting.")
+    if status.get("state") not in ("idle", "done"):
+        return []
+    found = sorted(ident for (ident, to), rec in box.outcomes.items()          # every one, not the newest only
+                   if to == name and rec.get("o") == "delivered" and rec.get("started") is False
+                   and rec.get("turn") == terminal.get("turn") and rec.get("term") == terminal.get("address")
+                   and (box.msgs.get(ident) or {}).get("kind") != "note")     # (@reviewer on #235)
+    return [f"operator: unstarted message #{ident} in {terminal.get('address')}: typed but did not start a turn;"
+            f" find #{ident} with {factory_command('inbox', '--for', name)} and ask a person to compare its sender"
+            f" and text with the operator's input before pressing Enter there." for ident in found]
 
 
 def cmd_status(args):
@@ -4637,8 +4637,7 @@ def cmd_status(args):
     print("operator: reachable" if reachable
           else f"operator: not reachable: run {factory_command('up')} in the operator's pane")
     if reachable and box is not None:
-        line = operator_unstarted(view.operator, box, cfg)
-        if line:
+        for line in operator_unstarted(view.operator, box, cfg):
             print(line)
     for word, hint in (("blocked", "blocked: waiting on an approval or a question."),
                        ("gone", "gone: run `{command}` to bring them back.")):

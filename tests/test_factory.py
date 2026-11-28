@@ -2978,8 +2978,8 @@ class MemberNoteTests(TeamCase):
         self.assertEqual([n["meta"] for n in notes], [{"what": "unstarted", "about": "lead-dev", "term": self.lead,
                                                        "id": ident}])
         self.assertIn(f"@lead-dev did not start a turn: message #{ident} was typed into {self.lead}", notes[0]["text"])
-        self.assertTrue(notes[0]["text"].endswith(f"Ask a person to inspect the input in {self.lead} and press Enter"
-                                                  f" only if they see message #{ident} waiting."))
+        self.assertIn(f"Find #{ident} with {CMD('inbox', '--for', 'lead-dev')}, and ask a person to compare its"
+                      f" sender and text with the input in {self.lead}", notes[0]["text"])
         self.assertEqual(self.fake.sent(self.lead), ["[from @operator]\na long message\n"])   # nothing more typed
         self.clock.sleep(factory.UNSTARTED_GRACE + 1)
         self.keeper.tick()
@@ -3078,15 +3078,23 @@ class MemberNoteTests(TeamCase):
 
     def test_status_shows_an_operator_s_unstarted_delivery(self):
         """For the operator the case is shown by status, never typed into its input (@operator)."""
-        box = types.SimpleNamespace(outcomes={(4, "operator"): {"o": "delivered", "started": False, "turn": 2,
-                                                                "term": "t1"}})
+        def box(*receipts):
+            outcomes = {(i, "operator"): {"o": "delivered", "started": s, "turn": 2, "term": "t1"}
+                        for i, s, _ in receipts}
+            return types.SimpleNamespace(outcomes=outcomes, msgs={i: {"kind": k} for i, _, k in receipts})
         cfg = types.SimpleNamespace(operator={"name": "operator", "harness": "omp"})
         idle = {"address": "t1", "turn": 2, "status": {"state": "idle", "app": "omp"}}
-        self.assertIn("operator: unstarted message #4 in t1: typed but did not start a turn; ask a person",
-                      factory.operator_unstarted(idle, box, cfg))
+        lines = factory.operator_unstarted(idle, box((4, False, "say")), cfg)
+        self.assertEqual(len(lines), 1)
+        self.assertIn("operator: unstarted message #4 in t1: typed but did not start a turn; find #4 with", lines[0])
+        # @reviewer on #235: a later receipt with started=null, or two unstarted ones, must not hide the earlier one
+        self.assertEqual(len(factory.operator_unstarted(idle, box((4, False, "say"), (5, None, "say")), cfg)), 1)
+        both = factory.operator_unstarted(idle, box((4, False, "say"), (5, False, "say")), cfg)
+        self.assertEqual([line.split()[3] for line in both], ["#4", "#5"])
+        self.assertEqual(factory.operator_unstarted(idle, box((4, False, "note")), cfg), [])     # notes excepted
         for terminal in ({**idle, "turn": 3}, {**idle, "status": {"state": "working", "app": "omp"}},
                          {**idle, "status": {"state": "idle", "app": "codex"}}):
-            self.assertIsNone(factory.operator_unstarted(terminal, box, cfg))
+            self.assertEqual(factory.operator_unstarted(terminal, box((4, False, "say")), cfg), [])
 
     def test_errors_and_exits_are_noted_with_their_facts(self):
         self.status(self.lead, "working")
