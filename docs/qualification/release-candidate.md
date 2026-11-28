@@ -56,7 +56,16 @@ The candidate SHA was `e7c2f26` for both passes. The five installed copies are u
 ### Proposed README at release
 
 - **Banner:** "Factory v2: a team of coding agents in hc and rodeo, led by the agent you already use." It would replace the pre-release banner, which stays until the owner publishes.
-- **Install:** `npx skills add pkieltyka/factory -g`. This is pending. The command fetches GitHub master, so it can only be tested once this candidate is on master, from a fresh scratch HOME with no inherited installer settings. The record will be the remote master SHA, the installed destination and a file comparison with that commit. Until then the checked install-from-checkout instructions stay.
+- **Install:** "`npx skills add pkieltyka/factory -g` (it asks which agents to install to; add `-y --agent '*'` to install for all without prompts)". The check is recorded in [Install from GitHub master](#install-from-github-master). Until the owner publishes, the checked install-from-checkout instructions stay.
+
+## Install from GitHub master
+
+The check ran on 2026-11-28 with `skills` 1.9.1 through `npx`. It used a fresh scratch HOME under `/tmp/factory-qa-install-*`, inherited only `PATH`, and had no terminal on stdin. Remote master was `a3b3bec` before and after. `skill/` there is unchanged since `9b316ec`, so it is Factory `bbd75423bc1f`.
+
+- **`npx skills add pkieltyka/factory -g`:** it found one skill, `factory2`, then asked which agents to install to. With no terminal it stopped with `SKILLS_PROMPT_REQUIRES_TTY` and installed nothing. At a terminal, a person answers that prompt.
+- **`npx skills add pkieltyka/factory -g -y --agent '*'`:** exit 0. It installed one copy, `~/.agents/skills/factory2`, which the installer says its "universal" agents read directly, Codex among them. It also made 54 symlinks to that copy, including Claude Code's `~/.claude/skills/factory2` and agy's `~/.gemini/config/skills/factory2`.
+- **pi, omp and OpenCode** got no link of their own. The installer shortens its universal list ("+16 more"), so whether they read `~/.agents/skills` is not established here.
+- **Contents:** `diff -r`, excluding `__pycache__`, of the installed copy against `skill/` in a clone at `a3b3bec`: identical.
 
 ## Before release
 
