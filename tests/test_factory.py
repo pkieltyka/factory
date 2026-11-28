@@ -7497,6 +7497,31 @@ class QualifyFrameworkTests(unittest.TestCase):
             with self.subTest(code=node["input"][:12]):
                 self.assertEqual([run for _, _, run in core.installed_seen([root])], expected)
 
+    def test_opencode_outputs_come_from_its_shell_folder_for_the_checkout(self):
+        """@operator (Phase 10): OpenCode keeps each shell call's output under shell/<the checkout's root commit>;
+        the database holding the commands is not opened, so the outputs are read unpaired, oldest first."""
+        import live
+        home = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(patch.dict(os.environ, {"HOME": str(home)}))
+        work = home / "work"
+        work.mkdir()
+        git = ["git", "-C", str(work), "-c", "user.name=t", "-c", "user.email=t@t"]
+        subprocess.run([*git, "init", "-q"], check=True)
+        subprocess.run([*git, "commit", "-q", "--allow-empty", "-m", "root"], check=True)
+        root = subprocess.run([*git, "rev-list", "--max-parents=0", "HEAD"], capture_output=True, text=True,
+                              check=True).stdout.strip()
+        folder = home / ".local/share/opencode/shell" / root
+        folder.mkdir(parents=True)
+        for n, text in enumerate(("factory abc (x), hc 0.1.20\nMember ...\n@lead-dev", "no messages for @operator\n")):
+            path = folder / f"sh_{n}.out"
+            path.write_text(text)
+            os.utime(path, (1000 + n, 1000 + n))
+        (home / ".local/share/opencode/shell/other").mkdir()
+        (home / ".local/share/opencode/shell/other/sh_9.out").write_text("another project")
+        self.assertEqual(live.opencode_outputs(work), ["factory abc (x), hc 0.1.20\nMember ...\n@lead-dev",
+                                                       "no messages for @operator\n"])
+        self.assertEqual(live.opencode_outputs(home / "missing"), [])
+
     def test_a_search_that_lists_an_installed_script_is_only_observed(self):
         """@operator (#173 pi member case 8 at a198b9c): the Codex peer's rg --files listed the installed v1
         script, which it never ran. A path in a shell call's output is an observation; in its command, a failure."""

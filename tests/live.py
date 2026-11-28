@@ -3112,18 +3112,63 @@ def _operator_commands(run, team, harness, peer):
     listed = sorted({int(n) for n in re.findall(r"\[Message (\d+) ", full["inbox"] or "")})
     inbox_ok = bool(full["inbox"]) and set(listed) <= set(to_operator) and (
         bool(listed) or "no messages for @operator" in full["inbox"])
+    observed_in = "Factory's log and each command's own tool result in the operator's transcript"
+    outputs_only = False
+    if team.real and harness == "opencode" and full["status"] is None and full["inbox"] is None:
+        # @operator: OpenCode keeps each shell call's output in its shell folder for the project; the command text
+        # is only in its database, which is not opened. The outputs, unpaired, mark the row "outputs only".
+        outs = opencode_outputs(team.work)
+        full = {"status": next((o for o in reversed(outs) if o.startswith("factory ") and "Member" in o), None),
+                "inbox": next((o for o in reversed(outs) if o.startswith("[Message ")
+                               or o.strip() == "no messages for @operator"), None)}
+        listed = sorted({int(n) for n in re.findall(r"\[Message (\d+) ", full["inbox"] or "")})
+        inbox_ok = bool(full["inbox"]) and set(listed) <= set(to_operator) and (
+            bool(listed) or "no messages for @operator" in full["inbox"])
+        outputs_only, observed_in = True, "outputs only: OpenCode's shell output files, not paired with their commands"
     status_ok = "@lead-dev" in (full["status"] or "")
     proof = {"member_acted": reached, "member_briefed": briefed, "say_id": say_id, "say_outcome": say_outcome,
              "status_names_member": status_ok, "inbox_ids": listed, "operator_ids_in_log": to_operator,
              "inbox_seen": full["inbox"] is not None, "status_seen": full["status"] is not None, "peer": peer,
-             "observed_in": "Factory's log and each command's own tool result in the operator's transcript",
+             "observed_in": observed_in, "outputs_only": outputs_only,
              "prompted_by": "the owner's paste and Enter through rodeo into a fresh operator (prefix+1)"}
-    ok = reached and briefed and bool(say_id) and (say_outcome or [""])[0] == "delivered" and status_ok and inbox_ok
-    run.row(2, "operator-commands", "operator", harness, "pass" if ok else "fail",
-            "the owner's first prompt has the operator run up, say, status and inbox --for itself; the brief is"
-            " delivered, the member acts on the say, status names it and the inbox lists the operator's messages",
-            proof=proof, elapsed=time.monotonic() - start, reason=None if ok else "see proof")
+    factory_ok = reached and briefed and bool(say_id) and (say_outcome or [""])[0] == "delivered"
+    what = ("the owner's first prompt has the operator run up, say, status and inbox --for itself; the brief is"
+            " delivered, the member acts on the say, status names it and the inbox lists the operator's messages")
+    if team.real and harness in NO_TOOL_RECORD and full["status"] is None and full["inbox"] is None:
+        # @operator: agy keeps no readable record of its tool calls; Factory's log proves up and say, and the
+        # status and inbox output stays unproved
+        proof["observed_in"] = "Factory's log only: the harness keeps no readable record of its tool calls"
+        run.row(2, "operator-commands", "operator", harness, "not_run" if factory_ok else "fail", what, proof=proof,
+                elapsed=time.monotonic() - start,
+                reason=("unproved: up (briefed member) and say (delivered, acted on) are in Factory's log; agy keeps"
+                        " no readable record of the status and inbox output") if factory_ok else "see proof")
+        return True
+    ok = factory_ok and status_ok and inbox_ok
+    run.row(2, "operator-commands", "operator", harness, "pass" if ok else "fail", what, proof=proof,
+            elapsed=time.monotonic() - start, observed="outputs only" if outputs_only and ok else None,
+            reason=None if ok else "see proof")
     return True
+
+
+NO_TOOL_RECORD = ("agy",)     # a bounded look found no readable record of agy's tool calls (Phase 10)
+
+
+def opencode_outputs(work):
+    """The text of each shell call OpenCode ran for this checkout, oldest first: the files it keeps in
+    ~/.local/share/opencode/shell/<project>/, where the project is the checkout's root commit. [] when none."""
+    try:
+        root = subprocess.run(["git", "-C", str(work), "rev-list", "--max-parents=0", "HEAD"], capture_output=True,
+                              text=True, timeout=10).stdout.split()
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if not root:
+        return []
+    folder = pathlib.Path(os.path.expanduser("~/.local/share/opencode/shell")) / root[0]
+    try:
+        files = sorted(folder.glob("sh_*.out"), key=lambda p: p.stat().st_mtime)
+        return [p.read_text(errors="replace") for p in files]
+    except OSError:
+        return []
 
 
 def case_2(run, role, harness, adapter_class):
