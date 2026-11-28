@@ -7243,6 +7243,25 @@ class QualifyReportTests(unittest.TestCase):
             self.assertIn("`/tmp/old`", trust)
             self.assertNotIn("/tmp/fake", trust)
 
+    def test_an_outputs_only_pass_is_reported_unproved(self):
+        """@operator: OpenCode's unpaired shell outputs never earn a pass; a row stored as one (8f7b61b) is shown
+        unproved and stays open, with its observations kept."""
+        head = subprocess.run(["git", "-C", str(live.ROOT), "rev-parse", "HEAD"], capture_output=True,
+                              text=True).stdout.strip()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            row = {"case": 2, "subcase": "operator-commands", "role": "operator", "harness": "opencode",
+                   "status": "pass", "observed": "outputs only",
+                   "proof": {"outputs_only": True, "status_seen": True, "inbox_seen": True, "say_id": 2}}
+            data = {"mode": "real", "source_head": head, "utc": "2026-11-28T00:00:00Z", "rows": [row], "profiles": [],
+                    "trust_entries": []}
+            (tmp / "a.json").write_text(json.dumps(data))
+            live.report([str(tmp / "a.json")], tmp / "out")
+            text = (tmp / "out" / "opencode.md").read_text()
+            self.assertIn("| 2 | operator-commands | unproved (outputs only: no call paired with its result) |"
+                          " outputs only |", text)
+            self.assertIn("Unresolved as operator: 2 operator-commands,", text)
+
     def test_the_latest_attempt_wins_across_heads_and_trust_entries_accumulate(self):
         """@reviewer: a later fail on an older head must not hide behind an earlier pass on a newer one; and a
         partial import must keep the cleanup entries an earlier import listed."""

@@ -3119,7 +3119,7 @@ def _operator_commands(run, team, harness, peer):
         # is only in its database, which is not opened. The outputs, unpaired, mark the row "outputs only".
         outs = opencode_outputs(team.work)
         full = {"status": next((o for o in reversed(outs) if o.startswith("factory ") and "Member" in o
-                                and f"({pathlib.Path(team.script).resolve()})" in o.splitlines()[0]), None),
+                                and f"({pathlib.Path(team.script).resolve()}), hc " in o.splitlines()[0]), None),
                 "inbox": next((o for o in reversed(outs) if o.startswith("[Message ")
                                or o.strip() == "no messages for @operator"), None)}
         listed = sorted({int(n) for n in re.findall(r"\[Message (\d+) ", full["inbox"] or "")})
@@ -3145,11 +3145,13 @@ def _operator_commands(run, team, harness, peer):
                         " no readable record of the status and inbox output") if factory_ok else "see proof")
         return True
     ok = factory_ok and status_ok and inbox_ok
-    if outputs_only and ok:     # @architect-2: unpaired outputs are observations; only a paired call earns a pass
+    if outputs_only and factory_ok:   # @operator: unpaired outputs are observations and never a pass; a failed
+        found = [n for n in ("status", "inbox") if proof[f"{n}_seen"]]      # up or say still fails below
         run.row(2, "operator-commands", "operator", harness, "not_run", what, proof=proof,
                 elapsed=time.monotonic() - start, observed="outputs only",
-                reason="unproved: outputs only. up and say are in Factory's log, and status and inbox outputs naming"
-                       " this run's script are in OpenCode's shell files, but no call is paired with its result")
+                reason="unproved: outputs only. up and say are in Factory's log; OpenCode's shell files hold "
+                       + (" and ".join(found) + " output for this run's script" if found else "no attributable output")
+                       + ", and no call is paired with its result")
         return True
     run.row(2, "operator-commands", "operator", harness, "pass" if ok else "fail", what, proof=proof,
             elapsed=time.monotonic() - start, reason=None if ok else "see proof")
@@ -5489,7 +5491,9 @@ def report(paths, out):
                 proof = row.get("proof") if isinstance(row.get("proof"), dict) else {}
                 status = row["status"]
                 needed = PROOF_NEEDED.get((case, subcase))
-                if status == "pass" and needed and not any(key in proof for key in needed):
+                if status == "pass" and proof.get("outputs_only"):    # @operator: never a pass (8f7b61b rows)
+                    status = "unproved (outputs only: no call paired with its result)"
+                elif status == "pass" and needed and not any(key in proof for key in needed):
                     status = "unproved (an older driver's weaker check)"
                 elif status == "pass" and (case, subcase) in REJUDGE and not REJUDGE[(case, subcase)](proof):
                     status = "unproved (its proof does not meet today's check)"
