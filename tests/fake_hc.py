@@ -190,6 +190,8 @@ def dispatch(directory, request):
                 raise RpcFailure("invalid_params", f"unknown method {method}")
             if not isinstance(params.get("text"), str):
                 raise RpcFailure("invalid_params", "missing text")
+            if params.get("if") not in (None, "idle", "working"):     # hc 0.1.20's schema: IdleOrWorking or null
+                raise RpcFailure("invalid_params", "expected `idle` or `working`")
             target_record = terminal(state, target)
             send_rule = state["rules"].get("send", {}).get(target, {})
             if send_rule.get("die"):

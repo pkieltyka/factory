@@ -70,6 +70,7 @@ HC = os.environ.get("HC_BIN", "hc")
 HC_MIN = (0, 1, 20)
 VERSION = hashlib.sha1(SCRIPT.read_bytes()).hexdigest()[:12]
 TICK = 1.0
+UNSTARTED_GRACE = 5     # seconds after an unstarted send before the member's idle turn is checked (keeper.md §5)
 LATCH_AFTER = 5
 BEAT_STALE = 30
 KEEPER_START = 5
@@ -1914,6 +1915,7 @@ class Keeper:
         self.unsettled = []
         self.inflight = {}
         self.held = set()
+        self.unstarted_seen = {}     # (member, id) -> when this keeper first saw it typed with no turn started
         self.op_null_since = None
         self._null_terminal = None
         self.damaged = None
@@ -2145,6 +2147,7 @@ class Keeper:
         try:
             if self.damaged is None and self.team.get("up") is True and not self.draining:
                 self._member_notes(view)
+                self._unstarted_notes(view)
                 self._quiet(view, now)
             if self.damaged is None and not self.draining:   # draining: no new claims, only settlements
                 self._deliver(view, now)
@@ -2434,6 +2437,54 @@ class Keeper:
             self.inflight.pop(name)
             self.held.discard((name, ident))
 
+    def _unstarted_notes(self, view):
+        """keeper.md §5 (#175): a member's newest delivery that hc typed without a turn starting, on a harness that
+        can hold a typed message unsent (omp with a large one), gets one note to the operator naming the message
+        and the pane, once the member is seen still idle at that turn: a person checks the input before pressing
+        Enter (@operator). Derived from the log on every pass, so a failed write is retried and a restart or drain
+        loses nothing; a stored note for that message and terminal ends it (@architect-2)."""
+        now = self.clock.monotonic()
+        operator = self.cfg.operator["name"]
+        cases = []           # every unnoted receipt, not only a member's newest (@architect-2: #6 and #7 at one turn)
+        for (ident, to), rec in sorted(self.box.outcomes.items()):
+            msg = self.box.msgs.get(ident)
+            if to != operator and rec.get("o") == "delivered" and msg and msg["kind"] != "note":
+                cases.append((to, ident, rec))
+        noted = {(m["meta"].get("id"), m["meta"].get("term")) for m in self.box.msgs.values()
+                 if m["kind"] == "note" and (m.get("meta") or {}).get("what") == "unstarted"}
+        live = set()
+        for name, ident, rec in cases:
+            term, turn = rec.get("term"), rec.get("turn")
+            if rec.get("started") is not False or (ident, term) in noted:
+                continue
+            live.add((name, ident))
+            since = self.unstarted_seen.setdefault((name, ident), now)
+            if now - since < UNSTARTED_GRACE:
+                continue
+            record = view.terminal(name)
+            status = (record or {}).get("status") or {}
+            if not record or record["address"] != term or status.get("state") not in ("idle", "done") \
+                    or record.get("turn") != turn:
+                continue                     # it started after all, or the pane changed
+            harness = harness_for_app(status["app"]) if status.get("app") else \
+                (self.cfg.members.get(name) or {}).get("harness")       # the live app first (@architect-2)
+            if TABLE.get(harness or "", {}).get("unstarted") != "note":
+                continue
+            label = TABLE[harness].get("label", harness)
+            text = (f"@{name} did not start a turn: message #{ident} was typed into {term}, and {label} can hold a"
+                    f" large message unsent in its input. Find #{ident} with"
+                    f" {factory_command('inbox', '--for', name, 20)} (raise the count until #{ident} appears), and"
+                    f" give its sender and exact text to a person, who compares them with the input in {term} and"
+                    f" presses Enter there only if that message is still waiting.")
+            meta = {"what": "unstarted", "about": name, "term": term, "id": ident}
+            note = self.log.add("factory", [operator], text, kind="note", meta=meta)[0]
+            self.log.refresh(self.box)
+            live.discard((name, ident))
+            stamp = time.strftime("%H:%M:%S", time.localtime(self.clock.time()))
+            self.emit(f"{stamp} #{note} note: @{name} unstarted #{ident}")
+        for key in set(self.unstarted_seen) - live:
+            del self.unstarted_seen[key]
+
     def _settle_result(self, name, ident, term, result):
         msg = self.box.msgs.get(ident)
         if msg is None:
@@ -2445,6 +2496,7 @@ class Keeper:
                     warning = self.log.remove_delivered_file(self.box, ident)
                     if warning:
                         self.emit(warning)
+
             else:
                 self._record(msg, name, "unconfirmed", why="hc returned an unexpected result", term=term)
             return
@@ -4501,6 +4553,27 @@ def _down(cfg, hc, team, state, names):
     return code
 
 
+def operator_unstarted(terminal, box, cfg):
+    """keeper.md §5, the operator's case of an unstarted delivery: shown by status, never typed into its input.
+    -> one line per delivery to the operator (notes excepted) that did not start a turn while it is still idle at
+    that turn, on a harness that can hold a typed message unsent; [] otherwise."""
+    status = terminal.get("status") or {}
+    harness = harness_for_app(status.get("app")) if status.get("app") else cfg.operator.get("harness")
+    if TABLE.get(harness or "", {}).get("unstarted") != "note":
+        return []
+    name = cfg.operator["name"]
+    if status.get("state") not in ("idle", "done"):
+        return []
+    found = sorted(ident for (ident, to), rec in box.outcomes.items()          # every one, not the newest only
+                   if to == name and rec.get("o") == "delivered" and rec.get("started") is False
+                   and rec.get("turn") == terminal.get("turn") and rec.get("term") == terminal.get("address")
+                   and (box.msgs.get(ident) or {}).get("kind") != "note")     # (@reviewer on #235)
+    return [f"operator: unstarted message #{ident} in {terminal.get('address')}: typed but did not start a turn;"
+            f" find #{ident} with {factory_command('inbox', '--for', name, 20)} (raise the count until it appears) and"
+            f" give its sender and exact text to a person, who compares them with the operator's input before pressing"
+            f" Enter there." for ident in found]
+
+
 def cmd_status(args):
     hc = Hc()
     try:
@@ -4565,6 +4638,9 @@ def cmd_status(args):
     reachable = view.operator is not None and view.operator.get("status") is not None
     print("operator: reachable" if reachable
           else f"operator: not reachable: run {factory_command('up')} in the operator's pane")
+    if reachable and box is not None:
+        for line in operator_unstarted(view.operator, box, cfg):
+            print(line)
     for word, hint in (("blocked", "blocked: waiting on an approval or a question."),
                        ("gone", "gone: run `{command}` to bring them back.")):
         hit = [n for n in cfg.members if view.state(n) == word]

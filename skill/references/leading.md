@@ -31,7 +31,7 @@ Check the reported tests before accepting work. `say` prints a message ID and on
 | Outcome | Action |
 |---|---|
 | `delivered` | The message was typed and submitted. |
-| `sending` or `queued` | Factory finishes delivery. Never resend it. Reasons include `waiting`, `blocked`, `not ready`, `gone` and `busy` (for a recipient that takes messages between turns, a Codex operator or member: delivered when its turn ends). In your own `inbox`, `queued` means not yet given to you: leave it, and Factory types it when your turn ends. |
+| `sending` or `queued` | Factory finishes delivery. Never resend it. Reasons include `waiting`, `blocked`, `not ready`, `gone` and `busy` (for a recipient that takes messages between turns, a Codex or omp operator or member: delivered when its turn ends). In your own `inbox`, `queued` means not yet given to you: leave it, and Factory types it when your turn ends. |
 | `unconfirmed` or `dropped` | Check the recipient before deciding whether to retry. Members tell you the message ID and recipient and resend only when asked. |
 | `nothing sent` | Fix the reported cause, then send again. |
 | `not stored` or `not confirmed stored` | Follow the diagnostic. Respect any instruction to check the inbox or leave the send alone. |
@@ -53,6 +53,7 @@ After you press Esc in a working Claude Code member’s pane, check `factory.py 
 | `first brief N is still` | Let Factory finish delivery. |
 | `no pane` or `keeper: not running` | Use `factory.py up` if the team should be running. |
 | `operator: not reachable` | Run `factory.py up` from the operator's pane. |
+| `operator: unstarted message` | Find #N with `factory.py inbox`, then ask a person to compare its sender and text with the operator's input before pressing Enter. If the message is still waiting there, they submit it. |
 
 Notes from `[from factory]` describe an observation that may have changed while delivery was held. Check `status`, the tracker and active work before acting.
 
@@ -63,6 +64,7 @@ Notes from `[from factory]` describe an observation that may have changed while 
 | Member exit (`exited`, `was killed`, `hc stopped`, `was lost`, or `its harness ended`) | Run `factory.py up NAME` or reassign. Reconcile the pickup report, tracker and inbox before assigning the task again. |
 | `team quiet` | Check who owes a report, then check for ready work. If neither needs action, end your turn without replying. |
 | `ready work` | Read the current tracker and take its next ready item if you can assign it. |
+| `@x did not start a turn` (message #N typed into its pane) | Find #N with `factory.py inbox --for NAME N`, raising the count until #N appears, then ask a person to compare its sender and text with that pane's input before anyone presses Enter. The input shows no message ID, and an agent cannot tell Factory's text from the owner's. If the message is still waiting, they press Enter in that pane. Never resend it. |
 
 ## Review and integrate
 

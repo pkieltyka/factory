@@ -931,6 +931,9 @@ class HcBackendTests(HcBackend, HcAssertions, unittest.TestCase):
         self.assert_hc_error("invalid_params", hc.call, "terminal.send", target)
         self.state(term, "idle")
         self.assert_hc_error("status_mismatch", hc.call, "terminal.send", {**target, "text": "x", "if": "working"})
+        for word in ("done", "error", "blocked"):      # if takes idle or working only (@architect-2 on hc 0.1.20)
+            with self.subTest(guard=word):
+                self.assert_hc_error("invalid_params", hc.call, "terminal.send", {**target, "text": "x", "if": word})
         self.checked_call(hc, "terminal.kill", target)
         self.assert_hc_error("finished", hc.send, term, "x")
         self.checked_call(hc, "terminal.rm", target)
@@ -1734,6 +1737,22 @@ class DeliveryDecisionTests(unittest.TestCase):
         self.assertEqual(factory.decide("boss", {"kind": "say"}, view("boss", "working", "codex"), self.box, boss, 10,
                                         None), ("queue", "busy"))
 
+    def test_omp_gets_messages_between_turns_in_both_roles(self):
+        """@operator's decision (#175, omp operator case 7 at 1be599e): a report arriving while omp worked replaced
+        an earlier, independent one. omp joins Codex; pi, which passed two-senders, still steers."""
+        def view(name, state, app, kind):
+            record = self.terminal(name, state, kind=kind)
+            record["status"]["app"] = app
+            return factory.View([record])
+        self.briefed()
+        for name, kind, address in (("operator", "operator", "t-operator"), ("lead-dev", "member", "t-lead-dev")):
+            for state, app, expected in (("working", "omp", ("queue", "busy")),
+                                         ("idle", "omp", ("send", address, "idle")),
+                                         ("done", "omp", ("send", address)), ("working", "pi", ("send", address))):
+                with self.subTest(name=name, state=state, app=app):
+                    self.assertEqual(factory.decide(name, {"kind": "say"}, view(name, state, app, kind), self.box,
+                                                    self.cfg, 10, None), expected)
+
     def test_a_codex_member_gets_messages_between_turns_too(self):
         """@operator's decision (#173, Codex member case 7 two-senders at a65a1fe): the rule holds in both roles,
         after a member's own rows (not started, gone, starting, not ready, blocked); other members still steer."""
@@ -1760,6 +1779,19 @@ class DeliveryDecisionTests(unittest.TestCase):
         lines, code = factory.outcome_lines({"lead-dev": {"o": "queued", "why": "busy"}}, "operator", "operator")
         self.assertEqual((lines, code), (["@lead-dev: queued (busy): Factory will deliver it when @lead-dev's turn"
                                           " ends."], 0))
+
+    def test_a_live_app_maps_to_its_harness_through_status_app(self):
+        """agy reports "antigravity" and Claude Code "claude-code" (@operator's decision on agy as operator at
+        5cdcbd4): decide finds the harness through status_app, so a between-turns rule would apply to them."""
+        self.assertEqual([factory.harness_for_app(a) for a in ("codex", "antigravity", "claude-code", "fake", None)],
+                         ["codex", "agy", "claude", None, None])
+        record = self.terminal("operator", "working", kind="operator")
+        record["status"]["app"] = "antigravity"
+        with patch.dict(factory.TABLE["agy"], deliver="idle"):
+            self.assertEqual(factory.decide("operator", {"kind": "say"}, factory.View([record]), self.box, self.cfg,
+                                            10, None), ("queue", "busy"))
+        self.assertEqual(factory.decide("operator", {"kind": "say"}, factory.View([record]), self.box, self.cfg, 10,
+                                        None), ("send", "t-operator"))
 
     def test_stale_note_takes_precedence_over_an_absent_operator(self):
         note = {"kind": "note", "meta": {"what": "quiet"}}
@@ -2927,6 +2959,146 @@ class MemberNoteTests(TeamCase):
         again.tick()
         again.tick()
         self.assertEqual(len(self.notes()), 1)
+
+    def test_an_unstarted_delivery_is_noted_once_when_the_member_stays_idle(self):
+        """@operator (#175, omp's 29 KB message at 19b4fd8): hc typed it but no turn started. The operator gets one
+        note naming the message and the pane, after the member is seen still idle at that turn; nothing is typed
+        into the member's pane, and a member that started meanwhile gets no note."""
+        self.enterContext(patch.dict(factory.TABLE["codex"], unstarted="note"))
+        self.fake.set_status(self.lead, "idle", app="codex")
+        self.fake.rule("send", **{self.lead: {"started": False}})
+        ident = self.log.add("operator", ["lead-dev"], "a long message")[0]
+        for _ in range(3):
+            self.keeper.tick()
+            self.run_jobs()
+        self.assertEqual(self.notes(), [])                               # not before the grace
+        self.clock.sleep(factory.UNSTARTED_GRACE + 1)
+        self.keeper.tick()
+        notes = self.notes()
+        self.assertEqual([n["meta"] for n in notes], [{"what": "unstarted", "about": "lead-dev", "term": self.lead,
+                                                       "id": ident}])
+        self.assertIn(f"@lead-dev did not start a turn: message #{ident} was typed into {self.lead}", notes[0]["text"])
+        self.assertIn(f"Find #{ident} with {CMD('inbox', '--for', 'lead-dev', 20)} (raise the count until #{ident}"
+                      f" appears), and give its sender and exact text to a person, who compares them with the input"
+                      f" in {self.lead}", notes[0]["text"])
+        argv = shlex.split(notes[0]["text"].split(" with ", 1)[1].split(" (raise", 1)[0])
+        self.assertEqual(argv[:3], ["python3", str(factory.SCRIPT), "inbox"])
+        self.assertEqual(argv[-2:], ["--cwd", str(self.root.resolve())])       # the team's checkout (#234)
+        self.assertEqual(self.fake.sent(self.lead), ["[from @operator]\na long message\n"])   # nothing more typed
+        self.clock.sleep(factory.UNSTARTED_GRACE + 1)
+        self.keeper.tick()
+        self.assertEqual(len(self.notes()), 1)                           # once
+        second = self.log.add("operator", ["lead-dev"], "another")[0]
+        for _ in range(3):
+            self.keeper.tick()
+            self.run_jobs()
+        self.status(self.lead, "working")                                # it started after all
+        self.clock.sleep(factory.UNSTARTED_GRACE + 1)
+        self.keeper.tick()
+        self.assertEqual([n["meta"].get("id") for n in self.notes()], [ident])
+        self.assertTrue(second)
+
+    def unstarted_send(self, text="a long message"):
+        self.fake.rule("send", **{self.lead: {"started": False}})
+        ident = self.log.add("operator", ["lead-dev"], text)[0]
+        for _ in range(3):
+            self.keeper.tick()
+            self.run_jobs()
+        return ident
+
+    def test_an_unstarted_note_survives_a_failed_write_and_a_restart(self):
+        """@architect-2 at 663adaf: the one notice must not be lost before it is stored. A failed write is
+        retried; a keeper restart (a drain's re-exec) during the grace still gives exactly one notice."""
+        self.enterContext(patch.dict(factory.TABLE["codex"], unstarted="note"))
+        self.fake.set_status(self.lead, "idle", app="codex")
+        ident = self.unstarted_send()
+        again = factory.Keeper(self.state_dir, self.hc, self.clock, self.pane.append, self.jobs.append)
+        again.tick()                                                     # the new image, mid-grace
+        self.clock.sleep(factory.UNSTARTED_GRACE + 1)
+        real, calls = again.log.add, []
+
+        def failing(*args, **kwargs):
+            calls.append(kwargs.get("kind"))
+            if len(calls) == 1:
+                raise OSError("disk full")
+            return real(*args, **kwargs)
+        with patch.object(again.log, "add", failing):
+            again.tick()                                                 # the write fails
+            self.assertEqual(self.notes(), [])
+            self.clock.sleep(61)                                         # the keeper retries the log
+            again.tick()
+            again.tick()
+        self.assertEqual([n["meta"]["id"] for n in self.notes()], [ident])
+        self.clock.sleep(factory.UNSTARTED_GRACE + 1)
+        again.tick()
+        self.keeper.tick()                                               # neither image repeats it
+        self.assertEqual(len(self.notes()), 1)
+
+    def test_two_unstarted_receipts_at_one_turn_are_each_noted_once(self):
+        """@architect-2 at 0092272: #6 and #7 both typed with no turn started, t3 still idle at that turn; after a
+        restart both get exactly one notice, and another pass adds none."""
+        self.enterContext(patch.dict(factory.TABLE["codex"], unstarted="note"))
+        self.fake.set_status(self.lead, "idle", app="codex")
+        self.fake.rule("send", **{self.lead: {"started": False}})
+        first = self.log.add("operator", ["lead-dev"], "one")[0]
+        second = self.log.add("operator", ["lead-dev"], "two")[0]
+        for _ in range(6):
+            self.keeper.tick()
+            self.run_jobs()
+        again = factory.Keeper(self.state_dir, self.hc, self.clock, self.pane.append, self.jobs.append)
+        again.tick()
+        self.clock.sleep(factory.UNSTARTED_GRACE + 1)
+        for _ in range(3):
+            again.tick()
+        self.assertEqual(sorted(n["meta"]["id"] for n in self.notes()), [first, second])
+
+    def test_an_unstarted_note_follows_the_live_app_not_the_formation(self):
+        """@architect-2: a live omp in a pane formed as Codex gets the notice, a Claude Code one in a pane formed
+        as a harness with the setting does not."""
+        self.fake.set_status(self.lead, "idle", app="omp")
+        ident = self.unstarted_send()
+        self.clock.sleep(factory.UNSTARTED_GRACE + 1)
+        self.keeper.tick()
+        notes = self.notes()
+        self.assertEqual([n["meta"]["id"] for n in notes], [ident])
+        self.assertIn("omp can hold", notes[0]["text"])
+        with patch.dict(factory.TABLE["codex"], unstarted="note"):
+            self.fake.set_status(self.lead, "idle", app="claude-code")
+            second = self.unstarted_send("another")
+            self.clock.sleep(factory.UNSTARTED_GRACE + 1)
+            self.keeper.tick()
+        self.assertEqual([n["meta"]["id"] for n in self.notes()], [ident])
+        self.assertTrue(second)
+
+    def test_an_unstarted_note_falls_back_to_the_formation_without_an_app(self):
+        self.enterContext(patch.dict(factory.TABLE["codex"], unstarted="note"))
+        self.fake.set_status(self.lead, "idle")
+        with self.fake.state() as state:                                # a status with no app reported
+            state["terminals"][self.lead]["status"].pop("app", None)
+        ident = self.unstarted_send()
+        self.clock.sleep(factory.UNSTARTED_GRACE + 1)
+        self.keeper.tick()
+        self.assertEqual([n["meta"]["id"] for n in self.notes()], [ident])
+
+    def test_status_shows_an_operator_s_unstarted_delivery(self):
+        """For the operator the case is shown by status, never typed into its input (@operator)."""
+        def box(*receipts):
+            outcomes = {(i, "operator"): {"o": "delivered", "started": s, "turn": 2, "term": "t1"}
+                        for i, s, _ in receipts}
+            return types.SimpleNamespace(outcomes=outcomes, msgs={i: {"kind": k} for i, _, k in receipts})
+        cfg = types.SimpleNamespace(operator={"name": "operator", "harness": "omp"})
+        idle = {"address": "t1", "turn": 2, "status": {"state": "idle", "app": "omp"}}
+        lines = factory.operator_unstarted(idle, box((4, False, "say")), cfg)
+        self.assertEqual(len(lines), 1)
+        self.assertIn("operator: unstarted message #4 in t1: typed but did not start a turn; find #4 with", lines[0])
+        # @reviewer on #235: a later receipt with started=null, or two unstarted ones, must not hide the earlier one
+        self.assertEqual(len(factory.operator_unstarted(idle, box((4, False, "say"), (5, None, "say")), cfg)), 1)
+        both = factory.operator_unstarted(idle, box((4, False, "say"), (5, False, "say")), cfg)
+        self.assertEqual([line.split()[3] for line in both], ["#4", "#5"])
+        self.assertEqual(factory.operator_unstarted(idle, box((4, False, "note")), cfg), [])     # notes excepted
+        for terminal in ({**idle, "turn": 3}, {**idle, "status": {"state": "working", "app": "omp"}},
+                         {**idle, "status": {"state": "idle", "app": "codex"}}):
+            self.assertEqual(factory.operator_unstarted(terminal, box((4, False, "say")), cfg), [])
 
     def test_errors_and_exits_are_noted_with_their_facts(self):
         self.status(self.lead, "working")
@@ -7014,6 +7186,49 @@ class QualifyJudgeTests(unittest.TestCase):
         self.assertIn("AttributeError", rows[(3, "draft-cleared")]["reason"])
         self.assertEqual(rows[(5, "blocked")]["status"], "pass")
 
+    def test_pi_and_omp_bash_calls_pair_with_their_results(self):
+        """pi's and omp's session files (pi- and omp-op-1-2-a4789d6): a toolCall named bash with arguments.command,
+        and a toolResult message with its toolCallId; isError leaves it None. omp may background a slow command
+        and inject its own result later as an async-result notice naming the job and the command."""
+        import live
+        status = "python3 /qa/skill/scripts/factory.py status"
+        lines = [{"type": "message", "message": {"role": "assistant", "content": [
+                     {"type": "toolCall", "id": "c1", "name": "bash", "arguments": {"command": status}}]}},
+                 {"type": "message", "message": {"role": "toolResult", "toolCallId": "c1", "toolName": "bash",
+                                                 "content": [{"type": "text", "text": "@lead-dev  lead-dev"}],
+                                                 "isError": False}},
+                 {"type": "message", "message": {"role": "assistant", "content": [
+                     {"type": "toolCall", "id": "c2", "name": "read", "arguments": {"path": status}}]}},
+                 {"type": "message", "message": {"role": "assistant", "content": [
+                     {"type": "toolCall", "id": "c3", "name": "bash", "arguments": {"command": "false"}}]}},
+                 {"type": "message", "message": {"role": "toolResult", "toolCallId": "c3", "content": [],
+                                                 "isError": True}}]
+        self.assertEqual(live.tool_calls("\n".join(json.dumps(x) for x in lines)),
+                         [(status, "@lead-dev  lead-dev"), ("false", None)])
+        omp = [{"type": "message", "message": {"role": "assistant", "content": [
+                   {"type": "toolCall", "id": "j1", "name": "bash", "arguments": {"i": "x", "command": status}}]}},
+               {"type": "message", "message": {"role": "toolResult", "toolCallId": "j1", "content": [
+                   {"type": "text", "text": "Backgrounded early to handle an incoming message.\n\nBackgrounded as job"
+                                            " bg_1 (killed once it has run 300s)"}], "isError": False}},
+               {"type": "custom_message", "customType": "async-result",
+                "content": f"<system-notice>\nBackground job bg_1 ({status}) has completed.\n"
+                           "Resume your work using the result below.\n@lead-dev idle"}]
+        self.assertEqual(live.tool_calls("\n".join(json.dumps(x) for x in omp)), [(status, "@lead-dev idle")])
+        self.assertEqual(live.tool_calls("\n".join(json.dumps(x) for x in omp[:2])), [(status, None)])   # not yet
+        other = {**omp[2], "content": omp[2]["content"].replace(status, "python3 /qa/other.py")}
+        self.assertEqual(live.tool_calls("\n".join(json.dumps(x) for x in [*omp[:2], other])), [(status, None)])
+        waited = {"type": "message", "message": {"role": "toolResult", "toolCallId": "w1", "toolName": "wait",
+                  "isError": False, "content": [{"type": "text", "text": (
+                      "## Completed (1)\n\n### bg_1 [bash] — completed\nIntent: Reading operator inbox\n"
+                      f"Label: {status}\nDelivery: handed over by this snapshot\n```\n@lead-dev idle\n\n```")}]}}
+        self.assertEqual(live.tool_calls("\n".join(json.dumps(x) for x in [*omp[:2], waited])),
+                         [(status, "@lead-dev idle\n\n")])                    # omp's wait tool hands it over
+        wrong = {**waited, "message": {**waited["message"], "toolName": "read"}}
+        self.assertEqual(live.tool_calls("\n".join(json.dumps(x) for x in [*omp[:2], wrong])), [(status, None)])
+        quote = {"type": "message", "message": {"role": "assistant", "content": [{"type": "text", "text":
+                 omp[2]["content"]}]}}                     # the model quoting the notice is not the notice
+        self.assertEqual(live.tool_calls("\n".join(json.dumps(x) for x in [*omp[:2], quote])), [(status, None)])
+
     def test_claude_code_bash_output_is_read_from_its_native_result(self):
         """claude-op-2-a65a1fe (@lead-dev): a successful Bash call's tool_result content is empty, and its output is
         the same line's toolUseResult.stdout. A failed call (is_error, an empty toolUseResult) stays None."""
@@ -7168,6 +7383,32 @@ class QualifyReportTests(unittest.TestCase):
             self.assertIn("`/tmp/old`", trust)
             self.assertNotIn("/tmp/fake", trust)
 
+    def test_an_outputs_only_pass_is_reported_unproved(self):
+        """@operator: OpenCode's unpaired shell outputs never earn a pass; a row stored as one (8f7b61b) is shown
+        unproved and stays open, with its observations kept."""
+        head = subprocess.run(["git", "-C", str(live.ROOT), "rev-parse", "HEAD"], capture_output=True,
+                              text=True).stdout.strip()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            row = {"case": 2, "subcase": "operator-commands", "role": "operator", "harness": "opencode",
+                   "status": "pass", "observed": "outputs only",
+                   "proof": {"outputs_only": True, "status_seen": True, "inbox_seen": True, "say_id": 2}}
+            data = {"mode": "real", "source_head": head, "utc": "2026-11-28T00:00:00Z", "rows": [row], "profiles": [],
+                    "trust_entries": []}
+            (tmp / "a.json").write_text(json.dumps(data))
+            live.report([str(tmp / "a.json")], tmp / "out")
+            text = (tmp / "out" / "opencode.md").read_text()
+            self.assertIn("| 2 | operator-commands | not_run | outputs only |", text)
+            self.assertIn("Unresolved as operator: 2 operator-commands,", text)
+            later = {**data, "utc": "2026-11-28T01:00:00Z", "rows": [{**row, "status": "fail", "observed": None,
+                                                                      "reason": "see proof", "proof": {}}]}
+            (tmp / "b.json").write_text(json.dumps(later))     # superseded history reads it the same way
+            live.report([str(tmp / "a.json"), str(tmp / "b.json")], tmp / "out")
+            text = (tmp / "out" / "opencode.md").read_text()
+            self.assertNotIn("operator-commands: pass at", text)
+            self.assertIn("2 | operator-commands | fail", text)
+            self.assertTrue(json.loads((tmp / "a.json").read_text())["rows"][0]["status"] == "pass")   # raw kept
+
     def test_the_latest_attempt_wins_across_heads_and_trust_entries_accumulate(self):
         """@reviewer: a later fail on an older head must not hide behind an earlier pass on a newer one; and a
         partial import must keep the cleanup entries an earlier import listed."""
@@ -7257,6 +7498,10 @@ class QualifyFrameworkTests(unittest.TestCase):
         caller = {"HERDR_ENV": "1", "HERDR_SOCKET_PATH": "/s", "HERDR_SESSION": "x", "HERDR_PANE_ID": "p",
                   "HERDR_CONFIG_PATH": "/c", "HC_SOCKET": "/h", "RODEO_X": "r", "PATH": "/bin", "HOME": "/home/o"}
         self.assertEqual(live.qa_environ(caller), {"PATH": "/bin", "HOME": "/home/o"})
+        runner = {"PATH": "/bin", "CODEX_HOME": "/c", "CLAUDECODE": "1", "CLAUDE_CODE_EXPERIMENTAL_CODE_MODE": "1",
+                  "CLAUDE_CODE_SESSION_ID": "s", "CLAUDE_CODE_CHILD_SESSION": "1", "CLAUDE_PID": "9",
+                  "CODEX_THREAD_ID": "t", "PI_SESSION_ID": "p", "ANTIGRAVITY_CONVERSATION_ID": "a"}
+        self.assertEqual(live.qa_environ(runner), {"PATH": "/bin", "CODEX_HOME": "/c"})   # the runner's own session
 
     @real_only
     def test_a_qa_team_cannot_reach_herdr_or_another_factory(self):
@@ -7410,11 +7655,38 @@ class QualifyFrameworkTests(unittest.TestCase):
         direct = {"type": "custom_tool_call", "call_id": "k1", "input": (
             f'const r = await tools.exec_command({{cmd:"python3 {installed} status"}});\ntext(r.output)')}
         output = {"type": "custom_tool_call_output", "call_id": "k1", "output": "nothing executed"}
-        for node, expected in ((commented, [False]), (direct, [True])):
+        wrapped = {"type": "custom_tool_call", "call_id": "k1", "input": (     # Codex's own (codex-op-2, c34561b)
+            f'text(await tools.exec_command({{cmd:"python3 {installed} status"}}))\n')}
+        for node, expected in ((commented, [False]), (direct, [True]), (wrapped, [True])):
             lines = [{"payload": {"cwd": str(root / "work")}}, node, output]
             (day / "rollout-1.jsonl").write_text("".join(json.dumps(line) + "\n" for line in lines))
             with self.subTest(code=node["input"][:12]):
                 self.assertEqual([run for _, _, run in core.installed_seen([root])], expected)
+
+    def test_opencode_outputs_come_from_its_shell_folder_for_the_checkout(self):
+        """@operator (Phase 10): OpenCode keeps each shell call's output under shell/<the checkout's root commit>;
+        the database holding the commands is not opened, so the outputs are read unpaired, oldest first."""
+        import live
+        home = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(patch.dict(os.environ, {"HOME": str(home)}))
+        work = home / "work"
+        work.mkdir()
+        git = ["git", "-C", str(work), "-c", "user.name=t", "-c", "user.email=t@t"]
+        subprocess.run([*git, "init", "-q"], check=True)
+        subprocess.run([*git, "commit", "-q", "--allow-empty", "-m", "root"], check=True)
+        root = subprocess.run([*git, "rev-list", "--max-parents=0", "HEAD"], capture_output=True, text=True,
+                              check=True).stdout.strip()
+        folder = home / ".local/share/opencode/shell" / root
+        folder.mkdir(parents=True)
+        for n, text in enumerate(("factory abc (x), hc 0.1.20\nMember ...\n@lead-dev", "no messages for @operator\n")):
+            path = folder / f"sh_{n}.out"
+            path.write_text(text)
+            os.utime(path, (1000 + n, 1000 + n))
+        (home / ".local/share/opencode/shell/other").mkdir()
+        (home / ".local/share/opencode/shell/other/sh_9.out").write_text("another project")
+        self.assertEqual(live.opencode_outputs(work), ["factory abc (x), hc 0.1.20\nMember ...\n@lead-dev",
+                                                       "no messages for @operator\n"])
+        self.assertEqual(live.opencode_outputs(home / "missing"), [])
 
     def test_a_search_that_lists_an_installed_script_is_only_observed(self):
         """@operator (#173 pi member case 8 at a198b9c): the Codex peer's rg --files listed the installed v1
@@ -7523,16 +7795,118 @@ class QualifyFrameworkTests(unittest.TestCase):
         self.assertFalse(adapter.restart(QA(), "t1"))
         self.assertEqual(sent, [])
 
+    def test_each_operator_starts_from_factory_s_own_builder_with_the_skills_switch_first(self):
+        """phase_10.md §1: the skills switch right after the executable, then the harness's own model form and full
+        preset; OpenCode's model in its terminal env, agy trusting the operator's own folder for the session only;
+        no member instructions; a case exemption and a model override honoured; argv the same for any form."""
+        import live
+        work = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
+        installed = [("/home/o/.codex/skills/factory", "/store/factory")]
+        adapter = live.RealAdapter.__new__(live.RealAdapter)
+        adapter.team = types.SimpleNamespace(qa=types.SimpleNamespace(installed=installed), skills_exempt=(),
+                                             script=live.ROOT / "skill/scripts/factory.py", work=work)
+        self.enterContext(patch.object(live.shutil, "which", lambda name, *a, **k: f"/bin/{name}"))
+        self.enterContext(patch.object(adapter, "model", lambda harness: f"{harness}-model", create=True))
+        launches = {h: adapter.operator_launch(h) for h in live.QUALIFY_HARNESSES}
+        self.assertEqual(launches["claude"][0][:2], ["/bin/claude", "--disable-slash-commands"])
+        self.assertEqual(launches["codex"][0][1], "-c")
+        for h in ("pi", "omp"):
+            argv = launches[h][0]
+            self.assertEqual(argv[:4], [f"/bin/{h}", "--no-skills", "--model", f"{h}-model"])
+            self.assertNotIn("--append-system-prompt", argv)
+            self.assertNotIn("--name", argv)
+        self.assertEqual(launches["omp"][0][-2:], ["--approval-mode", "yolo"])
+        argv, env = launches["opencode"]
+        self.assertEqual(argv[:2], ["/bin/opencode", "--standalone"])
+        self.assertEqual(json.loads(env["OPENCODE_CONFIG_CONTENT"])["model"].split("#")[0], "opencode-model")
+        argv, env = launches["agy"]
+        self.assertEqual((argv[:3], env), (["/bin/agy", "--model", "agy-model-high"], {}))
+        settings = json.loads(argv[argv.index("--settings") + 1])
+        self.assertEqual(settings["trustedWorkspaces"], [str(work)])
+        self.assertEqual(adapter.operator_argv("pi"), launches["pi"][0])            # argv-only callers
+        self.assertEqual(adapter.operator_launch("pi", "openai-codex/x")[0][3], "openai-codex/x")
+        adapter.team.skills_exempt = ("claude",)
+        self.assertEqual(adapter.operator_launch("claude")[0][:2], ["/bin/claude", "--model"])
+        self.assertEqual(live.operator_model_selected("agy", "gemini-4-neon"), "gemini-4-neon-high")   # the evidence
+        self.assertEqual(live.operator_model_selected("pi", "openai-codex/x"), "openai-codex/x")
+
+    def test_the_handoff_judge_refuses_polling_and_an_earlier_note(self):
+        """phase_10.md §2's negative controls: an operator that keeps working after the assignment, a quiet note
+        from before it, one to another terminal or before the turn ended."""
+        import live
+        good = {"assignment_id": 3, "action_count": 1, "worked": True, "ended_turn": True, "operator": "t1",
+                "member": "t3", "assignment_delivery": {"o": "delivered", "term": "t3"}, "member_replies": [],
+                "turn_at_end": 2,
+                "quiet_note": {"id": 4, "new": True, "o": "delivered", "term": "t1", "turn": 2, "after_turn_end": True}}
+        self.assertEqual(live.judge_handoff(good), ("pass", None))
+        note = good["quiet_note"]
+        for broken, why in (({"ended_turn": False}, "kept working"), ({"quiet_note": None}, "no quiet note"),
+                            ({"quiet_note": {**note, "new": False}}, "no quiet note"),
+                            ({"quiet_note": {**note, "term": "t9"}}, "not delivered"),
+                            ({"quiet_note": {**note, "after_turn_end": False}}, "not delivered"),
+                            ({"action_count": 2}, "2 times"), ({"assignment_id": None}, "did not assign"),
+                            ({"member_replies": [4]}, "member reply"),
+                            ({"assignment_delivery": {"o": "delivered", "term": "t9"}}, "briefed member"),
+                            ({"quiet_note": {**note, "turn": 1}}, "before the operator's turn ended")):
+            status, reason = live.judge_handoff({**good, **broken})
+            self.assertEqual(status, "fail", broken)
+            self.assertIn(why, reason)
+
+    def test_the_operator_terminal_gets_the_launch_argv_and_env_directly_and_through_its_shell(self):
+        """@lead-dev's pairing on 14cdca1: OpenCode's model env reaches terminal.run in the direct and the shell
+        form, and the shell types exactly the launch argv."""
+        import live
+        calls = []
+
+        class Core:
+            def __init__(self, *args, **kwargs):
+                self.installed, self.bin, self.env, self.id = [], None, {}, "core"
+
+            def rpc(self, method, params, timeout=None):
+                calls.append((method, params))
+                return {"address": "t1"}
+
+            def stop(self):
+                pass
+        scratch = self.enterContext(tempfile.TemporaryDirectory())
+        self.enterContext(patch.object(live, "Core", Core))
+        self.enterContext(patch.object(live.tempfile, "gettempdir", return_value=scratch))
+        self.enterContext(patch.object(live.RealAdapter, "prepare", lambda self, harnesses: None))
+        self.enterContext(patch.object(live.RealAdapter, "model", lambda self, harness: "openrouter/x/y"))
+        self.enterContext(patch.object(live.shutil, "which", lambda name, *a, **k: f"/bin/{name}"))
+        self.enterContext(patch.object(live.QATeam, "send", lambda self, term, text, timeout=180: calls.append(
+            ("terminal.send", {"terminal": term, "text": text}))))
+        for shell in (False, True):
+            calls.clear()
+            team = live.QATeam(live.RealAdapter, "opencode", {"lead-dev": "codex"}, operator_shell=shell)
+            run = next(p for m, p in calls if m == "terminal.run")
+            self.assertEqual(json.loads(run["env"]["OPENCODE_CONFIG_CONTENT"])["model"].split("#")[0], "openrouter/x/y")
+            launch = team.adapter.operator_launch("opencode")[0]
+            if shell:
+                self.assertEqual(run["argv"][0], "bash")
+                typed = next(p["text"] for m, p in calls if m == "terminal.send")
+                self.assertEqual(shlex.split(typed), launch)
+            else:
+                self.assertEqual(run["argv"], launch)
+
+    def test_case_1_maps_a_live_app_through_the_table(self):
+        import live
+        self.assertEqual([live.app_harness(a) for a in ("agy", "antigravity", "claude-code", "pi", "fake", "")],
+                         ["agy", "agy", "claude", "pi", None, None])
+
     def test_defaults_and_scope(self):
-        self.assertEqual(live.select_profiles("codex", None), [("operator", "codex"), ("member", "codex")])
-        self.assertEqual(live.select_profiles("pi", None), [("member", "pi")])
-        for harness, role, why in (("pi", "operator", "member in this phase"), ("vim", None, "is not one of")):
+        """Phase 10: every harness in both roles; an omitted role runs operator then member."""
+        for harness in live.QUALIFY_HARNESSES:
+            self.assertEqual(live.select_profiles(harness, None), [("operator", harness), ("member", harness)])
+            self.assertEqual(live.select_profiles(harness, "operator"), [("operator", harness)])
+            self.assertEqual(live.select_profiles(harness, "member"), [("member", harness)])
+        for harness, role, why in (("vim", None, "is not one of"), ("pi", "owner", "not owner")):
             with self.assertRaisesRegex(ValueError, why):
                 live.select_profiles(harness, role)
 
     def test_bad_choices_are_refused_before_any_core(self):
         with patch.object(live, "Core", side_effect=AssertionError("no core may start")):
-            for args, why in ((("pi", "operator", None), "member in this phase"), (("codex", None, [11]), "1 to 10"),
+            for args, why in ((("vim", "operator", None), "is not one of"), (("codex", None, [11]), "1 to 10"),
                               (("cross", "member", None), "no --role")):
                 with self.subTest(args=args), self.assertRaisesRegex(ValueError, why):
                     live.qualify(*args)
@@ -7629,7 +8003,8 @@ class QualifyFixtureTests(unittest.TestCase):
         self.assertEqual((evidence["mode"], code), ("fixture", 0 if live.RODEO else 2))
         self.assertEqual(sorted((r["role"], r["subcase"], r["status"]) for r in evidence["rows"]),
                          [("member", "guarded", "pass"), ("member", "idle-report", "pass"),
-                          ("operator", "idle-report", commands), ("operator", "operator-commands", commands)])
+                          ("operator", "guarded", "pass"), ("operator", "idle-report", commands),
+                          ("operator", "operator-commands", commands), ("operator", "operator-handoff", commands)])
 
     @real_only
     def test_sigterm_during_a_run_stops_its_cores_and_removes_its_scratch(self):
@@ -8718,11 +9093,12 @@ class SkillTextTests(unittest.TestCase):
         table = leading.split("| Status | Action |", 1)[1].split("\n\n", 1)[0]
         states = {"not started", "starting", "idle", "working", "done", "blocked", "error", "gone"}
         hints = {"first brief N is still", "no confirmed brief", "no pane", "operator: not reachable",
-                 "keeper: not running"}
+                 "keeper: not running", "operator: unstarted message"}
         words = {word for row in table.splitlines() if row.startswith("|")
                  for word in re.findall(r"`([^`]+)`", row.split("|", 2)[1])}
         self.assertEqual(words, states | hints)
-        source = inspect.getsource(factory.cmd_status) + inspect.getsource(factory._pending_brief_line)
+        source = (inspect.getsource(factory.cmd_status) + inspect.getsource(factory._pending_brief_line)
+                  + inspect.getsource(factory.operator_unstarted))
         for hint in hints - {"first brief N is still"}:
             self.assertIn(hint, source)
         self.assertIn("first brief {", source)
@@ -8737,6 +9113,7 @@ class SkillTextTests(unittest.TestCase):
             factory.end_cause: {"exited", "was killed", "hc stopped", "was lost", "its harness ended"},
             factory.quiet_text: {"team quiet"},
             factory.Keeper._ready_result: {"ready work"},
+            factory.Keeper._unstarted_notes: {"did not start a turn"},
         }
         self.assertEqual(names, set().union(*producers.values()))
         for producer, phrases in producers.items():

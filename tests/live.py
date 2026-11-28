@@ -164,11 +164,19 @@ class Conn:
             self.p.stdout.close()
 
 
+RUNNER_PREFIXES = ("HC_", "RODEO_", "HERDR", "CLAUDECODE", "CLAUDE_CODE_", "CLAUDE_PID", "CLAUDE_TMPDIR",
+                   "CLAUDE_EFFORT")
+
+
 def qa_environ(environ):
     """The caller's environment without any hc, rodeo or herdr variable: a runner started from the owner's herdr
     pane must not hand its session and pane IDs to the QA terminals, where a harness that finds the owner's
-    installed v1 skill could act in that session (@architect, #173)."""
-    return {k: v for k, v in environ.items() if not k.startswith(("HC_", "RODEO_", "HERDR"))}
+    installed v1 skill could act in that session (@architect, #173). Nor the runner's own harness session: a
+    driver started from a Claude Code session handed its CLAUDE_CODE_* variables on, code mode included, and the
+    QA Claude Code operator ran as its child, with no Bash calls or transcript of its own (claude-op-2 at
+    c34561b). Each harness's session variable goes too."""
+    sessions = {t.get("session_env") for t in harness_table().values()} - {None}
+    return {k: v for k, v in environ.items() if not k.startswith(RUNNER_PREFIXES) and k not in sessions}
 
 
 HERDR_STUB = "#!/bin/sh\necho 'herdr is not available in a Factory qualification run' >&2\nexit 1\n"
@@ -242,10 +250,15 @@ def installed_needles(installed):
     return sorted("".join(n.split()) for n in needles)
 
 
+OMP_WAIT_DONE = re.compile(r"### (bg_\d+) \[bash\] \S+ completed\n(?:Intent: [^\n]*\n)?Label: ([^\n]*)\n"
+                           r"(?:[^\n]*\n)*?```\n(.*?)```", re.S)
+OMP_BACKGROUNDED = re.compile(r"Backgrounded as job (bg_\d+)")
+OMP_JOB_DONE = re.compile(r"(bg_\d+) \((.*?)\) has completed\.\nResume your work using the result below\.\n(.*)", re.S)
 CODE_EXEC = re.compile(r'exec_command\(\{\s*cmd\s*:\s*("(?:[^"\\]|\\.)*")')
 # a statement that calls it directly, at the start of a line (@architect-2 at fd65f71)
-CODE_EXEC_DIRECT = re.compile(r'^[ \t]*(?:(?:const|let|var)\s+\w+\s*=\s*)?(?:await\s+)?(?:tools\.)?'
+CODE_EXEC_DIRECT = re.compile(r'^[ \t]*(?:(?:const|let|var)\s+\w+\s*=\s*)?(?:text\(\s*)?(?:await\s+)?(?:tools\.)?'
                               r'exec_command\(\{\s*cmd\s*:\s*("(?:[^"\\]|\\.)*")', re.M)
+# text(await tools.exec_command({cmd: ...})) is how Codex runs a command (codex-op-2 at c34561b)
 
 
 def _uncommented(code):
@@ -260,7 +273,7 @@ def tool_calls(text, pairing=False):
     Codex's shell or exec_command function_call (arguments' cmd or command), and a Codex code-mode call that runs
     exactly one exec_command. Searches, file reads and other tools are not executions and are left out; a result
     that reports failure (is_error, a non-zero exit) is None (@architect-2)."""
-    calls, results = {}, {}
+    calls, results, jobs = {}, {}, {}
 
     def command_of(node, kind):
         if kind == "tool_use":
@@ -291,6 +304,28 @@ def tool_calls(text, pairing=False):
     def walk(node):
         if isinstance(node, dict):
             kind = node.get("type")
+            if kind == "toolCall" and node.get("id") and node.get("name") == "bash":       # pi and omp
+                command = (node.get("arguments") or {}).get("command")
+                if isinstance(command, str):
+                    calls[node["id"]] = command
+            if node.get("role") == "toolResult" and node.get("toolCallId"):
+                text = "".join(c.get("text", "") for c in node.get("content") or [] if isinstance(c, dict))
+                results[node["toolCallId"]] = None if node.get("isError") is True else text
+                if node.get("toolName") == "wait" and node.get("isError") is not True:
+                    # omp's own wait tool hands over finished jobs: "### bg_N [bash] — completed", the job's
+                    # command as Label, then its output in a fence
+                    for job, command, output in OMP_WAIT_DONE.findall(text):
+                        if job in jobs and calls.get(jobs[job]) == command:
+                            results[jobs.pop(job)] = output
+                job = OMP_BACKGROUNDED.search(text)
+                if job:                          # omp ran it as a job: its own result comes later, by job name
+                    jobs[job.group(1)] = node["toolCallId"]
+                    results[node["toolCallId"]] = None
+            if kind == "custom_message" and node.get("customType") == "async-result" \
+                    and isinstance(node.get("content"), str):   # omp's own notice, never a quote (@lead-dev)
+                done = OMP_JOB_DONE.search(node["content"])
+                if done and done.group(1) in jobs and calls.get(jobs[done.group(1)]) == done.group(2):
+                    results[jobs.pop(done.group(1))] = done.group(3)
             ident = node.get("id") if kind == "tool_use" else node.get("call_id")
             if kind in ("tool_use", "function_call", "custom_tool_call") and ident:
                 command = command_of(node, kind)
@@ -423,6 +458,15 @@ def qa_transcripts(roots, labelled=False):
                   for f in d.glob("*.jsonl")]
     except OSError:
         pass
+    for base, harness, ends in ((os.path.expanduser("~/.pi/agent/sessions"), "pi", "--"),
+                                (os.path.expanduser("~/.omp/agent/sessions"), "omp", "-")):
+        # one folder per working directory: its path with "/" as "-", wrapped in "--" (pi) or led by "-" (omp)
+        encoded = [ends + r.strip("/").replace("/", "-") + "-" for r in roots]
+        try:
+            found += [(harness, f) for d in pathlib.Path(base).iterdir() if any(d.name.startswith(e) for e in encoded)
+                      for f in d.glob("*.jsonl")]
+        except OSError:
+            pass
     sessions = pathlib.Path(os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")) / "sessions"
     for day in {time.strftime("%Y/%m/%d", time.localtime(time.time() - s)) for s in (0, 86400)}:
         for f in sorted((sessions / day).glob("rollout-*.jsonl")) if (sessions / day).is_dir() else []:
@@ -2270,6 +2314,11 @@ class FixtureAdapter:
     def act_alone_each(self, commands):
         return "\n".join(self.act_alone(c) for c in commands)
 
+    def handoff_request(self, team, receipt, tok):
+        """The fake cannot read a skill: it sends the assignment itself and ends its turn, as the real one should."""
+        say = f"python3 {shlex.quote(str(team.script))} say lead-dev {shlex.quote(self.act_append(receipt, tok))}"
+        return f"ACT run {team.dir / 'handoff-receipt.txt'} {say}"
+
     def alone_output(self, command, others=(), prompt=None):
         out = self.team.dir / f"alone-{hashlib.sha1(command.encode()).hexdigest()[:12]}.txt"
         return out.read_text() if out.exists() else None
@@ -2326,9 +2375,30 @@ class RealAdapter(FixtureAdapter):
             raise NotRun(f"{', '.join(missing)} not on PATH")
 
     def operator_argv(self, harness, model=None):
-        """The operator as the owner would start it, with the profile's model pinned (as Factory pins a member's)."""
-        return [shutil.which(harness), *skills_off(harness, self.team.qa.installed, self.team.skills_exempt), "--model",
-                model or self.model(harness), *harness_table()[harness]["permissions"]["full"]]
+        """The operator's argv alone (operator_launch's), for callers that need no environment."""
+        return self.operator_launch(harness, model)[0]
+
+    def operator_launch(self, harness, model=None):
+        """(argv, env): the operator as the owner would start it, from Factory's own per-harness builder and full
+        preset (phase_10.md §1), with the profile's model pinned as Factory pins a member's, and the QA skills switch
+        right after the executable. No member instructions, name or session: an operator has none. The same argv
+        serves a direct launch, the shell-start form and a same-pane restart, and env goes on the terminal."""
+        table = harness_table()[harness]
+        model = model or self.model(harness)
+        argv = [shutil.which(harness), *skills_off(harness, self.team.qa.installed, self.team.skills_exempt)]
+        full = list(table["permissions"]["full"])
+        if harness in ("claude", "codex"):
+            return argv + ["--model", model, *full], {}
+        thinking = operator_thinking(harness)
+        if harness in ("pi", "omp"):
+            return argv + ["--model", model, "--thinking", thinking, *full], {}
+        module = factory_module(self.team.script)
+        m = {"name": "operator", "harness": harness, "model": model, "thinking": thinking, "permissions": "full",
+             "args": [], "dir": str(self.team.work)}
+        native, env = module.CODE[harness].argv(m, None, None)
+        if harness == "agy":                        # the operator's own scratch folder, session-only (LC-7)
+            full = module.agy_trusted(full, self.team.work)
+        return argv + native + full, env
 
     def act_append(self, path, token):
         return (f"Using your shell tool, append one line containing exactly {token} to the file {path}"
@@ -2344,6 +2414,12 @@ class RealAdapter(FixtureAdapter):
         3321bfc)."""
         return (f"Using your shell tool, run exactly this one command, by itself in its own tool call, with nothing"
                 f" added before or after it: {command} Then reply with the single word done.")
+
+    def handoff_request(self, team, receipt, tok):
+        """The owner's one request (phase_10.md §2); lead-dev without an @, which a composer picker can take."""
+        return (f"Read {team.skill / 'SKILL.md'} and follow it. Use {team.script} for all Factory commands. Read the"
+                f" Autonomous operation section of {team.skill / 'references' / 'leading.md'}. Assign lead-dev to"
+                f" append one line containing exactly {tok} to the file {receipt} and finish without reporting back.")
 
     def act_alone_each(self, commands):
         listed = " ".join(f"({i}) {c}" for i, c in enumerate(commands, 1))
@@ -2435,6 +2511,26 @@ class RealAdapter(FixtureAdapter):
         return True
 
 
+def operator_thinking(harness):
+    """The thinking level a QA operator starts with: the table's default, else medium where the harness has it."""
+    table = harness_table()[harness]
+    return table.get("default_thinking") or ("medium" if "medium" in table.get("thinking", []) else "default")
+
+
+def operator_model_selected(harness, model):
+    """The model string an operator's launch actually passes (agy's thinking suffix, OpenCode's #variant), for the
+    evidence beside the requested one (@lead-dev's pairing on 14cdca1)."""
+    if harness not in ("opencode", "agy"):
+        return model
+    module = factory_module(ROOT / "skill" / "scripts" / "factory.py")
+    m = {"name": "operator", "harness": harness, "model": model, "thinking": operator_thinking(harness),
+         "permissions": "full", "args": [], "dir": "/"}
+    argv, env = module.CODE[harness].argv(m, None, None)
+    if "--model" in argv:
+        return argv[argv.index("--model") + 1]
+    return json.loads(env.get("OPENCODE_CONFIG_CONTENT", "{}")).get("model", model)
+
+
 class QATeam:
     """A scratch project, a private QA core, a team with an operator terminal, and Factory's real commands from a
     private copy of the skill (phase_8.md §2)."""
@@ -2480,9 +2576,9 @@ class QATeam:
                   "XDG_CACHE_HOME": str(self.dir / "cache"), "HOME": str(self.home)}
         if not self.real:
             shared["CODEX_HOME"] = str(self.home / ".codex")
-        argv = (self.adapter.operator_argv(operator, operator_model) if self.real
-                else self.adapter.operator_argv(operator))
-        params = {"argv": argv, "cwd": str(self.work), "env": dict(shared)}
+        argv, launch_env = (self.adapter.operator_launch(operator, operator_model) if self.real
+                            else (self.adapter.operator_argv(operator), {}))
+        params = {"argv": argv, "cwd": str(self.work), "env": {**shared, **launch_env}}   # kept by a shell restart
         if not self.real:
             params["env"]["FAKE_LOG"] = str(self.dir / "operator-input.jsonl")   # every input the fake received
             params["env"]["FAKE_ECHO"] = "1"
@@ -2657,12 +2753,13 @@ class QATeam:
 # The current case's closed teams' diagnostics and test markers, and this run's rodeo_tabs probe.
 EVIDENCE = {"teams": [], "tokens": [], "rodeo_tabs": None}
 QUALIFY_HARNESSES = ("claude", "codex", "pi", "omp", "opencode", "agy")
-OPERATOR_HARNESSES = ("claude", "codex")
+OPERATOR_HARNESSES = QUALIFY_HARNESSES    # Phase 10: every harness as operator too
 CROSS_CASES = ("two-teams", "multi-down", "owner-pane", "other-version")
 STATUSES = ("pass", "fail", "not_run", "measured")
 CASES = {   # case -> its subcases: (name, roles it is required for, measurement only)
     1: (("states", "both", False), ("startup-dialog", "both", False)),
-    2: (("idle-report", "both", False), ("operator-commands", "operator", False)),
+    2: (("idle-report", "both", False), ("operator-commands", "operator", False),
+        ("operator-handoff", "operator", False)),
     3: (("draft", "both", False), ("draft-cleared", "operator", False)),
     4: (("mid-turn", "both", False), ("owner-interrupt", "both", False)),
     5: (("blocked", "both", False),),
@@ -2671,7 +2768,7 @@ CASES = {   # case -> its subcases: (name, roles it is required for, measurement
         ("pending-restart", "both", False), ("held-quiet", "both", False), ("upgrade", "both", False)),
     8: (("dead-member", "member", False), ("operator-gone", "operator", False), ("same-pane", "operator", False),
         ("unconfirmed-brief", "member", False), ("quit-during-hold", "both", True)),
-    9: (("guarded", "member", False),),
+    9: (("guarded", "both", False),),    # an operator's guarded peer member (phase_10.md §2)
     10: (("idle-latency", "both", False), ("idle-latency-times", "both", True), ("held-sender-exit", "both", False),
          ("crash", "both", False)),
 }
@@ -3015,23 +3112,178 @@ def _operator_commands(run, team, harness, peer):
     listed = sorted({int(n) for n in re.findall(r"\[Message (\d+) ", full["inbox"] or "")})
     inbox_ok = bool(full["inbox"]) and set(listed) <= set(to_operator) and (
         bool(listed) or "no messages for @operator" in full["inbox"])
+    observed_in = "Factory's log and each command's own tool result in the operator's transcript"
+    outputs_only = False
+    if team.real and harness == "opencode" and full["status"] is None and full["inbox"] is None:
+        # @operator: OpenCode keeps each shell call's output in its shell folder for the project; the command text
+        # is only in its database, which is not opened. The outputs, unpaired, mark the row "outputs only".
+        outs = opencode_outputs(team.work)
+        full = {"status": next((o for o in reversed(outs) if o.startswith("factory ") and "Member" in o
+                                and f"({pathlib.Path(team.script).resolve()}), hc " in o.splitlines()[0]), None),
+                "inbox": next((o for o in reversed(outs) if o.startswith("[Message ")
+                               or o.strip() == "no messages for @operator"), None)}
+        listed = sorted({int(n) for n in re.findall(r"\[Message (\d+) ", full["inbox"] or "")})
+        inbox_ok = bool(full["inbox"]) and set(listed) <= set(to_operator) and (
+            bool(listed) or "no messages for @operator" in full["inbox"])
+        outputs_only, observed_in = True, "outputs only: OpenCode's shell output files, not paired with their commands"
     status_ok = "@lead-dev" in (full["status"] or "")
     proof = {"member_acted": reached, "member_briefed": briefed, "say_id": say_id, "say_outcome": say_outcome,
              "status_names_member": status_ok, "inbox_ids": listed, "operator_ids_in_log": to_operator,
              "inbox_seen": full["inbox"] is not None, "status_seen": full["status"] is not None, "peer": peer,
-             "observed_in": "Factory's log and each command's own tool result in the operator's transcript",
+             "observed_in": observed_in, "outputs_only": outputs_only,
              "prompted_by": "the owner's paste and Enter through rodeo into a fresh operator (prefix+1)"}
-    ok = reached and briefed and bool(say_id) and (say_outcome or [""])[0] == "delivered" and status_ok and inbox_ok
-    run.row(2, "operator-commands", "operator", harness, "pass" if ok else "fail",
-            "the owner's first prompt has the operator run up, say, status and inbox --for itself; the brief is"
-            " delivered, the member acts on the say, status names it and the inbox lists the operator's messages",
-            proof=proof, elapsed=time.monotonic() - start, reason=None if ok else "see proof")
+    factory_ok = reached and briefed and bool(say_id) and (say_outcome or [""])[0] == "delivered"
+    what = ("the owner's first prompt has the operator run up, say, status and inbox --for itself; the brief is"
+            " delivered, the member acts on the say, status names it and the inbox lists the operator's messages")
+    if team.real and harness in NO_TOOL_RECORD and full["status"] is None and full["inbox"] is None:
+        # @operator: agy keeps no readable record of its tool calls; Factory's log proves up and say, and the
+        # status and inbox output stays unproved
+        proof["observed_in"] = "Factory's log only: the harness keeps no readable record of its tool calls"
+        run.row(2, "operator-commands", "operator", harness, "not_run" if factory_ok else "fail", what, proof=proof,
+                elapsed=time.monotonic() - start,
+                reason=("unproved: up (briefed member) and say (delivered, acted on) are in Factory's log; agy keeps"
+                        " no readable record of the status and inbox output") if factory_ok else "see proof")
+        return True
+    ok = factory_ok and status_ok and inbox_ok
+    if outputs_only and factory_ok:   # @operator: unpaired outputs are observations and never a pass; a failed
+        found = [n for n in ("status", "inbox") if proof[f"{n}_seen"]]      # up or say still fails below
+        run.row(2, "operator-commands", "operator", harness, "not_run", what, proof=proof,
+                elapsed=time.monotonic() - start, observed="outputs only",
+                reason="unproved: outputs only. up and say are in Factory's log; OpenCode's shell files hold "
+                       + (" and ".join(found) + " output for this run's script" if found else "no attributable output")
+                       + ", and no call is paired with its result")
+        return True
+    run.row(2, "operator-commands", "operator", harness, "pass" if ok else "fail", what, proof=proof,
+            elapsed=time.monotonic() - start, reason=None if ok else "see proof")
     return True
 
 
+NO_TOOL_RECORD = ("agy",)     # a bounded look found no readable record of agy's tool calls (Phase 10)
+
+
+def opencode_outputs(work):
+    """The text of each shell call OpenCode ran for this checkout, oldest first: the files it keeps in
+    ~/.local/share/opencode/shell/<project>/, where the project is the checkout's root commit. [] when none."""
+    try:
+        root = subprocess.run(["git", "-C", str(work), "rev-list", "--max-parents=0", "HEAD"], capture_output=True,
+                              text=True, timeout=10).stdout.split()
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if not root:
+        return []
+    folder = pathlib.Path(os.path.expanduser("~/.local/share/opencode/shell")) / root[0]
+    try:
+        files = sorted(folder.glob("sh_*.out"), key=lambda p: p.stat().st_mtime)
+        return [p.read_text(errors="replace") for p in files]
+    except OSError:
+        return []
+
+
 def case_2(run, role, harness, adapter_class):
-    """idle-report, and for an operator profile operator-commands (phase_8.md §3.2, @architect's change 1)."""
-    names = [n for n, _ in subcases(2, role)]
+    """idle-report, and for an operator profile operator-commands and operator-handoff, the latter in a team of its
+    own (phase_8.md §3.2, phase_10.md §2)."""
+    _case_2_main(run, role, harness, adapter_class)
+    if role == "operator":
+        _operator_handoff(run, harness, adapter_class)
+
+
+def judge_handoff(f):
+    """operator-handoff (phase_10.md §2), from the observed facts: the operator committed the assignment and it was
+    delivered to the briefed member's terminal, which acted once and sent nothing back; the operator was seen
+    working and then ready at a higher turn in a sample taken before the note was first seen delivered; and a quiet
+    note committed after the assignment was delivered to that same operator terminal, into a turn at or after the
+    end. -> (status, reason). Polling, an earlier note, a member reply, another terminal fail (@lead-dev)."""
+    if not f.get("assignment_id"):
+        return "fail", "the operator did not assign the member within the window"
+    delivery = f.get("assignment_delivery") or {}
+    if delivery.get("o") != "delivered" or delivery.get("term") != f.get("member"):
+        return "fail", "the assignment was not delivered to the briefed member's terminal"
+    if f.get("action_count") != 1:
+        return "fail", f"the member acted {f.get('action_count')} times, not once"
+    if f.get("member_replies"):
+        return "fail", "a member reply reached the operator before the quiet note: the note did not wake it"
+    if not f.get("worked") or not f.get("ended_turn"):
+        return "fail", "the operator kept working after the assignment (polling or waiting instead of ending its turn)"
+    note = f.get("quiet_note") or {}
+    if not note or not note.get("new"):
+        return "fail", "no quiet note committed after the assignment"
+    if note.get("term") != f.get("operator") or note.get("o") != "delivered" or not note.get("after_turn_end"):
+        return "fail", "the quiet note was not delivered to the operator's terminal after its turn ended"
+    if not isinstance(note.get("turn"), int) or not isinstance(f.get("turn_at_end"), int) \
+            or note["turn"] < f["turn_at_end"]:
+        return "fail", "the quiet note's receipt is from before the operator's turn ended"
+    return "pass", None
+
+
+def _operator_handoff(run, harness, adapter_class):
+    """operator-handoff: the owner's one request has the operator read the candidate skill and assign the member a
+    task that ends without a report; the operator must end its turn and be woken by Factory's own quiet note."""
+    team, peer = _team_for(adapter_class, "operator", harness, quiet_grace=30)
+    with team:
+        _operator_tab(team)
+        if not _up(team, run, 2, "operator", harness, ["operator-handoff"]):
+            return
+        if _team_quiet(team, hold=8, timeout=600) is None:
+            run.row(2, "operator-handoff", "operator", harness, "not_run", "case 2 operator-handoff",
+                    reason="the team was not quiet before the owner's request")
+            return
+        log = factory_log(team)
+        receipt, tok = team.receipt("handoff"), token()
+        prompt = team.adapter.handoff_request(team, receipt, tok)
+        view = _rodeo(team, ["operator"])
+        view.keys("ctrl+b")
+        time.sleep(0.2)
+        view.keys("1")
+        time.sleep(0.8)
+        view.focused_terminal = team.operator
+        turn_at_request = team.get(team.operator)["turn"]
+        before = max((rec["id"] for rec in log.read_box()[0] if rec["t"] == "msg"), default=0)
+        view.paste(prompt)                       # the last human input
+        start = time.monotonic()
+        facts = {"operator": team.operator, "member": team.member("lead-dev"), "turn_at_request": turn_at_request,
+                 "worked": False, "ended_turn": False, "peer": peer}
+        deadline = start + 600                   # up to five minutes after the assignment (below)
+        while time.monotonic() < deadline:
+            ended_before = facts["ended_turn"]   # a turn end seen in an earlier sample than this snapshot
+            records, box = log.read_box()
+            if not facts.get("assignment_id"):
+                facts["assignment_id"] = next((r["id"] for r in records if r["t"] == "msg" and r["id"] > before
+                                               and r.get("from") == "operator" and r.get("to") == ["lead-dev"]
+                                               and tok in (r.get("text") or "") and r["id"] in box.msgs), None)
+                if facts["assignment_id"]:
+                    deadline = min(deadline, time.monotonic() + 300)
+            sample = team.get(team.operator)     # one record per sample: its state and turn together
+            state, turn = (sample.get("status") or {}).get("state"), sample.get("turn")
+            if state == "working":
+                facts["worked"] = True
+            if facts["assignment_id"] and facts["worked"] and state in READY and turn > turn_at_request \
+                    and not facts["ended_turn"]:
+                facts["ended_turn"], facts["turn_at_end"] = True, turn
+            after = facts.get("assignment_id") or 10 ** 9
+            note = next((r for r in records if r["t"] == "msg" and r["id"] > after and r.get("kind") == "note"
+                         and (r.get("meta") or {}).get("what") == "quiet" and r.get("to") == ["operator"]), None)
+            if note and box.outcome(note["id"], "operator")["o"] == "delivered" and _lines(receipt).count(tok):
+                outcome = box.outcome(note["id"], "operator")
+                facts["quiet_note"] = {"id": note["id"], "new": True, "o": "delivered", "term": outcome.get("term"),
+                                       "turn": outcome.get("turn"), "after_turn_end": ended_before}
+                facts["member_replies"] = [r["id"] for r in records if r["t"] == "msg" and after < r["id"] < note["id"]
+                                           and r.get("from") == "lead-dev" and "operator" in (r.get("to") or [])]
+                break
+            time.sleep(0.5)
+        box = log.read_box()[1]
+        if facts.get("assignment_id"):
+            outcome = box.outcome(facts["assignment_id"], "lead-dev")
+            facts["assignment_delivery"] = {"o": outcome.get("o"), "term": outcome.get("term")}
+        facts["action_count"] = _lines(receipt).count(tok)
+        status, reason = judge_handoff(facts)
+        run.row(2, "operator-handoff", "operator", harness, status,
+                "after assigning work that ends without a report, the operator ends its turn and Factory's quiet note"
+                " wakes it, with no human or driver input in between", proof=facts,
+                elapsed=time.monotonic() - start, reason=reason)
+
+
+def _case_2_main(run, role, harness, adapter_class):
+    names = [n for n, _ in subcases(2, role) if n != "operator-handoff"]
     team, peer = _team_for(adapter_class, role, harness)
     with team:
         if role == "operator":
@@ -3081,9 +3333,15 @@ def case_9(run, role, harness, adapter_class):
         said = said["id"] if said else None
         new = team.until(team.keeper, 60)
         acted = team.until(lambda: receipt.exists() and tok in receipt.read_text(), 300)
+        member_harness = team.members["lead-dev"]       # the guarded one: the subject, or an operator's peer
+        preset = list(harness_table()[member_harness]["permissions"]["guarded"])
+        member = team.member("lead-dev")
+        argv = list(team.get(member).get("argv") or []) if member else []
+        carried = not preset or any(argv[i:i + len(preset)] == preset for i in range(len(argv)))   # as launched
         proof = {"old_keeper_finished": bool(gone), "new_keeper": bool(new) and new != old, "member_say_id": said,
-                 "guarded_args": harness_table()[harness]["permissions"]["guarded"], "peer": peer}
-        ok = bool(gone) and bool(new) and new != old and bool(acted) and said is not None
+                 "guarded_args": preset, "guarded_member": member_harness, "guarded_terminal": member,
+                 "argv_has_guarded_preset": carried, "peer": peer}
+        ok = bool(gone) and bool(new) and new != old and bool(acted) and said is not None and carried
         run.row(9, "guarded", role, harness, "pass" if ok else "fail",
                 "a guarded member's say reaches hc, restarts the keeper and is acted on", proof=proof,
                 reason=None if ok else "the keeper did not restart or the operator did not act")
@@ -3144,8 +3402,9 @@ def case_1(run, role, harness, adapter_class):
 
         def dialog_row(acted):
             suppressed = False
-            if role == "member" and ready and team.member("lead-dev"):
-                record = team.get(team.member("lead-dev"))       # the effective argv and the folder it runs in
+            terminal = team.member("lead-dev") if role == "member" else team.operator   # the subject (phase_10.md)
+            if ready and terminal:
+                record = team.get(terminal)                       # the effective argv and the folder it runs in
                 argv = record.get("argv") or []
                 at = argv.index("--settings") if "--settings" in argv else None
                 try:
@@ -3170,11 +3429,14 @@ def case_1(run, role, harness, adapter_class):
         subject = _subject(team, role)
         receipt = team.receipt("states")
         before = team.get(subject)
-        states = [(before.get("status") or {}).get("state")]
+        states, app, working_turn = [(before.get("status") or {}).get("state")], None, None
         _ask(team, role, team.adapter.act_run(receipt, "sleep 4"))
         deadline = time.monotonic() + 300
         while time.monotonic() < deadline and not (receipt.exists() and "exit" in receipt.read_text()):
-            state = team.state(subject)
+            record = team.get(subject)
+            state = (record.get("status") or {}).get("state")
+            if state == "working" and app is None:       # the live root status.app while it works, and that turn
+                app, working_turn = (record.get("status") or {}).get("app") or "", record.get("turn")
             if state != states[-1]:
                 states.append(state)
             time.sleep(0.25)
@@ -3183,12 +3445,18 @@ def case_1(run, role, harness, adapter_class):
         after = team.get(subject)
         proof = {"states": states, "turn": [before.get("turn"), after.get("turn")],
                  "action": receipt.read_text().strip() if receipt.exists() else None,
-                 "ready_after_up": getattr(team, "ready_states", None)}
+                 "ready_after_up": getattr(team, "ready_states", None), "subject": subject, "working_app": app,
+                 "working_harness": app_harness(app), "working_turn": working_turn}     # raw and mapped
         ok = (states[0] in READY and "working" in states and states[-1] in READY
               and after.get("turn", 0) > before.get("turn", 0) and proof["action"] == "exit 0")
-        run.row(1, "states", role, harness, "pass" if ok else "fail",
+        # a new operator's live app must be its own table key: Factory's between-turns rule selects by it, and the
+        # formation's fallback cannot show which harness hc observed (phase_10.md §2)
+        app_required = team.real and role == "operator" and harness in ("pi", "omp", "opencode", "agy")
+        app_ok = not app_required or app_harness(app) == harness     # agy reports "antigravity" (status_app)
+        run.row(1, "states", role, harness, "pass" if ok and app_ok else "fail",
                 "idle, working through a real tool action, idle again with the turn advanced", proof=proof,
-                reason=None if ok else "the states or the action were not as expected")
+                reason=None if ok and app_ok else "the states or the action were not as expected" if not ok
+                else f"the working operator reported app {app!r}, which the table does not map to {harness!r}")
         dialog_row(proof["action"] == "exit 0")
 
 
@@ -3243,18 +3511,31 @@ def _case_7_main(run, role, harness, adapter_class):
                           team.adapter.act_append(receipt2, marks[2])])
         body = team.dir / "multiline.md"
         body.write_text(text)
+        recipient = "lead-dev" if role == "member" else "operator"
         if role == "member":
-            team.call("say", "lead-dev", "--file", str(body), timeout=60)
+            _, said = team.call("say", "lead-dev", "--file", str(body), timeout=60)
+            ident = _say_id(said)
         else:
-            _member_says(team, text)
+            ident = (_member_says(team, text) or {}).get("id")
+            ident = re.match(r"(\d+)", str(ident)) if ident else None
         got = team.until(lambda: receipt2.exists() and all(m in receipt2.read_text() for m in marks) and
                          receipt2.read_text(), 300)
-        order = [line for line in (got or "").split() if line in marks]
-        ok = order == marks
+        seen = receipt2.read_text() if receipt2.exists() else ""
+        order = [line for line in seen.split() if line in marks]
+        ok = bool(got) and order == marks
+        proof = {"bytes": len(text.encode()), "order": [marks.index(m) for m in order]}
+        if ident:                          # what Factory did with it (omp member multiline at e7c2f26: order [])
+            records, box = factory_log(team).read_box()
+            n = int(ident.group(1))
+            proof.update(id=n, delivery={k: box.outcome(n, recipient).get(k) for k in ("o", "why", "term", "turn",
+                                                                                       "started")},
+                         history=[[r["o"], r.get("why")] for r in records if r["t"] == "out" and r["id"] == n
+                                  and r["to"] == recipient])
+        subject = _subject(team, role)
+        proof["recipient_state"] = team.state(subject) if subject else None
         run.row(7, "multiline", role, harness, "pass" if ok else "fail",
                 "a long multi-line message: the markers at its beginning, middle and end acted on in order",
-                proof={"bytes": len(text.encode()), "order": [marks.index(m) for m in order]},
-                reason=None if ok else "a marker was missing or out of order")
+                proof=proof, reason=None if ok else "a marker was missing or out of order")
 
 def _case_7_two_senders(run, role, harness, adapter_class):
     """two-senders (phase_8.md §3.7): two senders say to one recipient at the same moment; both IDs are acted on
@@ -4188,10 +4469,15 @@ def between_turns(harness, role):
     return harness_table().get(harness, {}).get("deliver") == "idle"
 
 
+def app_harness(app):
+    """The harness a live status.app names: Factory's own harness_for_app, the one lookup product and qualification
+    share (its key, or the key whose status_app it is)."""
+    return factory_module(ROOT / "skill" / "scripts" / "factory.py").harness_for_app(app)
+
+
 def _app_selects(app):
     """Whether a live status app selects between-turns delivery in the table (keeper.md §9's lookup)."""
-    harness = factory_module(ROOT / "skill" / "scripts" / "factory.py").harness_for_app(app)   # Factory's own lookup
-    return harness_table().get(harness or "", {}).get("deliver") == "idle"
+    return harness_table().get(app_harness(app) or "", {}).get("deliver") == "idle"
 
 
 def _ask_later(team, role, text):
@@ -5022,7 +5308,10 @@ def qualify(target, role=None, cases=None, json_path=None, fixture=False):
     for role_, harness, case in selected:
         print(f"qualify {role_} {harness} case {case}", file=sys.stderr)
         if not any(p["role"] == role_ and p["harness"] == harness for p in run.data["profiles"]):
-            run.profile(role_, harness, version=adapter.version(harness), model=adapter.model(harness))
+            facts = {"version": adapter.version(harness), "model": adapter.model(harness)}
+            if role_ == "operator" and adapter_class is RealAdapter:   # what the operator's launch really selects
+                facts["effective_model"] = operator_model_selected(harness, facts["model"])
+            run.profile(role_, harness, **facts)
         function = CASE_FUNCTIONS.get(case)
         if not subcases(case, role_):
             continue
@@ -5152,6 +5441,16 @@ def _commit_rank(head):
     return int(done.stdout.strip()) if done.returncode == 0 and done.stdout.strip().isdigit() else -1
 
 
+def _rejudged(row):
+    """A stored row as today's rules read it, the raw JSON untouched: an outputs-only pass (OpenCode at 8f7b61b)
+    is never a pass (@operator), so it enters the report unproved, as current and as superseded history alike."""
+    proof = row.get("proof") if isinstance(row.get("proof"), dict) else {}
+    if row.get("status") == "pass" and proof.get("outputs_only"):
+        return {**row, "status": "not_run",
+                "reason": "unproved: outputs only (rejudged); no call is paired with its result"}
+    return row
+
+
 def report(paths, out):
     """For each role, harness, case and subcase keep the row of the newest attempt (by UTC, then source head) and
     write one Markdown report per harness plus trust-entries.md; text outside the generated block is kept, and
@@ -5175,6 +5474,7 @@ def report(paths, out):
         runs.append(data)
         rank = (data.get("utc") or "", _commit_rank(data.get("source_head")))   # newest attempt by UTC (§1)
         for row in data["rows"]:
+            row = _rejudged(row)
             key = (row["role"], row["harness"], row["case"], row["subcase"])
             same_run = key in chosen and chosen[key][2] is data     # a repeated --case: its last row stands
             if key not in chosen or rank >= chosen[key][0]:
