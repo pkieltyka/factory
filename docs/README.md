@@ -48,3 +48,7 @@ Use these in the Claude Code operator conversation. For another harness, use its
 | `/factory2 say` | Lets the operator send one message to one or more teammates. |
 
 Members send messages with the standalone command `factory.py say NAME --file <path>`.
+
+## Qualification
+
+[Release candidate](qualification/release-candidate.md): the six harnesses in both roles, native discovery, cross cases and the proposed release notes. Each harness has its own report in [qualification](qualification/).
