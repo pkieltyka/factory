@@ -164,11 +164,19 @@ class Conn:
             self.p.stdout.close()
 
 
+RUNNER_PREFIXES = ("HC_", "RODEO_", "HERDR", "CLAUDECODE", "CLAUDE_CODE_", "CLAUDE_PID", "CLAUDE_TMPDIR",
+                   "CLAUDE_EFFORT")
+
+
 def qa_environ(environ):
     """The caller's environment without any hc, rodeo or herdr variable: a runner started from the owner's herdr
     pane must not hand its session and pane IDs to the QA terminals, where a harness that finds the owner's
-    installed v1 skill could act in that session (@architect, #173)."""
-    return {k: v for k, v in environ.items() if not k.startswith(("HC_", "RODEO_", "HERDR"))}
+    installed v1 skill could act in that session (@architect, #173). Nor the runner's own harness session: a
+    driver started from a Claude Code session handed its CLAUDE_CODE_* variables on, code mode included, and the
+    QA Claude Code operator ran as its child, with no Bash calls or transcript of its own (claude-op-2 at
+    c34561b). Each harness's session variable goes too."""
+    sessions = {t.get("session_env") for t in harness_table().values()} - {None}
+    return {k: v for k, v in environ.items() if not k.startswith(RUNNER_PREFIXES) and k not in sessions}
 
 
 HERDR_STUB = "#!/bin/sh\necho 'herdr is not available in a Factory qualification run' >&2\nexit 1\n"

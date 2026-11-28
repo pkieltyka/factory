@@ -7332,6 +7332,10 @@ class QualifyFrameworkTests(unittest.TestCase):
         caller = {"HERDR_ENV": "1", "HERDR_SOCKET_PATH": "/s", "HERDR_SESSION": "x", "HERDR_PANE_ID": "p",
                   "HERDR_CONFIG_PATH": "/c", "HC_SOCKET": "/h", "RODEO_X": "r", "PATH": "/bin", "HOME": "/home/o"}
         self.assertEqual(live.qa_environ(caller), {"PATH": "/bin", "HOME": "/home/o"})
+        runner = {"PATH": "/bin", "CODEX_HOME": "/c", "CLAUDECODE": "1", "CLAUDE_CODE_EXPERIMENTAL_CODE_MODE": "1",
+                  "CLAUDE_CODE_SESSION_ID": "s", "CLAUDE_CODE_CHILD_SESSION": "1", "CLAUDE_PID": "9",
+                  "CODEX_THREAD_ID": "t", "PI_SESSION_ID": "p", "ANTIGRAVITY_CONVERSATION_ID": "a"}
+        self.assertEqual(live.qa_environ(runner), {"PATH": "/bin", "CODEX_HOME": "/c"})   # the runner's own session
 
     @real_only
     def test_a_qa_team_cannot_reach_herdr_or_another_factory(self):
