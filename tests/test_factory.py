@@ -7485,7 +7485,9 @@ class QualifyFrameworkTests(unittest.TestCase):
         direct = {"type": "custom_tool_call", "call_id": "k1", "input": (
             f'const r = await tools.exec_command({{cmd:"python3 {installed} status"}});\ntext(r.output)')}
         output = {"type": "custom_tool_call_output", "call_id": "k1", "output": "nothing executed"}
-        for node, expected in ((commented, [False]), (direct, [True])):
+        wrapped = {"type": "custom_tool_call", "call_id": "k1", "input": (     # Codex's own (codex-op-2, c34561b)
+            f'text(await tools.exec_command({{cmd:"python3 {installed} status"}}))\n')}
+        for node, expected in ((commented, [False]), (direct, [True]), (wrapped, [True])):
             lines = [{"payload": {"cwd": str(root / "work")}}, node, output]
             (day / "rollout-1.jsonl").write_text("".join(json.dumps(line) + "\n" for line in lines))
             with self.subTest(code=node["input"][:12]):

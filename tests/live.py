@@ -248,8 +248,9 @@ OMP_BACKGROUNDED = re.compile(r"Backgrounded as job (bg_\d+)")
 OMP_JOB_DONE = re.compile(r"(bg_\d+) \((.*?)\) has completed\.\nResume your work using the result below\.\n(.*)", re.S)
 CODE_EXEC = re.compile(r'exec_command\(\{\s*cmd\s*:\s*("(?:[^"\\]|\\.)*")')
 # a statement that calls it directly, at the start of a line (@architect-2 at fd65f71)
-CODE_EXEC_DIRECT = re.compile(r'^[ \t]*(?:(?:const|let|var)\s+\w+\s*=\s*)?(?:await\s+)?(?:tools\.)?'
+CODE_EXEC_DIRECT = re.compile(r'^[ \t]*(?:(?:const|let|var)\s+\w+\s*=\s*)?(?:text\(\s*)?(?:await\s+)?(?:tools\.)?'
                               r'exec_command\(\{\s*cmd\s*:\s*("(?:[^"\\]|\\.)*")', re.M)
+# text(await tools.exec_command({cmd: ...})) is how Codex runs a command (codex-op-2 at c34561b)
 
 
 def _uncommented(code):
