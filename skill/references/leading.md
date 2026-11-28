@@ -53,7 +53,7 @@ After you press Esc in a working Claude Code member’s pane, check `factory.py 
 | `first brief N is still` | Let Factory finish delivery. |
 | `no pane` or `keeper: not running` | Use `factory.py up` if the team should be running. |
 | `operator: not reachable` | Run `factory.py up` from the operator's pane. |
-| `operator: unstarted message` | Look at your own input. If the message is still waiting there, submit it. |
+| `operator: unstarted message` | Ask a person to look at the operator's input before pressing Enter. If the message is still waiting there, they submit it. |
 
 Notes from `[from factory]` describe an observation that may have changed while delivery was held. Check `status`, the tracker and active work before acting.
 
@@ -64,7 +64,7 @@ Notes from `[from factory]` describe an observation that may have changed while 
 | Member exit (`exited`, `was killed`, `hc stopped`, `was lost`, or `its harness ended`) | Run `factory.py up NAME` or reassign. Reconcile the pickup report, tracker and inbox before assigning the task again. |
 | `team quiet` | Check who owes a report, then check for ready work. If neither needs action, end your turn without replying. |
 | `ready work` | Read the current tracker and take its next ready item if you can assign it. |
-| `@x did not start a turn` (message #N typed into its pane) | Look at that pane's input. If the message is still waiting there, press Enter in that pane. Never resend it. |
+| `@x did not start a turn` (message #N typed into its pane) | Ask a person to look at that pane's input before anyone presses Enter: an agent cannot tell whether the text there is Factory's or the owner's. If the message is still waiting, they press Enter in that pane. Never resend it. |
 
 ## Review and integrate
 

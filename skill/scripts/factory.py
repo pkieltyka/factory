@@ -1915,7 +1915,7 @@ class Keeper:
         self.unsettled = []
         self.inflight = {}
         self.held = set()
-        self.unstarted = {}     # (member, id) -> (terminal, turn, monotonic time): typed, no turn started
+        self.unstarted_seen = {}     # (member, id) -> when this keeper first saw it typed with no turn started
         self.op_null_since = None
         self._null_terminal = None
         self.damaged = None
@@ -2437,38 +2437,52 @@ class Keeper:
             self.inflight.pop(name)
             self.held.discard((name, ident))
 
-    def _unstarted(self, msg, name, ident, term, turn):
-        """keeper.md §5: a member whose harness can hold a typed message unsent (omp with a large one, #175) got
-        this message without a turn starting: watched for one more pass (_unstarted_notes). An operator's own
-        case is shown by status instead, and nothing is ever typed into that pane."""
-        harness = (getattr(self.cfg, "members", {}).get(name) or {}).get("harness")
-        if msg["kind"] != "note" and name != self.cfg.operator["name"] and \
-                TABLE.get(harness or "", {}).get("unstarted") == "note":
-            self.unstarted[(name, ident)] = (term, turn, self.clock.monotonic())
-
     def _unstarted_notes(self, view):
-        """One note to the operator, naming the message and the pane, when the member is still idle at the turn
-        the send returned: a person checks the input before pressing Enter (@operator). Otherwise forgotten."""
+        """keeper.md §5 (#175): a member's newest delivery that hc typed without a turn starting, on a harness that
+        can hold a typed message unsent (omp with a large one), gets one note to the operator naming the message
+        and the pane, once the member is seen still idle at that turn: a person checks the input before pressing
+        Enter (@operator). Derived from the log on every pass, so a failed write is retried and a restart or drain
+        loses nothing; a stored note for that message and terminal ends it (@architect-2)."""
         now = self.clock.monotonic()
-        for (name, ident), (term, turn, since) in list(self.unstarted.items()):
+        operator = self.cfg.operator["name"]
+        newest = {}
+        for (ident, to), rec in self.box.outcomes.items():
+            msg = self.box.msgs.get(ident)
+            if to != operator and rec.get("o") == "delivered" and msg and msg["kind"] != "note" and \
+                    ident > newest.get(to, (0, None))[0]:
+                newest[to] = (ident, rec)
+        noted = {(m["meta"].get("id"), m["meta"].get("term")) for m in self.box.msgs.values()
+                 if m["kind"] == "note" and (m.get("meta") or {}).get("what") == "unstarted"}
+        live = set()
+        for name, (ident, rec) in newest.items():
+            term, turn = rec.get("term"), rec.get("turn")
+            if rec.get("started") is not False or (ident, term) in noted:
+                continue
+            live.add((name, ident))
+            since = self.unstarted_seen.setdefault((name, ident), now)
             if now - since < UNSTARTED_GRACE:
                 continue
-            del self.unstarted[(name, ident)]
             record = view.terminal(name)
             status = (record or {}).get("status") or {}
             if not record or record["address"] != term or status.get("state") not in ("idle", "done") \
                     or record.get("turn") != turn:
                 continue                     # it started after all, or the pane changed
-            harness = (self.cfg.members.get(name) or {}).get("harness")
-            label = TABLE.get(harness or "", {}).get("label", harness)
+            harness = harness_for_app(status["app"]) if status.get("app") else \
+                (self.cfg.members.get(name) or {}).get("harness")       # the live app first (@architect-2)
+            if TABLE.get(harness or "", {}).get("unstarted") != "note":
+                continue
+            label = TABLE[harness].get("label", harness)
             text = (f"@{name} did not start a turn: message #{ident} was typed into {term}. {label} can hold a"
                     f" large message unsent in its input: check that pane, and press Enter there if it is still"
                     f" waiting.")
             meta = {"what": "unstarted", "about": name, "term": term, "id": ident}
-            note = self.log.add("factory", [self.cfg.operator["name"]], text, kind="note", meta=meta)[0]
+            note = self.log.add("factory", [operator], text, kind="note", meta=meta)[0]
             self.log.refresh(self.box)
+            live.discard((name, ident))
             stamp = time.strftime("%H:%M:%S", time.localtime(self.clock.time()))
             self.emit(f"{stamp} #{note} note: @{name} unstarted #{ident}")
+        for key in set(self.unstarted_seen) - live:
+            del self.unstarted_seen[key]
 
     def _settle_result(self, name, ident, term, result):
         msg = self.box.msgs.get(ident)
@@ -2481,8 +2495,7 @@ class Keeper:
                     warning = self.log.remove_delivered_file(self.box, ident)
                     if warning:
                         self.emit(warning)
-                    if started is False:
-                        self._unstarted(msg, name, ident, term, result["turn"])
+
             else:
                 self._record(msg, name, "unconfirmed", why="hc returned an unexpected result", term=term)
             return
@@ -4556,8 +4569,8 @@ def operator_unstarted(terminal, box, cfg):
     if rec.get("started") is not False or status.get("state") not in ("idle", "done") \
             or terminal.get("turn") != rec.get("turn") or rec.get("term") != terminal.get("address"):
         return None
-    return (f"operator: unstarted message #{ident}: typed but did not start a turn; check the operator's input and"
-            f" press Enter there if it is still waiting.")
+    return (f"operator: unstarted message #{ident} in {terminal.get('address')}: typed but did not start a turn; ask a"
+            f" person to look at the operator's input and press Enter there if it is still waiting.")
 
 
 def cmd_status(args):

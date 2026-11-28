@@ -2965,6 +2965,7 @@ class MemberNoteTests(TeamCase):
         note naming the message and the pane, after the member is seen still idle at that turn; nothing is typed
         into the member's pane, and a member that started meanwhile gets no note."""
         self.enterContext(patch.dict(factory.TABLE["codex"], unstarted="note"))
+        self.fake.set_status(self.lead, "idle", app="codex")
         self.fake.rule("send", **{self.lead: {"started": False}})
         ident = self.log.add("operator", ["lead-dev"], "a long message")[0]
         for _ in range(3):
@@ -2991,13 +2992,77 @@ class MemberNoteTests(TeamCase):
         self.assertEqual([n["meta"].get("id") for n in self.notes()], [ident])
         self.assertTrue(second)
 
+    def unstarted_send(self, text="a long message"):
+        self.fake.rule("send", **{self.lead: {"started": False}})
+        ident = self.log.add("operator", ["lead-dev"], text)[0]
+        for _ in range(3):
+            self.keeper.tick()
+            self.run_jobs()
+        return ident
+
+    def test_an_unstarted_note_survives_a_failed_write_and_a_restart(self):
+        """@architect-2 at 663adaf: the one notice must not be lost before it is stored. A failed write is
+        retried; a keeper restart (a drain's re-exec) during the grace still gives exactly one notice."""
+        self.enterContext(patch.dict(factory.TABLE["codex"], unstarted="note"))
+        self.fake.set_status(self.lead, "idle", app="codex")
+        ident = self.unstarted_send()
+        again = factory.Keeper(self.state_dir, self.hc, self.clock, self.pane.append, self.jobs.append)
+        again.tick()                                                     # the new image, mid-grace
+        self.clock.sleep(factory.UNSTARTED_GRACE + 1)
+        real, calls = again.log.add, []
+
+        def failing(*args, **kwargs):
+            calls.append(kwargs.get("kind"))
+            if len(calls) == 1:
+                raise OSError("disk full")
+            return real(*args, **kwargs)
+        with patch.object(again.log, "add", failing):
+            again.tick()                                                 # the write fails
+            self.assertEqual(self.notes(), [])
+            self.clock.sleep(61)                                         # the keeper retries the log
+            again.tick()
+            again.tick()
+        self.assertEqual([n["meta"]["id"] for n in self.notes()], [ident])
+        self.clock.sleep(factory.UNSTARTED_GRACE + 1)
+        again.tick()
+        self.keeper.tick()                                               # neither image repeats it
+        self.assertEqual(len(self.notes()), 1)
+
+    def test_an_unstarted_note_follows_the_live_app_not_the_formation(self):
+        """@architect-2: a live omp in a pane formed as Codex gets the notice, a Claude Code one in a pane formed
+        as a harness with the setting does not."""
+        self.fake.set_status(self.lead, "idle", app="omp")
+        ident = self.unstarted_send()
+        self.clock.sleep(factory.UNSTARTED_GRACE + 1)
+        self.keeper.tick()
+        notes = self.notes()
+        self.assertEqual([n["meta"]["id"] for n in notes], [ident])
+        self.assertIn("omp can hold", notes[0]["text"])
+        with patch.dict(factory.TABLE["codex"], unstarted="note"):
+            self.fake.set_status(self.lead, "idle", app="claude-code")
+            second = self.unstarted_send("another")
+            self.clock.sleep(factory.UNSTARTED_GRACE + 1)
+            self.keeper.tick()
+        self.assertEqual([n["meta"]["id"] for n in self.notes()], [ident])
+        self.assertTrue(second)
+
+    def test_an_unstarted_note_falls_back_to_the_formation_without_an_app(self):
+        self.enterContext(patch.dict(factory.TABLE["codex"], unstarted="note"))
+        self.fake.set_status(self.lead, "idle")
+        with self.fake.state() as state:                                # a status with no app reported
+            state["terminals"][self.lead]["status"].pop("app", None)
+        ident = self.unstarted_send()
+        self.clock.sleep(factory.UNSTARTED_GRACE + 1)
+        self.keeper.tick()
+        self.assertEqual([n["meta"]["id"] for n in self.notes()], [ident])
+
     def test_status_shows_an_operator_s_unstarted_delivery(self):
         """For the operator the case is shown by status, never typed into its input (@operator)."""
         box = types.SimpleNamespace(outcomes={(4, "operator"): {"o": "delivered", "started": False, "turn": 2,
                                                                 "term": "t1"}})
         cfg = types.SimpleNamespace(operator={"name": "operator", "harness": "omp"})
         idle = {"address": "t1", "turn": 2, "status": {"state": "idle", "app": "omp"}}
-        self.assertIn("operator: unstarted message #4: typed but did not start a turn",
+        self.assertIn("operator: unstarted message #4 in t1: typed but did not start a turn; ask a person",
                       factory.operator_unstarted(idle, box, cfg))
         for terminal in ({**idle, "turn": 3}, {**idle, "status": {"state": "working", "app": "omp"}},
                          {**idle, "status": {"state": "idle", "app": "codex"}}):
