@@ -2,7 +2,7 @@
 
 **Status: candidate, not released.** The owner chooses the release version, creates and pushes the tag, publishes the release and changes skills-sync. Nothing here does any of those.
 
-- **Candidate:** the reviewed implementation commit is `1dacdce` on branch `peter/175-phase-10`, with Factory `9bd62cf9c632` (`factory.py`'s own `VERSION`). The native-discovery and cross-case evidence below ran at `e7c2f26`, Factory `7d4b075acdb5`. Changes since then: the unstarted-delivery notice, the multiline proof and report rejudging. Neither ID is a published semver.
+- **Candidate:** the reviewed implementation commit is `9b316ec` on branch `peter/175-phase-10`, with Factory `bbd75423bc1f` (`factory.py`'s own `VERSION`). Since `1dacdce` (Factory `9bd62cf9c632`), only the unstarted-delivery notice changed: every operator receipt is reported, and the notice points to `inbox` for the message. The native-discovery and cross-case evidence below ran at `e7c2f26`, Factory `7d4b075acdb5`. Changes since then: the unstarted-delivery notice, the multiline proof and report rejudging. No ID here is a published semver.
 - **Environment:** hc 0.1.20, rodeo 0.2.1, Linux. Every run is on a private hc core, with rodeo on a second private core, and never in the owner's sessions.
 - **Isolation:** QA terminals get no `HC_*`, `RODEO_*`, `HERDR*` or driving-harness session variables, a failing `herdr` first on PATH, and a scratch `FACTORY.md` naming the candidate script. User skill discovery is off where a harness has a switch.
 
