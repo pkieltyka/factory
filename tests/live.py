@@ -3511,18 +3511,31 @@ def _case_7_main(run, role, harness, adapter_class):
                           team.adapter.act_append(receipt2, marks[2])])
         body = team.dir / "multiline.md"
         body.write_text(text)
+        recipient = "lead-dev" if role == "member" else "operator"
         if role == "member":
-            team.call("say", "lead-dev", "--file", str(body), timeout=60)
+            _, said = team.call("say", "lead-dev", "--file", str(body), timeout=60)
+            ident = _say_id(said)
         else:
-            _member_says(team, text)
+            ident = (_member_says(team, text) or {}).get("id")
+            ident = re.match(r"(\d+)", str(ident)) if ident else None
         got = team.until(lambda: receipt2.exists() and all(m in receipt2.read_text() for m in marks) and
                          receipt2.read_text(), 300)
-        order = [line for line in (got or "").split() if line in marks]
-        ok = order == marks
+        seen = receipt2.read_text() if receipt2.exists() else ""
+        order = [line for line in seen.split() if line in marks]
+        ok = bool(got) and order == marks
+        proof = {"bytes": len(text.encode()), "order": [marks.index(m) for m in order]}
+        if ident:                          # what Factory did with it (omp member multiline at e7c2f26: order [])
+            records, box = factory_log(team).read_box()
+            n = int(ident.group(1))
+            proof.update(id=n, delivery={k: box.outcome(n, recipient).get(k) for k in ("o", "why", "term", "turn",
+                                                                                       "started")},
+                         history=[[r["o"], r.get("why")] for r in records if r["t"] == "out" and r["id"] == n
+                                  and r["to"] == recipient])
+        subject = _subject(team, role)
+        proof["recipient_state"] = team.state(subject) if subject else None
         run.row(7, "multiline", role, harness, "pass" if ok else "fail",
                 "a long multi-line message: the markers at its beginning, middle and end acted on in order",
-                proof={"bytes": len(text.encode()), "order": [marks.index(m) for m in order]},
-                reason=None if ok else "a marker was missing or out of order")
+                proof=proof, reason=None if ok else "a marker was missing or out of order")
 
 def _case_7_two_senders(run, role, harness, adapter_class):
     """two-senders (phase_8.md §3.7): two senders say to one recipient at the same moment; both IDs are acted on
