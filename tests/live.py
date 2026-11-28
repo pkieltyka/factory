@@ -3118,7 +3118,8 @@ def _operator_commands(run, team, harness, peer):
         # @operator: OpenCode keeps each shell call's output in its shell folder for the project; the command text
         # is only in its database, which is not opened. The outputs, unpaired, mark the row "outputs only".
         outs = opencode_outputs(team.work)
-        full = {"status": next((o for o in reversed(outs) if o.startswith("factory ") and "Member" in o), None),
+        full = {"status": next((o for o in reversed(outs) if o.startswith("factory ") and "Member" in o
+                                and str(team.script) in o.splitlines()[0]), None),     # this run's candidate
                 "inbox": next((o for o in reversed(outs) if o.startswith("[Message ")
                                or o.strip() == "no messages for @operator"), None)}
         listed = sorted({int(n) for n in re.findall(r"\[Message (\d+) ", full["inbox"] or "")})
@@ -3144,9 +3145,14 @@ def _operator_commands(run, team, harness, peer):
                         " no readable record of the status and inbox output") if factory_ok else "see proof")
         return True
     ok = factory_ok and status_ok and inbox_ok
+    if outputs_only and ok:     # @architect-2: unpaired outputs are observations; only a paired call earns a pass
+        run.row(2, "operator-commands", "operator", harness, "not_run", what, proof=proof,
+                elapsed=time.monotonic() - start, observed="outputs only",
+                reason="unproved: outputs only. up and say are in Factory's log, and status and inbox outputs naming"
+                       " this run's script are in OpenCode's shell files, but no call is paired with its result")
+        return True
     run.row(2, "operator-commands", "operator", harness, "pass" if ok else "fail", what, proof=proof,
-            elapsed=time.monotonic() - start, observed="outputs only" if outputs_only and ok else None,
-            reason=None if ok else "see proof")
+            elapsed=time.monotonic() - start, reason=None if ok else "see proof")
     return True
 
 
