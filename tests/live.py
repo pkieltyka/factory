@@ -3119,7 +3119,7 @@ def _operator_commands(run, team, harness, peer):
         # is only in its database, which is not opened. The outputs, unpaired, mark the row "outputs only".
         outs = opencode_outputs(team.work)
         full = {"status": next((o for o in reversed(outs) if o.startswith("factory ") and "Member" in o
-                                and str(team.script) in o.splitlines()[0]), None),     # this run's candidate
+                                and f"({pathlib.Path(team.script).resolve()})" in o.splitlines()[0]), None),
                 "inbox": next((o for o in reversed(outs) if o.startswith("[Message ")
                                or o.strip() == "no messages for @operator"), None)}
         listed = sorted({int(n) for n in re.findall(r"\[Message (\d+) ", full["inbox"] or "")})
