@@ -64,7 +64,7 @@ Notes from `[from factory]` describe an observation that may have changed while 
 | Member exit (`exited`, `was killed`, `hc stopped`, `was lost`, or `its harness ended`) | Run `factory.py up NAME` or reassign. Reconcile the pickup report, tracker and inbox before assigning the task again. |
 | `team quiet` | Check who owes a report, then check for ready work. If neither needs action, end your turn without replying. |
 | `ready work` | Read the current tracker and take its next ready item if you can assign it. |
-| `@x did not start a turn` (message #N typed into its pane) | Find #N with `factory.py inbox --for NAME`, then ask a person to compare its sender and text with that pane's input before anyone presses Enter. The input shows no message ID, and an agent cannot tell Factory's text from the owner's. If the message is still waiting, they press Enter in that pane. Never resend it. |
+| `@x did not start a turn` (message #N typed into its pane) | Find #N with `factory.py inbox --for NAME N`, raising the count until #N appears, then ask a person to compare its sender and text with that pane's input before anyone presses Enter. The input shows no message ID, and an agent cannot tell Factory's text from the owner's. If the message is still waiting, they press Enter in that pane. Never resend it. |
 
 ## Review and integrate
 

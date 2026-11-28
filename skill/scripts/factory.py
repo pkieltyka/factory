@@ -2473,8 +2473,9 @@ class Keeper:
             label = TABLE[harness].get("label", harness)
             text = (f"@{name} did not start a turn: message #{ident} was typed into {term}, and {label} can hold a"
                     f" large message unsent in its input. Find #{ident} with"
-                    f" {factory_command('inbox', '--for', name)}, and ask a person to compare its sender and text"
-                    f" with the input in {term}; they press Enter there only if that message is still waiting.")
+                    f" {factory_command('inbox', '--for', name, 20)} (raise the count until #{ident} appears), and"
+                    f" give its sender and exact text to a person, who compares them with the input in {term} and"
+                    f" presses Enter there only if that message is still waiting.")
             meta = {"what": "unstarted", "about": name, "term": term, "id": ident}
             note = self.log.add("factory", [operator], text, kind="note", meta=meta)[0]
             self.log.refresh(self.box)
@@ -4568,8 +4569,9 @@ def operator_unstarted(terminal, box, cfg):
                    and rec.get("turn") == terminal.get("turn") and rec.get("term") == terminal.get("address")
                    and (box.msgs.get(ident) or {}).get("kind") != "note")     # (@reviewer on #235)
     return [f"operator: unstarted message #{ident} in {terminal.get('address')}: typed but did not start a turn;"
-            f" find #{ident} with {factory_command('inbox', '--for', name)} and ask a person to compare its sender"
-            f" and text with the operator's input before pressing Enter there." for ident in found]
+            f" find #{ident} with {factory_command('inbox', '--for', name, 20)} (raise the count until it appears) and"
+            f" give its sender and exact text to a person, who compares them with the operator's input before pressing"
+            f" Enter there." for ident in found]
 
 
 def cmd_status(args):

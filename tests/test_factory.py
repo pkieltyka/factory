@@ -2978,8 +2978,12 @@ class MemberNoteTests(TeamCase):
         self.assertEqual([n["meta"] for n in notes], [{"what": "unstarted", "about": "lead-dev", "term": self.lead,
                                                        "id": ident}])
         self.assertIn(f"@lead-dev did not start a turn: message #{ident} was typed into {self.lead}", notes[0]["text"])
-        self.assertIn(f"Find #{ident} with {CMD('inbox', '--for', 'lead-dev')}, and ask a person to compare its"
-                      f" sender and text with the input in {self.lead}", notes[0]["text"])
+        self.assertIn(f"Find #{ident} with {CMD('inbox', '--for', 'lead-dev', 20)} (raise the count until #{ident}"
+                      f" appears), and give its sender and exact text to a person, who compares them with the input"
+                      f" in {self.lead}", notes[0]["text"])
+        argv = shlex.split(notes[0]["text"].split(" with ", 1)[1].split(" (raise", 1)[0])
+        self.assertEqual(argv[:3], ["python3", str(factory.SCRIPT), "inbox"])
+        self.assertEqual(argv[-2:], ["--cwd", str(self.root.resolve())])       # the team's checkout (#234)
         self.assertEqual(self.fake.sent(self.lead), ["[from @operator]\na long message\n"])   # nothing more typed
         self.clock.sleep(factory.UNSTARTED_GRACE + 1)
         self.keeper.tick()
