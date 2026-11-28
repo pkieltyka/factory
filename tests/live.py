@@ -5428,6 +5428,16 @@ def _commit_rank(head):
     return int(done.stdout.strip()) if done.returncode == 0 and done.stdout.strip().isdigit() else -1
 
 
+def _rejudged(row):
+    """A stored row as today's rules read it, the raw JSON untouched: an outputs-only pass (OpenCode at 8f7b61b)
+    is never a pass (@operator), so it enters the report unproved, as current and as superseded history alike."""
+    proof = row.get("proof") if isinstance(row.get("proof"), dict) else {}
+    if row.get("status") == "pass" and proof.get("outputs_only"):
+        return {**row, "status": "not_run",
+                "reason": "unproved: outputs only (rejudged); no call is paired with its result"}
+    return row
+
+
 def report(paths, out):
     """For each role, harness, case and subcase keep the row of the newest attempt (by UTC, then source head) and
     write one Markdown report per harness plus trust-entries.md; text outside the generated block is kept, and
@@ -5451,6 +5461,7 @@ def report(paths, out):
         runs.append(data)
         rank = (data.get("utc") or "", _commit_rank(data.get("source_head")))   # newest attempt by UTC (§1)
         for row in data["rows"]:
+            row = _rejudged(row)
             key = (row["role"], row["harness"], row["case"], row["subcase"])
             same_run = key in chosen and chosen[key][2] is data     # a repeated --case: its last row stands
             if key not in chosen or rank >= chosen[key][0]:
@@ -5491,9 +5502,7 @@ def report(paths, out):
                 proof = row.get("proof") if isinstance(row.get("proof"), dict) else {}
                 status = row["status"]
                 needed = PROOF_NEEDED.get((case, subcase))
-                if status == "pass" and proof.get("outputs_only"):    # @operator: never a pass (8f7b61b rows)
-                    status = "unproved (outputs only: no call paired with its result)"
-                elif status == "pass" and needed and not any(key in proof for key in needed):
+                if status == "pass" and needed and not any(key in proof for key in needed):
                     status = "unproved (an older driver's weaker check)"
                 elif status == "pass" and (case, subcase) in REJUDGE and not REJUDGE[(case, subcase)](proof):
                     status = "unproved (its proof does not meet today's check)"

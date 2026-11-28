@@ -7258,9 +7258,16 @@ class QualifyReportTests(unittest.TestCase):
             (tmp / "a.json").write_text(json.dumps(data))
             live.report([str(tmp / "a.json")], tmp / "out")
             text = (tmp / "out" / "opencode.md").read_text()
-            self.assertIn("| 2 | operator-commands | unproved (outputs only: no call paired with its result) |"
-                          " outputs only |", text)
+            self.assertIn("| 2 | operator-commands | not_run | outputs only |", text)
             self.assertIn("Unresolved as operator: 2 operator-commands,", text)
+            later = {**data, "utc": "2026-11-28T01:00:00Z", "rows": [{**row, "status": "fail", "observed": None,
+                                                                      "reason": "see proof", "proof": {}}]}
+            (tmp / "b.json").write_text(json.dumps(later))     # superseded history reads it the same way
+            live.report([str(tmp / "a.json"), str(tmp / "b.json")], tmp / "out")
+            text = (tmp / "out" / "opencode.md").read_text()
+            self.assertNotIn("operator-commands: pass at", text)
+            self.assertIn("2 | operator-commands | fail", text)
+            self.assertTrue(json.loads((tmp / "a.json").read_text())["rows"][0]["status"] == "pass")   # raw kept
 
     def test_the_latest_attempt_wins_across_heads_and_trust_entries_accumulate(self):
         """@reviewer: a later fail on an older head must not hide behind an earlier pass on a newer one; and a
