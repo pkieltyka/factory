@@ -2978,6 +2978,8 @@ class MemberNoteTests(TeamCase):
         self.assertEqual([n["meta"] for n in notes], [{"what": "unstarted", "about": "lead-dev", "term": self.lead,
                                                        "id": ident}])
         self.assertIn(f"@lead-dev did not start a turn: message #{ident} was typed into {self.lead}", notes[0]["text"])
+        self.assertTrue(notes[0]["text"].endswith(f"Ask a person to inspect the input in {self.lead} and press Enter"
+                                                  f" only if they see message #{ident} waiting."))
         self.assertEqual(self.fake.sent(self.lead), ["[from @operator]\na long message\n"])   # nothing more typed
         self.clock.sleep(factory.UNSTARTED_GRACE + 1)
         self.keeper.tick()
@@ -3027,6 +3029,24 @@ class MemberNoteTests(TeamCase):
         again.tick()
         self.keeper.tick()                                               # neither image repeats it
         self.assertEqual(len(self.notes()), 1)
+
+    def test_two_unstarted_receipts_at_one_turn_are_each_noted_once(self):
+        """@architect-2 at 0092272: #6 and #7 both typed with no turn started, t3 still idle at that turn; after a
+        restart both get exactly one notice, and another pass adds none."""
+        self.enterContext(patch.dict(factory.TABLE["codex"], unstarted="note"))
+        self.fake.set_status(self.lead, "idle", app="codex")
+        self.fake.rule("send", **{self.lead: {"started": False}})
+        first = self.log.add("operator", ["lead-dev"], "one")[0]
+        second = self.log.add("operator", ["lead-dev"], "two")[0]
+        for _ in range(6):
+            self.keeper.tick()
+            self.run_jobs()
+        again = factory.Keeper(self.state_dir, self.hc, self.clock, self.pane.append, self.jobs.append)
+        again.tick()
+        self.clock.sleep(factory.UNSTARTED_GRACE + 1)
+        for _ in range(3):
+            again.tick()
+        self.assertEqual(sorted(n["meta"]["id"] for n in self.notes()), [first, second])
 
     def test_an_unstarted_note_follows_the_live_app_not_the_formation(self):
         """@architect-2: a live omp in a pane formed as Codex gets the notice, a Claude Code one in a pane formed

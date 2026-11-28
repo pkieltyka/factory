@@ -2445,16 +2445,15 @@ class Keeper:
         loses nothing; a stored note for that message and terminal ends it (@architect-2)."""
         now = self.clock.monotonic()
         operator = self.cfg.operator["name"]
-        newest = {}
-        for (ident, to), rec in self.box.outcomes.items():
+        cases = []           # every unnoted receipt, not only a member's newest (@architect-2: #6 and #7 at one turn)
+        for (ident, to), rec in sorted(self.box.outcomes.items()):
             msg = self.box.msgs.get(ident)
-            if to != operator and rec.get("o") == "delivered" and msg and msg["kind"] != "note" and \
-                    ident > newest.get(to, (0, None))[0]:
-                newest[to] = (ident, rec)
+            if to != operator and rec.get("o") == "delivered" and msg and msg["kind"] != "note":
+                cases.append((to, ident, rec))
         noted = {(m["meta"].get("id"), m["meta"].get("term")) for m in self.box.msgs.values()
                  if m["kind"] == "note" and (m.get("meta") or {}).get("what") == "unstarted"}
         live = set()
-        for name, (ident, rec) in newest.items():
+        for name, ident, rec in cases:
             term, turn = rec.get("term"), rec.get("turn")
             if rec.get("started") is not False or (ident, term) in noted:
                 continue
@@ -2472,9 +2471,9 @@ class Keeper:
             if TABLE.get(harness or "", {}).get("unstarted") != "note":
                 continue
             label = TABLE[harness].get("label", harness)
-            text = (f"@{name} did not start a turn: message #{ident} was typed into {term}. {label} can hold a"
-                    f" large message unsent in its input: check that pane, and press Enter there if it is still"
-                    f" waiting.")
+            text = (f"@{name} did not start a turn: message #{ident} was typed into {term}, and {label} can hold a"
+                    f" large message unsent in its input. Ask a person to inspect the input in {term} and press Enter"
+                    f" only if they see message #{ident} waiting.")
             meta = {"what": "unstarted", "about": name, "term": term, "id": ident}
             note = self.log.add("factory", [operator], text, kind="note", meta=meta)[0]
             self.log.refresh(self.box)
