@@ -174,6 +174,8 @@ For each member in state `gone` whose terminal is in `box.briefed()` and has no 
 
 Because a note's identity is in the log record itself, a restarted keeper repeats nothing, and a block or exit still present when it starts, or when a new operator is marked, is noted then. A state that begins and ends within one tick is not seen (§10).
 
+**Unstarted delivery (#175).** For a member on a harness whose table has `unstarted = "note"` (omp): when hc reports a message delivered with `started = false`, the keeper records `(member, id) → (terminal, turn)`. After `UNSTARTED_GRACE` (5 s), if that terminal is still the member's and is `idle` or `done` at the same turn, the operator gets one note naming the message and the pane (`what = "unstarted"`, text "@NAME did not start a turn: message #N was typed into tN. …"). Then a person checks the input before pressing Enter. Nothing is typed into the member's pane, and a member that started meanwhile gets no note. For an operator recipient, `status` shows the same case and nothing is typed into its input. hc 0.1.20 exposes no draft or input state, so Factory cannot safely press Enter itself. A longer protected gap before hc's own submit is requested upstream (#178).
+
 Note texts (`<msg>` is `status.msg` when the harness gave one):
 
 ```

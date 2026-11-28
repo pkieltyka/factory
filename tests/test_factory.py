@@ -2960,6 +2960,49 @@ class MemberNoteTests(TeamCase):
         again.tick()
         self.assertEqual(len(self.notes()), 1)
 
+    def test_an_unstarted_delivery_is_noted_once_when_the_member_stays_idle(self):
+        """@operator (#175, omp's 29 KB message at 19b4fd8): hc typed it but no turn started. The operator gets one
+        note naming the message and the pane, after the member is seen still idle at that turn; nothing is typed
+        into the member's pane, and a member that started meanwhile gets no note."""
+        self.enterContext(patch.dict(factory.TABLE["codex"], unstarted="note"))
+        self.fake.rule("send", **{self.lead: {"started": False}})
+        ident = self.log.add("operator", ["lead-dev"], "a long message")[0]
+        for _ in range(3):
+            self.keeper.tick()
+            self.run_jobs()
+        self.assertEqual(self.notes(), [])                               # not before the grace
+        self.clock.sleep(factory.UNSTARTED_GRACE + 1)
+        self.keeper.tick()
+        notes = self.notes()
+        self.assertEqual([n["meta"] for n in notes], [{"what": "unstarted", "about": "lead-dev", "term": self.lead,
+                                                       "id": ident}])
+        self.assertIn(f"@lead-dev did not start a turn: message #{ident} was typed into {self.lead}", notes[0]["text"])
+        self.assertEqual(self.fake.sent(self.lead), ["[from @operator]\na long message\n"])   # nothing more typed
+        self.clock.sleep(factory.UNSTARTED_GRACE + 1)
+        self.keeper.tick()
+        self.assertEqual(len(self.notes()), 1)                           # once
+        second = self.log.add("operator", ["lead-dev"], "another")[0]
+        for _ in range(3):
+            self.keeper.tick()
+            self.run_jobs()
+        self.status(self.lead, "working")                                # it started after all
+        self.clock.sleep(factory.UNSTARTED_GRACE + 1)
+        self.keeper.tick()
+        self.assertEqual([n["meta"].get("id") for n in self.notes()], [ident])
+        self.assertTrue(second)
+
+    def test_status_shows_an_operator_s_unstarted_delivery(self):
+        """For the operator the case is shown by status, never typed into its input (@operator)."""
+        box = types.SimpleNamespace(outcomes={(4, "operator"): {"o": "delivered", "started": False, "turn": 2,
+                                                                "term": "t1"}})
+        cfg = types.SimpleNamespace(operator={"name": "operator", "harness": "omp"})
+        idle = {"address": "t1", "turn": 2, "status": {"state": "idle", "app": "omp"}}
+        self.assertIn("operator: unstarted message #4: typed but did not start a turn",
+                      factory.operator_unstarted(idle, box, cfg))
+        for terminal in ({**idle, "turn": 3}, {**idle, "status": {"state": "working", "app": "omp"}},
+                         {**idle, "status": {"state": "idle", "app": "codex"}}):
+            self.assertIsNone(factory.operator_unstarted(terminal, box, cfg))
+
     def test_errors_and_exits_are_noted_with_their_facts(self):
         self.status(self.lead, "working")
         task = self.log.add("operator", ["lead-dev"], "do it")[0]
@@ -8953,11 +8996,12 @@ class SkillTextTests(unittest.TestCase):
         table = leading.split("| Status | Action |", 1)[1].split("\n\n", 1)[0]
         states = {"not started", "starting", "idle", "working", "done", "blocked", "error", "gone"}
         hints = {"first brief N is still", "no confirmed brief", "no pane", "operator: not reachable",
-                 "keeper: not running"}
+                 "keeper: not running", "operator: unstarted message"}
         words = {word for row in table.splitlines() if row.startswith("|")
                  for word in re.findall(r"`([^`]+)`", row.split("|", 2)[1])}
         self.assertEqual(words, states | hints)
-        source = inspect.getsource(factory.cmd_status) + inspect.getsource(factory._pending_brief_line)
+        source = (inspect.getsource(factory.cmd_status) + inspect.getsource(factory._pending_brief_line)
+                  + inspect.getsource(factory.operator_unstarted))
         for hint in hints - {"first brief N is still"}:
             self.assertIn(hint, source)
         self.assertIn("first brief {", source)
@@ -8972,6 +9016,7 @@ class SkillTextTests(unittest.TestCase):
             factory.end_cause: {"exited", "was killed", "hc stopped", "was lost", "its harness ended"},
             factory.quiet_text: {"team quiet"},
             factory.Keeper._ready_result: {"ready work"},
+            factory.Keeper._unstarted_notes: {"did not start a turn"},
         }
         self.assertEqual(names, set().union(*producers.values()))
         for producer, phrases in producers.items():

@@ -1,6 +1,6 @@
 # omp qualification (Phase 8 #173, Phase 10 #175)
 
-**Status: tested in both roles.** Factory gives omp messages between turns in both roles (#175). The open rows are 6 operator-switch and member-switch (omp gives its tool no session variable), operator 7 upgrade (the #178 request 4 limit), and member 7 multiline. That is a product defect found at e7c2f26 and 19b4fd8: an idle omp does not submit a large message, Factory records it delivered with started=false, and one more Enter submits it. The fix is @operator's decision. See "Unresolved" in each table and [the release candidate](release-candidate.md).
+**Status: tested in both roles.** Factory gives omp messages between turns in both roles (#175). The open rows are 6 operator-switch and member-switch (omp gives its tool no session variable), operator 7 upgrade (the #178 request 4 limit), and member 7 multiline. That is a recorded limit: an idle omp does not submit a large message (found at e7c2f26 and 19b4fd8), and one more Enter submits it. hc 0.1.20 exposes no draft state, so Factory does not press Enter. Instead the keeper tells the operator, naming the message and the pane, and status shows an operator's own case (keeper.md §5, @operator). A longer protected gap before hc's submit is requested upstream (#178). See "Unresolved" in each table and [the release candidate](release-candidate.md).
 
 - **As operator (Phase 10):** omp/19.2.1, model openai-codex/gpt-6-astra, from Factory's own launch builder with --no-skills; the members are Codex.
 

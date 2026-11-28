@@ -15,7 +15,7 @@ Each cell links the generated report. A full harness claim needs every required 
 | [Claude Code](claude.md) | 2.1.332, claude-fable-5-2 | all rows pass | 4 owner-interrupt: the recorded limit for a deliberate owner Esc (functional spec §8.3) |
 | [Codex](codex.md) | codex-cli 0.172.0, gpt-6.2-astra | 7 pending-restart: never reported blocked | 5 blocked, 7 pending-restart: never reported blocked |
 | [pi](pi.md) | 1.6.1, openai/gpt-6-astra | 7 pending-restart: never reported blocked | 4 mid-turn: recorded pi behaviour (steering can leave the current task unfinished); 5 blocked, 7 pending-restart: never reported blocked |
-| [omp](omp.md) | omp/19.2.1, openai-codex/gpt-6-astra | 6 operator-switch: no session variable; 7 upgrade: the #178 request 4 limit | 6 member-switch: no session variable; 7 multiline: **a product defect, decision pending.** An idle omp does not submit a large message: the paste becomes an attachment in its input, and the submit key is lost (started=false). One more Enter submits it |
+| [omp](omp.md) | omp/19.2.1, openai-codex/gpt-6-astra | 6 operator-switch: no session variable; 7 upgrade: the #178 request 4 limit | 6 member-switch: no session variable; 7 multiline: a recorded limit. An idle omp does not submit a large message, which sits in its input until one more Enter. The keeper notes it to the operator, naming the message and the pane, and status shows an operator's own case. A longer submit gap is requested from hc (#178) |
 | [OpenCode](opencode.md) | v2.4.1+6f05140, openrouter/openai/gpt-6-astra | 2 operator-commands: unproved (outputs only) | all rows pass |
 | [agy](agy.md) | 1.5.18, gemini-4-neon | 2 operator-commands: unproved (no readable record of its tool calls) | all rows pass |
 
@@ -49,7 +49,7 @@ The candidate SHA was `e7c2f26` for both passes. The five installed copies are u
 - **Messaging:** every message is stored before it is typed, and each one has an outcome you can check later with `inbox`. The keeper types messages into members' panes. It holds messages for a blocked or unbriefed member, and for a working Codex or omp. It also notes members that block, error or exit.
 - **Operator:** any of the six harnesses can run as operator. A member's report reaches it while it is idle, and a team-quiet note when nobody is working.
 - **Recovery:** `up` brings back stopped or lost members and resumes saved conversations where the harness allows. Every command Factory prints names `python3`, the running script's absolute path and the team's checkout, so it works from any directory.
-- **Limits:** a deliberate Esc in a working Claude Code member's pane can lose a message delivered in that turn, so check `inbox` (leading.md). pi and omp can leave a task unfinished when a message steers it. There is the `done` or `error` guard limit above. Factory never verifies a harness's own permission prompts.
+- **Limits:** a deliberate Esc in a working Claude Code member's pane can lose a message delivered in that turn, so check `inbox` (leading.md). An idle omp can leave a large message unsent in its input, and Factory says so, naming the message and the pane. pi and omp can leave a task unfinished when a message steers it. There is the `done` or `error` guard limit above. Factory never verifies a harness's own permission prompts.
 
 ### Proposed README at release
 
